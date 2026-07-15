@@ -1,0 +1,9 @@
+[package]
+name = "option-ext"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Small MIT-compatible Option extension surface used by GPUI PDF Reader"
+
+[lib]
+path = "src/lib.rs"

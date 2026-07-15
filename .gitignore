@@ -1,0 +1,21 @@
+# Rust build output. The vendored crate has its own Cargo target directory.
+/target/
+/vendor/*/target/
+**/*.rs.bk
+
+# macOS filesystem metadata.
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Local editor state.
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local environment files may contain machine-specific paths or secrets.
+.env
+.env.*
+!.env.example

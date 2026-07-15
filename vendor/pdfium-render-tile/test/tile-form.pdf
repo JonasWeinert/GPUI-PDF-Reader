@@ -1,0 +1,73 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] /Resources << /Font << /Helv 5 0 R >> >> >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Annots [7 0 R 9 0 R] >>
+endobj
+4 0 obj
+<<  /Length 198 >>
+stream
+q
+0.92 0.95 1 rg 0 0 612 792 re f
+Q
+BT /Helv 24 Tf 72 690 Td (Tile form and annotation fixture) Tj ET
+BT /Helv 13 Tf 72 650 Td (The field below is rendered through the form-fill environment.) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Fields [7 0 R] /DR << /Font << /Helv 5 0 R >> >> /DA (/Helv 16 Tf 0 g) /NeedAppearances true >>
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Widget /FT /Tx /T (tile_field) /V (FORM VALUE) /Rect [120 400 360 445] /P 3 0 R /F 4 /DA (/Helv 16 Tf 0 g) /AP << /N 8 0 R >> >>
+endobj
+8 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 240 45] /Resources << /Font << /Helv 5 0 R >> >> /Length 111 >>
+stream
+q
+1 1 0.85 rg 0 0 240 45 re f
+0.15 0.2 0.35 RG 2 w 1 1 238 43 re S
+Q
+BT /Helv 16 Tf 8 15 Td (FORM VALUE) Tj ET
+
+endstream
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Square /Rect [100 300 250 350] /C [1 0 1] /IC [0 1 1] /F 4 /AP << /N 10 0 R >> >>
+endobj
+10 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 150 50] /Length 58 >>
+stream
+q
+0 1 1 rg 0 0 150 50 re f
+1 0 1 RG 4 w 2 2 146 46 re S
+Q
+
+endstream
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000015 00000 n 
+0000000080 00000 n 
+0000000178 00000 n 
+0000000287 00000 n 
+0000000537 00000 n 
+0000000634 00000 n 
+0000000749 00000 n 
+0000000919 00000 n 
+0000001171 00000 n 
+0000001294 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R >>
+startxref
+1452
+%%EOF

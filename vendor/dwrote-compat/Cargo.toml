@@ -1,0 +1,9 @@
+[package]
+name = "dwrote"
+version = "0.11.5"
+edition = "2024"
+license = "MIT"
+description = "Unbuilt target placeholder for GPUI PDF Reader's macOS-only dependency graph"
+
+[lib]
+path = "src/lib.rs"
