@@ -36,12 +36,26 @@ are macOS-specific today.
 - Bounded high-resolution viewport tiles instead of oversized full-page
   bitmaps at high zoom.
 - Selectable text, word selection, cross-page selection, Select All, and copy.
+- Selection-anchored highlights in yellow, green, blue, pink, or purple.
+- Markdown-backed comments with a WYSIWYG editor for bold, italic, inline
+  code, bulleted lists, and numbered lists.
+- Animated comments and search sidebars that preserve the document position
+  while making room for the panel.
+- Case-insensitive in-document search with on-page result highlights, a
+  virtualized result list, and previous/next navigation.
 - PDFium rendering for intrinsic page rotation, CropBox pages, annotations,
   and AcroForm appearances.
 - Latest-wins rendering and bounded caches to keep rapid scrolling and zooming
   responsive.
 
 Forms are rendered for visual fidelity but are not interactive yet.
+
+Highlights and comments are app-managed annotations. GPUI PDF Reader leaves
+the PDF unchanged and stores them beside it in a versioned JSON sidecar named
+`<document>.pdf.gpui-pdf-reader.json`. The reader validates the sidecar against
+the PDF's file size, modification time, and page count before loading or
+saving it. Keep the sidecar with the PDF when moving a document if you want to
+retain its annotations.
 
 ## Build from source
 
@@ -106,6 +120,15 @@ been implemented yet.
 | First / last page | `Home` / `End` |
 | Select text | Left drag; `Shift`-click extends; double-click selects a word |
 | Select all / copy | `Command-A` / `Command-C` |
+| Highlight selection | Choose one of the five color controls in the toolbar |
+| Add comment to selection | Toolbar or `Command-Option-M` |
+| Search document | Toolbar or `Command-F` |
+| Next / previous search result | `Command-G` / `Command-Shift-G` |
+| Show / hide comments | Comments control in the toolbar |
+
+The comment editor displays formatted content directly while storing Markdown.
+Its hovering formatting pill provides bold, italic, inline code, bulleted-list,
+and numbered-list controls. Use `Command-Enter` to save or `Escape` to cancel.
 
 Keyboard scrolling is animated. Precise trackpad deltas are applied directly,
 and zoom gestures preserve the document position beneath the pointer.
@@ -114,8 +137,10 @@ and zoom gestures preserve the document position beneath the pointer.
 
 - Only macOS is currently implemented and supported.
 - Encrypted PDFs do not have a password prompt.
-- Search, outlines, thumbnails, editing, and interactive form filling are not
-  implemented yet.
+- Outlines, thumbnails, PDF-embedded annotation editing, and interactive form
+  filling are not implemented yet.
+- Highlights and comments use a companion sidecar; they are not written into
+  the PDF and are not interoperable with PDF annotation tools yet.
 - There is no packaged, signed, or notarized application release.
 - Zoom is limited to 20–500%.
 - PDFium's initial text-page loading call is synchronous. Later character
@@ -138,9 +163,10 @@ including on intrinsically rotated pages. Tile allocation is capped at
 protecting the exact visible working set.
 
 Viewport requests replace stale queued work. Visible tiles run before text
-extraction and prefetch work. Zoom rendering is debounced for 150ms, while a
-new zoom burst immediately cancels the previous queued viewport. Stale
-successes and failures are both discarded.
+extraction, document search, and prefetch work. PDFium rendering, text
+extraction, and search all stay on the same worker thread. Zoom rendering is
+debounced for 150ms, while a new zoom burst immediately cancels the previous
+queued viewport. Stale successes and failures are both discarded.
 
 Text coordinates are extracted at a stable precision independent of current
 zoom and indexed in a bounded spatial grid. Copy streams uncached pages rather
@@ -175,10 +201,21 @@ debounce:
 sh tests/e2e/macos_zoom.sh
 ```
 
+The feature scenario creates all five highlight colors, types and formats a
+multiword comment through GPUI's native input path, opens and closes both
+sidebars while injecting live trackpad-style input, types a query into the
+search field, navigates results, then relaunches the copied fixture to verify
+the sidecar round trip:
+
+```sh
+sh tests/e2e/macos_features.sh
+```
+
 Each E2E case has a hard watchdog and requires a quiet Ready state, all exact
 visible tiles, bounded tile memory, and no panic or GPU/Metal fault in the app
-or macOS logs. It needs a logged-in macOS GUI session but does not require
-Accessibility permission.
+or macOS logs. The feature scenario also measures document-anchor drift during
+sidebar transitions. Both scripts need a logged-in macOS GUI session but do
+not require Accessibility permission.
 
 The root integration fixture is `tests/fixtures/interaction.pdf`.
 
@@ -187,7 +224,7 @@ The root integration fixture is `tests/fixtures/interaction.pdf`.
 Likely development areas include:
 
 - Linux and Windows platform support
-- Search, outlines, and thumbnail navigation
+- Outlines and thumbnail navigation
 - Password handling for encrypted PDFs
 - Interactive forms
 - Packaged and signed application releases

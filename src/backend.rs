@@ -1,6 +1,9 @@
 use crate::model::{PageSize, PixelRect, TextBounds, TextChar, TextLayer, TileKey};
 #[cfg(test)]
 use crate::model::{RasterSize, TextPosition, TextSelection, selected_text};
+use crate::search::{
+    MAX_SEARCH_RESULTS, SearchPageOutcome, SearchPageResults, SearchQuery, search_page,
+};
 use pdfium_render::prelude::*;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -15,6 +18,7 @@ const MAX_PAGE_TEXT_CHARS: usize = 100_000;
 const MAX_CACHED_TEXT_PAGES: usize = 16;
 const TEXT_CANCEL_INTERVAL: usize = 64;
 const AUTOMATIC_TEXT_IDLE_DELAY: Duration = Duration::from_millis(200);
+const MAX_SEARCH_HIGHLIGHT_RUNS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TileRequest {
@@ -55,6 +59,31 @@ pub enum WorkerEvent {
         page: usize,
         message: String,
     },
+    SearchPageResults {
+        generation: u64,
+        revision: u64,
+        results: SearchPageResults,
+    },
+    SearchFinished {
+        generation: u64,
+        revision: u64,
+        searched_pages: usize,
+        total_results: usize,
+        total_highlight_runs: usize,
+        skipped_pages: usize,
+        truncated: bool,
+    },
+    SearchWarning {
+        generation: u64,
+        revision: u64,
+        page: usize,
+        message: String,
+    },
+    SearchFailed {
+        generation: u64,
+        revision: u64,
+        message: String,
+    },
     Error {
         generation: Option<u64>,
         message: String,
@@ -64,6 +93,19 @@ pub enum WorkerEvent {
 #[derive(Clone, Debug)]
 pub struct PdfWorker {
     commands: mpsc::Sender<WorkerCommand>,
+}
+
+#[derive(Clone, Debug)]
+struct SearchJob {
+    generation: u64,
+    revision: u64,
+    query: SearchQuery,
+    next_page: usize,
+    page_count: usize,
+    total_results: usize,
+    total_highlight_runs: usize,
+    skipped_pages: usize,
+    truncated: bool,
 }
 
 impl PdfWorker {
@@ -130,6 +172,27 @@ impl PdfWorker {
             .send(WorkerCommand::CancelExplicitText { generation })
             .is_ok()
     }
+
+    pub fn search(&self, generation: u64, revision: u64, query: SearchQuery) -> bool {
+        self.commands
+            .send(WorkerCommand::Search {
+                generation,
+                revision,
+                query,
+            })
+            .is_ok()
+    }
+
+    /// Cancels search revisions older than `next_revision` immediately while
+    /// still allowing the debounced search for `next_revision` to start.
+    pub fn cancel_search(&self, generation: u64, next_revision: u64) -> bool {
+        self.commands
+            .send(WorkerCommand::CancelSearch {
+                generation,
+                next_revision,
+            })
+            .is_ok()
+    }
 }
 
 #[derive(Debug)]
@@ -150,6 +213,15 @@ enum WorkerCommand {
     CancelExplicitText {
         generation: u64,
     },
+    Search {
+        generation: u64,
+        revision: u64,
+        query: SearchQuery,
+    },
+    CancelSearch {
+        generation: u64,
+        next_revision: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +238,10 @@ struct WorkerState {
     text_cache: HashMap<usize, Arc<TextLayer>>,
     partial_text: HashMap<usize, Vec<TextChar>>,
     automatic_text_needs_quiet: bool,
+    page_count: usize,
+    search: Option<SearchJob>,
+    latest_search_revision: Option<u64>,
+    search_partial: Option<(usize, Vec<TextChar>)>,
 }
 
 enum TextExtraction {
@@ -176,6 +252,7 @@ enum TextExtraction {
 enum WorkerWork {
     Tile(TileKey),
     Text { page: usize, explicit: bool },
+    Search,
 }
 
 fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<WorkerEvent>) {
@@ -189,7 +266,9 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
             return;
         }
     };
-    let _ = events.send(WorkerEvent::Ready);
+    if events.send(WorkerEvent::Ready).is_err() {
+        return;
+    }
 
     let mut state = WorkerState {
         document: None,
@@ -197,13 +276,21 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
         text_cache: HashMap::new(),
         partial_text: HashMap::new(),
         automatic_text_needs_quiet: false,
+        page_count: 0,
+        search: None,
+        latest_search_revision: None,
+        search_partial: None,
     };
     let mut pending = HashMap::<TileKey, RenderRequest>::new();
     let mut explicit_text = BTreeSet::<usize>::new();
     let mut automatic_text = VecDeque::<usize>::new();
 
     loop {
-        if pending.is_empty() && explicit_text.is_empty() && automatic_text.is_empty() {
+        if pending.is_empty()
+            && explicit_text.is_empty()
+            && automatic_text.is_empty()
+            && state.search.is_none()
+        {
             match commands.recv() {
                 Ok(command) => {
                     if !accept_command(
@@ -222,18 +309,16 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
             }
         }
 
-        for command in commands.try_iter() {
-            if !accept_command(
-                command,
-                pdfium,
-                &events,
-                &mut state,
-                &mut pending,
-                &mut explicit_text,
-                &mut automatic_text,
-            ) {
-                return;
-            }
+        if !accept_available_commands(
+            &commands,
+            pdfium,
+            &events,
+            &mut state,
+            &mut pending,
+            &mut explicit_text,
+            &mut automatic_text,
+        ) {
+            return;
         }
 
         let next_visible_tile = pending
@@ -292,6 +377,8 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
                     explicit: false,
                 }
             }
+        } else if state.search.is_some() {
+            WorkerWork::Search
         } else if let Some(key) = pending
             .iter()
             .min_by_key(|(_, request)| request.priority)
@@ -337,26 +424,51 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
 
             match result {
                 Ok((width, height, bgra)) => {
-                    let _ = events.send(WorkerEvent::TileRendered {
-                        generation: request.generation,
-                        key: request.tile.key,
-                        core_rect: request.tile.core_rect,
-                        render_rect: request.tile.render_rect,
-                        width,
-                        height,
-                        bgra,
-                    });
+                    if events
+                        .send(WorkerEvent::TileRendered {
+                            generation: request.generation,
+                            key: request.tile.key,
+                            core_rect: request.tile.core_rect,
+                            render_rect: request.tile.render_rect,
+                            width,
+                            height,
+                            bgra,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
                 Err(message) => {
-                    let _ = events.send(WorkerEvent::TileFailed {
-                        generation: request.generation,
-                        key: request.tile.key,
-                        message: format!(
-                            "Could not render page {}: {message}",
-                            request.tile.key.page + 1
-                        ),
-                    });
+                    if events
+                        .send(WorkerEvent::TileFailed {
+                            generation: request.generation,
+                            key: request.tile.key,
+                            message: format!(
+                                "Could not render page {}: {message}",
+                                request.tile.key.page + 1
+                            ),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
+            }
+            continue;
+        }
+
+        if matches!(work, WorkerWork::Search) {
+            if !process_search_work(
+                &commands,
+                pdfium,
+                &events,
+                &mut state,
+                &mut pending,
+                &mut explicit_text,
+                &mut automatic_text,
+            ) {
+                return;
             }
             continue;
         }
@@ -375,14 +487,23 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
             state.partial_text.remove(&page_index);
             explicit_text.remove(&page_index);
             automatic_text.retain(|page| *page != page_index);
-            let _ = events.send(WorkerEvent::TextExtracted {
-                generation,
-                page: page_index,
-                text,
-            });
+            if events
+                .send(WorkerEvent::TextExtracted {
+                    generation,
+                    page: page_index,
+                    text,
+                })
+                .is_err()
+            {
+                return;
+            }
             continue;
         }
-        let partial = state.partial_text.remove(&page_index).unwrap_or_default();
+        let partial = state
+            .partial_text
+            .remove(&page_index)
+            .or_else(|| take_search_partial(&mut state, page_index))
+            .unwrap_or_default();
         let mut deferred_commands = Vec::new();
         let mut explicit_replaced = false;
         let extracted = extract_page_text(&state, page_index, partial, || {
@@ -500,23 +621,443 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
         automatic_text.retain(|page| *page != page_index);
         match (text, warning) {
             (Some(text), None) => {
-                let _ = events.send(WorkerEvent::TextExtracted {
-                    generation,
-                    page: page_index,
-                    text,
-                });
+                if events
+                    .send(WorkerEvent::TextExtracted {
+                        generation,
+                        page: page_index,
+                        text,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
             }
             (Some(_), Some(message)) => {
-                let _ = events.send(WorkerEvent::TextFailed {
-                    generation,
-                    page: page_index,
-                    message,
-                });
+                if events
+                    .send(WorkerEvent::TextFailed {
+                        generation,
+                        page: page_index,
+                        message,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
             }
             (None, None) => {}
             (None, Some(_)) => unreachable!("a warning always carries a cached empty layer"),
         }
     }
+}
+
+fn accept_available_commands(
+    commands: &mpsc::Receiver<WorkerCommand>,
+    pdfium: &'static Pdfium,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    state: &mut WorkerState,
+    pending: &mut HashMap<TileKey, RenderRequest>,
+    explicit_text: &mut BTreeSet<usize>,
+    automatic_text: &mut VecDeque<usize>,
+) -> bool {
+    loop {
+        match commands.try_recv() {
+            Ok(command) => {
+                if !accept_command(
+                    command,
+                    pdfium,
+                    events,
+                    state,
+                    pending,
+                    explicit_text,
+                    automatic_text,
+                ) {
+                    return false;
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => return true,
+            Err(mpsc::TryRecvError::Disconnected) => return false,
+        }
+    }
+}
+
+fn collect_available_commands(
+    commands: &mpsc::Receiver<WorkerCommand>,
+    deferred: &mut Vec<WorkerCommand>,
+) -> bool {
+    loop {
+        match commands.try_recv() {
+            Ok(command) => deferred.push(command),
+            Err(mpsc::TryRecvError::Empty) => return true,
+            Err(mpsc::TryRecvError::Disconnected) => return false,
+        }
+    }
+}
+
+fn accept_deferred_commands(
+    deferred: Vec<WorkerCommand>,
+    pdfium: &'static Pdfium,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    state: &mut WorkerState,
+    pending: &mut HashMap<TileKey, RenderRequest>,
+    explicit_text: &mut BTreeSet<usize>,
+    automatic_text: &mut VecDeque<usize>,
+) -> bool {
+    for command in deferred {
+        if !accept_command(
+            command,
+            pdfium,
+            events,
+            state,
+            pending,
+            explicit_text,
+            automatic_text,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn process_search_work(
+    commands: &mpsc::Receiver<WorkerCommand>,
+    pdfium: &'static Pdfium,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    state: &mut WorkerState,
+    pending: &mut HashMap<TileKey, RenderRequest>,
+    explicit_text: &mut BTreeSet<usize>,
+    automatic_text: &mut VecDeque<usize>,
+) -> bool {
+    let Some(active) = state.search.clone() else {
+        return true;
+    };
+    if state.generation != Some(active.generation) {
+        state.search = None;
+        state.search_partial = None;
+        return true;
+    }
+    if active.next_page >= active.page_count {
+        state.search = None;
+        state.search_partial = None;
+        return send_search_finished(events, &active);
+    }
+
+    let page = active.next_page;
+    let text = if let Some(text) = state.text_cache.get(&page).cloned() {
+        text
+    } else {
+        let partial = take_search_partial(state, page).unwrap_or_default();
+        let mut deferred = Vec::new();
+        let mut connected = true;
+        let extracted = extract_page_text(state, page, partial, || {
+            connected &= collect_available_commands(commands, &mut deferred);
+            !connected || !deferred.is_empty()
+        });
+        if !connected {
+            return false;
+        }
+        if !accept_deferred_commands(
+            deferred,
+            pdfium,
+            events,
+            state,
+            pending,
+            explicit_text,
+            automatic_text,
+        ) {
+            return false;
+        }
+
+        match extracted {
+            Ok(TextExtraction::Cancelled(partial)) => {
+                preserve_partial_text(state, page, partial, explicit_text, automatic_text);
+                return true;
+            }
+            Ok(TextExtraction::Complete(characters)) => {
+                if state.generation != Some(active.generation) {
+                    return true;
+                }
+                cache_completed_text(state, page, characters)
+            }
+            Err(message) => {
+                if search_job_is_current(state.search.as_ref(), &active) {
+                    if let Some(search) = state.search.as_mut() {
+                        search.next_page += 1;
+                        search.skipped_pages += 1;
+                    }
+                    if events
+                        .send(WorkerEvent::SearchWarning {
+                            generation: active.generation,
+                            revision: active.revision,
+                            page,
+                            message: format!("Could not search page {}: {message}", page + 1),
+                        })
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+    };
+
+    if !search_job_is_current(state.search.as_ref(), &active) {
+        return true;
+    }
+
+    let remaining = MAX_SEARCH_RESULTS.saturating_sub(active.total_results);
+    let mut deferred = Vec::new();
+    let mut connected = true;
+    let outcome = search_page(page, text.as_slice(), &active.query, remaining, || {
+        connected &= collect_available_commands(commands, &mut deferred);
+        !connected || !deferred.is_empty()
+    });
+    if !connected {
+        return false;
+    }
+    // Close the publication gap after the matcher's final cancellation poll.
+    connected &= collect_available_commands(commands, &mut deferred);
+    if !connected {
+        return false;
+    }
+    if !accept_deferred_commands(
+        deferred,
+        pdfium,
+        events,
+        state,
+        pending,
+        explicit_text,
+        automatic_text,
+    ) {
+        return false;
+    }
+    if !search_job_is_current(state.search.as_ref(), &active) {
+        return true;
+    }
+    let SearchPageOutcome::Complete(mut results) = outcome else {
+        return true;
+    };
+
+    let remaining_runs = MAX_SEARCH_HIGHLIGHT_RUNS.saturating_sub(active.total_highlight_runs);
+    let added_runs = cap_search_highlight_runs(&mut results, remaining_runs);
+
+    let added_results = results.matches.len();
+    let stop = results.truncated;
+    let finished = {
+        let search = state
+            .search
+            .as_mut()
+            .expect("the current search job was checked above");
+        search.next_page += 1;
+        search.total_results += added_results;
+        search.total_highlight_runs += added_runs;
+        search.truncated |= stop;
+        (stop || search.next_page >= search.page_count).then(|| search.clone())
+    };
+
+    if !send_search_page_results(events, active.generation, active.revision, results) {
+        return false;
+    }
+    if let Some(finished) = finished {
+        state.search = None;
+        state.search_partial = None;
+        return send_search_finished(events, &finished);
+    }
+    true
+}
+
+fn cap_search_highlight_runs(results: &mut SearchPageResults, remaining_runs: usize) -> usize {
+    let mut added_runs = 0_usize;
+    let mut retained = 0;
+    for result in &results.matches {
+        let next_runs = added_runs.saturating_add(result.highlight_runs.len());
+        if next_runs > remaining_runs {
+            results.truncated = true;
+            break;
+        }
+        added_runs = next_runs;
+        retained += 1;
+    }
+    if retained != results.matches.len() {
+        results.matches.truncate(retained);
+        results.truncated = true;
+    }
+    added_runs
+}
+
+fn send_search_finished(events: &mpsc::SyncSender<WorkerEvent>, search: &SearchJob) -> bool {
+    events
+        .send(WorkerEvent::SearchFinished {
+            generation: search.generation,
+            revision: search.revision,
+            searched_pages: search.next_page,
+            total_results: search.total_results,
+            total_highlight_runs: search.total_highlight_runs,
+            skipped_pages: search.skipped_pages,
+            truncated: search.truncated,
+        })
+        .is_ok()
+}
+
+fn send_search_page_results(
+    events: &mpsc::SyncSender<WorkerEvent>,
+    generation: u64,
+    revision: u64,
+    results: SearchPageResults,
+) -> bool {
+    results.matches.is_empty()
+        || events
+            .send(WorkerEvent::SearchPageResults {
+                generation,
+                revision,
+                results,
+            })
+            .is_ok()
+}
+
+fn search_job_is_current(current: Option<&SearchJob>, expected: &SearchJob) -> bool {
+    current.is_some_and(|current| {
+        current.generation == expected.generation && current.revision == expected.revision
+    })
+}
+
+fn take_search_partial(state: &mut WorkerState, page: usize) -> Option<Vec<TextChar>> {
+    if state
+        .search_partial
+        .as_ref()
+        .is_some_and(|(partial_page, _)| *partial_page == page)
+    {
+        state.search_partial.take().map(|(_, partial)| partial)
+    } else {
+        None
+    }
+}
+
+fn preserve_partial_text(
+    state: &mut WorkerState,
+    page: usize,
+    partial: Vec<TextChar>,
+    explicit_text: &BTreeSet<usize>,
+    automatic_text: &VecDeque<usize>,
+) {
+    if explicit_text.contains(&page) || automatic_text.contains(&page) {
+        state.partial_text.insert(page, partial);
+    } else if state
+        .search
+        .as_ref()
+        .is_some_and(|search| search.next_page == page)
+    {
+        state.search_partial = Some((page, partial));
+    }
+}
+
+fn cache_completed_text(
+    state: &mut WorkerState,
+    page: usize,
+    characters: Vec<TextChar>,
+) -> Arc<TextLayer> {
+    if let Some(text) = state.text_cache.get(&page) {
+        return text.clone();
+    }
+    let (text, warning) = cache_text_layer(&mut state.text_cache, page, || Ok(characters));
+    debug_assert!(warning.is_none());
+    state.search_partial = None;
+    text.or_else(|| state.text_cache.get(&page).cloned())
+        .expect("completed text must be cached")
+}
+
+fn revision_is_newer(candidate: u64, current: u64) -> bool {
+    let distance = candidate.wrapping_sub(current);
+    distance != 0 && distance < (1_u64 << 63)
+}
+
+fn revision_is_current_or_newer(candidate: u64, current: u64) -> bool {
+    candidate == current || revision_is_newer(candidate, current)
+}
+
+fn advance_search_revision(state: &mut WorkerState, generation: u64, revision: u64) -> bool {
+    if state.generation != Some(generation)
+        || state
+            .latest_search_revision
+            .is_some_and(|current| !revision_is_newer(revision, current))
+    {
+        return false;
+    }
+    state.latest_search_revision = Some(revision);
+    state.search = None;
+    state.search_partial = None;
+    true
+}
+
+fn accept_search_demand(
+    state: &mut WorkerState,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    generation: u64,
+    revision: u64,
+    query: SearchQuery,
+) -> bool {
+    if state.generation.is_none() {
+        return events
+            .send(WorkerEvent::SearchFailed {
+                generation,
+                revision,
+                message: "Cannot search because no PDF document is open".into(),
+            })
+            .is_ok();
+    }
+    if !advance_search_revision(state, generation, revision) {
+        return true;
+    }
+    if state.document.is_none() {
+        return events
+            .send(WorkerEvent::SearchFailed {
+                generation,
+                revision,
+                message: "Cannot search because no PDF document is open".into(),
+            })
+            .is_ok();
+    }
+    state.search = Some(SearchJob {
+        generation,
+        revision,
+        query,
+        next_page: 0,
+        page_count: state.page_count,
+        total_results: 0,
+        total_highlight_runs: 0,
+        skipped_pages: 0,
+        truncated: false,
+    });
+    true
+}
+
+fn cancel_searches_before(state: &mut WorkerState, generation: u64, next_revision: u64) {
+    if state.generation != Some(generation) {
+        return;
+    }
+    let floor = next_revision.wrapping_sub(1);
+    if state
+        .latest_search_revision
+        .is_some_and(|current| !revision_is_current_or_newer(floor, current))
+    {
+        return;
+    }
+    state.latest_search_revision = Some(floor);
+    if state
+        .search
+        .as_ref()
+        .is_some_and(|search| revision_is_newer(next_revision, search.revision))
+    {
+        state.search = None;
+        state.search_partial = None;
+    }
+}
+
+fn reset_search_for_open(state: &mut WorkerState) {
+    state.page_count = 0;
+    state.search = None;
+    state.latest_search_revision = None;
+    state.search_partial = None;
 }
 
 fn accept_command(
@@ -536,23 +1077,35 @@ fn accept_command(
             state.text_cache.clear();
             state.partial_text.clear();
             state.automatic_text_needs_quiet = false;
+            reset_search_for_open(state);
             state.document = None;
             state.generation = Some(generation);
 
             match open_document(pdfium, &path) {
                 Ok((document, pages)) => {
+                    state.page_count = pages.len();
                     state.document = Some(document);
-                    let _ = events.send(WorkerEvent::Opened {
-                        generation,
-                        path,
-                        pages,
-                    });
+                    if events
+                        .send(WorkerEvent::Opened {
+                            generation,
+                            path,
+                            pages,
+                        })
+                        .is_err()
+                    {
+                        return false;
+                    }
                 }
                 Err(message) => {
-                    let _ = events.send(WorkerEvent::Error {
-                        generation: Some(generation),
-                        message: format!("Could not open PDF: {message}"),
-                    });
+                    if events
+                        .send(WorkerEvent::Error {
+                            generation: Some(generation),
+                            message: format!("Could not open PDF: {message}"),
+                        })
+                        .is_err()
+                    {
+                        return false;
+                    }
                 }
             }
             true
@@ -584,6 +1137,18 @@ fn accept_command(
             }
             true
         }
+        WorkerCommand::Search {
+            generation,
+            revision,
+            query,
+        } => accept_search_demand(state, events, generation, revision, query),
+        WorkerCommand::CancelSearch {
+            generation,
+            next_revision,
+        } => {
+            cancel_searches_before(state, generation, next_revision);
+            true
+        }
     }
 }
 
@@ -595,7 +1160,10 @@ fn command_supersedes_text(
     match command {
         WorkerCommand::ExtractText { page, .. } => *page != current_page,
         WorkerCommand::CancelExplicitText { .. } => current_is_explicit,
-        WorkerCommand::Open { .. } | WorkerCommand::RenderViewport { .. } => false,
+        WorkerCommand::Open { .. }
+        | WorkerCommand::RenderViewport { .. }
+        | WorkerCommand::Search { .. }
+        | WorkerCommand::CancelSearch { .. } => false,
     }
 }
 
@@ -879,10 +1447,19 @@ fn rect_bottom(rect: PixelRect) -> Option<u32> {
 fn extract_page_text(
     state: &WorkerState,
     page: usize,
+    extracted: Vec<TextChar>,
+    should_cancel: impl FnMut() -> bool,
+) -> Result<TextExtraction, String> {
+    let document = state.document.as_ref().ok_or("no document is open")?;
+    extract_page_text_from_document(document, page, extracted, should_cancel)
+}
+
+fn extract_page_text_from_document(
+    document: &PdfDocument<'static>,
+    page: usize,
     mut extracted: Vec<TextChar>,
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<TextExtraction, String> {
-    let document = state.document.as_ref().ok_or("no document is open")?;
     let page_index = i32::try_from(page).map_err(|_| "page index is too large")?;
     let page = document
         .pages()
@@ -1023,6 +1600,10 @@ mod tests {
             text_cache: HashMap::new(),
             partial_text: HashMap::new(),
             automatic_text_needs_quiet: false,
+            page_count: pages.len(),
+            search: None,
+            latest_search_revision: None,
+            search_partial: None,
         };
         assert!(matches!(
             extract_page_text(&state, 0, Vec::new(), || true),
@@ -1119,6 +1700,57 @@ mod tests {
             );
 
             rendered_text.push(text);
+        }
+
+        for (page, text) in rendered_text.iter().enumerate() {
+            let query = SearchQuery::new("page").unwrap();
+            let SearchPageOutcome::Complete(results) =
+                search_page(page, text.as_slice(), &query, MAX_SEARCH_RESULTS, || false)
+            else {
+                panic!("fixture search unexpectedly cancelled");
+            };
+            assert!(
+                !results.matches.is_empty(),
+                "the common term must be found on fixture page {}",
+                page + 1
+            );
+            assert!(results.matches.iter().all(|result| {
+                result.id.page == page
+                    && !result.highlight_runs.is_empty()
+                    && result.highlight_runs.iter().all(|run| {
+                        [run.left, run.top, run.right, run.bottom]
+                            .into_iter()
+                            .all(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+                    })
+            }));
+        }
+
+        for (page, query_text) in [
+            (0, "gpui pdf reader"),
+            (1, "rotate 90"),
+            (2, "wide cropbox"),
+            (0, "ω"),
+        ] {
+            let query = SearchQuery::new(query_text).unwrap();
+            let SearchPageOutcome::Complete(results) = search_page(
+                page,
+                rendered_text[page].as_slice(),
+                &query,
+                MAX_SEARCH_RESULTS,
+                || false,
+            ) else {
+                panic!("fixture search unexpectedly cancelled");
+            };
+            let result = results
+                .matches
+                .first()
+                .unwrap_or_else(|| panic!("{query_text:?} should match page {}", page + 1));
+            let source: String = rendered_text[page][result.id.range()]
+                .iter()
+                .filter_map(|character| (character.value != '\0').then_some(character.value))
+                .collect();
+            assert_eq!(source.to_lowercase(), query_text);
+            assert!(!result.highlight_runs.is_empty());
         }
 
         let high_resolution_tile = RenderRequest {
@@ -1391,6 +2023,265 @@ mod tests {
         let cancel = WorkerCommand::CancelExplicitText { generation: 7 };
         assert!(command_supersedes_text(&cancel, 2, true));
         assert!(!command_supersedes_text(&cancel, 2, false));
+    }
+
+    #[test]
+    fn search_highlight_storage_stops_before_exceeding_the_global_run_cap() {
+        let bounds = TextBounds {
+            left: 0.1,
+            top: 0.1,
+            right: 0.2,
+            bottom: 0.2,
+        };
+        let result = |start, run_count| crate::search::SearchMatch {
+            id: crate::search::SearchMatchId {
+                page: 0,
+                start,
+                end: start,
+            },
+            preview: String::new(),
+            highlight_runs: vec![bounds; run_count],
+        };
+        let mut results = SearchPageResults {
+            page: 0,
+            matches: vec![result(0, 2), result(1, 2)],
+            truncated: false,
+        };
+
+        assert_eq!(cap_search_highlight_runs(&mut results, 3), 2);
+        assert_eq!(results.matches.len(), 1);
+        assert!(results.truncated);
+
+        let mut exact = SearchPageResults {
+            page: 0,
+            matches: vec![result(0, 2), result(1, 2)],
+            truncated: false,
+        };
+        assert_eq!(cap_search_highlight_runs(&mut exact, 4), 4);
+        assert_eq!(exact.matches.len(), 2);
+        assert!(!exact.truncated);
+    }
+
+    fn empty_worker_state(generation: u64) -> WorkerState {
+        WorkerState {
+            document: None,
+            generation: Some(generation),
+            text_cache: HashMap::new(),
+            partial_text: HashMap::new(),
+            automatic_text_needs_quiet: false,
+            page_count: 3,
+            search: None,
+            latest_search_revision: None,
+            search_partial: None,
+        }
+    }
+
+    fn search_job(generation: u64, revision: u64) -> SearchJob {
+        SearchJob {
+            generation,
+            revision,
+            query: SearchQuery::new("page").unwrap(),
+            next_page: 0,
+            page_count: 3,
+            total_results: 0,
+            total_highlight_runs: 0,
+            skipped_pages: 0,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn preempted_search_text_is_transferred_to_higher_priority_consumers() {
+        let character = || TextChar {
+            value: 'P',
+            bounds: None,
+        };
+        let mut state = empty_worker_state(7);
+        state.search = Some(search_job(7, 1));
+
+        let explicit = BTreeSet::from([0]);
+        preserve_partial_text(
+            &mut state,
+            0,
+            vec![character()],
+            &explicit,
+            &VecDeque::new(),
+        );
+        assert_eq!(state.partial_text.remove(&0).unwrap(), vec![character()]);
+        assert!(state.search_partial.is_none());
+
+        preserve_partial_text(
+            &mut state,
+            0,
+            vec![character()],
+            &BTreeSet::new(),
+            &VecDeque::from([0]),
+        );
+        assert_eq!(state.partial_text.remove(&0).unwrap(), vec![character()]);
+        assert!(state.search_partial.is_none());
+
+        preserve_partial_text(
+            &mut state,
+            0,
+            vec![character()],
+            &BTreeSet::new(),
+            &VecDeque::new(),
+        );
+        assert_eq!(state.search_partial, Some((0, vec![character()])));
+        assert!(state.partial_text.is_empty());
+    }
+
+    #[test]
+    fn search_partial_survives_interleaved_text_work_for_another_page() {
+        let partial = vec![TextChar {
+            value: 'P',
+            bounds: None,
+        }];
+        let mut state = empty_worker_state(7);
+        state.search_partial = Some((0, partial.clone()));
+
+        assert_eq!(take_search_partial(&mut state, 1), None);
+        assert_eq!(state.search_partial, Some((0, partial.clone())));
+
+        assert_eq!(take_search_partial(&mut state, 0), Some(partial));
+        assert!(state.search_partial.is_none());
+    }
+
+    #[test]
+    fn latest_search_revision_replaces_and_rejects_stale_demand() {
+        let mut state = empty_worker_state(7);
+        assert!(advance_search_revision(&mut state, 7, 10));
+        state.search = Some(search_job(7, 10));
+        state.search_partial = Some((
+            0,
+            vec![TextChar {
+                value: 'P',
+                bounds: None,
+            }],
+        ));
+
+        assert!(advance_search_revision(&mut state, 7, 11));
+        assert!(state.search.is_none());
+        assert!(state.search_partial.is_none());
+        state.search = Some(search_job(7, 11));
+
+        assert!(!advance_search_revision(&mut state, 7, 10));
+        assert_eq!(state.search.as_ref().unwrap().revision, 11);
+        assert!(!advance_search_revision(&mut state, 6, 12));
+        assert_eq!(state.search.as_ref().unwrap().revision, 11);
+    }
+
+    #[test]
+    fn cancellation_barrier_and_open_replacement_clear_only_stale_searches() {
+        let mut state = empty_worker_state(7);
+        state.latest_search_revision = Some(10);
+        state.search = Some(search_job(7, 10));
+        state.search_partial = Some((0, Vec::new()));
+
+        cancel_searches_before(&mut state, 7, 11);
+        assert!(state.search.is_none());
+        assert!(state.search_partial.is_none());
+        assert_eq!(state.latest_search_revision, Some(10));
+
+        assert!(advance_search_revision(&mut state, 7, 11));
+        state.search = Some(search_job(7, 11));
+        cancel_searches_before(&mut state, 7, 11);
+        assert_eq!(state.search.as_ref().unwrap().revision, 11);
+
+        reset_search_for_open(&mut state);
+        assert!(state.search.is_none());
+        assert!(state.latest_search_revision.is_none());
+        assert!(state.search_partial.is_none());
+        assert_eq!(state.page_count, 0);
+    }
+
+    #[test]
+    fn no_match_page_emits_no_empty_result_event_and_finishes_cleanly() {
+        let query = SearchQuery::new("absent").unwrap();
+        let text = [TextChar {
+            value: 'x',
+            bounds: None,
+        }];
+        let SearchPageOutcome::Complete(results) =
+            search_page(2, &text, &query, MAX_SEARCH_RESULTS, || false)
+        else {
+            panic!("search unexpectedly cancelled");
+        };
+        assert!(results.matches.is_empty());
+
+        let (events, received) = mpsc::sync_channel(1);
+        assert!(send_search_page_results(&events, 7, 4, results));
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let mut finished = search_job(7, 4);
+        finished.next_page = 3;
+        assert!(send_search_finished(&events, &finished));
+        assert!(matches!(
+            received.recv().unwrap(),
+            WorkerEvent::SearchFinished {
+                generation: 7,
+                revision: 4,
+                searched_pages: 3,
+                total_results: 0,
+                truncated: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn search_without_document_emits_a_terminal_revision_specific_failure() {
+        let mut state = empty_worker_state(9);
+        let (events, received) = mpsc::sync_channel(1);
+        assert!(accept_search_demand(
+            &mut state,
+            &events,
+            9,
+            3,
+            SearchQuery::new("page").unwrap(),
+        ));
+        assert!(matches!(
+            received.recv().unwrap(),
+            WorkerEvent::SearchFailed {
+                generation: 9,
+                revision: 3,
+                ..
+            }
+        ));
+        assert!(state.search.is_none());
+        assert_eq!(state.latest_search_revision, Some(3));
+
+        assert!(accept_search_demand(
+            &mut state,
+            &events,
+            9,
+            2,
+            SearchQuery::new("stale").unwrap(),
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        state.generation = None;
+        assert!(accept_search_demand(
+            &mut state,
+            &events,
+            0,
+            1,
+            SearchQuery::new("before open").unwrap(),
+        ));
+        assert!(matches!(
+            received.recv().unwrap(),
+            WorkerEvent::SearchFailed {
+                generation: 0,
+                revision: 1,
+                ..
+            }
+        ));
     }
 
     fn pixel(bytes: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {

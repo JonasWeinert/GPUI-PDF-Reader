@@ -1,0 +1,28 @@
+# Annotations, comments, and search
+
+- Anchor app annotations to inclusive PDFium page/character indices, never screen coordinates. Recompute paint bounds from the current text layer at any zoom.
+- Keep highlights and comments in one exact-range record so recoloring preserves a comment and adding a comment preserves its highlight.
+- Store app annotations in a versioned sidecar. Validate PDF size, modification time, and page count on load and immediately before every atomic save.
+- The current PDF identity is metadata-based to avoid hashing a large document on every edit. A future stronger identity needs a cached content/PDF identifier plus a cheap way to detect replacement without putting full-file I/O on each save.
+- Unix `rename` replaces an existing sidecar atomically; Windows does not offer the same behavior through `std::fs::rename`. Use a platform-specific atomic replace before enabling Windows support.
+- Treat a corrupt or stale sidecar as blocked persistence. Do not accept edits that look saved when they cannot be written safely.
+- Coalesce queued same-document snapshots before sidecar writes. Color clicks can arrive much faster than `fsync` completes.
+- Multiple app instances need both an observed-revision compare-and-replace check and a cross-process lock around check plus atomic write. The PDF file itself is a convenient crash-safe advisory lock and avoids leaving a separate lock file.
+- PDFium search belongs on the existing PDFium worker. A second worker is unsafe because the binding and document handles are not assumed thread-safe.
+- Search revisions are latest-wins. Cancel stale extraction and matching, bound both result count and highlight geometry, and never publish partial canceled results.
+- Unicode case folding can expand one source character. Keep a normalized-to-source index map so result anchors still address the original PDFium text layer.
+- A marker-free Markdown editor needs two models: canonical plain text plus styles/blocks, and a display projection that adds list prefixes without putting Markdown markers in the editable text.
+- GPUI text inputs must implement UTF-16 conversion and IME marked ranges. Clear reverse-selection state when a selection collapses at its anchor.
+- Enforce input limits inside the shared replacement primitive used by typing, paste, and IME, before allocating or rebuilding layouts. Rejection must preserve text, selection, marked composition, and styles.
+- A rich editor must bound the serialized Markdown, not only visible text. Escapes, style markers, code fences, and list prefixes all add stored bytes.
+- Validate persisted Markdown again after canonical parsing. Raw input can fit the limit while canonical escaping does not; fail explicitly and leave the stored annotation untouched.
+- Walk ordered style runs with one monotonic cursor across lines. Restarting the run scan for every line makes serialization, size checks, and display projection quadratic.
+- Parse unmatched delimiter runs as whole runs and index exact backtick fences. Retrying every shorter suffix of one unmatched run is quadratic.
+- Do not attach full serialized Markdown to per-keystroke change events when no subscriber needs it. Serialize only on the guarded save path.
+- Animate sidebar width with `on_next_frame`, hold zoom fixed, and preserve the document-center page anchor while the viewport changes.
+- Precise scroll or middle-drag input during a sidebar slide must keep that frame chain alive. Once the user moves the document, drop the old center anchor and continue toward the panel target.
+- When a sidebar closes or switches, explicitly move focus away from any hidden text field or comment editor.
+- Scope reader Space, arrow, Page, Home, and End bindings away from nested text-editor contexts. A global Space binding otherwise consumes spaces before GPUI's input handler sees them.
+- Prioritize active annotations/search hits, but enforce one hard total quad/run budget across the entire frame. An active result must never bypass the safety cap.
+- Scroll a virtualized result list only when navigation changes the active result. Calling `scroll_to_item` during every render fights manual list browsing.
+- Never replace the current document while an annotation revision is unsaved. Hold the requested path until the exact latest revision reports success; a failed save cancels the switch and leaves the dirty document intact.

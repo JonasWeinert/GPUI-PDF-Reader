@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
@@ -312,21 +313,23 @@ impl TextLayer {
     }
 
     /// Visits selected character highlights that intersect the logical
-    /// viewport. Visit order is spatial and must not be used as text order.
-    pub fn for_each_visible_in_range(
+    /// viewport until `visit` returns false. Visit order is spatial and must
+    /// not be used as text order. Early stopping bounds both painting and index
+    /// traversal for dense or adversarial text layers.
+    pub fn for_each_visible_in_range_while(
         &self,
         page_rect: Rect,
         viewport: Rect,
         range: RangeInclusive<usize>,
-        visit: impl FnMut(usize, Rect),
-    ) {
-        self.spatial_index.for_each_visible_in_range(
+        visit: impl FnMut(usize, Rect) -> bool,
+    ) -> bool {
+        self.spatial_index.for_each_visible_in_range_while(
             &self.characters,
             page_rect,
             viewport,
             range,
             visit,
-        );
+        )
     }
 }
 
@@ -544,21 +547,21 @@ impl TextSpatialIndex {
         }
     }
 
-    fn for_each_visible_in_range(
+    fn for_each_visible_in_range_while(
         &self,
         characters: &[TextChar],
         page_rect: Rect,
         viewport: Rect,
         range: RangeInclusive<usize>,
-        mut visit: impl FnMut(usize, Rect),
-    ) {
+        mut visit: impl FnMut(usize, Rect) -> bool,
+    ) -> bool {
         if characters.is_empty() || !valid_page_rect(page_rect) || !valid_query_rect(viewport) {
-            return;
+            return true;
         }
         let first = *range.start();
         let last = (*range.end()).min(characters.len() - 1);
         if first > last {
-            return;
+            return true;
         }
 
         for cell in &self.cells {
@@ -579,11 +582,12 @@ impl TextSpatialIndex {
                     continue;
                 };
                 let highlight = text_highlight_bounds(rect);
-                if highlight.intersects(viewport) {
-                    visit(index, highlight);
+                if highlight.intersects(viewport) && !visit(index, highlight) {
+                    return false;
                 }
             }
         }
+        true
     }
 }
 
@@ -695,7 +699,7 @@ fn valid_query_rect(rect: Rect) -> bool {
         && rect.height > 0.0
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct TextPosition {
     pub page: usize,
     pub index: usize,
@@ -1210,8 +1214,9 @@ mod tests {
         };
         let range = 317..=1_402;
         let mut indexed = Vec::new();
-        layer.for_each_visible_in_range(page, viewport, range.clone(), |index, _| {
+        layer.for_each_visible_in_range_while(page, viewport, range.clone(), |index, _| {
             indexed.push(index);
+            true
         });
         indexed.sort_unstable();
 
@@ -1233,6 +1238,36 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(indexed, expected);
+    }
+
+    #[test]
+    fn visible_range_iteration_stops_at_the_requested_budget() {
+        let characters = (0..20)
+            .map(|column| {
+                bounded_char(
+                    'x',
+                    column as f32 / 20.0,
+                    0.1,
+                    (column as f32 + 0.8) / 20.0,
+                    0.2,
+                )
+            })
+            .collect();
+        let layer = TextLayer::new(characters);
+        let page = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1_000.0,
+            height: 1_000.0,
+        };
+        let mut visits = 0;
+        let exhausted = layer.for_each_visible_in_range_while(page, page, 0..=19, |_, _| {
+            visits += 1;
+            visits < 7
+        });
+
+        assert!(!exhausted);
+        assert_eq!(visits, 7);
     }
 
     fn linear_hit_test(

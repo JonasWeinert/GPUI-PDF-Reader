@@ -1835,17 +1835,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui-pdf-reader"
-version = "0.1.0"
-dependencies = [
- "block2",
- "gpui",
- "image",
- "objc2-app-kit",
- "pdfium-render",
-]
-
-[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2010,6 +1999,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "gpui-pdf-reader"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "gpui",
+ "image",
+ "objc2-app-kit",
+ "pdfium-render",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
