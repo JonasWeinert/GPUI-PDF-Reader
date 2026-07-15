@@ -11,10 +11,10 @@ use crate::model::{
 use crate::search::{MAX_SEARCH_QUERY_BYTES, SearchMatch, SearchMatchId, SearchQuery};
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::{
-    ActualSize, AddComment, CopySelection, EditCopy, EditCut, EditPaste, EditSelectAll, Find,
-    FirstPage, FitWidth, LastPage, NextSearchResult, OpenDocument, PageDown, PageUp,
-    PreviousSearchResult, Quit, ScrollDown, ScrollLeft, ScrollRight, ScrollUp, SelectAll,
-    ToggleComments, ZoomIn, ZoomOut,
+    ActualSize, AddComment, ClassicView, CopySelection, EditCopy, EditCut, EditPaste,
+    EditSelectAll, Find, FirstPage, FitWidth, FluidView, LastPage, NextSearchResult, OpenDocument,
+    PageDown, PageUp, PreviousSearchResult, Quit, ScrollDown, ScrollLeft, ScrollRight, ScrollUp,
+    SelectAll, ToggleComments, ZoomIn, ZoomOut,
 };
 use gpui::{
     App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners, CursorStyle, Entity,
@@ -54,8 +54,13 @@ const MAX_VISIBLE_ANNOTATION_QUADS: usize = 8_000;
 const MAX_VISIBLE_SELECTION_QUADS: usize = 8_000;
 const ZOOM_RENDER_DEBOUNCE: Duration = Duration::from_millis(150);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
+const COMMENT_AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 const SIDEBAR_WIDTH: f32 = 344.0;
 const MIN_DOCUMENT_VIEWPORT_WIDTH: f32 = 300.0;
+const FLUID_PANEL_HORIZONTAL_MARGIN: f32 = 12.0;
+const FLUID_PANEL_VERTICAL_MARGIN: f32 = 18.0;
+const FLUID_CONTEXT_PILL_WIDTH: f32 = 214.0;
+const FLUID_CONTEXT_PILL_HEIGHT: f32 = 40.0;
 
 // A deliberately small visual system keeps the reader chrome consistent and
 // makes future light/dark variants a token change instead of another rewrite.
@@ -153,6 +158,25 @@ fn comments_toolbar_label(
     }
 }
 
+fn floating_pill_position(
+    anchor: Rect,
+    available_width: f32,
+    viewport_height: f32,
+    pill_width: f32,
+    pill_height: f32,
+) -> Offset {
+    let margin = 12.0;
+    let maximum_x = (available_width - pill_width - margin).max(margin);
+    let x = (anchor.x + anchor.width * 0.5 - pill_width * 0.5).clamp(margin, maximum_x);
+    let below = anchor.bottom() + 10.0;
+    let y = if below + pill_height <= viewport_height - margin {
+        below
+    } else {
+        (anchor.y - pill_height - 10.0).max(margin)
+    };
+    Offset { x, y }
+}
+
 #[derive(Debug)]
 struct DocumentState {
     path: PathBuf,
@@ -192,10 +216,28 @@ enum SidePanel {
     Search,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ReaderView {
+    #[default]
+    Classic,
+    Fluid,
+}
+
+struct FluidPillState {
+    available_width: f32,
+    document_open: bool,
+    zoom_out_enabled: bool,
+    zoom_in_enabled: bool,
+    zoom_label: SharedString,
+    search_selected: bool,
+    comments_selected: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChromeButtonStyle {
     Neutral,
     Ghost,
+    Floating,
     Selected,
     Primary,
 }
@@ -226,6 +268,20 @@ enum QaFeaturePhase {
     WaitSearchClosed,
     WaitSearchReopened,
     WaitFinalNavigation,
+    Complete,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QaFluidPhase {
+    Seed,
+    WaitEditor,
+    WaitAutosave,
+    WaitList,
+    WaitReopenedEditor,
+    WaitFinalList,
+    WaitSearchOpen,
+    WaitSearchResults,
     Complete,
 }
 
@@ -272,6 +328,44 @@ impl SidebarState {
     fn available_width(self, full_width: f32) -> f32 {
         let maximum_sidebar = (full_width - MIN_DOCUMENT_VIEWPORT_WIDTH).max(0.0);
         SIDEBAR_WIDTH.min(maximum_sidebar) * self.progress
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CommentPaneState {
+    progress: f32,
+    target: f32,
+    close_editor_on_finish: bool,
+}
+
+impl CommentPaneState {
+    fn show_editor(&mut self, animated: bool) {
+        if !animated {
+            self.progress = 1.0;
+        }
+        self.target = 1.0;
+        self.close_editor_on_finish = false;
+    }
+
+    fn show_list(&mut self, animated: bool) {
+        if !animated {
+            self.progress = 0.0;
+        }
+        self.target = 0.0;
+        self.close_editor_on_finish = true;
+    }
+
+    fn is_animating(self) -> bool {
+        (self.progress - self.target).abs() > 0.001
+    }
+
+    fn advance(&mut self, dt: f32) {
+        let blend = 1.0 - (-24.0 * dt.clamp(1.0 / 240.0, 0.05)).exp();
+        self.progress += (self.target - self.progress) * blend;
+        if (self.target - self.progress).abs() < 0.001 {
+            self.progress = self.target;
+        }
+        self.progress = self.progress.clamp(0.0, 1.0);
     }
 }
 
@@ -631,12 +725,16 @@ pub struct PdfReader {
     comment_editor: Option<Entity<CommentEditor>>,
     comment_draft_dirty: bool,
     comment_discard_prompt_open: bool,
+    comment_pane: CommentPaneState,
+    comment_autosave_revision: u64,
+    comment_autosave_task: Option<Task<()>>,
     editing_annotation: Option<AnnotationId>,
     pending_comment_range: Option<TextRange>,
     comment_order: Vec<AnnotationId>,
     search_list_scroll: UniformListScrollHandle,
     comment_list_scroll: UniformListScrollHandle,
     status: ReaderStatus,
+    view_mode: ReaderView,
     warning: Option<SharedString>,
     focus_handle: FocusHandle,
     zoom: f32,
@@ -647,6 +745,7 @@ pub struct PdfReader {
     viewport_height: f32,
     selection: Option<TextSelection>,
     selecting: bool,
+    pending_annotation_click: Option<AnnotationId>,
     pan: Option<PanState>,
     animation_active: bool,
     animation_frame_queued: bool,
@@ -655,6 +754,8 @@ pub struct PdfReader {
     sidebar_anchor: Option<PageAnchor>,
     #[cfg(debug_assertions)]
     qa_feature_phase: QaFeaturePhase,
+    #[cfg(debug_assertions)]
+    qa_fluid_phase: QaFluidPhase,
     #[cfg(debug_assertions)]
     qa_sidebar_anchor_reference: Option<PageAnchor>,
     #[cfg(debug_assertions)]
@@ -717,12 +818,16 @@ impl PdfReader {
                 comment_editor: None,
                 comment_draft_dirty: false,
                 comment_discard_prompt_open: false,
+                comment_pane: CommentPaneState::default(),
+                comment_autosave_revision: 0,
+                comment_autosave_task: None,
                 editing_annotation: None,
                 pending_comment_range: None,
                 comment_order: Vec::new(),
                 search_list_scroll: UniformListScrollHandle::new(),
                 comment_list_scroll: UniformListScrollHandle::new(),
                 status: ReaderStatus::Initializing,
+                view_mode: ReaderView::Classic,
                 warning: None,
                 focus_handle: cx.focus_handle(),
                 zoom: 1.0,
@@ -733,6 +838,7 @@ impl PdfReader {
                 viewport_height: 1.0,
                 selection: None,
                 selecting: false,
+                pending_annotation_click: None,
                 pan: None,
                 animation_active: false,
                 animation_frame_queued: false,
@@ -741,6 +847,8 @@ impl PdfReader {
                 sidebar_anchor: None,
                 #[cfg(debug_assertions)]
                 qa_feature_phase: QaFeaturePhase::Seed,
+                #[cfg(debug_assertions)]
+                qa_fluid_phase: QaFluidPhase::Seed,
                 #[cfg(debug_assertions)]
                 qa_sidebar_anchor_reference: None,
                 #[cfg(debug_assertions)]
@@ -817,7 +925,8 @@ impl PdfReader {
             .and_then(|active| self.search.order.iter().position(|id| *id == active))
             .map_or(0, |index| index + 1);
         format!(
-            "GPUI_PDF_READER_QA zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_complete={} status={:?}",
+            self.view_mode,
             self.zoom,
             self.rendered.len(),
             cached_bytes,
@@ -834,6 +943,11 @@ impl PdfReader {
             self.scroll.y,
             self.sidebar.progress,
             self.sidebar.target,
+            self.comment_pane.progress,
+            self.comment_pane.target,
+            u8::from(self.comment_editor.is_some()),
+            u8::from(self.comment_draft_dirty),
+            u8::from(self.comment_autosave_task.is_some()),
             self.qa_sidebar_transitions,
             self.qa_max_sidebar_anchor_error,
             self.annotations.as_ref().map_or(0, AnnotationSet::len),
@@ -855,6 +969,11 @@ impl PdfReader {
     }
 
     #[cfg(debug_assertions)]
+    pub fn qa_use_fluid_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view_mode(ReaderView::Fluid, window, cx);
+    }
+
+    #[cfg(debug_assertions)]
     pub fn qa_viewport_is_settled(&self) -> bool {
         if !matches!(self.status, ReaderStatus::Ready)
             || self.render_debounce_until.is_some()
@@ -867,6 +986,8 @@ impl PdfReader {
             || (!self.search.query.is_empty()
                 && (!self.search.complete || self.search_debounce_task.is_some()))
             || self.sidebar.is_animating()
+            || self.comment_pane.is_animating()
+            || self.comment_autosave_task.is_some()
         {
             return false;
         }
@@ -1306,6 +1427,257 @@ impl PdfReader {
                 }
             }
             QaFeaturePhase::Complete => return Ok(true),
+        }
+        Ok(false)
+    }
+
+    /// Exercises Fluid-only interaction semantics through native editor input,
+    /// production autosave/persistence, annotation hit testing, both comment
+    /// pane slide directions, and the overlay search-panel geometry.
+    #[cfg(debug_assertions)]
+    pub fn qa_drive_fluid_scenario(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        match self.qa_fluid_phase {
+            QaFluidPhase::Seed => {
+                if !self.qa_viewport_is_settled()
+                    || self.annotations_loading
+                    || !self.page_text.contains_key(&0)
+                {
+                    return Ok(false);
+                }
+                if self
+                    .annotations
+                    .as_ref()
+                    .is_none_or(|annotations| annotations.iter().next().is_some())
+                {
+                    return Err("fluid scenario requires a PDF with no existing sidecar".into());
+                }
+                self.set_view_mode(ReaderView::Fluid, window, cx);
+                let range = self
+                    .qa_text_range(0, "Select this sentence")
+                    .ok_or_else(|| "fixture Fluid text was not extracted".to_owned())?;
+                self.selection = Some(range.as_selection());
+                if std::env::var_os("GPUI_PDF_READER_QA_FLUID_SELECTION_VISUAL").is_some() {
+                    self.qa_fluid_phase = QaFluidPhase::Complete;
+                    cx.notify();
+                    return Ok(true);
+                }
+                self.add_highlight(HighlightColor::Yellow, cx);
+                let id = self
+                    .active_annotation
+                    .ok_or_else(|| "Fluid highlight did not become active".to_owned())?;
+                if self.annotation_at_text_position(range.start()) != Some(id) {
+                    return Err("highlight hit lookup did not resolve the active annotation".into());
+                }
+                self.comment_on_context(window, cx);
+                self.qa_fluid_phase = QaFluidPhase::WaitEditor;
+            }
+            QaFluidPhase::WaitEditor => {
+                let Some(editor) = self.comment_editor.clone() else {
+                    return Err("Fluid comment editor disappeared before painting".into());
+                };
+                if editor.read(cx).qa_has_painted()
+                    && self.comment_pane.progress == 1.0
+                    && self.sidebar.progress == 1.0
+                {
+                    Self::qa_defer_keystrokes(
+                        &["f", "l", "u", "i", "d", "space", "n", "o", "t", "e"],
+                        window,
+                        cx,
+                    )?;
+                    self.qa_fluid_phase = QaFluidPhase::WaitAutosave;
+                }
+            }
+            QaFluidPhase::WaitAutosave => {
+                if !self.qa_viewport_is_settled() {
+                    return Ok(false);
+                }
+                let (id, range, comment, highlight) = self
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| {
+                        annotations.iter().find_map(|annotation| {
+                            annotation.comment_markdown().map(|comment| {
+                                (
+                                    annotation.id(),
+                                    annotation.range(),
+                                    comment.to_owned(),
+                                    annotation.highlight(),
+                                )
+                            })
+                        })
+                    })
+                    .ok_or_else(|| "Fluid autosave produced no persisted comment".to_owned())?;
+                if comment != "fluid note" || highlight != Some(HighlightColor::Yellow) {
+                    return Err(format!(
+                        "Fluid autosave produced unexpected annotation: comment={comment:?}, highlight={highlight:?}"
+                    ));
+                }
+                if self.comment_editor.is_none()
+                    || self.comment_draft_dirty
+                    || self.editing_annotation != Some(id)
+                {
+                    return Err(
+                        "Fluid autosave closed the editor or left the saved draft dirty".into(),
+                    );
+                }
+                if self.context_range() != Some(range) || !self.context_has_comment() {
+                    return Err("Fluid context did not switch from Add note to Edit note".into());
+                }
+                self.return_to_comment_list(window, cx);
+                self.qa_fluid_phase = QaFluidPhase::WaitList;
+            }
+            QaFluidPhase::WaitList => {
+                if !self.qa_viewport_is_settled()
+                    || self.comment_editor.is_some()
+                    || self.comment_pane.progress != 0.0
+                {
+                    return Ok(false);
+                }
+                let (id, start) = self
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| {
+                        annotations.iter().find_map(|annotation| {
+                            annotation
+                                .comment_markdown()
+                                .is_some()
+                                .then_some((annotation.id(), annotation.range().start()))
+                        })
+                    })
+                    .ok_or_else(|| "Fluid comment vanished after Back".to_owned())?;
+                let page = self
+                    .layout()
+                    .and_then(|layout| layout.page_rect(start.page))
+                    .ok_or_else(|| "Fluid hit-test page is not laid out".to_owned())?;
+                let bounds = self
+                    .page_text
+                    .get(&start.page)
+                    .and_then(|text| text.get(start.index))
+                    .and_then(|character| character.bounds)
+                    .ok_or_else(|| "Fluid hit-test character has no bounds".to_owned())?;
+                let pointer = point(
+                    px(page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x),
+                    px(self.content_top()
+                        + page.y
+                        + (bounds.top + bounds.bottom) * page.height * 0.5
+                        - self.scroll.y),
+                );
+                self.active_annotation = None;
+                self.on_mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: pointer,
+                        click_count: 1,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                self.on_mouse_up(
+                    &MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: pointer,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                if self.active_annotation != Some(id) || self.selection.is_some() {
+                    return Err("clicking a Fluid highlight did not activate it cleanly".into());
+                }
+                if std::env::var_os("GPUI_PDF_READER_QA_FLUID_CONTEXT_VISUAL").is_some() {
+                    self.qa_fluid_phase = QaFluidPhase::Complete;
+                    return Ok(true);
+                }
+                // This is the exact two-command behavior attached to a Fluid
+                // comment-list row: reposition the PDF and slide to editor.
+                self.navigate_annotation(id, window, cx);
+                self.edit_comment(id, window, cx);
+                self.qa_fluid_phase = QaFluidPhase::WaitReopenedEditor;
+            }
+            QaFluidPhase::WaitReopenedEditor => {
+                let Some(editor) = self.comment_editor.clone() else {
+                    return Err("comment-list navigation did not open the Fluid editor".into());
+                };
+                if self.comment_pane.progress == 1.0 && editor.read(cx).qa_has_painted() {
+                    if editor.read(cx).markdown() != "fluid note" {
+                        return Err("reopened Fluid editor did not preserve Markdown".into());
+                    }
+                    if std::env::var_os("GPUI_PDF_READER_QA_FLUID_EDITOR_VISUAL").is_some() {
+                        self.qa_fluid_phase = QaFluidPhase::Complete;
+                        return Ok(true);
+                    }
+                    self.return_to_comment_list(window, cx);
+                    self.qa_fluid_phase = QaFluidPhase::WaitFinalList;
+                }
+            }
+            QaFluidPhase::WaitFinalList => {
+                if self.qa_viewport_is_settled()
+                    && self.comment_editor.is_none()
+                    && self.comment_pane.progress == 0.0
+                {
+                    self.show_sidebar(SidePanel::Search, window, cx);
+                    self.qa_fluid_phase = QaFluidPhase::WaitSearchOpen;
+                }
+            }
+            QaFluidPhase::WaitSearchOpen => {
+                if self.qa_viewport_is_settled()
+                    && self.sidebar.panel == SidePanel::Search
+                    && self.sidebar.progress == 1.0
+                {
+                    window.focus(&self.search_field.focus_handle(cx));
+                    Self::qa_defer_keystrokes(&["p", "a", "g", "e"], window, cx)?;
+                    self.qa_fluid_phase = QaFluidPhase::WaitSearchResults;
+                }
+            }
+            QaFluidPhase::WaitSearchResults => {
+                if !self.qa_viewport_is_settled() {
+                    return Ok(false);
+                }
+                let annotations = self
+                    .annotations
+                    .as_ref()
+                    .ok_or_else(|| "Fluid annotations disappeared".to_owned())?;
+                let annotation = annotations
+                    .iter()
+                    .next()
+                    .ok_or_else(|| "Fluid scenario annotation disappeared".to_owned())?;
+                if self.view_mode != ReaderView::Fluid
+                    || annotations.len() != 1
+                    || annotation.highlight() != Some(HighlightColor::Yellow)
+                    || annotation.comment_markdown() != Some("fluid note")
+                    || self.active_annotation != Some(annotation.id())
+                    || !self.context_has_comment()
+                    || self.context_anchor_in_viewport().is_none()
+                    || self.search.order.len() < 2
+                    || !self.search.complete
+                {
+                    return Err(format!(
+                        "unexpected final Fluid state: view={:?}, annotations={}, results={}, complete={}",
+                        self.view_mode,
+                        annotations.len(),
+                        self.search.order.len(),
+                        self.search.complete
+                    ));
+                }
+                let layout = self
+                    .layout()
+                    .ok_or_else(|| "Fluid layout disappeared".to_owned())?;
+                let base_max = (layout.content_width - self.viewport_width).max(0.0);
+                let expected_max = base_max + self.fluid_panel_occlusion();
+                if (self.max_scroll_x(layout) - expected_max).abs() > 0.01
+                    || self.fluid_panel_occlusion() <= SIDEBAR_WIDTH
+                {
+                    return Err("Fluid panel occlusion was not added to horizontal reach".into());
+                }
+                self.qa_fluid_phase = QaFluidPhase::Complete;
+                return Ok(true);
+            }
+            QaFluidPhase::Complete => return Ok(true),
         }
         Ok(false)
     }
@@ -1813,16 +2185,21 @@ impl PdfReader {
         self.comment_editor = None;
         self.comment_draft_dirty = false;
         self.comment_discard_prompt_open = false;
+        self.comment_pane = CommentPaneState::default();
+        self.comment_autosave_revision = self.comment_autosave_revision.wrapping_add(1);
+        self.comment_autosave_task = None;
         self.editing_annotation = None;
         self.pending_comment_range = None;
         self.warning = None;
         self.selection = None;
+        self.pending_annotation_click = None;
         self.scroll = Offset::default();
         self.scroll_target = Offset::default();
         self.animation_active = false;
         #[cfg(debug_assertions)]
         {
             self.qa_feature_phase = QaFeaturePhase::Seed;
+            self.qa_fluid_phase = QaFluidPhase::Seed;
             self.qa_sidebar_anchor_reference = None;
             self.qa_sidebar_transitions = 0;
             self.qa_max_sidebar_anchor_error = 0.0;
@@ -1864,7 +2241,7 @@ impl PdfReader {
         let previous_width = self.viewport_width;
         let previous_zoom = self.zoom;
         let full_width = f32::from(size.width).max(1.0);
-        self.viewport_width = (full_width - self.sidebar.available_width(full_width)).max(1.0);
+        self.viewport_width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
         let error_height = self.content_top() - TOOLBAR_HEIGHT;
         self.viewport_height = (f32::from(size.height) - TOOLBAR_HEIGHT - error_height).max(1.0);
         if self.fit_width {
@@ -1881,7 +2258,7 @@ impl PdfReader {
     fn update_sidebar_viewport_preserving_anchor(&mut self, window: &Window) {
         let size = window.viewport_size();
         let full_width = f32::from(size.width).max(1.0);
-        let next_width = (full_width - self.sidebar.available_width(full_width)).max(1.0);
+        let next_width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
         if (next_width - self.viewport_width).abs() <= 0.01 {
             return;
         }
@@ -1899,6 +2276,66 @@ impl PdfReader {
             self.scroll_target = self.scroll;
         }
         self.clamp_scroll();
+    }
+
+    fn sidebar_reserved_width(&self, full_width: f32) -> f32 {
+        match self.view_mode {
+            ReaderView::Classic => self.sidebar.available_width(full_width),
+            ReaderView::Fluid => 0.0,
+        }
+    }
+
+    fn fluid_panel_occlusion(&self) -> f32 {
+        if self.view_mode == ReaderView::Fluid {
+            (self.fluid_panel_width() + FLUID_PANEL_HORIZONTAL_MARGIN * 2.0) * self.sidebar.progress
+        } else {
+            0.0
+        }
+    }
+
+    fn fluid_panel_width(&self) -> f32 {
+        SIDEBAR_WIDTH.min((self.viewport_width - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(0.0))
+    }
+
+    fn max_scroll_x(&self, layout: &DocumentLayout) -> f32 {
+        (layout.content_width - self.viewport_width + self.fluid_panel_occlusion()).max(0.0)
+    }
+
+    fn set_view_mode(&mut self, mode: ReaderView, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_mode == mode {
+            return;
+        }
+        self.sidebar_anchor = self.layout().and_then(|layout| {
+            layout.anchor_at_content_point(
+                self.scroll.x + self.viewport_width * 0.5,
+                self.scroll.y + self.viewport_height * 0.5,
+            )
+        });
+        self.fit_width = false;
+        self.cancel_comment_autosave();
+        self.view_mode = mode;
+        let editor_open = self.comment_editor.is_some();
+        self.comment_pane = CommentPaneState {
+            progress: if editor_open { 1.0 } else { 0.0 },
+            target: if editor_open { 1.0 } else { 0.0 },
+            close_editor_on_finish: false,
+        };
+        self.update_sidebar_viewport_preserving_anchor(window);
+        self.sidebar_anchor = None;
+        self.clamp_scroll();
+        self.request_visible_tiles(window);
+        if mode == ReaderView::Fluid && self.comment_draft_dirty {
+            self.schedule_comment_autosave(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn use_classic_view(&mut self, _: &ClassicView, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view_mode(ReaderView::Classic, window, cx);
+    }
+
+    fn use_fluid_view(&mut self, _: &FluidView, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view_mode(ReaderView::Fluid, window, cx);
     }
 
     fn toggle_sidebar(&mut self, panel: SidePanel, window: &mut Window, cx: &mut Context<Self>) {
@@ -2160,12 +2597,19 @@ impl PdfReader {
             cx.notify();
             return;
         }
-        let Some(selection) = self.selection else {
+        let range = self.selection.map(TextRange::from_selection).or_else(|| {
+            self.active_annotation.and_then(|id| {
+                self.annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(id))
+                    .map(|annotation| annotation.range())
+            })
+        });
+        let Some(range) = range else {
             self.warning = Some("Select text before adding a highlight".into());
             cx.notify();
             return;
         };
-        let range = TextRange::from_selection(selection);
         if range.end().index > MAX_TEXT_CHARACTER_INDEX {
             self.warning = Some(
                 "Highlighting Select All is not supported yet; select a concrete text range".into(),
@@ -2270,6 +2714,136 @@ impl PdfReader {
         self.open_comment_editor(range, editing, markdown, window, cx);
     }
 
+    fn comment_on_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.is_some() {
+            self.add_comment(&AddComment, window, cx);
+            return;
+        }
+        let Some(id) = self.active_annotation else {
+            self.warning = Some("Select text before adding a comment".into());
+            cx.notify();
+            return;
+        };
+        let Some((range, markdown)) = self
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(id))
+            .map(|annotation| {
+                (
+                    annotation.range(),
+                    annotation.comment_markdown().unwrap_or("").to_owned(),
+                )
+            })
+        else {
+            return;
+        };
+        self.open_comment_editor(range, Some(id), markdown, window, cx);
+    }
+
+    fn context_range(&self) -> Option<TextRange> {
+        self.selection
+            .filter(|selection| selection.anchor != selection.focus)
+            .map(TextRange::from_selection)
+            .or_else(|| {
+                self.active_annotation.and_then(|id| {
+                    self.annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.get(id))
+                        .map(|annotation| annotation.range())
+                })
+            })
+    }
+
+    fn context_has_comment(&self) -> bool {
+        self.active_annotation.is_some_and(|id| {
+            self.annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(id))
+                .is_some_and(|annotation| annotation.comment_markdown().is_some())
+        }) || self.selection.is_some_and(|selection| {
+            if selection.anchor == selection.focus {
+                return false;
+            }
+            let range = TextRange::from_selection(selection);
+            self.annotations.as_ref().is_some_and(|annotations| {
+                annotations.overlapping(range).any(|annotation| {
+                    annotation.range() == range && annotation.comment_markdown().is_some()
+                })
+            })
+        })
+    }
+
+    fn context_anchor_in_viewport(&self) -> Option<Rect> {
+        let range = self.context_range()?;
+        let layout = self.layout()?;
+        let content_viewport = Rect {
+            x: self.scroll.x,
+            y: self.scroll.y,
+            width: self.viewport_width,
+            height: self.viewport_height,
+        };
+        let visible_pages: Vec<_> = layout
+            .visible_pages(self.scroll.y, self.viewport_height, 0.0)
+            .collect();
+        for page in visible_pages.into_iter().rev() {
+            if page < range.start().page || page > range.end().page {
+                continue;
+            }
+            let Some(chars) = self.page_text.get(&page) else {
+                continue;
+            };
+            let Some(page_rect) = layout.page_rect(page) else {
+                continue;
+            };
+            let Some(indices) = range.indices_on_page(page, chars.len()) else {
+                continue;
+            };
+            let mut bottom_line: Option<Rect> = None;
+            let mut visited = 0usize;
+            chars.for_each_visible_in_range_while(
+                page_rect,
+                content_viewport,
+                indices,
+                |_, rect| {
+                    visited += 1;
+                    if visited > MAX_VISIBLE_SELECTION_QUADS {
+                        return false;
+                    }
+                    bottom_line = Some(match bottom_line {
+                        None => rect,
+                        Some(current) => {
+                            let tolerance = current.height.max(rect.height) * 0.5;
+                            if rect.bottom() > current.bottom() + tolerance {
+                                rect
+                            } else if (rect.bottom() - current.bottom()).abs() <= tolerance {
+                                let left = current.x.min(rect.x);
+                                let top = current.y.min(rect.y);
+                                Rect {
+                                    x: left,
+                                    y: top,
+                                    width: current.right().max(rect.right()) - left,
+                                    height: current.bottom().max(rect.bottom()) - top,
+                                }
+                            } else {
+                                current
+                            }
+                        }
+                    });
+                    true
+                },
+            );
+            if let Some(line) = bottom_line {
+                return Some(Rect {
+                    x: line.x - self.scroll.x,
+                    y: line.y - self.scroll.y,
+                    width: line.width,
+                    height: line.height,
+                });
+            }
+        }
+        None
+    }
+
     fn open_comment_editor(
         &mut self,
         range: TextRange,
@@ -2298,9 +2872,10 @@ impl PdfReader {
             &editor,
             window,
             |reader, _, event, window, cx| match event {
-                CommentEditorEvent::Changed => {
-                    reader.comment_draft_dirty = true;
-                    cx.notify();
+                CommentEditorEvent::Changed => reader.comment_editor_changed(window, cx),
+                CommentEditorEvent::Save(markdown) if reader.view_mode == ReaderView::Fluid => {
+                    reader.cancel_comment_autosave();
+                    let _ = reader.write_comment(markdown.clone(), false, window, cx);
                 }
                 CommentEditorEvent::Save(markdown) => {
                     reader.save_comment(markdown.clone(), window, cx)
@@ -2313,12 +2888,20 @@ impl PdfReader {
         self.editing_annotation = editing;
         self.comment_editor = Some(editor.clone());
         self.comment_draft_dirty = false;
+        self.comment_pane
+            .show_editor(self.view_mode == ReaderView::Fluid);
         self.show_sidebar(SidePanel::Comments, window, cx);
+        if self.view_mode == ReaderView::Fluid {
+            self.start_animation(window, cx);
+        }
         window.focus(&editor.focus_handle(cx));
         cx.notify();
     }
 
     fn edit_comment(&mut self, id: AnnotationId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comment_editor.is_some() {
+            return;
+        }
         let Some((range, markdown)) = self
             .annotations
             .as_ref()
@@ -2335,19 +2918,29 @@ impl PdfReader {
     }
 
     fn save_comment(&mut self, markdown: String, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.write_comment(markdown, true, window, cx);
+    }
+
+    fn write_comment(
+        &mut self,
+        markdown: String,
+        close_after_save: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if markdown.trim().is_empty() {
             self.annotation_error = Some("A comment cannot be empty".into());
             cx.notify();
-            return;
+            return false;
         }
         let Some(range) = self.pending_comment_range else {
-            return;
+            return false;
         };
         if self.annotation_failed_revision.is_none() && !self.annotation_persistence_blocked {
             self.annotation_error = None;
         }
         let Some(annotations) = self.annotations.as_mut() else {
-            return;
+            return false;
         };
         let result = if let Some(id) = self.editing_annotation {
             let highlight = annotations
@@ -2373,18 +2966,98 @@ impl PdfReader {
                     let _ = self.persist_annotations();
                 }
                 self.refresh_comment_order();
-                self.comment_editor = None;
                 self.comment_draft_dirty = false;
-                self.editing_annotation = None;
-                self.pending_comment_range = None;
-                window.focus(&self.focus_handle);
+                self.editing_annotation = Some(id);
+                if close_after_save {
+                    self.comment_pane.show_list(false);
+                    self.finish_comment_editor_close();
+                    window.focus(&self.focus_handle);
+                }
+                cx.notify();
+                true
             }
-            Err(error) => self.annotation_error = Some(error.to_string().into()),
+            Err(error) => {
+                self.annotation_error = Some(error.to_string().into());
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn comment_editor_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.comment_draft_dirty = true;
+        if self.view_mode == ReaderView::Fluid {
+            self.schedule_comment_autosave(window, cx);
         }
         cx.notify();
     }
 
+    fn schedule_comment_autosave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.comment_autosave_revision = self.comment_autosave_revision.wrapping_add(1);
+        let revision = self.comment_autosave_revision;
+        let weak = cx.weak_entity();
+        self.comment_autosave_task = Some(window.spawn(cx, async move |cx| {
+            cx.background_executor()
+                .timer(COMMENT_AUTOSAVE_DEBOUNCE)
+                .await;
+            let _ = cx.update(|window, cx| {
+                weak.update(cx, |reader, cx| {
+                    if reader.view_mode == ReaderView::Fluid
+                        && reader.comment_autosave_revision == revision
+                    {
+                        reader.comment_autosave_task = None;
+                        let _ = reader.flush_comment_autosave(window, cx);
+                    }
+                })
+                .ok();
+            });
+        }));
+    }
+
+    fn cancel_comment_autosave(&mut self) {
+        self.comment_autosave_revision = self.comment_autosave_revision.wrapping_add(1);
+        self.comment_autosave_task = None;
+    }
+
+    fn flush_comment_autosave(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.cancel_comment_autosave();
+        if !self.comment_draft_dirty {
+            return true;
+        }
+        let Some(editor) = self.comment_editor.as_ref() else {
+            return true;
+        };
+        let markdown = editor.read(cx).markdown();
+        if markdown.trim().is_empty() {
+            return false;
+        }
+        self.write_comment(markdown, false, window, cx)
+    }
+
+    fn return_to_comment_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let markdown_is_blank = self
+            .comment_editor
+            .as_ref()
+            .is_none_or(|editor| editor.read(cx).is_blank());
+        if self.comment_draft_dirty
+            && !markdown_is_blank
+            && !self.flush_comment_autosave(window, cx)
+        {
+            return;
+        }
+        self.cancel_comment_autosave();
+        self.comment_draft_dirty = false;
+        self.comment_pane.show_list(true);
+        window.focus(&self.focus_handle);
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
     fn cancel_comment_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_mode == ReaderView::Fluid {
+            self.return_to_comment_list(window, cx);
+            return;
+        }
         if self.comment_draft_needs_confirmation() {
             self.confirm_discard_comment(DraftDiscardAction::CancelComment, window, cx);
         } else {
@@ -2393,12 +3066,19 @@ impl PdfReader {
     }
 
     fn discard_comment_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_comment_autosave();
+        self.comment_pane.show_list(false);
+        self.finish_comment_editor_close();
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn finish_comment_editor_close(&mut self) {
         self.comment_editor = None;
         self.comment_draft_dirty = false;
         self.editing_annotation = None;
         self.pending_comment_range = None;
-        window.focus(&self.focus_handle);
-        cx.notify();
+        self.comment_pane.close_editor_on_finish = false;
     }
 
     fn comment_draft_needs_confirmation(&self) -> bool {
@@ -2781,7 +3461,7 @@ impl PdfReader {
             self.scroll_target = Offset::default();
             return;
         };
-        let max_x = (layout.content_width - self.viewport_width).max(0.0);
+        let max_x = self.max_scroll_x(layout);
         let max_y = (layout.content_height - self.viewport_height).max(0.0);
         self.scroll.x = self.scroll.x.clamp(0.0, max_x);
         self.scroll.y = self.scroll.y.clamp(0.0, max_y);
@@ -2797,7 +3477,7 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let sidebar_is_animating = self.sidebar.is_animating();
+        let ui_is_animating = self.sidebar.is_animating() || self.comment_pane.is_animating();
         self.sidebar_anchor = None;
         #[cfg(debug_assertions)]
         {
@@ -2809,7 +3489,7 @@ impl PdfReader {
             return;
         }
         if immediate {
-            if !sidebar_is_animating {
+            if !ui_is_animating {
                 self.animation_active = false;
             }
             self.scroll_target = self.scroll;
@@ -2820,7 +3500,7 @@ impl PdfReader {
         if immediate {
             self.scroll = self.scroll_target;
             self.request_visible_tiles(window);
-            if sidebar_is_animating {
+            if ui_is_animating {
                 self.start_animation(window, cx);
             }
             cx.notify();
@@ -2876,13 +3556,22 @@ impl PdfReader {
                 self.sidebar_anchor = None;
             }
         }
+        if self.comment_pane.is_animating() {
+            self.comment_pane.advance(dt);
+            if !self.comment_pane.is_animating()
+                && self.comment_pane.target == 0.0
+                && self.comment_pane.close_editor_on_finish
+            {
+                self.finish_comment_editor_close();
+            }
+        }
         if self.sidebar_anchor.is_none() {
             self.scroll.x += (self.scroll_target.x - self.scroll.x) * blend;
             self.scroll.y += (self.scroll_target.y - self.scroll.y) * blend;
         }
         let distance = (self.scroll_target.x - self.scroll.x).abs()
             + (self.scroll_target.y - self.scroll.y).abs();
-        if distance < 0.35 && !self.sidebar.is_animating() {
+        if distance < 0.35 && !self.sidebar.is_animating() && !self.comment_pane.is_animating() {
             self.scroll = self.scroll_target;
             self.animation_active = false;
         }
@@ -3070,6 +3759,16 @@ impl PdfReader {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        if self.view_mode == ReaderView::Fluid && !event.modifiers.shift && event.click_count == 1 {
+            self.pending_annotation_click = self
+                .hit_test_text(event.position, false)
+                .and_then(|position| self.annotation_at_text_position(position));
+            if self.pending_annotation_click.is_none() {
+                self.active_annotation = None;
+            }
+        } else {
+            self.pending_annotation_click = None;
+        }
         match event.button {
             MouseButton::Left => {
                 if let Some(position) = self.hit_test_text(event.position, false) {
@@ -3096,7 +3795,8 @@ impl PdfReader {
                 }
             }
             MouseButton::Middle => {
-                let sidebar_is_animating = self.sidebar.is_animating();
+                let ui_is_animating =
+                    self.sidebar.is_animating() || self.comment_pane.is_animating();
                 self.sidebar_anchor = None;
                 #[cfg(debug_assertions)]
                 {
@@ -3106,7 +3806,7 @@ impl PdfReader {
                     pointer: event.position,
                     scroll: self.scroll,
                 });
-                if sidebar_is_animating {
+                if ui_is_animating {
                     self.start_animation(window, cx);
                 } else {
                     self.animation_active = false;
@@ -3141,6 +3841,9 @@ impl PdfReader {
             && let Some(position) = self.hit_test_text(event.position, true)
         {
             if let Some(selection) = self.selection.as_mut() {
+                if selection.focus != position {
+                    self.pending_annotation_click = None;
+                }
                 selection.focus = position;
             }
             let local_y = f32::from(event.position.y) - self.content_top();
@@ -3153,7 +3856,13 @@ impl PdfReader {
         }
     }
 
-    fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if event.button == MouseButton::Left
+            && let Some(id) = self.pending_annotation_click.take()
+        {
+            self.active_annotation = Some(id);
+            self.selection = None;
+        }
         self.selecting = false;
         self.pan = None;
         cx.notify();
@@ -3184,6 +3893,18 @@ impl PdfReader {
         chars
             .hit_test(page_rect, x, y, nearest)
             .map(|index| TextPosition { page, index })
+    }
+
+    fn annotation_at_text_position(&self, position: TextPosition) -> Option<AnnotationId> {
+        self.annotations.as_ref().and_then(|annotations| {
+            annotations
+                .at(position)
+                .filter(|annotation| {
+                    annotation.highlight().is_some() || annotation.comment_markdown().is_some()
+                })
+                .max_by_key(|annotation| (annotation.updated_revision(), annotation.id()))
+                .map(|annotation| annotation.id())
+        })
     }
 
     fn select_word(&mut self, position: TextPosition) {
@@ -3450,6 +4171,13 @@ impl PdfReader {
                 UI_CONTROL_HOVER,
                 UI_CONTROL_PRESSED,
             ),
+            ChromeButtonStyle::Floating => (
+                UI_SURFACE,
+                UI_SURFACE,
+                UI_TEXT_SECONDARY,
+                0xf0f0f2,
+                0xe4e4e8,
+            ),
             ChromeButtonStyle::Selected => {
                 (UI_ACCENT_SOFT, 0xb8d5f4, UI_ACCENT, 0xdbeafd, 0xc9e0f8)
             }
@@ -3465,6 +4193,7 @@ impl PdfReader {
             .flex()
             .items_center()
             .justify_center()
+            .overflow_hidden()
             .rounded_md()
             .border_1()
             .border_color(rgb(border))
@@ -3497,6 +4226,8 @@ impl PdfReader {
             .flex()
             .items_center()
             .justify_center()
+            .overflow_hidden()
+            .rounded_md()
             .text_color(rgb(UI_TEXT))
             .text_sm()
             .when(enabled, |button| {
@@ -3530,6 +4261,7 @@ impl PdfReader {
             .flex()
             .items_center()
             .justify_center()
+            .overflow_hidden()
             .rounded_md()
             .when(enabled, |button| {
                 button
@@ -3549,7 +4281,198 @@ impl PdfReader {
             )
     }
 
+    fn render_fluid_main_pill(
+        &mut self,
+        state: FluidPillState,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let compact = state.available_width < 700.0;
+        let has_context = self.context_range().is_some() && self.comment_editor.is_none();
+        // When a side panel leaves a narrow document strip, the local pill
+        // keeps context actions available and the main pill keeps its global
+        // zoom/search/comments controls unclipped.
+        let show_context_in_main = has_context && state.available_width >= 520.0;
+        let context_actions_enabled =
+            has_context && !self.annotations_loading && !self.annotation_persistence_blocked;
+        let comment_label = if self.context_has_comment() {
+            if compact { "✎" } else { "Edit note" }
+        } else if compact {
+            "+"
+        } else {
+            "Add note"
+        };
+
+        div()
+            .id("fluid-main-pill")
+            .block_mouse_except_scroll()
+            .h(px(44.0))
+            .max_w(px((state.available_width - 24.0).max(280.0)))
+            .px_1()
+            .flex()
+            .items_center()
+            .gap_1()
+            .overflow_hidden()
+            .rounded_full()
+            .border_1()
+            .border_color(rgba(0x00000022))
+            .bg(rgb(UI_SURFACE))
+            .shadow_sm()
+            .text_color(rgb(UI_TEXT))
+            .child(Self::segment_button(
+                "fluid-zoom-out",
+                "−",
+                state.zoom_out_enabled,
+                cx.listener(|reader, _, window, cx| reader.zoom_out(&ZoomOut, window, cx)),
+            ))
+            .child(
+                div()
+                    .h(px(30.0))
+                    .min_w(px(if compact { 46.0 } else { 54.0 }))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(if state.document_open {
+                        UI_TEXT
+                    } else {
+                        UI_TEXT_TERTIARY
+                    }))
+                    .child(state.zoom_label),
+            )
+            .child(Self::segment_button(
+                "fluid-zoom-in",
+                "+",
+                state.zoom_in_enabled,
+                cx.listener(|reader, _, window, cx| reader.zoom_in(&ZoomIn, window, cx)),
+            ))
+            .when(!compact, |pill| {
+                pill.child(Self::segment_button(
+                    "fluid-fit-width",
+                    "Fit",
+                    state.document_open,
+                    cx.listener(|reader, _, window, cx| reader.fit_width(&FitWidth, window, cx)),
+                ))
+            })
+            .when(show_context_in_main, |pill| {
+                pill.child(div().h(px(24.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+                    .children(
+                        [
+                            "fluid-main-highlight-yellow",
+                            "fluid-main-highlight-green",
+                            "fluid-main-highlight-blue",
+                            "fluid-main-highlight-pink",
+                            "fluid-main-highlight-purple",
+                        ]
+                        .into_iter()
+                        .zip(HighlightColor::ALL)
+                        .map(|(id, color)| {
+                            Self::highlight_button(
+                                id,
+                                color,
+                                context_actions_enabled,
+                                cx.listener(move |reader, _, _, cx| {
+                                    reader.add_highlight(color, cx)
+                                }),
+                            )
+                        }),
+                    )
+                    .child(Self::segment_button(
+                        "fluid-main-context-comment",
+                        comment_label,
+                        context_actions_enabled,
+                        cx.listener(|reader, _, window, cx| reader.comment_on_context(window, cx)),
+                    ))
+            })
+            .child(div().h(px(24.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+            .child(Self::chrome_button(
+                "fluid-toggle-search",
+                if compact { "⌕" } else { "Search" },
+                if state.search_selected {
+                    ChromeButtonStyle::Selected
+                } else {
+                    ChromeButtonStyle::Floating
+                },
+                state.document_open,
+                cx.listener(|reader, _, window, cx| reader.find_document(&Find, window, cx)),
+            ))
+            .child(Self::chrome_button(
+                "fluid-toggle-comments",
+                if compact { "☰" } else { "Comments" },
+                if state.comments_selected {
+                    ChromeButtonStyle::Selected
+                } else {
+                    ChromeButtonStyle::Floating
+                },
+                state.document_open,
+                cx.listener(|reader, _, window, cx| {
+                    reader.toggle_comments(&ToggleComments, window, cx)
+                }),
+            ))
+            .into_any_element()
+    }
+
+    fn render_fluid_context_pill(
+        &mut self,
+        position: Offset,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let comment_label = if self.context_has_comment() {
+            "✎"
+        } else {
+            "+"
+        };
+        div()
+            .id("fluid-context-pill")
+            .block_mouse_except_scroll()
+            .absolute()
+            .left(px(position.x))
+            .top(px(position.y))
+            .h(px(FLUID_CONTEXT_PILL_HEIGHT))
+            .w(px(FLUID_CONTEXT_PILL_WIDTH))
+            .px_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .rounded_full()
+            .border_1()
+            .border_color(rgba(0x00000026))
+            .bg(rgb(UI_SURFACE))
+            .shadow_sm()
+            .children(
+                [
+                    "fluid-context-highlight-yellow",
+                    "fluid-context-highlight-green",
+                    "fluid-context-highlight-blue",
+                    "fluid-context-highlight-pink",
+                    "fluid-context-highlight-purple",
+                ]
+                .into_iter()
+                .zip(HighlightColor::ALL)
+                .map(|(id, color)| {
+                    Self::highlight_button(
+                        id,
+                        color,
+                        enabled,
+                        cx.listener(move |reader, _, _, cx| reader.add_highlight(color, cx)),
+                    )
+                }),
+            )
+            .child(div().h(px(22.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+            .child(Self::segment_button(
+                "fluid-context-comment",
+                comment_label,
+                enabled,
+                cx.listener(|reader, _, window, cx| reader.comment_on_context(window, cx)),
+            ))
+            .into_any_element()
+    }
+
     fn render_search_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let fluid = self.view_mode == ReaderView::Fluid;
         let result_count = self.search.order.len();
         let input_error = self.search.input_error.clone();
         let page_count = self
@@ -3737,6 +4660,7 @@ impl PdfReader {
             .min_h(px(0.0))
             .w_full()
             .bg(rgb(UI_SURFACE_SUBTLE))
+            .when(fluid, |list| list.rounded_b_xl())
             .into_any_element()
         };
 
@@ -3744,6 +4668,7 @@ impl PdfReader {
             .size_full()
             .flex()
             .flex_col()
+            .when(fluid, |panel| panel.rounded_xl())
             .bg(rgb(UI_SURFACE))
             .text_color(rgb(UI_TEXT))
             .child(
@@ -3832,7 +4757,363 @@ impl PdfReader {
             .into_any_element()
     }
 
+    fn render_fluid_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let editor_open = self.comment_editor.is_some();
+        let can_add_comment = annotation_actions_enabled(
+            self.selection.is_some(),
+            self.annotations_loading,
+            self.annotation_persistence_blocked,
+            editor_open,
+        );
+        let list_header = div()
+            .h(px(54.0))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(rgb(UI_SEPARATOR))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Comments"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(Self::chrome_button(
+                        "fluid-add-comment",
+                        "+ New",
+                        ChromeButtonStyle::Neutral,
+                        can_add_comment,
+                        cx.listener(|reader, _, window, cx| {
+                            reader.add_comment(&AddComment, window, cx)
+                        }),
+                    ))
+                    .child(Self::chrome_button(
+                        "fluid-close-comments",
+                        "Close",
+                        ChromeButtonStyle::Ghost,
+                        true,
+                        cx.listener(|reader, _, window, cx| {
+                            reader.toggle_sidebar(SidePanel::Comments, window, cx)
+                        }),
+                    )),
+            );
+
+        let list_body = if self.comment_order.is_empty() {
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_6()
+                .text_center()
+                .child(
+                    div()
+                        .size(px(38.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(rgb(UI_ACCENT_SOFT))
+                        .text_color(rgb(UI_ACCENT))
+                        .text_lg()
+                        .child("✎"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(UI_TEXT))
+                        .child(if self.annotations_loading {
+                            "Loading comments…"
+                        } else if self.annotation_persistence_blocked {
+                            "Comments unavailable"
+                        } else {
+                            "No comments yet"
+                        }),
+                )
+                .child(
+                    div()
+                        .max_w(px(248.0))
+                        .text_xs()
+                        .line_height(px(18.0))
+                        .text_color(rgb(UI_TEXT_SECONDARY))
+                        .child(if self.annotation_persistence_blocked {
+                            "Resolve the annotation sidecar problem before adding comments."
+                        } else {
+                            "Select text, then use either floating Note control."
+                        }),
+                )
+                .into_any_element()
+        } else {
+            uniform_list(
+                "fluid-comment-list",
+                self.comment_order.len(),
+                cx.processor(|reader, range: std::ops::Range<usize>, _window, cx| {
+                    range
+                        .filter_map(|index| {
+                            let id = *reader.comment_order.get(index)?;
+                            let annotation = reader.annotations.as_ref()?.get(id)?;
+                            let page = annotation.range().start().page;
+                            let markdown = annotation.comment_markdown().unwrap_or("");
+                            let preview = RichTextBuffer::try_from_markdown(markdown)
+                                .map(|buffer| compact_preview(buffer.text(), 96))
+                                .unwrap_or_else(|_| compact_preview(markdown, 96));
+                            let preview: SharedString = preview.into();
+                            let color = match annotation.highlight() {
+                                Some(HighlightColor::Yellow) => rgb(0xffd447),
+                                Some(HighlightColor::Green) => rgb(0x55d987),
+                                Some(HighlightColor::Blue) => rgb(0x5aa7ff),
+                                Some(HighlightColor::Pink) => rgb(0xff75b7),
+                                Some(HighlightColor::Purple) => rgb(0xb98cff),
+                                None => rgb(0xf0a53b),
+                            };
+                            let active = reader.active_annotation == Some(id);
+                            Some(
+                                div().h(px(96.0)).w_full().px_3().py_1().child(
+                                    div()
+                                        .id(("fluid-comment", index))
+                                        .size_full()
+                                        .overflow_hidden()
+                                        .flex()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(if active {
+                                            0xb8d5f4
+                                        } else {
+                                            UI_SEPARATOR
+                                        }))
+                                        .bg(rgb(if active { UI_ACCENT_SOFT } else { UI_SURFACE }))
+                                        .cursor_pointer()
+                                        .hover(move |row| {
+                                            row.bg(rgb(if active {
+                                                0xdbeafd
+                                            } else {
+                                                UI_SURFACE_SUBTLE
+                                            }))
+                                        })
+                                        .on_click(cx.listener(move |reader, _, window, cx| {
+                                            reader.navigate_annotation(id, window, cx);
+                                            reader.edit_comment(id, window, cx);
+                                        }))
+                                        .child(div().w(px(4.0)).h_full().flex_none().bg(color))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .px_3()
+                                                .py_2()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(if active {
+                                                            rgb(UI_ACCENT)
+                                                        } else {
+                                                            rgb(UI_TEXT_SECONDARY)
+                                                        })
+                                                        .child(format!("PAGE {}", page + 1))
+                                                        .child("Open →"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .h(px(42.0))
+                                                        .overflow_hidden()
+                                                        .text_sm()
+                                                        .line_height(px(20.0))
+                                                        .text_color(rgb(UI_TEXT))
+                                                        .child(preview),
+                                                ),
+                                        ),
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(self.comment_list_scroll.clone())
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .bg(rgb(UI_SURFACE_SUBTLE))
+            .rounded_b_xl()
+            .into_any_element()
+        };
+
+        let list_error = self.annotation_error.clone().map(|message| {
+            div()
+                .mx_4()
+                .mt_3()
+                .p_3()
+                .rounded_md()
+                .bg(rgb(UI_ERROR_SOFT))
+                .text_xs()
+                .line_height(px(18.0))
+                .text_color(rgb(UI_ERROR))
+                .child(message)
+        });
+        let progress = self.comment_pane.progress;
+        let list_pane = div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(-SIDEBAR_WIDTH * progress))
+            .w_full()
+            .flex()
+            .flex_col()
+            .rounded_xl()
+            .bg(rgb(UI_SURFACE))
+            .child(list_header)
+            .children(list_error)
+            .child(list_body);
+
+        let editor_pane = self.comment_editor.clone().map(|editor| {
+            let title = if self.editing_annotation.is_some() {
+                "Edit Comment"
+            } else {
+                "New Comment"
+            };
+            let annotations_pending = self
+                .annotations
+                .as_ref()
+                .is_some_and(|annotations| annotations.revision() > self.annotation_saved_revision);
+            let save_status = if self.comment_draft_dirty
+                || self.comment_autosave_task.is_some()
+                || annotations_pending
+            {
+                "Saving…"
+            } else if self.editing_annotation.is_some() {
+                "Saved"
+            } else {
+                "Auto-save"
+            };
+            let editor_error = self.annotation_error.clone().map(|message| {
+                div()
+                    .mx_4()
+                    .mt_3()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(UI_ERROR_SOFT))
+                    .text_xs()
+                    .line_height(px(18.0))
+                    .text_color(rgb(UI_ERROR))
+                    .child(message)
+            });
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(SIDEBAR_WIDTH * (1.0 - progress)))
+                .w_full()
+                .flex()
+                .flex_col()
+                .rounded_xl()
+                .bg(rgb(UI_SURFACE))
+                .child(
+                    div()
+                        .h(px(54.0))
+                        .flex_none()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(rgb(UI_SEPARATOR))
+                        .child(Self::chrome_button(
+                            "fluid-comment-back",
+                            "‹ Back",
+                            ChromeButtonStyle::Ghost,
+                            true,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.return_to_comment_list(window, cx)
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .px_2()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .max_w(px(150.0))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(if save_status == "Saved" {
+                                            0x2f7d4a
+                                        } else {
+                                            UI_TEXT_SECONDARY
+                                        }))
+                                        .child(save_status),
+                                ),
+                        )
+                        .child(Self::chrome_button(
+                            "fluid-close-comment-editor",
+                            "Close",
+                            ChromeButtonStyle::Ghost,
+                            true,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.toggle_sidebar(SidePanel::Comments, window, cx)
+                            }),
+                        )),
+                )
+                .children(editor_error)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .child(editor),
+                )
+        });
+
+        div()
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .rounded_xl()
+            .bg(rgb(UI_SURFACE))
+            .text_color(rgb(UI_TEXT))
+            .child(list_pane)
+            .children(editor_pane)
+            .into_any_element()
+    }
+
     fn render_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match self.view_mode {
+            ReaderView::Classic => self.render_classic_comments_panel(cx),
+            ReaderView::Fluid => self.render_fluid_comments_panel(cx),
+        }
+    }
+
+    fn render_classic_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let error = self.annotation_error.clone();
         let editor_open = self.comment_editor.is_some();
         let editor_is_blank = self
@@ -4087,6 +5368,7 @@ impl PdfReader {
                                                                 .id(("edit-comment", index))
                                                                 .px_2()
                                                                 .py_1()
+                                                                .overflow_hidden()
                                                                 .rounded_md()
                                                                 .text_color(rgb(UI_ACCENT))
                                                                 .hover(|button| {
@@ -4383,10 +5665,11 @@ impl PdfReader {
             ));
         }
 
-        let max_x = (snapshot.layout.content_width - snapshot.viewport_width).max(0.0);
+        let max_x = snapshot.max_scroll_x;
         if max_x > 0.0 {
+            let effective_content_width = snapshot.viewport_width + max_x;
             let thumb_width = (snapshot.viewport_width * snapshot.viewport_width
-                / snapshot.layout.content_width)
+                / effective_content_width)
                 .max(38.0)
                 .min(snapshot.viewport_width);
             let travel = snapshot.viewport_width - thumb_width - 12.0;
@@ -4455,7 +5738,7 @@ impl Render for PdfReader {
             self.sidebar.panel == SidePanel::Comments && self.sidebar.target > 0.5;
         let show_status = !matches!(status_text.as_ref(), "Ready" | "Open a PDF to begin");
 
-        let toolbar = div()
+        let classic_toolbar = div()
             .h(px(TOOLBAR_HEIGHT))
             .flex_none()
             .w_full()
@@ -4518,7 +5801,7 @@ impl Render for PdfReader {
                             } else {
                                 UI_TEXT_TERTIARY
                             }))
-                            .child(zoom_label),
+                            .child(zoom_label.clone()),
                     )
                     .child(Self::segment_button(
                         "zoom-in",
@@ -4560,7 +5843,7 @@ impl Render for PdfReader {
                                 .text_ellipsis()
                                 .text_sm()
                                 .font_weight(FontWeight::MEDIUM)
-                                .child(filename),
+                                .child(filename.clone()),
                         )
                     })
                     .when(document_open && !very_compact_toolbar, |title| {
@@ -4584,7 +5867,7 @@ impl Render for PdfReader {
                                 .text_ellipsis()
                                 .text_xs()
                                 .text_color(rgb(UI_TEXT_SECONDARY))
-                                .child(status_text),
+                                .child(status_text.clone()),
                         )
                     }),
             )
@@ -4680,6 +5963,94 @@ impl Render for PdfReader {
                 },
             );
 
+        let fluid_toolbar = div()
+            .h(px(TOOLBAR_HEIGHT))
+            .flex_none()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .bg(rgb(UI_CHROME))
+            .border_b_1()
+            .border_color(rgb(UI_SEPARATOR))
+            .text_color(rgb(UI_TEXT))
+            .child(
+                div()
+                    .h_full()
+                    .w(px(TITLEBAR_CONTROL_INSET))
+                    .flex_none()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .child(Self::chrome_button(
+                "fluid-open-document",
+                "Open…",
+                ChromeButtonStyle::Ghost,
+                true,
+                cx.listener(|reader, _, window, cx| reader.open_dialog(&OpenDocument, window, cx)),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(
+                        div()
+                            .max_w(px(320.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(filename.clone()),
+                    )
+                    .when(document_open, |title| {
+                        title.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_full()
+                                .bg(rgb(UI_CONTROL_HOVER))
+                                .text_xs()
+                                .text_color(rgb(UI_TEXT_SECONDARY))
+                                .child(format!("{current_page} / {page_count}")),
+                        )
+                    })
+                    .when(show_status && !compact_toolbar, |title| {
+                        title.child(
+                            div()
+                                .max_w(px(180.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .text_color(rgb(UI_TEXT_SECONDARY))
+                                .child(status_text.clone()),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_full()
+                    .bg(rgb(UI_ACCENT_SOFT))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(UI_ACCENT))
+                    .child("Fluid"),
+            );
+
+        let toolbar = match self.view_mode {
+            ReaderView::Classic => classic_toolbar.into_any_element(),
+            ReaderView::Fluid => fluid_toolbar.into_any_element(),
+        };
+
         let content = if let Some(layout) = self.layout() {
             let visible = layout.visible_pages(
                 self.scroll.y,
@@ -4727,10 +6098,12 @@ impl Render for PdfReader {
                 active_search: self.search.active,
                 viewport_width: self.viewport_width,
                 viewport_height: self.viewport_height,
+                max_scroll_x: self.max_scroll_x(layout),
             };
             div()
                 .id("document-viewport")
                 .flex_none()
+                .h_full()
                 .w(px(self.viewport_width))
                 .overflow_hidden()
                 .bg(rgb(UI_CANVAS))
@@ -4759,6 +6132,7 @@ impl Render for PdfReader {
             div()
                 .id("empty-state")
                 .flex_none()
+                .h_full()
                 .w(px(self.viewport_width))
                 .flex()
                 .flex_col()
@@ -4817,28 +6191,124 @@ impl Render for PdfReader {
                 .into_any_element()
         };
 
-        let sidebar_width = self.sidebar.available_width(full_width);
-        let sidebar_inner_width =
-            SIDEBAR_WIDTH.min((full_width - MIN_DOCUMENT_VIEWPORT_WIDTH).max(0.0));
         let sidebar_content = match self.sidebar.panel {
             SidePanel::Comments => self.render_comments_panel(cx),
             SidePanel::Search => self.render_search_panel(cx),
         };
-        let sidebar = div()
-            .id("reader-sidebar")
-            .h_full()
-            .w(px(sidebar_width))
-            .flex_none()
-            .overflow_hidden()
-            .bg(rgb(UI_SURFACE))
-            .border_l_1()
-            .border_color(rgb(UI_SEPARATOR))
-            .child(
-                div()
+        let workspace = match self.view_mode {
+            ReaderView::Classic => {
+                let sidebar_width = self.sidebar.available_width(full_width);
+                let sidebar_inner_width =
+                    SIDEBAR_WIDTH.min((full_width - MIN_DOCUMENT_VIEWPORT_WIDTH).max(0.0));
+                let sidebar = div()
+                    .id("reader-sidebar")
                     .h_full()
-                    .w(px(sidebar_inner_width))
-                    .child(sidebar_content),
-            );
+                    .w(px(sidebar_width))
+                    .flex_none()
+                    .overflow_hidden()
+                    .bg(rgb(UI_SURFACE))
+                    .border_l_1()
+                    .border_color(rgb(UI_SEPARATOR))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(px(sidebar_inner_width))
+                            .child(sidebar_content),
+                    );
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .flex()
+                    .child(content)
+                    .child(sidebar)
+                    .into_any_element()
+            }
+            ReaderView::Fluid => {
+                let panel_width = self.fluid_panel_width();
+                let panel_reveal = self.fluid_panel_occlusion();
+                let available_width = (self.viewport_width - panel_reveal).max(1.0);
+                let main_pill = self.render_fluid_main_pill(
+                    FluidPillState {
+                        available_width,
+                        document_open,
+                        zoom_out_enabled,
+                        zoom_in_enabled,
+                        zoom_label,
+                        search_selected,
+                        comments_selected,
+                    },
+                    cx,
+                );
+                let has_stable_selection = self
+                    .selection
+                    .is_some_and(|selection| selection.anchor != selection.focus);
+                let show_context_pill = !self.selecting
+                    && self.comment_editor.is_none()
+                    && (has_stable_selection || self.active_annotation.is_some());
+                let context_enabled = show_context_pill
+                    && !self.annotations_loading
+                    && !self.annotation_persistence_blocked;
+                let context_pill = show_context_pill
+                    .then(|| self.context_anchor_in_viewport())
+                    .flatten()
+                    .map(|anchor| {
+                        let position = floating_pill_position(
+                            anchor,
+                            available_width,
+                            self.viewport_height,
+                            FLUID_CONTEXT_PILL_WIDTH,
+                            FLUID_CONTEXT_PILL_HEIGHT,
+                        );
+                        self.render_fluid_context_pill(position, context_enabled, cx)
+                    });
+                let sidebar = div()
+                    .id("fluid-sidebar-reveal")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(panel_reveal))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id("reader-sidebar")
+                            .occlude()
+                            .absolute()
+                            .top(px(FLUID_PANEL_VERTICAL_MARGIN))
+                            .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
+                            .right(px(FLUID_PANEL_HORIZONTAL_MARGIN))
+                            .w(px(panel_width))
+                            .overflow_hidden()
+                            .rounded_xl()
+                            .border_1()
+                            .border_color(rgba(0x00000020))
+                            .bg(rgb(UI_SURFACE))
+                            .shadow_sm()
+                            .child(sidebar_content),
+                    );
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .overflow_hidden()
+                    .child(content)
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(14.0))
+                            .left_0()
+                            .w(px(available_width))
+                            .flex()
+                            .justify_center()
+                            .child(main_pill),
+                    )
+                    .children(context_pill)
+                    .child(sidebar)
+                    .into_any_element()
+            }
+        };
 
         let error_bar = if let ReaderStatus::Error(message) = &self.status {
             Some(
@@ -4889,18 +6359,12 @@ impl Render for PdfReader {
             .on_action(cx.listener(Self::add_comment))
             .on_action(cx.listener(Self::next_search_result))
             .on_action(cx.listener(Self::previous_search_result))
+            .on_action(cx.listener(Self::use_classic_view))
+            .on_action(cx.listener(Self::use_fluid_view))
             .on_action(cx.listener(Self::quit_application))
             .child(toolbar)
             .children(error_bar)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .w_full()
-                    .flex()
-                    .child(content)
-                    .child(sidebar),
-            )
+            .child(workspace)
     }
 }
 
@@ -4939,6 +6403,7 @@ struct PaintSnapshot {
     active_search: Option<SearchMatchId>,
     viewport_width: f32,
     viewport_height: f32,
+    max_scroll_x: f32,
 }
 
 fn normalized_bounds_in_page(page: Rect, bounds: TextBounds) -> Rect {
@@ -5318,6 +6783,79 @@ mod tests {
         );
         assert_eq!(comments_toolbar_label(true, true, false), "Notes •");
         assert_eq!(comments_toolbar_label(true, true, true), "Notes •");
+    }
+
+    #[test]
+    fn fluid_context_pill_stays_on_screen_and_prefers_below_the_selection() {
+        let below = floating_pill_position(
+            Rect {
+                x: 160.0,
+                y: 120.0,
+                width: 80.0,
+                height: 18.0,
+            },
+            500.0,
+            600.0,
+            FLUID_CONTEXT_PILL_WIDTH,
+            FLUID_CONTEXT_PILL_HEIGHT,
+        );
+        assert_eq!(below.y, 148.0);
+        assert!((below.x - 93.0).abs() < f32::EPSILON);
+
+        let clamped_left = floating_pill_position(
+            Rect {
+                x: -200.0,
+                y: 20.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            500.0,
+            600.0,
+            FLUID_CONTEXT_PILL_WIDTH,
+            FLUID_CONTEXT_PILL_HEIGHT,
+        );
+        assert_eq!(clamped_left.x, 12.0);
+
+        let above = floating_pill_position(
+            Rect {
+                x: 450.0,
+                y: 570.0,
+                width: 30.0,
+                height: 18.0,
+            },
+            500.0,
+            600.0,
+            FLUID_CONTEXT_PILL_WIDTH,
+            FLUID_CONTEXT_PILL_HEIGHT,
+        );
+        assert_eq!(above.x, 274.0);
+        assert_eq!(above.y, 520.0);
+    }
+
+    #[test]
+    fn comment_pane_slides_both_directions_and_only_closes_after_back_finishes() {
+        let mut pane = CommentPaneState::default();
+        pane.show_editor(true);
+        assert_eq!(pane.target, 1.0);
+        assert!(!pane.close_editor_on_finish);
+        for _ in 0..240 {
+            pane.advance(1.0 / 60.0);
+        }
+        assert_eq!(pane.progress, 1.0);
+        assert!(!pane.is_animating());
+
+        pane.show_list(true);
+        assert_eq!(pane.target, 0.0);
+        assert!(pane.close_editor_on_finish);
+        pane.advance(1.0 / 60.0);
+        assert!(pane.progress > 0.0);
+        assert!(pane.is_animating());
+        for _ in 0..240 {
+            pane.advance(1.0 / 60.0);
+        }
+        assert_eq!(pane.progress, 0.0);
+        assert!(!pane.is_animating());
+        assert!(pane.close_editor_on_finish);
     }
 
     #[test]

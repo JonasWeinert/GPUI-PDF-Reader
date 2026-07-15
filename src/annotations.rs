@@ -86,7 +86,6 @@ impl TextRange {
         }
     }
 
-    #[cfg(test)]
     pub fn contains(self, position: TextPosition) -> bool {
         self.start <= position && position <= self.end
     }
@@ -259,7 +258,6 @@ impl AnnotationSet {
 
     /// Returns annotations containing a character position in deterministic
     /// start/id order.
-    #[cfg(test)]
     pub fn at(&self, position: TextPosition) -> impl Iterator<Item = &Annotation> {
         self.records
             .iter()

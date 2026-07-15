@@ -39,8 +39,12 @@ are macOS-specific today.
 - Selection-anchored highlights in yellow, green, blue, pink, or purple.
 - Markdown-backed comments with a WYSIWYG editor for bold, italic, inline
   code, bulleted lists, and numbered lists.
-- Animated comments and search sidebars that preserve the document position
-  while making room for the panel.
+- Classic and Fluid reader views, selectable from the View menu. Classic keeps
+  controls in the titlebar; Fluid uses intent-sensitive floating controls over
+  the document.
+- Animated comments and search panels. Classic makes room for them; Fluid
+  floats near-full-height panels over the PDF while extending horizontal reach
+  so covered content remains accessible.
 - Case-insensitive in-document search with on-page result highlights, a
   virtualized result list, and previous/next navigation.
 - PDFium rendering for intrinsic page rotation, CropBox pages, annotations,
@@ -109,6 +113,7 @@ been implemented yet.
 | Action | Input |
 |---|---|
 | Open | Toolbar or `Command-O` |
+| Switch layout | Classic View or Fluid View in the View menu |
 | Scroll | Two-finger trackpad, mouse wheel, or both trackpad axes |
 | Horizontal scroll | Native horizontal gesture or `Shift`-wheel |
 | Pan | Middle-button drag |
@@ -120,7 +125,7 @@ been implemented yet.
 | First / last page | `Home` / `End` |
 | Select text | Left drag; `Shift`-click extends; double-click selects a word |
 | Select all / copy | `Command-A` / `Command-C` |
-| Highlight selection | Choose one of the five color controls in the toolbar |
+| Highlight selection | Choose one of the five color controls; Fluid also shows a selection pill |
 | Add comment to selection | Toolbar or `Command-Option-M` |
 | Search document | Toolbar or `Command-F` |
 | Next / previous search result | `Command-G` / `Command-Shift-G` |
@@ -128,7 +133,9 @@ been implemented yet.
 
 The comment editor displays formatted content directly while storing Markdown.
 Its hovering formatting pill provides bold, italic, inline code, bulleted-list,
-and numbered-list controls. Use `Command-Enter` to save or `Escape` to cancel.
+and numbered-list controls. Classic uses `Command-Enter` to save or `Escape` to
+cancel. Fluid auto-saves after edits and uses Back to return to the animated
+comments list.
 
 Keyboard scrolling is animated. Precise trackpad deltas are applied directly,
 and zoom gestures preserve the document position beneath the pointer.
@@ -209,6 +216,15 @@ the sidecar round trip:
 
 ```sh
 sh tests/e2e/macos_features.sh
+```
+
+The Fluid scenario types and auto-saves a comment, clicks its highlighted text,
+slides between the comment list and editor, opens a list item, searches the
+document, verifies overlay-panel horizontal reach, and relaunches to check the
+sidecar:
+
+```sh
+sh tests/e2e/macos_fluid.sh
 ```
 
 Each E2E case has a hard watchdog and requires a quiet Ready state, all exact

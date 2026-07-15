@@ -10,6 +10,7 @@
 - Test large-document layout by comparing lazy geometry with the eager equations and checking that rescaling reuses shared geometry. Avoid timing assertions.
 - The macOS E2E test opens the fixture, crosses minimum and maximum zoom while pages enter and leave the viewport, and requires a clean settled state before a hard timeout.
 - The feature E2E uses a temporary fixture copy, paints the real WYSIWYG editor, types a multiword comment, formats and saves it through native GPUI keystrokes, creates all five colors, types a search query into the real field, measures sidebar anchor drift, searches and navigates, then relaunches to verify sidecar persistence.
+- The Fluid E2E types into the real editor, waits through the autosave debounce and sidecar worker, runs the production highlight mouse hit-test, exercises both comment-pane slide directions and list-to-editor navigation, checks Edit-note context resolution, and proves overlay width is added to horizontal scroll reach before reloading the sidecar.
 - Test text limits at the exact UTF-8 boundary and one scalar beyond it. Include native replacement ranges, IME composition, ignored search characters, and Markdown encoding overhead; every rejected edit must leave the full buffer state unchanged.
 - Prove parser and rich-text traversal complexity with deterministic operation counts proportional to bytes, lines, and runs. Timing tests are noisy and can miss quadratic inputs at small fixture sizes.
 - Inject a precise scroll packet while a sidebar transition is active. Waiting until after the slide misses frame-chain cancellation bugs that leave a panel partially open.
@@ -17,3 +18,4 @@
 - The debug `GPUI_PDF_READER_QA_*` hook dispatches real GPUI keystrokes and directly exercises the production command-wheel handler without Accessibility permission. Cocoa event translation and physical trackpad gestures remain manual checks.
 - For the historical Metal freeze, require clean process exit and inspect app/system logs for invalid resources, GPU faults, and panics.
 - Root tests do not run a dependency crate's own tests. Keep the focused vendored PDFium command in the saved suite.
+- External-display regressions need a real macOS screen transition: move the native window between displays with different backing scales, then test external-display disconnect/reconnect. Resize-only simulation does not emit `windowDidChangeScreen` and cannot cover this GPUI platform path.

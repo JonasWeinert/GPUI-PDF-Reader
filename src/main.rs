@@ -56,8 +56,10 @@ actions!(
         Find,
         ToggleComments,
         AddComment,
+        ClassicView,
         NextSearchResult,
         PreviousSearchResult,
+        FluidView,
         Quit,
     ]
 );
@@ -94,6 +96,9 @@ fn main() {
             Menu {
                 name: "View".into(),
                 items: vec![
+                    MenuItem::action("Classic View", ClassicView),
+                    MenuItem::action("Fluid View", FluidView),
+                    MenuItem::separator(),
                     MenuItem::action("Zoom In", ZoomIn),
                     MenuItem::action("Zoom Out", ZoomOut),
                     MenuItem::action("Actual Size", ActualSize),
@@ -146,6 +151,13 @@ fn main() {
         // Accessibility permission.
         #[cfg(debug_assertions)]
         {
+            if std::env::var_os("GPUI_PDF_READER_QA_FLUID_VIEW").is_some() {
+                window
+                    .update(cx, |reader, window, cx| {
+                        reader.qa_use_fluid_view(window, cx);
+                    })
+                    .ok();
+            }
             let keystrokes: Vec<_> = std::env::var("GPUI_PDF_READER_QA_KEYS")
                 .unwrap_or_default()
                 .split_whitespace()
@@ -183,11 +195,14 @@ fn main() {
             let exit_after_report = std::env::var_os("GPUI_PDF_READER_QA_EXIT").is_some();
             let feature_scenario =
                 std::env::var_os("GPUI_PDF_READER_QA_FEATURE_SCENARIO").is_some();
+            let fluid_scenario =
+                std::env::var_os("GPUI_PDF_READER_QA_FLUID_SCENARIO").is_some();
             if !keystrokes.is_empty()
                 || !wheel_deltas.is_empty()
                 || report
                 || exit_after_report
                 || feature_scenario
+                || fluid_scenario
             {
                 window
                     .update(cx, |_, window, cx| {
@@ -220,7 +235,7 @@ fn main() {
                                         .timer(Duration::from_millis(25))
                                         .await;
                                 }
-                                if feature_scenario {
+                                if feature_scenario || fluid_scenario {
                                     let feature_deadline =
                                         std::time::Instant::now() + Duration::from_millis(timeout);
                                     loop {
@@ -232,7 +247,11 @@ fn main() {
                                                     return Ok(false);
                                                 };
                                                 reader.update(cx, |reader, cx| {
-                                                    reader.qa_drive_feature_scenario(window, cx)
+                                                    if fluid_scenario {
+                                                        reader.qa_drive_fluid_scenario(window, cx)
+                                                    } else {
+                                                        reader.qa_drive_feature_scenario(window, cx)
+                                                    }
                                                 })
                                             })
                                             .unwrap_or_else(|error| {
@@ -253,8 +272,9 @@ fn main() {
                                         }
                                         if std::time::Instant::now() >= feature_deadline {
                                             eprintln!(
-                                                "GPUI_PDF_READER_QA_ERROR feature scenario did not settle"
-                                            );
+                                                    "GPUI_PDF_READER_QA_ERROR {} scenario did not settle",
+                                                    if fluid_scenario { "Fluid" } else { "feature" }
+                                                );
                                             let _ = cx.update(|_, cx| cx.quit());
                                             return;
                                         }
