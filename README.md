@@ -42,6 +42,9 @@ are macOS-specific today.
 - Classic and Fluid reader views, selectable from the View menu. Classic keeps
   controls in the titlebar; Fluid uses intent-sensitive floating controls over
   the document.
+- Thirty-seven bundled gpui-component themes, selectable from View → Theme,
+  plus a system-following mode. All reader chrome and icons use shared semantic
+  theme tokens; PDF page pixels are never recolored.
 - Animated comments and search panels. Classic makes room for them; Fluid
   floats near-full-height panels over the PDF while extending horizontal reach
   so covered content remains accessible.
