@@ -3,6 +3,10 @@
 /vendor/*/target/
 **/*.rs.bk
 
+# Local annotation sidecars and interrupted atomic-save temporaries.
+*.gpui-pdf-reader.json
+*.gpui-pdf-reader.json.tmp-*
+
 # macOS filesystem metadata.
 .DS_Store
 .AppleDouble

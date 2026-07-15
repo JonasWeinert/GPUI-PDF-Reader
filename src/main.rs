@@ -1,10 +1,22 @@
+mod annotations;
 mod backend;
+mod comment_editor;
 mod model;
 mod native_gestures;
 mod reader;
+mod search;
+mod text_field;
 
+use comment_editor::{
+    CommentBackspace, CommentCancel, CommentDelete, CommentDown, CommentEnd, CommentHome,
+    CommentLeft, CommentRight, CommentSave, CommentSelectDown, CommentSelectLeft,
+    CommentSelectRight, CommentSelectUp, CommentToggleBold, CommentToggleBulletedList,
+    CommentToggleCode, CommentToggleItalic, CommentToggleNumberedList, CommentUp,
+};
 #[cfg(debug_assertions)]
 use gpui::Keystroke;
+#[cfg(target_os = "macos")]
+use gpui::TitlebarOptions;
 use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, Point, WindowBounds, WindowOptions,
     actions, px, size,
@@ -12,6 +24,12 @@ use gpui::{
 use std::path::PathBuf;
 #[cfg(debug_assertions)]
 use std::time::Duration;
+use text_field::{
+    FieldBackspace, FieldCancel, FieldDelete, FieldEnd, FieldHome, FieldLeft, FieldRight,
+    FieldSelectLeft, FieldSelectRight, FieldSubmit,
+};
+
+const READER_NAVIGATION_CONTEXT: &str = "PdfReader && !TextField && !CommentEditor";
 
 actions!(
     gpui_pdf_reader,
@@ -23,6 +41,10 @@ actions!(
         FitWidth,
         CopySelection,
         SelectAll,
+        EditCopy,
+        EditCut,
+        EditPaste,
+        EditSelectAll,
         ScrollUp,
         ScrollDown,
         ScrollLeft,
@@ -31,6 +53,13 @@ actions!(
         PageDown,
         FirstPage,
         LastPage,
+        Find,
+        ToggleComments,
+        AddComment,
+        ClassicView,
+        NextSearchResult,
+        PreviousSearchResult,
+        FluidView,
         Quit,
     ]
 );
@@ -52,33 +81,61 @@ fn main() {
             Menu {
                 name: "Edit".into(),
                 items: vec![
-                    MenuItem::action("Copy", CopySelection),
-                    MenuItem::action("Select All", SelectAll),
+                    MenuItem::action("Cut", EditCut),
+                    MenuItem::action("Copy", EditCopy),
+                    MenuItem::action("Paste", EditPaste),
+                    MenuItem::action("Select All", EditSelectAll),
+                    MenuItem::separator(),
+                    MenuItem::action("Find…", Find),
+                    MenuItem::action("Find Next", NextSearchResult),
+                    MenuItem::action("Find Previous", PreviousSearchResult),
+                    MenuItem::separator(),
+                    MenuItem::action("Add Comment", AddComment),
                 ],
             },
             Menu {
                 name: "View".into(),
                 items: vec![
+                    MenuItem::action("Classic View", ClassicView),
+                    MenuItem::action("Fluid View", FluidView),
+                    MenuItem::separator(),
                     MenuItem::action("Zoom In", ZoomIn),
                     MenuItem::action("Zoom Out", ZoomOut),
                     MenuItem::action("Actual Size", ActualSize),
                     MenuItem::action("Fit Width", FitWidth),
+                    MenuItem::separator(),
+                    MenuItem::action("Comments", ToggleComments),
                 ],
             },
         ]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-
         let bounds = Bounds {
             origin: Point::new(px(120.0), px(80.0)),
             size: size(px(1180.0), px(820.0)),
         };
+        let window_options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // The side panel needs room for both its editor/list and a usable
+            // document viewport. Prevent a focused editor from becoming
+            // invisible in an impossibly narrow window.
+            window_min_size: Some(size(px(700.0), px(480.0))),
+            focus: true,
+            ..Default::default()
+        };
+        #[cfg(target_os = "macos")]
+        let window_options = WindowOptions {
+            // GPUI owns the chrome so the toolbar and macOS traffic lights read
+            // as one continuous titlebar. Other platforms retain their native
+            // decorations until their platform-specific chrome is developed.
+            titlebar: Some(TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: Some(Point::new(px(14.0), px(18.0))),
+            }),
+            ..window_options
+        };
         let window = cx
             .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    focus: true,
-                    ..Default::default()
-                },
+                window_options,
                 move |window, cx| reader::PdfReader::new(initial_path.clone(), window, cx),
             )
             .expect("failed to open the GPUI PDF Reader window");
@@ -94,6 +151,13 @@ fn main() {
         // Accessibility permission.
         #[cfg(debug_assertions)]
         {
+            if std::env::var_os("GPUI_PDF_READER_QA_FLUID_VIEW").is_some() {
+                window
+                    .update(cx, |reader, window, cx| {
+                        reader.qa_use_fluid_view(window, cx);
+                    })
+                    .ok();
+            }
             let keystrokes: Vec<_> = std::env::var("GPUI_PDF_READER_QA_KEYS")
                 .unwrap_or_default()
                 .split_whitespace()
@@ -129,7 +193,17 @@ fn main() {
                 .unwrap_or(20_000);
             let report = std::env::var_os("GPUI_PDF_READER_QA_REPORT").is_some();
             let exit_after_report = std::env::var_os("GPUI_PDF_READER_QA_EXIT").is_some();
-            if !keystrokes.is_empty() || !wheel_deltas.is_empty() || report || exit_after_report {
+            let feature_scenario =
+                std::env::var_os("GPUI_PDF_READER_QA_FEATURE_SCENARIO").is_some();
+            let fluid_scenario =
+                std::env::var_os("GPUI_PDF_READER_QA_FLUID_SCENARIO").is_some();
+            if !keystrokes.is_empty()
+                || !wheel_deltas.is_empty()
+                || report
+                || exit_after_report
+                || feature_scenario
+                || fluid_scenario
+            {
                 window
                     .update(cx, |_, window, cx| {
                         window
@@ -160,6 +234,54 @@ fn main() {
                                     cx.background_executor()
                                         .timer(Duration::from_millis(25))
                                         .await;
+                                }
+                                if feature_scenario || fluid_scenario {
+                                    let feature_deadline =
+                                        std::time::Instant::now() + Duration::from_millis(timeout);
+                                    loop {
+                                        let outcome = cx
+                                            .update(|window, cx| {
+                                                let Some(Some(reader)) =
+                                                    window.root::<reader::PdfReader>()
+                                                else {
+                                                    return Ok(false);
+                                                };
+                                                reader.update(cx, |reader, cx| {
+                                                    if fluid_scenario {
+                                                        reader.qa_drive_fluid_scenario(window, cx)
+                                                    } else {
+                                                        reader.qa_drive_feature_scenario(window, cx)
+                                                    }
+                                                })
+                                            })
+                                            .unwrap_or_else(|error| {
+                                                Err(format!(
+                                                    "feature scenario window update failed: {error}"
+                                                ))
+                                            });
+                                        match outcome {
+                                            Ok(true) => break,
+                                            Ok(false) => {}
+                                            Err(message) => {
+                                                eprintln!(
+                                                    "GPUI_PDF_READER_QA_ERROR {message}"
+                                                );
+                                                let _ = cx.update(|_, cx| cx.quit());
+                                                return;
+                                            }
+                                        }
+                                        if std::time::Instant::now() >= feature_deadline {
+                                            eprintln!(
+                                                    "GPUI_PDF_READER_QA_ERROR {} scenario did not settle",
+                                                    if fluid_scenario { "Fluid" } else { "feature" }
+                                                );
+                                            let _ = cx.update(|_, cx| cx.quit());
+                                            return;
+                                        }
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(25))
+                                            .await;
+                                    }
                                 }
                                 for keystroke in keystrokes {
                                     let _ = cx.update(|window, cx| {
@@ -255,18 +377,79 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-+", ZoomIn, None),
         KeyBinding::new("cmd--", ZoomOut, None),
         KeyBinding::new("cmd-0", ActualSize, None),
-        KeyBinding::new("cmd-c", CopySelection, None),
-        KeyBinding::new("cmd-a", SelectAll, None),
-        KeyBinding::new("up", ScrollUp, None),
-        KeyBinding::new("down", ScrollDown, None),
-        KeyBinding::new("left", ScrollLeft, None),
-        KeyBinding::new("right", ScrollRight, None),
-        KeyBinding::new("pageup", PageUp, None),
-        KeyBinding::new("pagedown", PageDown, None),
-        KeyBinding::new("space", PageDown, None),
-        KeyBinding::new("shift-space", PageUp, None),
-        KeyBinding::new("home", FirstPage, None),
-        KeyBinding::new("end", LastPage, None),
+        KeyBinding::new("cmd-c", EditCopy, None),
+        KeyBinding::new("cmd-x", EditCut, None),
+        KeyBinding::new("cmd-v", EditPaste, None),
+        KeyBinding::new("cmd-a", EditSelectAll, None),
+        KeyBinding::new("cmd-f", Find, None),
+        KeyBinding::new("cmd-g", NextSearchResult, None),
+        KeyBinding::new("cmd-shift-g", PreviousSearchResult, None),
+        KeyBinding::new("cmd-alt-m", AddComment, None),
+        KeyBinding::new("up", ScrollUp, Some(READER_NAVIGATION_CONTEXT)),
+        KeyBinding::new("down", ScrollDown, Some(READER_NAVIGATION_CONTEXT)),
+        KeyBinding::new("left", ScrollLeft, Some(READER_NAVIGATION_CONTEXT)),
+        KeyBinding::new("right", ScrollRight, Some(READER_NAVIGATION_CONTEXT)),
+        KeyBinding::new("pageup", PageUp, Some(READER_NAVIGATION_CONTEXT)),
+        KeyBinding::new("pagedown", PageDown, Some(READER_NAVIGATION_CONTEXT)),
+        KeyBinding::new("space", PageDown, Some(READER_NAVIGATION_CONTEXT)),
+        KeyBinding::new("shift-space", PageUp, Some(READER_NAVIGATION_CONTEXT)),
+        KeyBinding::new("home", FirstPage, Some(READER_NAVIGATION_CONTEXT)),
+        KeyBinding::new("end", LastPage, Some(READER_NAVIGATION_CONTEXT)),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("backspace", FieldBackspace, Some("TextField")),
+        KeyBinding::new("delete", FieldDelete, Some("TextField")),
+        KeyBinding::new("left", FieldLeft, Some("TextField")),
+        KeyBinding::new("right", FieldRight, Some("TextField")),
+        KeyBinding::new("shift-left", FieldSelectLeft, Some("TextField")),
+        KeyBinding::new("shift-right", FieldSelectRight, Some("TextField")),
+        KeyBinding::new("home", FieldHome, Some("TextField")),
+        KeyBinding::new("end", FieldEnd, Some("TextField")),
+        KeyBinding::new("enter", FieldSubmit, Some("TextField")),
+        KeyBinding::new("escape", FieldCancel, Some("TextField")),
+        KeyBinding::new("backspace", CommentBackspace, Some("CommentEditor")),
+        KeyBinding::new("delete", CommentDelete, Some("CommentEditor")),
+        KeyBinding::new("left", CommentLeft, Some("CommentEditor")),
+        KeyBinding::new("right", CommentRight, Some("CommentEditor")),
+        KeyBinding::new("up", CommentUp, Some("CommentEditor")),
+        KeyBinding::new("down", CommentDown, Some("CommentEditor")),
+        KeyBinding::new("shift-left", CommentSelectLeft, Some("CommentEditor")),
+        KeyBinding::new("shift-right", CommentSelectRight, Some("CommentEditor")),
+        KeyBinding::new("shift-up", CommentSelectUp, Some("CommentEditor")),
+        KeyBinding::new("shift-down", CommentSelectDown, Some("CommentEditor")),
+        KeyBinding::new("home", CommentHome, Some("CommentEditor")),
+        KeyBinding::new("end", CommentEnd, Some("CommentEditor")),
+        KeyBinding::new("cmd-b", CommentToggleBold, Some("CommentEditor")),
+        KeyBinding::new("cmd-i", CommentToggleItalic, Some("CommentEditor")),
+        KeyBinding::new("cmd-e", CommentToggleCode, Some("CommentEditor")),
+        KeyBinding::new(
+            "cmd-shift-8",
+            CommentToggleBulletedList,
+            Some("CommentEditor"),
+        ),
+        KeyBinding::new(
+            "cmd-shift-7",
+            CommentToggleNumberedList,
+            Some("CommentEditor"),
+        ),
+        KeyBinding::new("cmd-enter", CommentSave, Some("CommentEditor")),
+        KeyBinding::new("escape", CommentCancel, Some("CommentEditor")),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::READER_NAVIGATION_CONTEXT;
+    use gpui::{KeyBindingContextPredicate, KeyContext};
+
+    #[test]
+    fn reader_navigation_context_excludes_both_text_editors() {
+        let predicate = KeyBindingContextPredicate::parse(READER_NAVIGATION_CONTEXT).unwrap();
+        let reader = KeyContext::parse("PdfReader").unwrap();
+        let search = KeyContext::parse("TextField").unwrap();
+        let comment = KeyContext::parse("CommentEditor").unwrap();
+
+        assert_eq!(predicate.depth_of(std::slice::from_ref(&reader)), Some(1));
+        assert_eq!(predicate.depth_of(&[reader.clone(), search]), None);
+        assert_eq!(predicate.depth_of(&[reader, comment]), None);
+    }
 }

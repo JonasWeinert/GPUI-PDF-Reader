@@ -1,0 +1,24 @@
+# GPUI UI notes
+
+- A transparent macOS `TitlebarOptions` lets the app toolbar and traffic lights share one surface. Reserve the traffic-light width and mark only empty toolbar regions as `WindowControlArea::Drag`.
+- Keep custom titlebar setup behind `cfg(target_os = "macos")`; other platforms should retain native decorations until their own chrome is implemented.
+- `TOOLBAR_HEIGHT` is geometry, not just styling. Viewport sizing, content offsets, pointer mapping, and sidebar-anchor E2E all depend on it.
+- GPUI has no first-class disabled button. A disabled control must omit `on_click`, lower opacity, and avoid a pointer cursor; dimming an active handler is misleading.
+- Use `FocusHandle::is_focused(window)` before moving a cloned handle into an input canvas to style focused text fields and editors.
+- `uniform_list` rows have fixed heights. Put spacing on an outer row and the border/background on an inner card so clipping stays deterministic.
+- A custom editor toolbar can hover over a text surface with `absolute`, explicit top spacing, and `shadow_sm`; leave enough body inset so the pill never covers the first line.
+- At the 700 px minimum width, selection actions take priority. Hide lower-priority global toggles temporarily rather than clipping controls or replacing labels with unclear glyphs.
+- `Window::on_window_should_close` is synchronous: return `false`, open one guarded async prompt, then call `remove_window()` only after confirmation. Handle the app's Quit action at the reader root; `on_app_quit` runs too late to cancel termination.
+- For native visual QA, identify the exact app window by PID/title with `CGWindowListCopyWindowInfo`, then capture that window ID only. Never use a full-screen capture when other documents may be visible.
+- A child moved from a flex row into a `relative` overlay container needs an explicit height such as `h_full`; width alone can leave a canvas at zero height even though its paint snapshot is valid.
+- Keep Classic and Fluid geometry behind one view-mode state. Classic subtracts animated panel width from the viewport; Fluid keeps the full viewport and adds the panel's occluded width to `max_scroll_x` so covered PDF content remains reachable.
+- Context pills need viewport-local geometry. Build the visible selected line in content coordinates, subtract scroll, then clamp below/above placement to the currently unobscured width.
+- For two-pane panel transitions, retain both panes and animate their opposing absolute `left` offsets. Close the editor entity only after the Back animation reaches the list, otherwise the outgoing pane disappears before the slide.
+- Comment autosave is view-independent: debounce editor changes, update the existing annotation ID so its highlight survives, and flush before returning to the list. Fluid animates the pane transition; Classic closes the editor immediately inside its docked sidebar.
+- Annotation context is also view-independent. Both canvases resolve clicks on highlighted text, and both tool surfaces operate on either a selection or the active annotation; only control placement differs.
+- GPUI `Normal` hitboxes do not block hitboxes behind them. A floating control over an interactive canvas must use `block_mouse_except_scroll()` (or `occlude()` when scrolling must also stop); otherwise the canvas receives the same mouse-down and can clear the selection before the button click runs.
+- Rounded GPUI controls should clip their own hover/pressed backgrounds with `overflow_hidden`; otherwise a square state layer can leak through a rounded button. Floating-pill buttons also need a base color matching the pill rather than the titlebar's gray ghost style.
+- Keep Fluid panel horizontal occlusion separate from its vertical inset. Equal explicit `top`/`bottom` values center the panel without changing how much PDF content remains reachable behind it.
+- GPUI's `overflow_hidden` content mask is rectangular; it does not round child paint to the parent's corners. A full-size child with its own background must carry matching corner radii (including bottom-only radii for full-height list fills), or it will appear as a square layer behind a rounded floating panel.
+- Crates.io GPUI 0.2.2 predates upstream commit `46eb9e522303` / Zed PR #38269. On macOS, `windowDidChangeScreen` must update the CAMetalLayer contents scale, drawable size, and GPUI resize callback after restarting the display link; `viewDidChangeBackingProperties` is not guaranteed when an external display disconnects.
+- GPUI 0.2.2's optional `macos-blade` bridge must transfer a retained `CAMetalLayer` into `metal::MetalLayer`. Calling `ForeignType::from_ptr` on Blade's borrowed layer pointer invents ownership; the temporary wrapper then over-releases the live AppKit layer, producing a later `EXC_BAD_ACCESS` in Core Animation layer collection.

@@ -1,27 +1,39 @@
-use crate::backend::{PdfWorker, TileRequest, WorkerEvent};
-use crate::model::{
-    DocumentLayout, PageSize, PixelRect, RasterSize, Rect, TextLayer, TextPosition, TextSelection,
-    TileKey, append_selected_page_text,
+use crate::annotations::{
+    AnnotationId, AnnotationSet, DocumentIdentity, HighlightColor, MAX_TEXT_CHARACTER_INDEX,
+    TextRange, load_sidecar, save_sidecar,
 };
+use crate::backend::{PdfWorker, TileRequest, WorkerEvent};
+use crate::comment_editor::{CommentEditor, CommentEditorEvent, RichTextBuffer};
+use crate::model::{
+    DocumentLayout, PageAnchor, PageSize, PixelRect, RasterSize, Rect, TextBounds, TextLayer,
+    TextPosition, TextSelection, TileKey, append_selected_page_text,
+};
+use crate::search::{MAX_SEARCH_QUERY_BYTES, SearchMatch, SearchMatchId, SearchQuery};
+use crate::text_field::{TextField, TextFieldEvent};
 use crate::{
-    ActualSize, CopySelection, FirstPage, FitWidth, LastPage, OpenDocument, PageDown, PageUp,
-    ScrollDown, ScrollLeft, ScrollRight, ScrollUp, SelectAll, ZoomIn, ZoomOut,
+    ActualSize, AddComment, ClassicView, CopySelection, EditCopy, EditCut, EditPaste,
+    EditSelectAll, Find, FirstPage, FitWidth, FluidView, LastPage, NextSearchResult, OpenDocument,
+    PageDown, PageUp, PreviousSearchResult, Quit, ScrollDown, ScrollLeft, ScrollRight, ScrollUp,
+    SelectAll, ToggleComments, ZoomIn, ZoomOut,
 };
 use gpui::{
     App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners, CursorStyle, Entity,
-    FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathPromptOptions, Pixels, Point, Render, RenderImage, ScrollWheelEvent, SharedString, Task,
-    Window, canvas, div, point, prelude::*, px, quad, rgb, rgba, size,
+    FocusHandle, Focusable, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PathPromptOptions, Pixels, Point, PromptButton, PromptLevel, Render, RenderImage,
+    ScrollStrategy, ScrollWheelEvent, SharedString, Task, UniformListScrollHandle, Window,
+    WindowControlArea, canvas, div, point, prelude::*, px, quad, rgb, rgba, size, uniform_list,
 };
 #[cfg(debug_assertions)]
-use gpui::{Modifiers, ScrollDelta, TouchPhase};
+use gpui::{Keystroke, Modifiers, ScrollDelta, TouchPhase};
 use image::{Frame, RgbaImage};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
-const TOOLBAR_HEIGHT: f32 = 54.0;
+const TOOLBAR_HEIGHT: f32 = 52.0;
 const ERROR_BAR_HEIGHT: f32 = 34.0;
 const MIN_ZOOM: f32 = 0.2;
 const MAX_ZOOM: f32 = 5.0;
@@ -37,12 +49,132 @@ const MAX_CACHED_TILES: usize = 48;
 const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CACHED_TEXT_PAGES: usize = 16;
 const MAX_COPY_TEXT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_VISIBLE_SEARCH_HIGHLIGHT_RUNS: usize = 4_000;
+const MAX_VISIBLE_ANNOTATION_QUADS: usize = 8_000;
+const MAX_VISIBLE_SELECTION_QUADS: usize = 8_000;
 const ZOOM_RENDER_DEBOUNCE: Duration = Duration::from_millis(150);
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
+const COMMENT_AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+const SIDEBAR_WIDTH: f32 = 344.0;
+const MIN_DOCUMENT_VIEWPORT_WIDTH: f32 = 300.0;
+const FLUID_PANEL_HORIZONTAL_MARGIN: f32 = 12.0;
+const FLUID_PANEL_VERTICAL_MARGIN: f32 = 18.0;
+const FLUID_CONTEXT_PILL_WIDTH: f32 = 214.0;
+const FLUID_CONTEXT_PILL_HEIGHT: f32 = 40.0;
+
+// A deliberately small visual system keeps the reader chrome consistent and
+// makes future light/dark variants a token change instead of another rewrite.
+const UI_CHROME: u32 = 0xf5f5f7;
+const UI_SURFACE: u32 = 0xffffff;
+const UI_SURFACE_SUBTLE: u32 = 0xf8f8fa;
+const UI_CONTROL: u32 = 0xffffff;
+const UI_CONTROL_HOVER: u32 = 0xeaeaec;
+const UI_CONTROL_PRESSED: u32 = 0xdedee2;
+const UI_SEPARATOR: u32 = 0xd8d8dc;
+const UI_TEXT: u32 = 0x202124;
+const UI_TEXT_SECONDARY: u32 = 0x6e6e73;
+const UI_TEXT_TERTIARY: u32 = 0x92939a;
+const UI_ACCENT: u32 = 0x0a78e3;
+const UI_ACCENT_HOVER: u32 = 0x0068cc;
+const UI_ACCENT_SOFT: u32 = 0xe7f1fd;
+const UI_ERROR: u32 = 0xb42318;
+const UI_ERROR_SOFT: u32 = 0xffebe9;
+const UI_CANVAS: u32 = 0x3c4148;
+const UI_CANVAS_EMPTY: u32 = 0x343941;
+
+#[cfg(target_os = "macos")]
+const TITLEBAR_CONTROL_INSET: f32 = 76.0;
+#[cfg(not(target_os = "macos"))]
+const TITLEBAR_CONTROL_INSET: f32 = 0.0;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Offset {
     x: f32,
     y: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PaintBudget {
+    remaining: usize,
+}
+
+impl PaintBudget {
+    fn new(limit: usize) -> Self {
+        Self { remaining: limit }
+    }
+
+    fn take(&mut self) -> bool {
+        let Some(remaining) = self.remaining.checked_sub(1) else {
+            return false;
+        };
+        self.remaining = remaining;
+        true
+    }
+
+    fn exhausted(self) -> bool {
+        self.remaining == 0
+    }
+}
+
+fn is_inactive<T: Copy + PartialEq>(candidate: T, active: Option<T>) -> bool {
+    Some(candidate) != active
+}
+
+fn annotation_actions_enabled(
+    has_context: bool,
+    annotations_loading: bool,
+    persistence_blocked: bool,
+    comment_editor_open: bool,
+) -> bool {
+    has_context && !annotations_loading && !persistence_blocked && !comment_editor_open
+}
+
+fn zoom_controls_enabled(document_open: bool, zoom: f32) -> (bool, bool) {
+    (
+        document_open && zoom > MIN_ZOOM + 0.001,
+        document_open && zoom < MAX_ZOOM - 0.001,
+    )
+}
+
+fn comment_draft_needs_confirmation(editor_open: bool, draft_dirty: bool) -> bool {
+    editor_open && draft_dirty
+}
+
+fn comments_toolbar_label(
+    editor_open: bool,
+    compact_toolbar: bool,
+    very_compact_toolbar: bool,
+) -> &'static str {
+    if editor_open {
+        if compact_toolbar {
+            "Notes •"
+        } else {
+            "Comments · Editing"
+        }
+    } else if very_compact_toolbar {
+        "Notes"
+    } else {
+        "Comments"
+    }
+}
+
+fn floating_pill_position(
+    anchor: Rect,
+    available_width: f32,
+    viewport_height: f32,
+    pill_width: f32,
+    pill_height: f32,
+) -> Offset {
+    let margin = 12.0;
+    let maximum_x = (available_width - pill_width - margin).max(margin);
+    let x = (anchor.x + anchor.width * 0.5 - pill_width * 0.5).clamp(margin, maximum_x);
+    let below = anchor.bottom() + 10.0;
+    let y = if below + pill_height <= viewport_height - margin {
+        below
+    } else {
+        (anchor.y - pill_height - 10.0).max(margin)
+    };
+    Offset { x, y }
 }
 
 #[derive(Debug)]
@@ -78,12 +210,480 @@ struct PanState {
     scroll: Offset,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidePanel {
+    Comments,
+    Search,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ReaderView {
+    #[default]
+    Classic,
+    Fluid,
+}
+
+struct FluidPillState {
+    available_width: f32,
+    document_open: bool,
+    zoom_out_enabled: bool,
+    zoom_in_enabled: bool,
+    zoom_label: SharedString,
+    search_selected: bool,
+    comments_selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChromeButtonStyle {
+    Neutral,
+    Ghost,
+    Floating,
+    Selected,
+    Primary,
+}
+
+#[derive(Clone, Debug)]
+enum DraftDiscardAction {
+    Open(PathBuf),
+    Quit,
+    CloseWindow,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QaFeaturePhase {
+    Seed,
+    WaitCommentEditor,
+    WaitCommentEdited,
+    WaitCommentSaved,
+    WaitCommentBack,
+    WaitCommentList,
+    WaitCommentsOpen,
+    WaitCommentsClosed,
+    WaitSearchOpen,
+    WaitSearch,
+    WaitNavigation,
+    WaitSearchReturn,
+    WaitSearchClosed,
+    WaitSearchReopened,
+    WaitFinalNavigation,
+    Complete,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QaFluidPhase {
+    Seed,
+    WaitEditor,
+    WaitAutosave,
+    WaitList,
+    WaitReopenedEditor,
+    WaitFinalList,
+    WaitSearchOpen,
+    WaitSearchResults,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SidebarState {
+    panel: SidePanel,
+    progress: f32,
+    target: f32,
+}
+
+impl Default for SidebarState {
+    fn default() -> Self {
+        Self {
+            panel: SidePanel::Comments,
+            progress: 0.0,
+            target: 0.0,
+        }
+    }
+}
+
+impl SidebarState {
+    fn toggle(&mut self, panel: SidePanel) {
+        if self.panel == panel && self.target > 0.5 {
+            self.target = 0.0;
+        } else {
+            self.panel = panel;
+            self.target = 1.0;
+        }
+    }
+
+    fn is_animating(self) -> bool {
+        (self.progress - self.target).abs() > 0.001
+    }
+
+    fn advance(&mut self, dt: f32) {
+        let blend = 1.0 - (-22.0 * dt.clamp(1.0 / 240.0, 0.05)).exp();
+        self.progress += (self.target - self.progress) * blend;
+        if (self.target - self.progress).abs() < 0.001 {
+            self.progress = self.target;
+        }
+        self.progress = self.progress.clamp(0.0, 1.0);
+    }
+
+    fn available_width(self, full_width: f32) -> f32 {
+        let maximum_sidebar = (full_width - MIN_DOCUMENT_VIEWPORT_WIDTH).max(0.0);
+        SIDEBAR_WIDTH.min(maximum_sidebar) * self.progress
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CommentPaneState {
+    progress: f32,
+    target: f32,
+    close_editor_on_finish: bool,
+}
+
+impl CommentPaneState {
+    fn show_editor(&mut self, animated: bool) {
+        if !animated {
+            self.progress = 1.0;
+        }
+        self.target = 1.0;
+        self.close_editor_on_finish = false;
+    }
+
+    fn show_list(&mut self, animated: bool) {
+        if !animated {
+            self.progress = 0.0;
+        }
+        self.target = 0.0;
+        self.close_editor_on_finish = true;
+    }
+
+    fn is_animating(self) -> bool {
+        (self.progress - self.target).abs() > 0.001
+    }
+
+    fn advance(&mut self, dt: f32) {
+        let blend = 1.0 - (-24.0 * dt.clamp(1.0 / 240.0, 0.05)).exp();
+        self.progress += (self.target - self.progress) * blend;
+        if (self.target - self.progress).abs() < 0.001 {
+            self.progress = self.target;
+        }
+        self.progress = self.progress.clamp(0.0, 1.0);
+    }
+}
+
 #[derive(Debug)]
 struct PendingCopy {
     selection: TextSelection,
     next_page: usize,
     end_page: usize,
     text: String,
+}
+
+#[derive(Debug, Default)]
+struct SearchState {
+    query: String,
+    input_error: Option<SharedString>,
+    revision: u64,
+    pages: BTreeMap<usize, Arc<[SearchMatch]>>,
+    order: Vec<SearchMatchId>,
+    active: Option<SearchMatchId>,
+    searched_pages: usize,
+    total_highlight_runs: usize,
+    complete: bool,
+    truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnnotationIoOperation {
+    Load,
+    Save,
+}
+
+enum AnnotationIoCommand {
+    Load {
+        generation: u64,
+        path: PathBuf,
+        page_count: usize,
+    },
+    Save {
+        generation: u64,
+        path: PathBuf,
+        identity: DocumentIdentity,
+        expected_disk_revision: u64,
+        annotations: AnnotationSet,
+    },
+}
+
+enum AnnotationIoEvent {
+    Loaded {
+        generation: u64,
+        identity: DocumentIdentity,
+        annotations: AnnotationSet,
+    },
+    Saved {
+        generation: u64,
+        revision: u64,
+    },
+    Failed {
+        generation: u64,
+        operation: AnnotationIoOperation,
+        revision: Option<u64>,
+        message: String,
+    },
+}
+
+struct AnnotationIo {
+    commands: Option<mpsc::Sender<AnnotationIoCommand>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl AnnotationIo {
+    fn start() -> (Self, mpsc::Receiver<AnnotationIoEvent>) {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("annotation-sidecar".into())
+            .spawn(move || {
+                let mut deferred = None;
+                let mut observed_disk_revisions = HashMap::<(u64, PathBuf), u64>::new();
+                loop {
+                    let command = match deferred.take() {
+                        Some(command) => command,
+                        None => match command_rx.recv() {
+                            Ok(command) => command,
+                            Err(_) => break,
+                        },
+                    };
+                    match command {
+                        AnnotationIoCommand::Load {
+                            generation,
+                            path,
+                            page_count,
+                        } => match DocumentIdentity::from_pdf(&path, page_count).and_then(
+                            |identity| {
+                                load_sidecar(&path, &identity)
+                                    .map(|annotations| (identity, annotations))
+                            },
+                        ) {
+                            Ok((identity, annotations)) => {
+                                // A load is an ordering boundary for the sole
+                                // current document; older generations can no
+                                // longer save and must not accumulate paths.
+                                observed_disk_revisions.clear();
+                                observed_disk_revisions.insert(
+                                    (generation, path.clone()),
+                                    annotations.revision(),
+                                );
+                                let _ = event_tx.send(AnnotationIoEvent::Loaded {
+                                    generation,
+                                    identity,
+                                    annotations,
+                                });
+                            }
+                            Err(error) => {
+                                observed_disk_revisions.clear();
+                                let _ = event_tx.send(AnnotationIoEvent::Failed {
+                                    generation,
+                                    operation: AnnotationIoOperation::Load,
+                                    revision: None,
+                                    message: error.to_string(),
+                                });
+                            }
+                        },
+                        AnnotationIoCommand::Save {
+                            generation,
+                            path,
+                            mut identity,
+                            expected_disk_revision,
+                            mut annotations,
+                        } => {
+                            // Saving a sidecar snapshot is much slower than a
+                            // color click. Collapse a queued same-document
+                            // burst to its newest revision while preserving a
+                            // load or another document's ordering boundary. The
+                            // first command's expected disk revision remains the
+                            // base for the whole coalesced burst.
+                            while let Ok(command) = command_rx.try_recv() {
+                                match command {
+                                    AnnotationIoCommand::Save {
+                                        generation: next_generation,
+                                        path: next_path,
+                                        identity: next_identity,
+                                        expected_disk_revision: _,
+                                        annotations: next_annotations,
+                                    } if next_generation == generation && next_path == path => {
+                                        identity = next_identity;
+                                        annotations = next_annotations;
+                                    }
+                                    command => {
+                                        deferred = Some(command);
+                                        break;
+                                    }
+                                }
+                            }
+                            let revision = annotations.revision();
+                            let revision_key = (generation, path.clone());
+                            let expected_disk_revision = observed_disk_revisions
+                                .get(&revision_key)
+                                .copied()
+                                .unwrap_or(expected_disk_revision);
+                            let save_result: Result<(), String> = (|| {
+                                // Serialize the compare-and-replace section
+                                // across app processes. The lock is advisory,
+                                // crash-safe, and attached to the PDF itself,
+                                // so no stale lock file is left beside it.
+                                let pdf_lock = File::open(&path)
+                                    .map_err(|error| format!("could not lock PDF: {error}"))?;
+                                pdf_lock.lock().map_err(|error| {
+                                    format!("could not lock PDF for annotation save: {error}")
+                                })?;
+                                let current_identity =
+                                    DocumentIdentity::from_pdf(&path, identity.page_count())
+                                        .map_err(|error| error.to_string())?;
+                                if current_identity != identity {
+                                    return Err(
+                                        crate::annotations::AnnotationError::DocumentIdentityMismatch {
+                                            expected: identity.clone(),
+                                            found: current_identity,
+                                        }
+                                        .to_string(),
+                                    );
+                                }
+
+                                let disk_revision = load_sidecar(&path, &identity)
+                                    .map_err(|error| error.to_string())?
+                                    .revision();
+                                if disk_revision != expected_disk_revision {
+                                    return Err(format!(
+                                        "annotation sidecar changed on disk (expected revision {expected_disk_revision}, found revision {disk_revision}); reload the PDF before saving"
+                                    ));
+                                }
+
+                                save_sidecar(&path, &identity, &annotations)
+                                    .map(|_| ())
+                                    .map_err(|error| error.to_string())
+                            })();
+                            match save_result {
+                                Ok(_) => {
+                                    observed_disk_revisions.insert(revision_key, revision);
+                                    let _ = event_tx.send(AnnotationIoEvent::Saved {
+                                        generation,
+                                        revision,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = event_tx.send(AnnotationIoEvent::Failed {
+                                        generation,
+                                        operation: AnnotationIoOperation::Save,
+                                        revision: Some(revision),
+                                        message: error.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("failed to start the annotation sidecar thread");
+        (
+            Self {
+                commands: Some(command_tx),
+                thread: Some(thread),
+            },
+            event_rx,
+        )
+    }
+
+    fn load(&self, generation: u64, path: PathBuf, page_count: usize) -> bool {
+        self.commands.as_ref().is_some_and(|commands| {
+            commands
+                .send(AnnotationIoCommand::Load {
+                    generation,
+                    path,
+                    page_count,
+                })
+                .is_ok()
+        })
+    }
+
+    fn save(
+        &self,
+        generation: u64,
+        path: PathBuf,
+        identity: DocumentIdentity,
+        expected_disk_revision: u64,
+        annotations: AnnotationSet,
+    ) -> bool {
+        self.commands.as_ref().is_some_and(|commands| {
+            commands
+                .send(AnnotationIoCommand::Save {
+                    generation,
+                    path,
+                    identity,
+                    expected_disk_revision,
+                    annotations,
+                })
+                .is_ok()
+        })
+    }
+}
+
+impl Drop for AnnotationIo {
+    fn drop(&mut self) {
+        self.commands.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn next_search_match_id(
+    results: &[SearchMatchId],
+    active: Option<SearchMatchId>,
+    forward: bool,
+) -> Option<SearchMatchId> {
+    let len = results.len();
+    if len == 0 {
+        return None;
+    }
+    let current = active.and_then(|id| results.iter().position(|result| *result == id));
+    let index = match (current, forward) {
+        (Some(index), true) => (index + 1) % len,
+        (Some(index), false) => (index + len - 1) % len,
+        (None, true) => 0,
+        (None, false) => len - 1,
+    };
+    Some(results[index])
+}
+
+fn unsaved_annotation_revision(current: Option<u64>, saved: u64) -> Option<u64> {
+    current.filter(|revision| *revision > saved)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PendingOpenTransition {
+    None,
+    Waiting,
+    Open(PathBuf),
+    Cancelled(PathBuf),
+}
+
+fn transition_pending_open(
+    pending: &mut Option<PathBuf>,
+    current_revision: Option<u64>,
+    saved_revision: u64,
+    save_failed: bool,
+) -> PendingOpenTransition {
+    if pending.is_none() {
+        return PendingOpenTransition::None;
+    }
+    if save_failed {
+        return PendingOpenTransition::Cancelled(
+            pending.take().expect("pending path checked above"),
+        );
+    }
+    if unsaved_annotation_revision(current_revision, saved_revision).is_some() {
+        PendingOpenTransition::Waiting
+    } else {
+        PendingOpenTransition::Open(pending.take().expect("pending path checked above"))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +697,7 @@ enum ReaderStatus {
 
 pub struct PdfReader {
     worker: PdfWorker,
+    annotation_io: AnnotationIo,
     generation: u64,
     document: Option<DocumentState>,
     layout: Option<Arc<DocumentLayout>>,
@@ -107,7 +708,32 @@ pub struct PdfReader {
     text_viewport: Vec<usize>,
     text_pending: HashSet<usize>,
     copy_pending: Option<PendingCopy>,
+    search: SearchState,
+    search_debounce_task: Option<Task<()>>,
+    annotations: Option<AnnotationSet>,
+    annotation_identity: Option<DocumentIdentity>,
+    annotations_loading: bool,
+    annotation_persistence_blocked: bool,
+    annotation_error: Option<SharedString>,
+    annotation_enqueued_revision: u64,
+    annotation_failed_revision: Option<u64>,
+    annotation_saved_revision: u64,
+    pending_open: Option<PathBuf>,
+    active_annotation: Option<AnnotationId>,
+    search_field: Entity<TextField>,
+    comment_editor: Option<Entity<CommentEditor>>,
+    comment_draft_dirty: bool,
+    comment_discard_prompt_open: bool,
+    comment_pane: CommentPaneState,
+    comment_autosave_revision: u64,
+    comment_autosave_task: Option<Task<()>>,
+    editing_annotation: Option<AnnotationId>,
+    pending_comment_range: Option<TextRange>,
+    comment_order: Vec<AnnotationId>,
+    search_list_scroll: UniformListScrollHandle,
+    comment_list_scroll: UniformListScrollHandle,
     status: ReaderStatus,
+    view_mode: ReaderView,
     warning: Option<SharedString>,
     focus_handle: FocusHandle,
     zoom: f32,
@@ -118,10 +744,23 @@ pub struct PdfReader {
     viewport_height: f32,
     selection: Option<TextSelection>,
     selecting: bool,
+    pending_annotation_click: Option<AnnotationId>,
     pan: Option<PanState>,
     animation_active: bool,
     animation_frame_queued: bool,
     last_animation_tick: Instant,
+    sidebar: SidebarState,
+    sidebar_anchor: Option<PageAnchor>,
+    #[cfg(debug_assertions)]
+    qa_feature_phase: QaFeaturePhase,
+    #[cfg(debug_assertions)]
+    qa_fluid_phase: QaFluidPhase,
+    #[cfg(debug_assertions)]
+    qa_sidebar_anchor_reference: Option<PageAnchor>,
+    #[cfg(debug_assertions)]
+    qa_sidebar_transitions: usize,
+    #[cfg(debug_assertions)]
+    qa_max_sidebar_anchor_error: f32,
     zoom_render_revision: u64,
     render_debounce_until: Option<Instant>,
     zoom_render_task: Option<Task<()>>,
@@ -130,40 +769,105 @@ pub struct PdfReader {
 impl PdfReader {
     pub fn new(initial_path: Option<PathBuf>, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let (worker, events) = PdfWorker::start();
-        let entity = cx.new(|cx| Self {
-            worker,
-            generation: 0,
-            document: None,
-            layout: None,
-            rendered: HashMap::new(),
-            page_text: HashMap::new(),
-            pending: HashSet::new(),
-            render_viewport: Vec::new(),
-            text_viewport: Vec::new(),
-            text_pending: HashSet::new(),
-            copy_pending: None,
-            status: ReaderStatus::Initializing,
-            warning: None,
-            focus_handle: cx.focus_handle(),
-            zoom: 1.0,
-            fit_width: false,
-            scroll: Offset::default(),
-            scroll_target: Offset::default(),
-            viewport_width: 1.0,
-            viewport_height: 1.0,
-            selection: None,
-            selecting: false,
-            pan: None,
-            animation_active: false,
-            animation_frame_queued: false,
-            last_animation_tick: Instant::now(),
-            zoom_render_revision: 0,
-            render_debounce_until: None,
-            zoom_render_task: None,
+        let (annotation_io, annotation_events) = AnnotationIo::start();
+        let search_field =
+            cx.new(|cx| TextField::new(cx, "Search document", MAX_SEARCH_QUERY_BYTES));
+        let search_field_for_reader = search_field.clone();
+        let entity: Entity<Self> = cx.new(|cx: &mut Context<Self>| {
+            cx.subscribe_in(
+                &search_field_for_reader,
+                window,
+                |reader, _, event, window, cx| match event {
+                    TextFieldEvent::Changed(query) => reader.set_search_query(query.clone(), cx),
+                    TextFieldEvent::Rejected(rejection) => {
+                        reader.search.input_error = Some(rejection.to_string().into());
+                        cx.notify();
+                    }
+                    TextFieldEvent::Submit => reader.navigate_search(true, window, cx),
+                    TextFieldEvent::Cancel => reader.toggle_sidebar(SidePanel::Search, window, cx),
+                },
+            )
+            .detach();
+            Self {
+                worker,
+                annotation_io,
+                generation: 0,
+                document: None,
+                layout: None,
+                rendered: HashMap::new(),
+                page_text: HashMap::new(),
+                pending: HashSet::new(),
+                render_viewport: Vec::new(),
+                text_viewport: Vec::new(),
+                text_pending: HashSet::new(),
+                copy_pending: None,
+                search: SearchState::default(),
+                search_debounce_task: None,
+                annotations: None,
+                annotation_identity: None,
+                annotations_loading: false,
+                annotation_persistence_blocked: false,
+                annotation_error: None,
+                annotation_enqueued_revision: 0,
+                annotation_failed_revision: None,
+                annotation_saved_revision: 0,
+                pending_open: None,
+                active_annotation: None,
+                search_field,
+                comment_editor: None,
+                comment_draft_dirty: false,
+                comment_discard_prompt_open: false,
+                comment_pane: CommentPaneState::default(),
+                comment_autosave_revision: 0,
+                comment_autosave_task: None,
+                editing_annotation: None,
+                pending_comment_range: None,
+                comment_order: Vec::new(),
+                search_list_scroll: UniformListScrollHandle::new(),
+                comment_list_scroll: UniformListScrollHandle::new(),
+                status: ReaderStatus::Initializing,
+                view_mode: ReaderView::Classic,
+                warning: None,
+                focus_handle: cx.focus_handle(),
+                zoom: 1.0,
+                fit_width: false,
+                scroll: Offset::default(),
+                scroll_target: Offset::default(),
+                viewport_width: 1.0,
+                viewport_height: 1.0,
+                selection: None,
+                selecting: false,
+                pending_annotation_click: None,
+                pan: None,
+                animation_active: false,
+                animation_frame_queued: false,
+                last_animation_tick: Instant::now(),
+                sidebar: SidebarState::default(),
+                sidebar_anchor: None,
+                #[cfg(debug_assertions)]
+                qa_feature_phase: QaFeaturePhase::Seed,
+                #[cfg(debug_assertions)]
+                qa_fluid_phase: QaFluidPhase::Seed,
+                #[cfg(debug_assertions)]
+                qa_sidebar_anchor_reference: None,
+                #[cfg(debug_assertions)]
+                qa_sidebar_transitions: 0,
+                #[cfg(debug_assertions)]
+                qa_max_sidebar_anchor_error: 0.0,
+                zoom_render_revision: 0,
+                render_debounce_until: None,
+                zoom_render_task: None,
+            }
         });
 
         Self::listen_for_worker_events(&entity, events, window, cx);
+        Self::listen_for_annotation_events(&entity, annotation_events, window, cx);
         Self::listen_for_native_pinch(&entity, window, cx);
+        let weak = entity.downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |reader, cx| reader.should_close_window(window, cx))
+                .unwrap_or(true)
+        });
 
         if let Some(path) = initial_path {
             entity.update(cx, |reader, cx| reader.open_path(path, window, cx));
@@ -202,8 +906,26 @@ impl PdfReader {
             .map(|tile| tile.byte_len)
             .max()
             .unwrap_or(0);
+        let mut highlight_colors = HashSet::new();
+        let mut highlight_count = 0;
+        let mut comment_count = 0;
+        if let Some(annotations) = self.annotations.as_ref() {
+            for annotation in annotations.iter() {
+                if let Some(color) = annotation.highlight() {
+                    highlight_count += 1;
+                    highlight_colors.insert(color);
+                }
+                comment_count += usize::from(annotation.comment_markdown().is_some());
+            }
+        }
+        let active_search = self
+            .search
+            .active
+            .and_then(|active| self.search.order.iter().position(|id| *id == active))
+            .map_or(0, |index| index + 1);
         format!(
-            "GPUI_PDF_READER_QA zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) status={:?}",
+            "GPUI_PDF_READER_QA view={:?} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_complete={} status={:?}",
+            self.view_mode,
             self.zoom,
             self.rendered.len(),
             cached_bytes,
@@ -218,8 +940,36 @@ impl PdfReader {
             u8::from(self.render_debounce_until.is_some()),
             self.scroll.x,
             self.scroll.y,
+            self.sidebar.progress,
+            self.sidebar.target,
+            self.comment_pane.progress,
+            self.comment_pane.target,
+            u8::from(self.comment_editor.is_some()),
+            u8::from(self.comment_draft_dirty),
+            u8::from(self.comment_autosave_task.is_some()),
+            self.qa_sidebar_transitions,
+            self.qa_max_sidebar_anchor_error,
+            self.annotations.as_ref().map_or(0, AnnotationSet::len),
+            highlight_count,
+            highlight_colors.len(),
+            comment_count,
+            self.annotations.as_ref().map_or(0, AnnotationSet::revision),
+            self.annotation_enqueued_revision,
+            self.annotation_saved_revision,
+            u8::from(self.annotations_loading),
+            u8::from(self.annotation_persistence_blocked),
+            self.search.order.len(),
+            self.search.searched_pages,
+            self.search.total_highlight_runs,
+            active_search,
+            u8::from(self.search.complete),
             self.status,
         )
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn qa_use_fluid_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view_mode(ReaderView::Fluid, window, cx);
     }
 
     #[cfg(debug_assertions)]
@@ -227,6 +977,16 @@ impl PdfReader {
         if !matches!(self.status, ReaderStatus::Ready)
             || self.render_debounce_until.is_some()
             || !self.pending.is_empty()
+            || self.annotations_loading
+            || (!self.annotation_persistence_blocked
+                && self.annotations.as_ref().is_some_and(|annotations| {
+                    annotations.revision() > self.annotation_saved_revision
+                }))
+            || (!self.search.query.is_empty()
+                && (!self.search.complete || self.search_debounce_task.is_some()))
+            || self.sidebar.is_animating()
+            || self.comment_pane.is_animating()
+            || self.comment_autosave_task.is_some()
         {
             return false;
         }
@@ -263,6 +1023,719 @@ impl PdfReader {
         );
     }
 
+    #[cfg(debug_assertions)]
+    fn qa_text_range(&self, page: usize, needle: &str) -> Option<TextRange> {
+        let characters = self.page_text.get(&page)?.as_slice();
+        let needle: Vec<_> = needle.chars().collect();
+        if needle.is_empty() || needle.len() > characters.len() {
+            return None;
+        }
+        let start = characters.windows(needle.len()).position(|window| {
+            window
+                .iter()
+                .map(|character| character.value)
+                .eq(needle.iter().copied())
+        })?;
+        Some(TextRange::new(
+            TextPosition { page, index: start },
+            TextPosition {
+                page,
+                index: start + needle.len() - 1,
+            },
+        ))
+    }
+
+    #[cfg(debug_assertions)]
+    fn qa_defer_keystrokes(
+        keys: &[&str],
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let keystrokes = keys
+            .iter()
+            .map(|key| {
+                Keystroke::parse(key)
+                    .map(|keystroke| ((*key).to_owned(), keystroke))
+                    .map_err(|error| format!("invalid QA key {key:?}: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        window.defer(cx, move |window, cx| {
+            for (name, keystroke) in keystrokes {
+                if !window.dispatch_keystroke(keystroke, cx) {
+                    eprintln!("GPUI_PDF_READER_QA_ERROR key {name:?} was not handled");
+                    cx.quit();
+                    return;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn qa_seed_annotations_and_comment(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let annotations = self
+            .annotations
+            .as_ref()
+            .ok_or_else(|| "annotations have not loaded".to_owned())?;
+        if annotations.iter().next().is_some() {
+            return Err("feature scenario requires a PDF with no existing sidecar".to_owned());
+        }
+        if self.annotation_persistence_blocked {
+            return Err("annotation persistence is blocked".to_owned());
+        }
+
+        let needles = ["GPUI", "PDF", "Reader", "integration", "fixture"];
+        let ranges = needles
+            .iter()
+            .map(|needle| {
+                self.qa_text_range(0, needle)
+                    .ok_or_else(|| format!("fixture text {needle:?} was not extracted"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (range, color) in ranges.into_iter().zip(HighlightColor::ALL) {
+            self.selection = Some(range.as_selection());
+            self.add_highlight(color, cx);
+        }
+
+        let comment_range = self
+            .qa_text_range(0, "Select this sentence")
+            .ok_or_else(|| "fixture comment text was not extracted".to_owned())?;
+        self.selection = Some(comment_range.as_selection());
+        self.open_comment_editor(comment_range, None, String::new(), window, cx);
+
+        let annotations = self
+            .annotations
+            .as_ref()
+            .ok_or_else(|| "annotations disappeared while seeding".to_owned())?;
+        if annotations.len() != 5 || annotations.revision() != 5 {
+            return Err(format!(
+                "feature seeding produced {} annotations at revision {}, expected 5/5 before the comment save",
+                annotations.len(),
+                annotations.revision()
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn qa_validate_feature_scenario(&self) -> Result<(), String> {
+        let annotations = self
+            .annotations
+            .as_ref()
+            .ok_or_else(|| "annotations disappeared".to_owned())?;
+        let colors: HashSet<_> = annotations
+            .iter()
+            .filter_map(|annotation| annotation.highlight())
+            .collect();
+        let highlights = annotations
+            .iter()
+            .filter(|annotation| annotation.highlight().is_some())
+            .count();
+        let comments = annotations
+            .iter()
+            .filter(|annotation| annotation.comment_markdown().is_some())
+            .count();
+        if annotations.len() != 6
+            || highlights != 5
+            || colors.len() != HighlightColor::ALL.len()
+            || comments != 1
+            || self.annotation_saved_revision != annotations.revision()
+        {
+            return Err(format!(
+                "unexpected persisted feature state: annotations={}, highlights={highlights}, colors={}, comments={comments}, revision={}/{},",
+                annotations.len(),
+                colors.len(),
+                annotations.revision(),
+                self.annotation_saved_revision
+            ));
+        }
+        if self.search.order.len() < 3
+            || !self.search.complete
+            || self.search.total_highlight_runs == 0
+            || self
+                .search
+                .active
+                .and_then(|active| self.search.order.iter().position(|id| *id == active))
+                != Some(1)
+        {
+            return Err(format!(
+                "unexpected search state: results={}, runs={}, active={:?}, complete={}",
+                self.search.order.len(),
+                self.search.total_highlight_runs,
+                self.search.active,
+                self.search.complete
+            ));
+        }
+        if self.sidebar.panel != SidePanel::Search
+            || self.sidebar.progress != 1.0
+            || self.sidebar.target != 1.0
+            || self.qa_sidebar_transitions < 4
+            || self.qa_max_sidebar_anchor_error > 0.002
+        {
+            return Err(format!(
+                "unexpected sidebar state: panel={:?}, progress={}, target={}, transitions={}, anchor_error={}",
+                self.sidebar.panel,
+                self.sidebar.progress,
+                self.sidebar.target,
+                self.qa_sidebar_transitions,
+                self.qa_max_sidebar_anchor_error
+            ));
+        }
+        Ok(())
+    }
+
+    /// Advances one deterministic native feature scenario without bypassing
+    /// production annotation persistence, sidebar animation, or PDFium search.
+    #[cfg(debug_assertions)]
+    pub fn qa_drive_feature_scenario(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        match self.qa_feature_phase {
+            QaFeaturePhase::Seed => {
+                if !self.qa_viewport_is_settled()
+                    || self.annotations_loading
+                    || !self.page_text.contains_key(&0)
+                {
+                    return Ok(false);
+                }
+                self.qa_seed_annotations_and_comment(window, cx)?;
+                self.qa_feature_phase = QaFeaturePhase::WaitCommentEditor;
+            }
+            QaFeaturePhase::WaitCommentEditor => {
+                let Some(editor) = self.comment_editor.clone() else {
+                    return Err("comment editor disappeared before its native frame".to_owned());
+                };
+                if editor.read(cx).qa_has_painted() {
+                    // Repeating Add Comment used to silently replace the open
+                    // editor and lose its draft. Exercise the production
+                    // command path and require identity/range preservation.
+                    let pending_range = self.pending_comment_range;
+                    self.add_comment(&AddComment, window, cx);
+                    if self.comment_editor.as_ref() != Some(&editor)
+                        || self.pending_comment_range != pending_range
+                    {
+                        return Err("repeated Add Comment replaced the open draft".to_owned());
+                    }
+                    self.warning = None;
+                    // Exercise the same native key/input path a person uses:
+                    // multiword text (including Space), selection, and
+                    // formatting. The shared debounce must persist it without
+                    // an explicit save command.
+                    Self::qa_defer_keystrokes(
+                        &[
+                            "i", "m", "p", "o", "r", "t", "a", "n", "t", "space", "c", "o", "p",
+                            "y", "space", "c", "h", "e", "c", "k", "cmd-a", "cmd-b",
+                        ],
+                        window,
+                        cx,
+                    )?;
+                    self.qa_feature_phase = QaFeaturePhase::WaitCommentEdited;
+                }
+            }
+            QaFeaturePhase::WaitCommentEdited => {
+                let Some(editor) = self.comment_editor.as_ref() else {
+                    return Err("comment editor disappeared after native editing".to_owned());
+                };
+                if !self.comment_draft_dirty {
+                    return Err("native comment edits did not mark the draft dirty".to_owned());
+                }
+                if editor.read(cx).markdown() != "**important copy check**" {
+                    return Ok(false);
+                }
+                self.qa_feature_phase = QaFeaturePhase::WaitCommentSaved;
+            }
+            QaFeaturePhase::WaitCommentSaved => {
+                let annotations = self
+                    .annotations
+                    .as_ref()
+                    .ok_or_else(|| "annotations disappeared after comment save".to_owned())?;
+                if annotations.len() != 6 || annotations.revision() != 6 {
+                    return Ok(false);
+                }
+                if self.comment_draft_dirty {
+                    return Ok(false);
+                }
+                if self.comment_editor.is_none() {
+                    return Err("Classic autosave closed the comment editor".to_owned());
+                }
+                let comment = annotations
+                    .iter()
+                    .find_map(|annotation| annotation.comment_markdown().map(ToOwned::to_owned))
+                    .ok_or_else(|| "native comment save produced no Markdown".to_owned())?;
+                if comment != "**important copy check**" {
+                    return Err(format!(
+                        "native comment input/formatting produced unexpected Markdown: {comment:?}"
+                    ));
+                }
+                self.qa_feature_phase = QaFeaturePhase::WaitCommentBack;
+            }
+            QaFeaturePhase::WaitCommentBack => {
+                let Some(editor) = self.comment_editor.clone() else {
+                    return Err("comment editor disappeared before Back QA".to_owned());
+                };
+                if editor.read(cx).qa_has_painted() {
+                    Self::qa_defer_keystrokes(&["escape"], window, cx)?;
+                    self.qa_feature_phase = QaFeaturePhase::WaitCommentList;
+                }
+            }
+            QaFeaturePhase::WaitCommentList => {
+                if self.comment_editor.is_some() {
+                    return Ok(false);
+                }
+                let annotations = self
+                    .annotations
+                    .as_ref()
+                    .ok_or_else(|| "annotations disappeared after comment cancel".to_owned())?;
+                let comment = annotations
+                    .iter()
+                    .find_map(|annotation| annotation.comment_markdown());
+                if annotations.revision() != 6 || comment != Some("**important copy check**") {
+                    return Err("Back changed the persisted comment".to_owned());
+                }
+                let annotation = annotations
+                    .iter()
+                    .find(|annotation| annotation.comment_markdown().is_some())
+                    .ok_or_else(|| "Classic comment vanished before parity checks".to_owned())?;
+                let id = annotation.id();
+                let start = annotation.range().start();
+                let page = self
+                    .layout()
+                    .and_then(|layout| layout.page_rect(start.page))
+                    .ok_or_else(|| "Classic hit-test page is not laid out".to_owned())?;
+                let bounds = self
+                    .page_text
+                    .get(&start.page)
+                    .and_then(|text| text.get(start.index))
+                    .and_then(|character| character.bounds)
+                    .ok_or_else(|| "Classic hit-test character has no bounds".to_owned())?;
+                let pointer = point(
+                    px(page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x),
+                    px(self.content_top()
+                        + page.y
+                        + (bounds.top + bounds.bottom) * page.height * 0.5
+                        - self.scroll.y),
+                );
+                self.active_annotation = None;
+                self.on_mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: pointer,
+                        click_count: 1,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                self.on_mouse_up(
+                    &MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: pointer,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                if self.active_annotation != Some(id)
+                    || self.selection.is_some()
+                    || !self.context_has_comment()
+                {
+                    return Err(
+                        "clicking a Classic highlight did not expose its toolbar context".into(),
+                    );
+                }
+                self.comment_on_context(window, cx);
+                if self.comment_editor.is_none() || self.editing_annotation != Some(id) {
+                    return Err("Classic toolbar Edit Comment did not open the annotation".into());
+                }
+                self.return_to_comment_list(window, cx);
+                self.open_comment_from_list(id, window, cx);
+                if self.comment_editor.is_none() || self.editing_annotation != Some(id) {
+                    return Err("Classic comment-list row did not open the editor".into());
+                }
+                self.return_to_comment_list(window, cx);
+                self.qa_feature_phase = QaFeaturePhase::WaitCommentsOpen;
+            }
+            QaFeaturePhase::WaitCommentsOpen => {
+                if self.qa_viewport_is_settled()
+                    && self.sidebar.panel == SidePanel::Comments
+                    && self.sidebar.progress == 1.0
+                {
+                    self.toggle_sidebar(SidePanel::Comments, window, cx);
+                    // A precise trackpad packet during the slide must move the
+                    // document without cancelling the sidebar's frame chain.
+                    self.scroll_by(0.0, 12.0, true, window, cx);
+                    // Middle-button panning used to cancel the same frame
+                    // chain through a separate input branch. Press/release is
+                    // enough to prove the slide remains scheduled.
+                    let pointer = point(px(100.0), px(self.content_top() + 100.0));
+                    self.on_mouse_down(
+                        &MouseDownEvent {
+                            button: MouseButton::Middle,
+                            position: pointer,
+                            ..Default::default()
+                        },
+                        window,
+                        cx,
+                    );
+                    self.on_mouse_up(
+                        &MouseUpEvent {
+                            button: MouseButton::Middle,
+                            position: pointer,
+                            ..Default::default()
+                        },
+                        window,
+                        cx,
+                    );
+                    self.qa_feature_phase = QaFeaturePhase::WaitCommentsClosed;
+                }
+            }
+            QaFeaturePhase::WaitCommentsClosed => {
+                if self.qa_viewport_is_settled() && self.sidebar.progress == 0.0 {
+                    if !self.focus_handle.is_focused(window) {
+                        return Err(
+                            "closing Comments left a hidden comment input focused".to_owned()
+                        );
+                    }
+                    self.show_sidebar(SidePanel::Search, window, cx);
+                    self.qa_feature_phase = QaFeaturePhase::WaitSearchOpen;
+                }
+            }
+            QaFeaturePhase::WaitSearchOpen => {
+                if self.qa_viewport_is_settled()
+                    && self.sidebar.panel == SidePanel::Search
+                    && self.sidebar.progress == 1.0
+                {
+                    window.focus(&self.search_field.focus_handle(cx));
+                    Self::qa_defer_keystrokes(&["p", "a", "g", "e"], window, cx)?;
+                    self.qa_feature_phase = QaFeaturePhase::WaitSearch;
+                }
+            }
+            QaFeaturePhase::WaitSearch => {
+                if self.qa_viewport_is_settled() {
+                    if self.search_field.read(cx).text() != "page" {
+                        return Err("native search typing did not update the field".to_owned());
+                    }
+                    if self.search.order.len() < 2 {
+                        return Err(format!(
+                            "fixture search returned only {} result(s)",
+                            self.search.order.len()
+                        ));
+                    }
+                    Self::qa_defer_keystrokes(&["enter"], window, cx)?;
+                    self.qa_feature_phase = QaFeaturePhase::WaitNavigation;
+                }
+            }
+            QaFeaturePhase::WaitNavigation => {
+                if self.qa_viewport_is_settled() {
+                    let active_position = self
+                        .search
+                        .active
+                        .and_then(|active| self.search.order.iter().position(|id| *id == active));
+                    if active_position != Some(1) {
+                        return Ok(false);
+                    }
+                    self.navigate_search(false, window, cx);
+                    self.qa_feature_phase = QaFeaturePhase::WaitSearchReturn;
+                }
+            }
+            QaFeaturePhase::WaitSearchReturn => {
+                if self.qa_viewport_is_settled() {
+                    // Closing a sidebar widens the viewport. Center the
+                    // document first so preserving its center is geometrically
+                    // possible instead of being dominated by a scroll-edge
+                    // clamp near the search hit.
+                    if let Some(layout) = self.layout() {
+                        self.scroll.x = (layout.content_width - self.viewport_width).max(0.0) * 0.5;
+                        self.scroll_target.x = self.scroll.x;
+                    }
+                    self.toggle_sidebar(SidePanel::Search, window, cx);
+                    self.qa_feature_phase = QaFeaturePhase::WaitSearchClosed;
+                }
+            }
+            QaFeaturePhase::WaitSearchClosed => {
+                if self.qa_viewport_is_settled() && self.sidebar.progress == 0.0 {
+                    if !self.focus_handle.is_focused(window) {
+                        return Err("closing Search left its hidden text field focused".to_owned());
+                    }
+                    self.show_sidebar(SidePanel::Search, window, cx);
+                    self.qa_feature_phase = QaFeaturePhase::WaitSearchReopened;
+                }
+            }
+            QaFeaturePhase::WaitSearchReopened => {
+                if self.qa_viewport_is_settled()
+                    && self.sidebar.panel == SidePanel::Search
+                    && self.sidebar.progress == 1.0
+                {
+                    self.navigate_search(true, window, cx);
+                    self.qa_feature_phase = QaFeaturePhase::WaitFinalNavigation;
+                }
+            }
+            QaFeaturePhase::WaitFinalNavigation => {
+                if self.qa_viewport_is_settled() {
+                    self.qa_validate_feature_scenario()?;
+                    self.qa_feature_phase = QaFeaturePhase::Complete;
+                    return Ok(true);
+                }
+            }
+            QaFeaturePhase::Complete => return Ok(true),
+        }
+        Ok(false)
+    }
+
+    /// Exercises Fluid-only interaction semantics through native editor input,
+    /// production autosave/persistence, annotation hit testing, both comment
+    /// pane slide directions, and the overlay search-panel geometry.
+    #[cfg(debug_assertions)]
+    pub fn qa_drive_fluid_scenario(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        match self.qa_fluid_phase {
+            QaFluidPhase::Seed => {
+                if !self.qa_viewport_is_settled()
+                    || self.annotations_loading
+                    || !self.page_text.contains_key(&0)
+                {
+                    return Ok(false);
+                }
+                if self
+                    .annotations
+                    .as_ref()
+                    .is_none_or(|annotations| annotations.iter().next().is_some())
+                {
+                    return Err("fluid scenario requires a PDF with no existing sidecar".into());
+                }
+                self.set_view_mode(ReaderView::Fluid, window, cx);
+                let range = self
+                    .qa_text_range(0, "Select this sentence")
+                    .ok_or_else(|| "fixture Fluid text was not extracted".to_owned())?;
+                self.selection = Some(range.as_selection());
+                if std::env::var_os("GPUI_PDF_READER_QA_FLUID_SELECTION_VISUAL").is_some() {
+                    self.qa_fluid_phase = QaFluidPhase::Complete;
+                    cx.notify();
+                    return Ok(true);
+                }
+                self.add_highlight(HighlightColor::Yellow, cx);
+                let id = self
+                    .active_annotation
+                    .ok_or_else(|| "Fluid highlight did not become active".to_owned())?;
+                if self.annotation_at_text_position(range.start()) != Some(id) {
+                    return Err("highlight hit lookup did not resolve the active annotation".into());
+                }
+                self.comment_on_context(window, cx);
+                self.qa_fluid_phase = QaFluidPhase::WaitEditor;
+            }
+            QaFluidPhase::WaitEditor => {
+                let Some(editor) = self.comment_editor.clone() else {
+                    return Err("Fluid comment editor disappeared before painting".into());
+                };
+                if editor.read(cx).qa_has_painted()
+                    && self.comment_pane.progress == 1.0
+                    && self.sidebar.progress == 1.0
+                {
+                    Self::qa_defer_keystrokes(
+                        &["f", "l", "u", "i", "d", "space", "n", "o", "t", "e"],
+                        window,
+                        cx,
+                    )?;
+                    self.qa_fluid_phase = QaFluidPhase::WaitAutosave;
+                }
+            }
+            QaFluidPhase::WaitAutosave => {
+                if !self.qa_viewport_is_settled() {
+                    return Ok(false);
+                }
+                let (id, range, comment, highlight) = self
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| {
+                        annotations.iter().find_map(|annotation| {
+                            annotation.comment_markdown().map(|comment| {
+                                (
+                                    annotation.id(),
+                                    annotation.range(),
+                                    comment.to_owned(),
+                                    annotation.highlight(),
+                                )
+                            })
+                        })
+                    })
+                    .ok_or_else(|| "Fluid autosave produced no persisted comment".to_owned())?;
+                if comment != "fluid note" || highlight != Some(HighlightColor::Yellow) {
+                    return Err(format!(
+                        "Fluid autosave produced unexpected annotation: comment={comment:?}, highlight={highlight:?}"
+                    ));
+                }
+                if self.comment_editor.is_none()
+                    || self.comment_draft_dirty
+                    || self.editing_annotation != Some(id)
+                {
+                    return Err(
+                        "Fluid autosave closed the editor or left the saved draft dirty".into(),
+                    );
+                }
+                if self.context_range() != Some(range) || !self.context_has_comment() {
+                    return Err("Fluid context did not switch from Add note to Edit note".into());
+                }
+                self.return_to_comment_list(window, cx);
+                self.qa_fluid_phase = QaFluidPhase::WaitList;
+            }
+            QaFluidPhase::WaitList => {
+                if !self.qa_viewport_is_settled()
+                    || self.comment_editor.is_some()
+                    || self.comment_pane.progress != 0.0
+                {
+                    return Ok(false);
+                }
+                let (id, start) = self
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| {
+                        annotations.iter().find_map(|annotation| {
+                            annotation
+                                .comment_markdown()
+                                .is_some()
+                                .then_some((annotation.id(), annotation.range().start()))
+                        })
+                    })
+                    .ok_or_else(|| "Fluid comment vanished after Back".to_owned())?;
+                let page = self
+                    .layout()
+                    .and_then(|layout| layout.page_rect(start.page))
+                    .ok_or_else(|| "Fluid hit-test page is not laid out".to_owned())?;
+                let bounds = self
+                    .page_text
+                    .get(&start.page)
+                    .and_then(|text| text.get(start.index))
+                    .and_then(|character| character.bounds)
+                    .ok_or_else(|| "Fluid hit-test character has no bounds".to_owned())?;
+                let pointer = point(
+                    px(page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x),
+                    px(self.content_top()
+                        + page.y
+                        + (bounds.top + bounds.bottom) * page.height * 0.5
+                        - self.scroll.y),
+                );
+                self.active_annotation = None;
+                self.on_mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: pointer,
+                        click_count: 1,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                self.on_mouse_up(
+                    &MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: pointer,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                if self.active_annotation != Some(id) || self.selection.is_some() {
+                    return Err("clicking a Fluid highlight did not activate it cleanly".into());
+                }
+                if std::env::var_os("GPUI_PDF_READER_QA_FLUID_CONTEXT_VISUAL").is_some() {
+                    self.qa_fluid_phase = QaFluidPhase::Complete;
+                    return Ok(true);
+                }
+                self.open_comment_from_list(id, window, cx);
+                self.qa_fluid_phase = QaFluidPhase::WaitReopenedEditor;
+            }
+            QaFluidPhase::WaitReopenedEditor => {
+                let Some(editor) = self.comment_editor.clone() else {
+                    return Err("comment-list navigation did not open the Fluid editor".into());
+                };
+                if self.comment_pane.progress == 1.0 && editor.read(cx).qa_has_painted() {
+                    if editor.read(cx).markdown() != "fluid note" {
+                        return Err("reopened Fluid editor did not preserve Markdown".into());
+                    }
+                    if std::env::var_os("GPUI_PDF_READER_QA_FLUID_EDITOR_VISUAL").is_some() {
+                        self.qa_fluid_phase = QaFluidPhase::Complete;
+                        return Ok(true);
+                    }
+                    self.return_to_comment_list(window, cx);
+                    self.qa_fluid_phase = QaFluidPhase::WaitFinalList;
+                }
+            }
+            QaFluidPhase::WaitFinalList => {
+                if self.qa_viewport_is_settled()
+                    && self.comment_editor.is_none()
+                    && self.comment_pane.progress == 0.0
+                {
+                    self.show_sidebar(SidePanel::Search, window, cx);
+                    self.qa_fluid_phase = QaFluidPhase::WaitSearchOpen;
+                }
+            }
+            QaFluidPhase::WaitSearchOpen => {
+                if self.qa_viewport_is_settled()
+                    && self.sidebar.panel == SidePanel::Search
+                    && self.sidebar.progress == 1.0
+                {
+                    window.focus(&self.search_field.focus_handle(cx));
+                    Self::qa_defer_keystrokes(&["p", "a", "g", "e"], window, cx)?;
+                    self.qa_fluid_phase = QaFluidPhase::WaitSearchResults;
+                }
+            }
+            QaFluidPhase::WaitSearchResults => {
+                if !self.qa_viewport_is_settled() {
+                    return Ok(false);
+                }
+                let annotations = self
+                    .annotations
+                    .as_ref()
+                    .ok_or_else(|| "Fluid annotations disappeared".to_owned())?;
+                let annotation = annotations
+                    .iter()
+                    .next()
+                    .ok_or_else(|| "Fluid scenario annotation disappeared".to_owned())?;
+                if self.view_mode != ReaderView::Fluid
+                    || annotations.len() != 1
+                    || annotation.highlight() != Some(HighlightColor::Yellow)
+                    || annotation.comment_markdown() != Some("fluid note")
+                    || self.active_annotation != Some(annotation.id())
+                    || !self.context_has_comment()
+                    || self.context_anchor_in_viewport().is_none()
+                    || self.search.order.len() < 2
+                    || !self.search.complete
+                {
+                    return Err(format!(
+                        "unexpected final Fluid state: view={:?}, annotations={}, results={}, complete={}",
+                        self.view_mode,
+                        annotations.len(),
+                        self.search.order.len(),
+                        self.search.complete
+                    ));
+                }
+                let layout = self
+                    .layout()
+                    .ok_or_else(|| "Fluid layout disappeared".to_owned())?;
+                let base_max = (layout.content_width - self.viewport_width).max(0.0);
+                let expected_max = base_max + self.fluid_panel_occlusion();
+                if (self.max_scroll_x(layout) - expected_max).abs() > 0.01
+                    || self.fluid_panel_occlusion() <= SIDEBAR_WIDTH
+                {
+                    return Err("Fluid panel occlusion was not added to horizontal reach".into());
+                }
+                self.qa_fluid_phase = QaFluidPhase::Complete;
+                return Ok(true);
+            }
+            QaFluidPhase::Complete => return Ok(true),
+        }
+        Ok(false)
+    }
+
     fn listen_for_worker_events(
         entity: &Entity<Self>,
         events: mpsc::Receiver<WorkerEvent>,
@@ -284,6 +1757,35 @@ impl PdfReader {
                     let _ = async_cx.update(|window, cx| {
                         weak.update(cx, |reader, cx| {
                             reader.handle_worker_event(event, window, cx)
+                        })
+                        .ok();
+                    });
+                }
+            })
+            .detach();
+    }
+
+    fn listen_for_annotation_events(
+        entity: &Entity<Self>,
+        events: mpsc::Receiver<AnnotationIoEvent>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let events = Arc::new(Mutex::new(events));
+        let weak = entity.downgrade();
+        window
+            .spawn(cx, async move |async_cx| {
+                loop {
+                    let events = events.clone();
+                    let receive = async_cx
+                        .background_executor()
+                        .spawn(async move { events.lock().unwrap().recv() });
+                    let Ok(event) = receive.await else {
+                        break;
+                    };
+                    let _ = async_cx.update(|window, cx| {
+                        weak.update(cx, |reader, cx| {
+                            reader.handle_annotation_event(event, window, cx)
                         })
                         .ok();
                     });
@@ -336,6 +1838,17 @@ impl PdfReader {
                 pages,
             } if generation == self.generation => {
                 self.drop_all_images(window, cx);
+                let page_count = pages.len();
+                self.annotations_loading = true;
+                if !self
+                    .annotation_io
+                    .load(generation, path.clone(), page_count)
+                {
+                    self.annotations_loading = false;
+                    self.annotation_persistence_blocked = true;
+                    self.annotations = Some(AnnotationSet::new(page_count));
+                    self.warning = Some("The annotation sidecar worker is unavailable".into());
+                }
                 self.document = Some(DocumentState {
                     path: path.clone(),
                     pages,
@@ -442,6 +1955,71 @@ impl PdfReader {
                 self.continue_pending_copy(cx);
                 self.evict_distant_text();
             }
+            WorkerEvent::SearchPageResults {
+                generation,
+                revision,
+                results,
+            } if generation == self.generation && revision == self.search.revision => {
+                self.search.searched_pages = self.search.searched_pages.max(results.page + 1);
+                if let Some(previous) = self.search.pages.remove(&results.page) {
+                    let previous_ids: HashSet<_> =
+                        previous.iter().map(|result| result.id).collect();
+                    self.search.order.retain(|id| !previous_ids.contains(id));
+                }
+                self.search
+                    .order
+                    .extend(results.matches.iter().map(|result| result.id));
+                self.search.order.sort_unstable();
+                self.search
+                    .pages
+                    .insert(results.page, Arc::from(results.matches));
+                self.search.truncated |= results.truncated;
+            }
+            WorkerEvent::SearchFinished {
+                generation,
+                revision,
+                searched_pages,
+                total_results,
+                total_highlight_runs,
+                skipped_pages,
+                truncated,
+            } if generation == self.generation && revision == self.search.revision => {
+                self.search.searched_pages = searched_pages;
+                self.search.total_highlight_runs = total_highlight_runs;
+                self.search.complete = true;
+                self.search.truncated = truncated;
+                debug_assert_eq!(total_results, self.search.order.len());
+                if self.search.active.is_none()
+                    && let Some(first) = self.search.order.first().copied()
+                {
+                    self.activate_search_match(first, window, cx);
+                }
+                if skipped_pages > 0 {
+                    self.warning = Some(
+                        format!(
+                            "Search skipped {skipped_pages} page{} whose text could not be read",
+                            if skipped_pages == 1 { "" } else { "s" }
+                        )
+                        .into(),
+                    );
+                }
+            }
+            WorkerEvent::SearchWarning {
+                generation,
+                revision,
+                page,
+                message,
+            } if generation == self.generation && revision == self.search.revision => {
+                self.warning = Some(format!("Search page {}: {message}", page + 1).into());
+            }
+            WorkerEvent::SearchFailed {
+                generation,
+                revision,
+                message,
+            } if generation == self.generation && revision == self.search.revision => {
+                self.search.complete = true;
+                self.warning = Some(message.into());
+            }
             WorkerEvent::Error {
                 generation,
                 message,
@@ -456,6 +2034,103 @@ impl PdfReader {
                 self.status = ReaderStatus::Error(message.into());
             }
             _ => {}
+        }
+        cx.notify();
+    }
+
+    fn handle_annotation_event(
+        &mut self,
+        event: AnnotationIoEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut saved_current_annotations = false;
+        match event {
+            AnnotationIoEvent::Loaded {
+                generation,
+                identity,
+                annotations,
+            } if generation == self.generation => {
+                self.annotation_saved_revision = annotations.revision();
+                self.annotation_enqueued_revision = annotations.revision();
+                self.annotation_identity = Some(identity);
+                self.annotations = Some(annotations);
+                self.refresh_comment_order();
+                self.annotations_loading = false;
+                self.annotation_persistence_blocked = false;
+                self.annotation_error = None;
+                self.annotation_failed_revision = None;
+            }
+            AnnotationIoEvent::Saved {
+                generation,
+                revision,
+            } if generation == self.generation => {
+                self.annotation_saved_revision = self.annotation_saved_revision.max(revision);
+                if self
+                    .annotation_failed_revision
+                    .is_some_and(|failed| revision >= failed)
+                {
+                    self.annotation_failed_revision = None;
+                    self.annotation_error = None;
+                }
+                saved_current_annotations = true;
+            }
+            AnnotationIoEvent::Failed {
+                generation,
+                operation,
+                revision,
+                message,
+            } if generation == self.generation => {
+                if operation == AnnotationIoOperation::Load {
+                    self.annotations_loading = false;
+                    self.annotation_persistence_blocked = true;
+                    let page_count = self
+                        .document
+                        .as_ref()
+                        .map(|document| document.pages.len())
+                        .unwrap_or(0);
+                    self.annotations = Some(AnnotationSet::new(page_count));
+                    self.comment_order.clear();
+                }
+                if let Some(revision) = revision {
+                    self.annotation_failed_revision = Some(
+                        self.annotation_failed_revision
+                            .map_or(revision, |current| current.max(revision)),
+                    );
+                }
+                let cancelled_open = operation == AnnotationIoOperation::Save
+                    && matches!(
+                        transition_pending_open(
+                            &mut self.pending_open,
+                            self.annotations.as_ref().map(AnnotationSet::revision),
+                            self.annotation_saved_revision,
+                            true,
+                        ),
+                        PendingOpenTransition::Cancelled(_)
+                    );
+                if cancelled_open {
+                    self.annotation_error = Some(
+                        format!(
+                            "Could not open another PDF because annotations could not be saved: {message}"
+                        )
+                        .into(),
+                    );
+                } else {
+                    self.annotation_error = Some(message.into());
+                }
+            }
+            _ => {}
+        }
+        if saved_current_annotations
+            && let PendingOpenTransition::Open(path) = transition_pending_open(
+                &mut self.pending_open,
+                self.annotations.as_ref().map(AnnotationSet::revision),
+                self.annotation_saved_revision,
+                false,
+            )
+        {
+            self.begin_open_path(path, window, cx);
+            return;
         }
         cx.notify();
     }
@@ -483,6 +2158,52 @@ impl PdfReader {
     }
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comment_draft_needs_confirmation() {
+            self.confirm_discard_comment(DraftDiscardAction::Open(path), window, cx);
+            return;
+        }
+        self.open_path_after_comment_guard(path, window, cx);
+    }
+
+    fn open_path_after_comment_guard(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dirty_revision = unsaved_annotation_revision(
+            self.annotations.as_ref().map(AnnotationSet::revision),
+            self.annotation_saved_revision,
+        );
+        if let Some(revision) = dirty_revision {
+            if self.annotation_persistence_blocked {
+                self.annotation_error = Some(
+                    "Could not open another PDF because unsaved annotations are blocked".into(),
+                );
+                cx.notify();
+                return;
+            }
+            self.pending_open = Some(path);
+            if (self.annotation_enqueued_revision < revision
+                || self.annotation_failed_revision.is_some())
+                && !self.persist_annotations()
+            {
+                self.pending_open = None;
+                if self.annotation_error.is_none() {
+                    self.annotation_error = Some(
+                        "Could not open another PDF because annotations could not be queued for saving"
+                            .into(),
+                    );
+                }
+            }
+            cx.notify();
+            return;
+        }
+        self.begin_open_path(path, window, cx);
+    }
+
+    fn begin_open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_open = None;
         self.generation = self.generation.wrapping_add(1);
         self.drop_all_images(window, cx);
         self.document = None;
@@ -496,11 +2217,47 @@ impl PdfReader {
         self.zoom_render_task = None;
         self.text_pending.clear();
         self.copy_pending = None;
+        self.search = SearchState::default();
+        self.search_debounce_task = None;
+        if !self.search_field.read(cx).text().is_empty()
+            && let Err(rejection) = self
+                .search_field
+                .update(cx, |field, cx| field.set_text("", cx))
+        {
+            self.search.input_error = Some(rejection.to_string().into());
+        }
+        self.annotations = None;
+        self.annotation_identity = None;
+        self.annotations_loading = false;
+        self.annotation_persistence_blocked = false;
+        self.annotation_error = None;
+        self.annotation_enqueued_revision = 0;
+        self.annotation_failed_revision = None;
+        self.annotation_saved_revision = 0;
+        self.active_annotation = None;
+        self.comment_order.clear();
+        self.comment_editor = None;
+        self.comment_draft_dirty = false;
+        self.comment_discard_prompt_open = false;
+        self.comment_pane = CommentPaneState::default();
+        self.comment_autosave_revision = self.comment_autosave_revision.wrapping_add(1);
+        self.comment_autosave_task = None;
+        self.editing_annotation = None;
+        self.pending_comment_range = None;
         self.warning = None;
         self.selection = None;
+        self.pending_annotation_click = None;
         self.scroll = Offset::default();
         self.scroll_target = Offset::default();
         self.animation_active = false;
+        #[cfg(debug_assertions)]
+        {
+            self.qa_feature_phase = QaFeaturePhase::Seed;
+            self.qa_fluid_phase = QaFluidPhase::Seed;
+            self.qa_sidebar_anchor_reference = None;
+            self.qa_sidebar_transitions = 0;
+            self.qa_max_sidebar_anchor_error = 0.0;
+        }
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -537,7 +2294,8 @@ impl PdfReader {
         let size = window.viewport_size();
         let previous_width = self.viewport_width;
         let previous_zoom = self.zoom;
-        self.viewport_width = f32::from(size.width).max(1.0);
+        let full_width = f32::from(size.width).max(1.0);
+        self.viewport_width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
         let error_height = self.content_top() - TOOLBAR_HEIGHT;
         self.viewport_height = (f32::from(size.height) - TOOLBAR_HEIGHT - error_height).max(1.0);
         if self.fit_width {
@@ -549,6 +2307,949 @@ impl PdfReader {
             self.rebuild_layout();
         }
         self.clamp_scroll();
+    }
+
+    fn update_sidebar_viewport_preserving_anchor(&mut self, window: &Window) {
+        let size = window.viewport_size();
+        let full_width = f32::from(size.width).max(1.0);
+        let next_width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
+        if (next_width - self.viewport_width).abs() <= 0.01 {
+            return;
+        }
+        self.viewport_width = next_width;
+        self.rebuild_layout();
+        if let Some(anchor) = self.sidebar_anchor
+            && let Some((x, y)) = self
+                .layout()
+                .and_then(|layout| layout.content_point_for_anchor(anchor))
+        {
+            self.scroll = Offset {
+                x: x - self.viewport_width * 0.5,
+                y: y - self.viewport_height * 0.5,
+            };
+            self.scroll_target = self.scroll;
+        }
+        self.clamp_scroll();
+    }
+
+    fn sidebar_reserved_width(&self, full_width: f32) -> f32 {
+        match self.view_mode {
+            ReaderView::Classic => self.sidebar.available_width(full_width),
+            ReaderView::Fluid => 0.0,
+        }
+    }
+
+    fn fluid_panel_occlusion(&self) -> f32 {
+        if self.view_mode == ReaderView::Fluid {
+            (self.fluid_panel_width() + FLUID_PANEL_HORIZONTAL_MARGIN * 2.0) * self.sidebar.progress
+        } else {
+            0.0
+        }
+    }
+
+    fn fluid_panel_width(&self) -> f32 {
+        SIDEBAR_WIDTH.min((self.viewport_width - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(0.0))
+    }
+
+    fn max_scroll_x(&self, layout: &DocumentLayout) -> f32 {
+        (layout.content_width - self.viewport_width + self.fluid_panel_occlusion()).max(0.0)
+    }
+
+    fn set_view_mode(&mut self, mode: ReaderView, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view_mode == mode {
+            return;
+        }
+        self.sidebar_anchor = self.layout().and_then(|layout| {
+            layout.anchor_at_content_point(
+                self.scroll.x + self.viewport_width * 0.5,
+                self.scroll.y + self.viewport_height * 0.5,
+            )
+        });
+        self.fit_width = false;
+        self.cancel_comment_autosave();
+        self.view_mode = mode;
+        let editor_open = self.comment_editor.is_some();
+        self.comment_pane = CommentPaneState {
+            progress: if editor_open { 1.0 } else { 0.0 },
+            target: if editor_open { 1.0 } else { 0.0 },
+            close_editor_on_finish: false,
+        };
+        self.update_sidebar_viewport_preserving_anchor(window);
+        self.sidebar_anchor = None;
+        self.clamp_scroll();
+        self.request_visible_tiles(window);
+        if self.comment_draft_dirty {
+            self.schedule_comment_autosave(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn use_classic_view(&mut self, _: &ClassicView, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view_mode(ReaderView::Classic, window, cx);
+    }
+
+    fn use_fluid_view(&mut self, _: &FluidView, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view_mode(ReaderView::Fluid, window, cx);
+    }
+
+    fn toggle_sidebar(&mut self, panel: SidePanel, window: &mut Window, cx: &mut Context<Self>) {
+        let center_anchor = self.layout().and_then(|layout| {
+            layout.anchor_at_content_point(
+                self.scroll.x + self.viewport_width * 0.5,
+                self.scroll.y + self.viewport_height * 0.5,
+            )
+        });
+        self.sidebar_anchor = center_anchor;
+        #[cfg(debug_assertions)]
+        {
+            self.qa_sidebar_anchor_reference = center_anchor;
+        }
+        // A panel transition is a viewport slide. Holding zoom fixed avoids a
+        // render-scale churn on every animation frame when Fit was last used.
+        self.fit_width = false;
+        self.scroll_target = self.scroll;
+        self.sidebar.toggle(panel);
+        if self.sidebar.target < 0.5 {
+            window.focus(&self.focus_handle);
+        } else if panel == SidePanel::Comments {
+            if let Some(editor) = self.comment_editor.as_ref() {
+                window.focus(&editor.focus_handle(cx));
+            } else {
+                window.focus(&self.focus_handle);
+            }
+        } else {
+            window.focus(&self.focus_handle);
+        }
+        self.start_animation(window, cx);
+    }
+
+    #[cfg(debug_assertions)]
+    fn record_qa_sidebar_transition(&mut self) {
+        let Some(expected) = self.qa_sidebar_anchor_reference.take() else {
+            return;
+        };
+        let actual = self.layout().and_then(|layout| {
+            layout.anchor_at_content_point(
+                self.scroll.x + self.viewport_width * 0.5,
+                self.scroll.y + self.viewport_height * 0.5,
+            )
+        });
+        let error = actual.map_or(1.0, |actual| {
+            if actual.page != expected.page {
+                1.0
+            } else {
+                (actual.x_fraction - expected.x_fraction)
+                    .abs()
+                    .max((actual.y_fraction - expected.y_fraction).abs())
+            }
+        });
+        self.qa_sidebar_transitions += 1;
+        self.qa_max_sidebar_anchor_error = self.qa_max_sidebar_anchor_error.max(error);
+    }
+
+    fn show_sidebar(&mut self, panel: SidePanel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar.panel != panel || self.sidebar.target < 0.5 {
+            self.toggle_sidebar(panel, window, cx);
+        }
+    }
+
+    fn find_document(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_sidebar(SidePanel::Search, window, cx);
+        window.focus(&self.search_field.focus_handle(cx));
+    }
+
+    fn toggle_comments(&mut self, _: &ToggleComments, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_sidebar(SidePanel::Comments, window, cx);
+    }
+
+    fn next_search_result(
+        &mut self,
+        _: &NextSearchResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_search(true, window, cx);
+    }
+
+    fn previous_search_result(
+        &mut self,
+        _: &PreviousSearchResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_search(false, window, cx);
+    }
+
+    fn set_search_query(&mut self, query: String, cx: &mut Context<Self>) {
+        let cleared_input_error = self.search.input_error.take().is_some();
+        if self.search.query == query {
+            if cleared_input_error {
+                if let Err(error) = SearchQuery::new(&query)
+                    && !matches!(error, crate::search::SearchQueryError::Empty)
+                {
+                    self.search.input_error = Some(error.to_string().into());
+                }
+                cx.notify();
+            }
+            return;
+        }
+        self.search.revision = self.search.revision.wrapping_add(1);
+        self.search.query = query.clone();
+        self.search.pages.clear();
+        self.search.order.clear();
+        self.search.active = None;
+        self.search.searched_pages = 0;
+        self.search.total_highlight_runs = 0;
+        self.search.complete = false;
+        self.search.truncated = false;
+        self.search_debounce_task = None;
+        let _ = self
+            .worker
+            .cancel_search(self.generation, self.search.revision);
+
+        let search_query = match SearchQuery::new(&query) {
+            Ok(query) => query,
+            Err(crate::search::SearchQueryError::Empty) => {
+                self.search.complete = true;
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.search.complete = true;
+                self.search.input_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let generation = self.generation;
+        let revision = self.search.revision;
+        self.search_debounce_task = Some(cx.spawn(async move |weak, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            weak.update(cx, |reader, cx| {
+                if reader.generation == generation && reader.search.revision == revision {
+                    reader.search_debounce_task = None;
+                    if !reader.worker.search(generation, revision, search_query) {
+                        reader.search.complete = true;
+                        reader.warning = Some("The PDF search worker is unavailable".into());
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn activate_search_match(
+        &mut self,
+        id: SearchMatchId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(result) = self
+            .search
+            .pages
+            .get(&id.page)
+            .and_then(|matches| matches.iter().find(|result| result.id == id))
+        else {
+            return;
+        };
+        let Some(page_rect) = self.layout().and_then(|layout| layout.page_rect(id.page)) else {
+            return;
+        };
+        let (x, y) = result
+            .highlight_runs
+            .first()
+            .map(|run| {
+                (
+                    page_rect.x + (run.left + run.right) * 0.5 * page_rect.width,
+                    page_rect.y + (run.top + run.bottom) * 0.5 * page_rect.height,
+                )
+            })
+            .unwrap_or((
+                page_rect.x + page_rect.width * 0.5,
+                page_rect.y + page_rect.height * 0.15,
+            ));
+        self.search.active = Some(id);
+        if let Some(index) = self.search.order.iter().position(|result| *result == id) {
+            self.search_list_scroll
+                .scroll_to_item(index, ScrollStrategy::Center);
+        }
+        self.sidebar_anchor = None;
+        self.scroll_target = Offset {
+            x: x - self.viewport_width * 0.5,
+            y: y - self.viewport_height * 0.35,
+        };
+        self.clamp_scroll();
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
+    fn navigate_search(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = next_search_match_id(&self.search.order, self.search.active, forward) else {
+            return;
+        };
+        self.activate_search_match(id, window, cx);
+    }
+
+    fn persist_annotations(&mut self) -> bool {
+        if self.annotation_persistence_blocked {
+            return false;
+        }
+        let (Some(document), Some(identity), Some(annotations)) = (
+            self.document.as_ref(),
+            self.annotation_identity.clone(),
+            self.annotations.clone(),
+        ) else {
+            return false;
+        };
+        let revision = annotations.revision();
+        if !self.annotation_io.save(
+            self.generation,
+            document.path.clone(),
+            identity,
+            self.annotation_saved_revision,
+            annotations,
+        ) {
+            self.annotation_failed_revision = Some(revision);
+            self.annotation_error = Some("The annotation sidecar worker is unavailable".into());
+            false
+        } else {
+            self.annotation_enqueued_revision = self.annotation_enqueued_revision.max(revision);
+            true
+        }
+    }
+
+    fn refresh_comment_order(&mut self) {
+        self.comment_order = self
+            .annotations
+            .as_ref()
+            .map(|annotations| {
+                let mut comments = Vec::with_capacity(annotations.len());
+                comments.extend(
+                    annotations
+                        .iter()
+                        .filter(|annotation| annotation.comment_markdown().is_some())
+                        .map(|annotation| annotation.id()),
+                );
+                comments
+            })
+            .unwrap_or_default();
+    }
+
+    fn add_highlight(&mut self, color: HighlightColor, cx: &mut Context<Self>) {
+        if self.annotations_loading {
+            self.annotation_error = Some("Annotations are still loading".into());
+            cx.notify();
+            return;
+        }
+        if self.annotation_persistence_blocked {
+            if self.annotation_error.is_none() {
+                self.annotation_error =
+                    Some("Annotations are disabled because the sidecar could not be loaded".into());
+            }
+            cx.notify();
+            return;
+        }
+        let range = self.selection.map(TextRange::from_selection).or_else(|| {
+            self.active_annotation.and_then(|id| {
+                self.annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(id))
+                    .map(|annotation| annotation.range())
+            })
+        });
+        let Some(range) = range else {
+            self.warning = Some("Select text before adding a highlight".into());
+            cx.notify();
+            return;
+        };
+        if range.end().index > MAX_TEXT_CHARACTER_INDEX {
+            self.warning = Some(
+                "Highlighting Select All is not supported yet; select a concrete text range".into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(annotations) = self.annotations.as_mut() else {
+            return;
+        };
+        let existing = annotations
+            .overlapping(range)
+            .filter(|annotation| annotation.range() == range)
+            .max_by_key(|annotation| (annotation.updated_revision(), annotation.id()))
+            .map(|annotation| {
+                (
+                    annotation.id(),
+                    annotation.comment_markdown().map(ToOwned::to_owned),
+                )
+            });
+        let result = if let Some((id, comment)) = existing {
+            annotations
+                .update(id, range, Some(color), comment)
+                .map(|changed| (id, changed))
+        } else {
+            annotations
+                .add(range, Some(color), None)
+                .map(|id| (id, true))
+        };
+        match result {
+            Ok((id, changed)) => {
+                if self.annotation_failed_revision.is_none() && !self.annotation_persistence_blocked
+                {
+                    self.annotation_error = None;
+                }
+                self.active_annotation = Some(id);
+                self.selection = None;
+                if changed
+                    || self.annotations.as_ref().is_some_and(|annotations| {
+                        annotations.revision() > self.annotation_saved_revision
+                    })
+                {
+                    let _ = self.persist_annotations();
+                }
+                self.refresh_comment_order();
+            }
+            Err(error) => self.warning = Some(error.to_string().into()),
+        }
+        cx.notify();
+    }
+
+    fn add_comment(&mut self, _: &AddComment, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comment_editor.is_some() {
+            self.warning =
+                Some("Finish or cancel the current comment before starting another".into());
+            self.show_sidebar(SidePanel::Comments, window, cx);
+            cx.notify();
+            return;
+        }
+        if self.annotations_loading {
+            self.annotation_error = Some("Annotations are still loading".into());
+            cx.notify();
+            return;
+        }
+        if self.annotation_persistence_blocked {
+            if self.annotation_error.is_none() {
+                self.annotation_error =
+                    Some("Comments are disabled because the sidecar could not be loaded".into());
+            }
+            cx.notify();
+            return;
+        }
+        let Some(selection) = self.selection else {
+            self.warning = Some("Select text before adding a comment".into());
+            cx.notify();
+            return;
+        };
+        let range = TextRange::from_selection(selection);
+        if range.end().index > MAX_TEXT_CHARACTER_INDEX {
+            self.warning = Some(
+                "Commenting on Select All is not supported yet; select a concrete text range"
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let exact = self.annotations.as_ref().and_then(|annotations| {
+            annotations
+                .overlapping(range)
+                .filter(|annotation| annotation.range() == range)
+                .max_by_key(|annotation| (annotation.updated_revision(), annotation.id()))
+                .map(|annotation| {
+                    (
+                        annotation.id(),
+                        annotation.comment_markdown().unwrap_or("").to_owned(),
+                    )
+                })
+        });
+        let (editing, markdown) = exact
+            .map(|(id, markdown)| (Some(id), markdown))
+            .unwrap_or((None, String::new()));
+        self.open_comment_editor(range, editing, markdown, window, cx);
+    }
+
+    fn comment_on_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.is_some() {
+            self.add_comment(&AddComment, window, cx);
+            return;
+        }
+        let Some(id) = self.active_annotation else {
+            self.warning = Some("Select text before adding a comment".into());
+            cx.notify();
+            return;
+        };
+        let Some((range, markdown)) = self
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(id))
+            .map(|annotation| {
+                (
+                    annotation.range(),
+                    annotation.comment_markdown().unwrap_or("").to_owned(),
+                )
+            })
+        else {
+            return;
+        };
+        self.open_comment_editor(range, Some(id), markdown, window, cx);
+    }
+
+    fn context_range(&self) -> Option<TextRange> {
+        self.selection
+            .filter(|selection| selection.anchor != selection.focus)
+            .map(TextRange::from_selection)
+            .or_else(|| {
+                self.active_annotation.and_then(|id| {
+                    self.annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.get(id))
+                        .map(|annotation| annotation.range())
+                })
+            })
+    }
+
+    fn context_has_comment(&self) -> bool {
+        self.active_annotation.is_some_and(|id| {
+            self.annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(id))
+                .is_some_and(|annotation| annotation.comment_markdown().is_some())
+        }) || self.selection.is_some_and(|selection| {
+            if selection.anchor == selection.focus {
+                return false;
+            }
+            let range = TextRange::from_selection(selection);
+            self.annotations.as_ref().is_some_and(|annotations| {
+                annotations.overlapping(range).any(|annotation| {
+                    annotation.range() == range && annotation.comment_markdown().is_some()
+                })
+            })
+        })
+    }
+
+    fn context_anchor_in_viewport(&self) -> Option<Rect> {
+        let range = self.context_range()?;
+        let layout = self.layout()?;
+        let content_viewport = Rect {
+            x: self.scroll.x,
+            y: self.scroll.y,
+            width: self.viewport_width,
+            height: self.viewport_height,
+        };
+        let visible_pages: Vec<_> = layout
+            .visible_pages(self.scroll.y, self.viewport_height, 0.0)
+            .collect();
+        for page in visible_pages.into_iter().rev() {
+            if page < range.start().page || page > range.end().page {
+                continue;
+            }
+            let Some(chars) = self.page_text.get(&page) else {
+                continue;
+            };
+            let Some(page_rect) = layout.page_rect(page) else {
+                continue;
+            };
+            let Some(indices) = range.indices_on_page(page, chars.len()) else {
+                continue;
+            };
+            let mut bottom_line: Option<Rect> = None;
+            let mut visited = 0usize;
+            chars.for_each_visible_in_range_while(
+                page_rect,
+                content_viewport,
+                indices,
+                |_, rect| {
+                    visited += 1;
+                    if visited > MAX_VISIBLE_SELECTION_QUADS {
+                        return false;
+                    }
+                    bottom_line = Some(match bottom_line {
+                        None => rect,
+                        Some(current) => {
+                            let tolerance = current.height.max(rect.height) * 0.5;
+                            if rect.bottom() > current.bottom() + tolerance {
+                                rect
+                            } else if (rect.bottom() - current.bottom()).abs() <= tolerance {
+                                let left = current.x.min(rect.x);
+                                let top = current.y.min(rect.y);
+                                Rect {
+                                    x: left,
+                                    y: top,
+                                    width: current.right().max(rect.right()) - left,
+                                    height: current.bottom().max(rect.bottom()) - top,
+                                }
+                            } else {
+                                current
+                            }
+                        }
+                    });
+                    true
+                },
+            );
+            if let Some(line) = bottom_line {
+                return Some(Rect {
+                    x: line.x - self.scroll.x,
+                    y: line.y - self.scroll.y,
+                    width: line.width,
+                    height: line.height,
+                });
+            }
+        }
+        None
+    }
+
+    fn open_comment_editor(
+        &mut self,
+        range: TextRange,
+        editing: Option<AnnotationId>,
+        markdown: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let buffer = match RichTextBuffer::try_from_markdown(&markdown) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                self.annotation_error = Some(
+                    format!("Unable to open comment: {error}. The stored comment was not changed.")
+                        .into(),
+                );
+                self.show_sidebar(SidePanel::Comments, window, cx);
+                cx.notify();
+                return;
+            }
+        };
+        if self.annotation_failed_revision.is_none() && !self.annotation_persistence_blocked {
+            self.annotation_error = None;
+        }
+        let editor = cx.new(|cx| CommentEditor::new(cx, buffer));
+        cx.subscribe_in(
+            &editor,
+            window,
+            |reader, _, event, window, cx| match event {
+                CommentEditorEvent::Changed => reader.comment_editor_changed(window, cx),
+                CommentEditorEvent::Save(markdown) => {
+                    reader.cancel_comment_autosave();
+                    let _ = reader.write_comment(markdown.clone(), cx);
+                }
+                CommentEditorEvent::Cancel => reader.cancel_comment_editor(window, cx),
+            },
+        )
+        .detach();
+        self.pending_comment_range = Some(range);
+        self.editing_annotation = editing;
+        self.comment_editor = Some(editor.clone());
+        self.comment_draft_dirty = false;
+        self.comment_pane
+            .show_editor(self.view_mode == ReaderView::Fluid);
+        self.show_sidebar(SidePanel::Comments, window, cx);
+        if self.view_mode == ReaderView::Fluid {
+            self.start_animation(window, cx);
+        }
+        window.focus(&editor.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn edit_comment(&mut self, id: AnnotationId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comment_editor.is_some() {
+            return;
+        }
+        let Some((range, markdown)) = self
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(id))
+            .and_then(|annotation| {
+                annotation
+                    .comment_markdown()
+                    .map(|markdown| (annotation.range(), markdown.to_owned()))
+            })
+        else {
+            return;
+        };
+        self.open_comment_editor(range, Some(id), markdown, window, cx);
+    }
+
+    fn write_comment(&mut self, markdown: String, cx: &mut Context<Self>) -> bool {
+        if markdown.trim().is_empty() {
+            self.annotation_error = Some("A comment cannot be empty".into());
+            cx.notify();
+            return false;
+        }
+        let Some(range) = self.pending_comment_range else {
+            return false;
+        };
+        if self.annotation_failed_revision.is_none() && !self.annotation_persistence_blocked {
+            self.annotation_error = None;
+        }
+        let Some(annotations) = self.annotations.as_mut() else {
+            return false;
+        };
+        let result = if let Some(id) = self.editing_annotation {
+            let highlight = annotations
+                .get(id)
+                .and_then(|annotation| annotation.highlight());
+            annotations
+                .update(id, range, highlight, Some(markdown))
+                .map(|changed| (id, changed))
+        } else {
+            annotations
+                .add(range, None, Some(markdown))
+                .map(|id| (id, true))
+        };
+        match result {
+            Ok((id, changed)) => {
+                self.active_annotation = Some(id);
+                self.selection = None;
+                if changed
+                    || self.annotations.as_ref().is_some_and(|annotations| {
+                        annotations.revision() > self.annotation_saved_revision
+                    })
+                {
+                    let _ = self.persist_annotations();
+                }
+                self.refresh_comment_order();
+                self.comment_draft_dirty = false;
+                self.editing_annotation = Some(id);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.annotation_error = Some(error.to_string().into());
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn comment_editor_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.comment_draft_dirty = true;
+        self.schedule_comment_autosave(window, cx);
+        cx.notify();
+    }
+
+    fn schedule_comment_autosave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.comment_autosave_revision = self.comment_autosave_revision.wrapping_add(1);
+        let revision = self.comment_autosave_revision;
+        let weak = cx.weak_entity();
+        self.comment_autosave_task = Some(window.spawn(cx, async move |cx| {
+            cx.background_executor()
+                .timer(COMMENT_AUTOSAVE_DEBOUNCE)
+                .await;
+            let _ = cx.update(|_, cx| {
+                weak.update(cx, |reader, cx| {
+                    if reader.comment_autosave_revision == revision {
+                        reader.comment_autosave_task = None;
+                        let _ = reader.flush_comment_autosave(cx);
+                    }
+                })
+                .ok();
+            });
+        }));
+    }
+
+    fn cancel_comment_autosave(&mut self) {
+        self.comment_autosave_revision = self.comment_autosave_revision.wrapping_add(1);
+        self.comment_autosave_task = None;
+    }
+
+    fn flush_comment_autosave(&mut self, cx: &mut Context<Self>) -> bool {
+        self.cancel_comment_autosave();
+        if !self.comment_draft_dirty {
+            return true;
+        }
+        let Some(editor) = self.comment_editor.as_ref() else {
+            return true;
+        };
+        let markdown = editor.read(cx).markdown();
+        if markdown.trim().is_empty() {
+            return false;
+        }
+        self.write_comment(markdown, cx)
+    }
+
+    fn return_to_comment_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let markdown_is_blank = self
+            .comment_editor
+            .as_ref()
+            .is_none_or(|editor| editor.read(cx).is_blank());
+        if self.comment_draft_dirty && !markdown_is_blank && !self.flush_comment_autosave(cx) {
+            return;
+        }
+        self.cancel_comment_autosave();
+        self.comment_draft_dirty = false;
+        window.focus(&self.focus_handle);
+        if self.view_mode == ReaderView::Fluid {
+            self.comment_pane.show_list(true);
+            self.start_animation(window, cx);
+        } else {
+            self.comment_pane.show_list(false);
+            self.finish_comment_editor_close();
+        }
+        cx.notify();
+    }
+
+    fn cancel_comment_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.return_to_comment_list(window, cx);
+    }
+
+    fn discard_comment_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_comment_autosave();
+        self.comment_pane.show_list(false);
+        self.finish_comment_editor_close();
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn finish_comment_editor_close(&mut self) {
+        self.comment_editor = None;
+        self.comment_draft_dirty = false;
+        self.editing_annotation = None;
+        self.pending_comment_range = None;
+        self.comment_pane.close_editor_on_finish = false;
+    }
+
+    fn comment_draft_needs_confirmation(&self) -> bool {
+        comment_draft_needs_confirmation(self.comment_editor.is_some(), self.comment_draft_dirty)
+    }
+
+    fn confirm_discard_comment(
+        &mut self,
+        action: DraftDiscardAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.comment_discard_prompt_open {
+            return;
+        }
+
+        let (message, detail, discard_label) = match &action {
+            DraftDiscardAction::Open(_) => (
+                "Discard this comment draft?",
+                "Opening another PDF will permanently discard the unsaved comment.",
+                "Discard and Open",
+            ),
+            DraftDiscardAction::Quit => (
+                "Quit with an unsaved comment?",
+                "The comment draft will be permanently discarded.",
+                "Discard and Quit",
+            ),
+            DraftDiscardAction::CloseWindow => (
+                "Close with an unsaved comment?",
+                "The comment draft will be permanently discarded.",
+                "Discard and Close",
+            ),
+        };
+        self.comment_discard_prompt_open = true;
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            message,
+            Some(detail),
+            &[
+                PromptButton::cancel("Keep Editing"),
+                PromptButton::ok(discard_label),
+            ],
+            cx,
+        );
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                let discard = answer.await.ok() == Some(1);
+                let _ = cx.update(|window, cx| {
+                    weak.update(cx, |reader, cx| {
+                        reader.comment_discard_prompt_open = false;
+                        if discard {
+                            reader.discard_comment_editor(window, cx);
+                            match action {
+                                DraftDiscardAction::Open(path) => {
+                                    reader.open_path_after_comment_guard(path, window, cx)
+                                }
+                                DraftDiscardAction::Quit => cx.quit(),
+                                DraftDiscardAction::CloseWindow => window.remove_window(),
+                            }
+                        } else {
+                            reader.show_sidebar(SidePanel::Comments, window, cx);
+                            if let Some(editor) = reader.comment_editor.as_ref() {
+                                window.focus(&editor.focus_handle(cx));
+                            }
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                });
+            })
+            .detach();
+    }
+
+    fn quit_application(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comment_draft_needs_confirmation() {
+            self.confirm_discard_comment(DraftDiscardAction::Quit, window, cx);
+        } else {
+            cx.quit();
+        }
+    }
+
+    pub fn should_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.comment_draft_needs_confirmation() {
+            return true;
+        }
+        self.confirm_discard_comment(DraftDiscardAction::CloseWindow, window, cx);
+        false
+    }
+
+    fn navigate_annotation(
+        &mut self,
+        id: AnnotationId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(range) = self
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(id))
+            .map(|annotation| annotation.range())
+        else {
+            return;
+        };
+        let start = range.start();
+        let Some(page_rect) = self
+            .layout()
+            .and_then(|layout| layout.page_rect(start.page))
+        else {
+            return;
+        };
+        let target = self
+            .page_text
+            .get(&start.page)
+            .and_then(|text| text.get(start.index))
+            .and_then(|character| character.bounds)
+            .map(|bounds| {
+                (
+                    page_rect.x + (bounds.left + bounds.right) * 0.5 * page_rect.width,
+                    page_rect.y + (bounds.top + bounds.bottom) * 0.5 * page_rect.height,
+                )
+            })
+            .unwrap_or((
+                page_rect.x + page_rect.width * 0.5,
+                page_rect.y + page_rect.height * 0.15,
+            ));
+        self.active_annotation = Some(id);
+        self.sidebar_anchor = None;
+        self.scroll_target = Offset {
+            x: target.0 - self.viewport_width * 0.5,
+            y: target.1 - self.viewport_height * 0.35,
+        };
+        self.clamp_scroll();
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
+    fn open_comment_from_list(
+        &mut self,
+        id: AnnotationId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_annotation(id, window, cx);
+        self.edit_comment(id, window, cx);
     }
 
     fn content_top(&self) -> f32 {
@@ -790,7 +3491,7 @@ impl PdfReader {
             self.scroll_target = Offset::default();
             return;
         };
-        let max_x = (layout.content_width - self.viewport_width).max(0.0);
+        let max_x = self.max_scroll_x(layout);
         let max_y = (layout.content_height - self.viewport_height).max(0.0);
         self.scroll.x = self.scroll.x.clamp(0.0, max_x);
         self.scroll.y = self.scroll.y.clamp(0.0, max_y);
@@ -806,11 +3507,21 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let ui_is_animating = self.sidebar.is_animating() || self.comment_pane.is_animating();
+        self.sidebar_anchor = None;
+        #[cfg(debug_assertions)]
+        {
+            // Once the user moves the document, the original transition
+            // anchor is intentionally no longer the expected outcome.
+            self.qa_sidebar_anchor_reference = None;
+        }
         if !x.is_finite() || !y.is_finite() {
             return;
         }
         if immediate {
-            self.animation_active = false;
+            if !ui_is_animating {
+                self.animation_active = false;
+            }
             self.scroll_target = self.scroll;
         }
         self.scroll_target.x += x;
@@ -819,6 +3530,9 @@ impl PdfReader {
         if immediate {
             self.scroll = self.scroll_target;
             self.request_visible_tiles(window);
+            if ui_is_animating {
+                self.start_animation(window, cx);
+            }
             cx.notify();
         } else {
             self.start_animation(window, cx);
@@ -862,11 +3576,32 @@ impl PdfReader {
             .clamp(1.0 / 240.0, 0.05);
         self.last_animation_tick = now;
         let blend = 1.0 - (-18.0 * dt).exp();
-        self.scroll.x += (self.scroll_target.x - self.scroll.x) * blend;
-        self.scroll.y += (self.scroll_target.y - self.scroll.y) * blend;
+        let sidebar_was_animating = self.sidebar.is_animating();
+        if sidebar_was_animating {
+            self.sidebar.advance(dt);
+            self.update_sidebar_viewport_preserving_anchor(window);
+            if !self.sidebar.is_animating() {
+                #[cfg(debug_assertions)]
+                self.record_qa_sidebar_transition();
+                self.sidebar_anchor = None;
+            }
+        }
+        if self.comment_pane.is_animating() {
+            self.comment_pane.advance(dt);
+            if !self.comment_pane.is_animating()
+                && self.comment_pane.target == 0.0
+                && self.comment_pane.close_editor_on_finish
+            {
+                self.finish_comment_editor_close();
+            }
+        }
+        if self.sidebar_anchor.is_none() {
+            self.scroll.x += (self.scroll_target.x - self.scroll.x) * blend;
+            self.scroll.y += (self.scroll_target.y - self.scroll.y) * blend;
+        }
         let distance = (self.scroll_target.x - self.scroll.x).abs()
             + (self.scroll_target.y - self.scroll.y).abs();
-        if distance < 0.35 {
+        if distance < 0.35 && !self.sidebar.is_animating() && !self.comment_pane.is_animating() {
             self.scroll = self.scroll_target;
             self.animation_active = false;
         }
@@ -913,6 +3648,7 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sidebar_anchor = None;
         let raw_x = f32::from(window_position.x);
         let raw_y = f32::from(window_position.y);
         if self.document.is_none() || !zoom.is_finite() || !raw_x.is_finite() || !raw_y.is_finite()
@@ -1053,6 +3789,16 @@ impl PdfReader {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        if !event.modifiers.shift && event.click_count == 1 {
+            self.pending_annotation_click = self
+                .hit_test_text(event.position, false)
+                .and_then(|position| self.annotation_at_text_position(position));
+            if self.pending_annotation_click.is_none() {
+                self.active_annotation = None;
+            }
+        } else {
+            self.pending_annotation_click = None;
+        }
         match event.button {
             MouseButton::Left => {
                 if let Some(position) = self.hit_test_text(event.position, false) {
@@ -1079,11 +3825,22 @@ impl PdfReader {
                 }
             }
             MouseButton::Middle => {
+                let ui_is_animating =
+                    self.sidebar.is_animating() || self.comment_pane.is_animating();
+                self.sidebar_anchor = None;
+                #[cfg(debug_assertions)]
+                {
+                    self.qa_sidebar_anchor_reference = None;
+                }
                 self.pan = Some(PanState {
                     pointer: event.position,
                     scroll: self.scroll,
                 });
-                self.animation_active = false;
+                if ui_is_animating {
+                    self.start_animation(window, cx);
+                } else {
+                    self.animation_active = false;
+                }
             }
             _ => {}
         }
@@ -1114,6 +3871,9 @@ impl PdfReader {
             && let Some(position) = self.hit_test_text(event.position, true)
         {
             if let Some(selection) = self.selection.as_mut() {
+                if selection.focus != position {
+                    self.pending_annotation_click = None;
+                }
                 selection.focus = position;
             }
             let local_y = f32::from(event.position.y) - self.content_top();
@@ -1126,7 +3886,13 @@ impl PdfReader {
         }
     }
 
-    fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if event.button == MouseButton::Left
+            && let Some(id) = self.pending_annotation_click.take()
+        {
+            self.active_annotation = Some(id);
+            self.selection = None;
+        }
         self.selecting = false;
         self.pan = None;
         cx.notify();
@@ -1157,6 +3923,18 @@ impl PdfReader {
         chars
             .hit_test(page_rect, x, y, nearest)
             .map(|index| TextPosition { page, index })
+    }
+
+    fn annotation_at_text_position(&self, position: TextPosition) -> Option<AnnotationId> {
+        self.annotations.as_ref().and_then(|annotations| {
+            annotations
+                .at(position)
+                .filter(|annotation| {
+                    annotation.highlight().is_some() || annotation.comment_markdown().is_some()
+                })
+                .max_by_key(|annotation| (annotation.updated_revision(), annotation.id()))
+                .map(|annotation| annotation.id())
+        })
     }
 
     fn select_word(&mut self, position: TextPosition) {
@@ -1216,6 +3994,19 @@ impl PdfReader {
         cx.notify();
     }
 
+    fn edit_copy(&mut self, _: &EditCopy, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selection(&CopySelection, window, cx);
+        cx.stop_propagation();
+    }
+
+    fn edit_cut(&mut self, _: &EditCut, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+    }
+
+    fn edit_paste(&mut self, _: &EditPaste, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+    }
+
     fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(page_count) = self
             .document
@@ -1236,6 +4027,11 @@ impl PdfReader {
             },
         });
         cx.notify();
+    }
+
+    fn edit_select_all(&mut self, _: &EditSelectAll, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_all(&SelectAll, window, cx);
+        cx.stop_propagation();
     }
 
     fn continue_pending_copy(&mut self, cx: &mut Context<Self>) {
@@ -1360,6 +4156,17 @@ impl PdfReader {
             ReaderStatus::Empty => "Open a PDF to begin".into(),
             ReaderStatus::Loading(message) => message.clone(),
             ReaderStatus::Error(message) => message.clone(),
+            ReaderStatus::Ready if self.annotations_loading => "Loading annotations…".into(),
+            ReaderStatus::Ready if self.annotation_error.is_some() => {
+                self.annotation_error.clone().unwrap()
+            }
+            ReaderStatus::Ready
+                if self.annotations.as_ref().is_some_and(|annotations| {
+                    annotations.revision() > self.annotation_saved_revision
+                }) =>
+            {
+                "Saving annotations…".into()
+            }
             ReaderStatus::Ready if self.copy_pending.is_some() => "Reading text for copy…".into(),
             ReaderStatus::Ready if self.warning.is_some() => self.warning.clone().unwrap(),
             ReaderStatus::Ready if !self.pending.is_empty() => format!(
@@ -1372,9 +4179,73 @@ impl PdfReader {
         }
     }
 
-    fn toolbar_button(
+    fn chrome_button(
         id: &'static str,
         label: impl Into<SharedString>,
+        style: ChromeButtonStyle,
+        enabled: bool,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        let (background, border, text, hover, pressed) = match style {
+            ChromeButtonStyle::Neutral => (
+                UI_CONTROL,
+                UI_SEPARATOR,
+                UI_TEXT,
+                UI_CONTROL_HOVER,
+                UI_CONTROL_PRESSED,
+            ),
+            ChromeButtonStyle::Ghost => (
+                UI_CHROME,
+                UI_CHROME,
+                UI_TEXT_SECONDARY,
+                UI_CONTROL_HOVER,
+                UI_CONTROL_PRESSED,
+            ),
+            ChromeButtonStyle::Floating => (
+                UI_SURFACE,
+                UI_SURFACE,
+                UI_TEXT_SECONDARY,
+                0xf0f0f2,
+                0xe4e4e8,
+            ),
+            ChromeButtonStyle::Selected => {
+                (UI_ACCENT_SOFT, 0xb8d5f4, UI_ACCENT, 0xdbeafd, 0xc9e0f8)
+            }
+            ChromeButtonStyle::Primary => {
+                (UI_ACCENT, UI_ACCENT, 0xffffff, UI_ACCENT_HOVER, 0x005cad)
+            }
+        };
+        div()
+            .id(id)
+            .h(px(32.0))
+            .min_w(px(32.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(border))
+            .bg(rgb(background))
+            .text_color(rgb(text))
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(rgb(hover)))
+                    .active(move |button| button.bg(rgb(pressed)))
+                    .on_click(handler)
+            })
+            .when(!enabled, |button| button.opacity(0.42))
+            .child(label.into())
+    }
+
+    fn segment_button(
+        id: &'static str,
+        label: impl Into<SharedString>,
+        enabled: bool,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
         div()
@@ -1385,17 +4256,1208 @@ impl PdfReader {
             .flex()
             .items_center()
             .justify_center()
+            .overflow_hidden()
             .rounded_md()
-            .border_1()
-            .border_color(rgb(0x3b4658))
-            .bg(rgb(0x252d3a))
-            .text_color(rgb(0xe7eaf0))
+            .text_color(rgb(UI_TEXT))
             .text_sm()
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(0x354155)))
-            .active(|style| style.bg(rgb(0x18202b)))
-            .on_click(handler)
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(|button| button.bg(rgb(UI_CONTROL_HOVER)))
+                    .active(|button| button.bg(rgb(UI_CONTROL_PRESSED)))
+                    .on_click(handler)
+            })
+            .when(!enabled, |button| button.opacity(0.38))
             .child(label.into())
+    }
+
+    fn highlight_button(
+        id: &'static str,
+        color: HighlightColor,
+        enabled: bool,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        let dot = match color {
+            HighlightColor::Yellow => rgb(0xffd447),
+            HighlightColor::Green => rgb(0x55d987),
+            HighlightColor::Blue => rgb(0x5aa7ff),
+            HighlightColor::Pink => rgb(0xff75b7),
+            HighlightColor::Purple => rgb(0xb98cff),
+        };
+        div()
+            .id(id)
+            .size(px(28.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .rounded_md()
+            .when(enabled, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(|button| button.bg(rgb(UI_CONTROL_HOVER)))
+                    .active(|button| button.bg(rgb(UI_CONTROL_PRESSED)))
+                    .on_click(handler)
+            })
+            .when(!enabled, |button| button.opacity(0.34))
+            .child(
+                div()
+                    .size(px(14.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgba(0x00000024))
+                    .bg(dot),
+            )
+    }
+
+    fn render_fluid_main_pill(
+        &mut self,
+        state: FluidPillState,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let compact = state.available_width < 700.0;
+        let has_context = self.context_range().is_some() && self.comment_editor.is_none();
+        // When a side panel leaves a narrow document strip, the local pill
+        // keeps context actions available and the main pill keeps its global
+        // zoom/search/comments controls unclipped.
+        let show_context_in_main = has_context && state.available_width >= 520.0;
+        let context_actions_enabled =
+            has_context && !self.annotations_loading && !self.annotation_persistence_blocked;
+        let comment_label = if self.context_has_comment() {
+            if compact { "✎" } else { "Edit note" }
+        } else if compact {
+            "+"
+        } else {
+            "Add note"
+        };
+
+        div()
+            .id("fluid-main-pill")
+            .block_mouse_except_scroll()
+            .h(px(44.0))
+            .max_w(px((state.available_width - 24.0).max(280.0)))
+            .px_1()
+            .flex()
+            .items_center()
+            .gap_1()
+            .overflow_hidden()
+            .rounded_full()
+            .border_1()
+            .border_color(rgba(0x00000022))
+            .bg(rgb(UI_SURFACE))
+            .shadow_sm()
+            .text_color(rgb(UI_TEXT))
+            .child(Self::segment_button(
+                "fluid-zoom-out",
+                "−",
+                state.zoom_out_enabled,
+                cx.listener(|reader, _, window, cx| reader.zoom_out(&ZoomOut, window, cx)),
+            ))
+            .child(
+                div()
+                    .h(px(30.0))
+                    .min_w(px(if compact { 46.0 } else { 54.0 }))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(if state.document_open {
+                        UI_TEXT
+                    } else {
+                        UI_TEXT_TERTIARY
+                    }))
+                    .child(state.zoom_label),
+            )
+            .child(Self::segment_button(
+                "fluid-zoom-in",
+                "+",
+                state.zoom_in_enabled,
+                cx.listener(|reader, _, window, cx| reader.zoom_in(&ZoomIn, window, cx)),
+            ))
+            .when(!compact, |pill| {
+                pill.child(Self::segment_button(
+                    "fluid-fit-width",
+                    "Fit",
+                    state.document_open,
+                    cx.listener(|reader, _, window, cx| reader.fit_width(&FitWidth, window, cx)),
+                ))
+            })
+            .when(show_context_in_main, |pill| {
+                pill.child(div().h(px(24.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+                    .children(
+                        [
+                            "fluid-main-highlight-yellow",
+                            "fluid-main-highlight-green",
+                            "fluid-main-highlight-blue",
+                            "fluid-main-highlight-pink",
+                            "fluid-main-highlight-purple",
+                        ]
+                        .into_iter()
+                        .zip(HighlightColor::ALL)
+                        .map(|(id, color)| {
+                            Self::highlight_button(
+                                id,
+                                color,
+                                context_actions_enabled,
+                                cx.listener(move |reader, _, _, cx| {
+                                    reader.add_highlight(color, cx)
+                                }),
+                            )
+                        }),
+                    )
+                    .child(Self::segment_button(
+                        "fluid-main-context-comment",
+                        comment_label,
+                        context_actions_enabled,
+                        cx.listener(|reader, _, window, cx| reader.comment_on_context(window, cx)),
+                    ))
+            })
+            .child(div().h(px(24.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+            .child(Self::chrome_button(
+                "fluid-toggle-search",
+                if compact { "⌕" } else { "Search" },
+                if state.search_selected {
+                    ChromeButtonStyle::Selected
+                } else {
+                    ChromeButtonStyle::Floating
+                },
+                state.document_open,
+                cx.listener(|reader, _, window, cx| reader.find_document(&Find, window, cx)),
+            ))
+            .child(Self::chrome_button(
+                "fluid-toggle-comments",
+                if compact { "☰" } else { "Comments" },
+                if state.comments_selected {
+                    ChromeButtonStyle::Selected
+                } else {
+                    ChromeButtonStyle::Floating
+                },
+                state.document_open,
+                cx.listener(|reader, _, window, cx| {
+                    reader.toggle_comments(&ToggleComments, window, cx)
+                }),
+            ))
+            .into_any_element()
+    }
+
+    fn render_fluid_context_pill(
+        &mut self,
+        position: Offset,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let comment_label = if self.context_has_comment() {
+            "✎"
+        } else {
+            "+"
+        };
+        div()
+            .id("fluid-context-pill")
+            .block_mouse_except_scroll()
+            .absolute()
+            .left(px(position.x))
+            .top(px(position.y))
+            .h(px(FLUID_CONTEXT_PILL_HEIGHT))
+            .w(px(FLUID_CONTEXT_PILL_WIDTH))
+            .px_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .rounded_full()
+            .border_1()
+            .border_color(rgba(0x00000026))
+            .bg(rgb(UI_SURFACE))
+            .shadow_sm()
+            .children(
+                [
+                    "fluid-context-highlight-yellow",
+                    "fluid-context-highlight-green",
+                    "fluid-context-highlight-blue",
+                    "fluid-context-highlight-pink",
+                    "fluid-context-highlight-purple",
+                ]
+                .into_iter()
+                .zip(HighlightColor::ALL)
+                .map(|(id, color)| {
+                    Self::highlight_button(
+                        id,
+                        color,
+                        enabled,
+                        cx.listener(move |reader, _, _, cx| reader.add_highlight(color, cx)),
+                    )
+                }),
+            )
+            .child(div().h(px(22.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+            .child(Self::segment_button(
+                "fluid-context-comment",
+                comment_label,
+                enabled,
+                cx.listener(|reader, _, window, cx| reader.comment_on_context(window, cx)),
+            ))
+            .into_any_element()
+    }
+
+    fn render_search_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let fluid = self.view_mode == ReaderView::Fluid;
+        let result_count = self.search.order.len();
+        let input_error = self.search.input_error.clone();
+        let page_count = self
+            .document
+            .as_ref()
+            .map_or(0, |document| document.pages.len());
+        let status: SharedString = if let Some(error) = input_error.clone() {
+            error
+        } else if self.search.query.trim().is_empty() {
+            "Type to search the document".into()
+        } else if self.search.complete {
+            format!(
+                "{} result{}{}",
+                result_count,
+                if result_count == 1 { "" } else { "s" },
+                if self.search.truncated {
+                    " (limit reached)"
+                } else {
+                    ""
+                }
+            )
+            .into()
+        } else {
+            format!(
+                "Searching… {} / {} pages",
+                self.search.searched_pages, page_count
+            )
+            .into()
+        };
+        let active_index = self.search.active.and_then(|active| {
+            self.search
+                .order
+                .iter()
+                .position(|candidate| *candidate == active)
+        });
+        let navigation_enabled = result_count > 0;
+        let (empty_title, empty_detail): (SharedString, SharedString) = if input_error.is_some() {
+            (
+                "Search needs attention".into(),
+                "Fix the query above to continue searching.".into(),
+            )
+        } else if self.search.complete && !self.search.query.trim().is_empty() {
+            (
+                "No matches".into(),
+                "Try a different word or a shorter phrase.".into(),
+            )
+        } else {
+            (
+                "Find text in this document".into(),
+                "Matches will be highlighted as you type.".into(),
+            )
+        };
+        let results = if result_count == 0 {
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_6()
+                .text_center()
+                .child(
+                    div()
+                        .size(px(38.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(rgb(UI_ACCENT_SOFT))
+                        .text_color(rgb(UI_ACCENT))
+                        .text_lg()
+                        .child("⌕"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(UI_TEXT))
+                        .child(empty_title),
+                )
+                .child(
+                    div()
+                        .max_w(px(240.0))
+                        .text_xs()
+                        .line_height(px(18.0))
+                        .text_color(rgb(UI_TEXT_SECONDARY))
+                        .child(empty_detail),
+                )
+                .into_any_element()
+        } else {
+            uniform_list(
+                "search-results",
+                result_count,
+                cx.processor(|reader, range: std::ops::Range<usize>, _window, cx| {
+                    range
+                        .filter_map(|index| {
+                            let id = *reader.search.order.get(index)?;
+                            let result = reader
+                                .search
+                                .pages
+                                .get(&id.page)?
+                                .iter()
+                                .find(|result| result.id == id)?;
+                            let preview: SharedString = result.preview.clone().into();
+                            let active = reader.search.active == Some(id);
+                            Some(
+                                div().h(px(88.0)).w_full().px_3().py_1().child(
+                                    div()
+                                        .id(("search-result", index))
+                                        .size_full()
+                                        .overflow_hidden()
+                                        .flex()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(if active {
+                                            0xb8d5f4
+                                        } else {
+                                            UI_SEPARATOR
+                                        }))
+                                        .bg(rgb(if active { UI_ACCENT_SOFT } else { UI_SURFACE }))
+                                        .cursor_pointer()
+                                        .hover(move |row| {
+                                            row.bg(rgb(if active {
+                                                0xdbeafd
+                                            } else {
+                                                UI_SURFACE_SUBTLE
+                                            }))
+                                        })
+                                        .on_click(cx.listener(move |reader, _, window, cx| {
+                                            reader.activate_search_match(id, window, cx)
+                                        }))
+                                        .when(active, |row| {
+                                            row.child(
+                                                div()
+                                                    .w(px(3.0))
+                                                    .h_full()
+                                                    .flex_none()
+                                                    .bg(rgb(UI_ACCENT)),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .px_3()
+                                                .py_2()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(if active {
+                                                            rgb(UI_ACCENT)
+                                                        } else {
+                                                            rgb(UI_TEXT_SECONDARY)
+                                                        })
+                                                        .child(format!("PAGE {}", id.page + 1))
+                                                        .child(format!("{}", index + 1)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .h(px(40.0))
+                                                        .overflow_hidden()
+                                                        .text_sm()
+                                                        .line_height(px(19.0))
+                                                        .text_color(rgb(UI_TEXT))
+                                                        .child(preview),
+                                                ),
+                                        ),
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(self.search_list_scroll.clone())
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .bg(rgb(UI_SURFACE_SUBTLE))
+            .when(fluid, |list| list.rounded_b_xl())
+            .into_any_element()
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .when(fluid, |panel| panel.rounded_xl())
+            .bg(rgb(UI_SURFACE))
+            .text_color(rgb(UI_TEXT))
+            .child(
+                div()
+                    .h(px(54.0))
+                    .flex_none()
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(UI_SEPARATOR))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Find in Document"),
+                    )
+                    .child(Self::chrome_button(
+                        "close-search",
+                        "Close",
+                        ChromeButtonStyle::Ghost,
+                        true,
+                        cx.listener(|reader, _, window, cx| {
+                            reader.toggle_sidebar(SidePanel::Search, window, cx)
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .p_4()
+                    .pb_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(UI_SEPARATOR))
+                    .child(self.search_field.clone())
+                    .child(
+                        div()
+                            .h(px(32.0))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if input_error.is_some() {
+                                        rgb(UI_ERROR)
+                                    } else {
+                                        rgb(UI_TEXT_SECONDARY)
+                                    })
+                                    .child(if let Some(index) = active_index {
+                                        format!("{} of {}", index + 1, result_count).into()
+                                    } else {
+                                        status
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(Self::chrome_button(
+                                        "previous-search-result",
+                                        "↑",
+                                        ChromeButtonStyle::Ghost,
+                                        navigation_enabled,
+                                        cx.listener(|reader, _, window, cx| {
+                                            reader.navigate_search(false, window, cx)
+                                        }),
+                                    ))
+                                    .child(Self::chrome_button(
+                                        "next-search-result",
+                                        "↓",
+                                        ChromeButtonStyle::Ghost,
+                                        navigation_enabled,
+                                        cx.listener(|reader, _, window, cx| {
+                                            reader.navigate_search(true, window, cx)
+                                        }),
+                                    )),
+                            ),
+                    ),
+            )
+            .child(results)
+            .into_any_element()
+    }
+
+    fn render_fluid_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let editor_open = self.comment_editor.is_some();
+        let can_add_comment = annotation_actions_enabled(
+            self.selection.is_some(),
+            self.annotations_loading,
+            self.annotation_persistence_blocked,
+            editor_open,
+        );
+        let list_header = div()
+            .h(px(54.0))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(rgb(UI_SEPARATOR))
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Comments"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(Self::chrome_button(
+                        "fluid-add-comment",
+                        "+ New",
+                        ChromeButtonStyle::Neutral,
+                        can_add_comment,
+                        cx.listener(|reader, _, window, cx| {
+                            reader.add_comment(&AddComment, window, cx)
+                        }),
+                    ))
+                    .child(Self::chrome_button(
+                        "fluid-close-comments",
+                        "Close",
+                        ChromeButtonStyle::Ghost,
+                        true,
+                        cx.listener(|reader, _, window, cx| {
+                            reader.toggle_sidebar(SidePanel::Comments, window, cx)
+                        }),
+                    )),
+            );
+
+        let list_body = if self.comment_order.is_empty() {
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_6()
+                .text_center()
+                .child(
+                    div()
+                        .size(px(38.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(rgb(UI_ACCENT_SOFT))
+                        .text_color(rgb(UI_ACCENT))
+                        .text_lg()
+                        .child("✎"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(UI_TEXT))
+                        .child(if self.annotations_loading {
+                            "Loading comments…"
+                        } else if self.annotation_persistence_blocked {
+                            "Comments unavailable"
+                        } else {
+                            "No comments yet"
+                        }),
+                )
+                .child(
+                    div()
+                        .max_w(px(248.0))
+                        .text_xs()
+                        .line_height(px(18.0))
+                        .text_color(rgb(UI_TEXT_SECONDARY))
+                        .child(if self.annotation_persistence_blocked {
+                            "Resolve the annotation sidecar problem before adding comments."
+                        } else {
+                            "Select text, then use either floating Note control."
+                        }),
+                )
+                .into_any_element()
+        } else {
+            uniform_list(
+                "fluid-comment-list",
+                self.comment_order.len(),
+                cx.processor(|reader, range: std::ops::Range<usize>, _window, cx| {
+                    range
+                        .filter_map(|index| {
+                            let id = *reader.comment_order.get(index)?;
+                            let annotation = reader.annotations.as_ref()?.get(id)?;
+                            let page = annotation.range().start().page;
+                            let markdown = annotation.comment_markdown().unwrap_or("");
+                            let preview = RichTextBuffer::try_from_markdown(markdown)
+                                .map(|buffer| compact_preview(buffer.text(), 96))
+                                .unwrap_or_else(|_| compact_preview(markdown, 96));
+                            let preview: SharedString = preview.into();
+                            let color = match annotation.highlight() {
+                                Some(HighlightColor::Yellow) => rgb(0xffd447),
+                                Some(HighlightColor::Green) => rgb(0x55d987),
+                                Some(HighlightColor::Blue) => rgb(0x5aa7ff),
+                                Some(HighlightColor::Pink) => rgb(0xff75b7),
+                                Some(HighlightColor::Purple) => rgb(0xb98cff),
+                                None => rgb(0xf0a53b),
+                            };
+                            let active = reader.active_annotation == Some(id);
+                            Some(
+                                div().h(px(96.0)).w_full().px_3().py_1().child(
+                                    div()
+                                        .id(("fluid-comment", index))
+                                        .size_full()
+                                        .overflow_hidden()
+                                        .flex()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(if active {
+                                            0xb8d5f4
+                                        } else {
+                                            UI_SEPARATOR
+                                        }))
+                                        .bg(rgb(if active { UI_ACCENT_SOFT } else { UI_SURFACE }))
+                                        .cursor_pointer()
+                                        .hover(move |row| {
+                                            row.bg(rgb(if active {
+                                                0xdbeafd
+                                            } else {
+                                                UI_SURFACE_SUBTLE
+                                            }))
+                                        })
+                                        .on_click(cx.listener(move |reader, _, window, cx| {
+                                            reader.open_comment_from_list(id, window, cx);
+                                        }))
+                                        .child(div().w(px(4.0)).h_full().flex_none().bg(color))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .px_3()
+                                                .py_2()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(if active {
+                                                            rgb(UI_ACCENT)
+                                                        } else {
+                                                            rgb(UI_TEXT_SECONDARY)
+                                                        })
+                                                        .child(format!("PAGE {}", page + 1))
+                                                        .child("Open →"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .h(px(42.0))
+                                                        .overflow_hidden()
+                                                        .text_sm()
+                                                        .line_height(px(20.0))
+                                                        .text_color(rgb(UI_TEXT))
+                                                        .child(preview),
+                                                ),
+                                        ),
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(self.comment_list_scroll.clone())
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .bg(rgb(UI_SURFACE_SUBTLE))
+            .rounded_b_xl()
+            .into_any_element()
+        };
+
+        let list_error = self.annotation_error.clone().map(|message| {
+            div()
+                .mx_4()
+                .mt_3()
+                .p_3()
+                .rounded_md()
+                .bg(rgb(UI_ERROR_SOFT))
+                .text_xs()
+                .line_height(px(18.0))
+                .text_color(rgb(UI_ERROR))
+                .child(message)
+        });
+        let progress = self.comment_pane.progress;
+        let list_pane = div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(-SIDEBAR_WIDTH * progress))
+            .w_full()
+            .flex()
+            .flex_col()
+            .rounded_xl()
+            .bg(rgb(UI_SURFACE))
+            .child(list_header)
+            .children(list_error)
+            .child(list_body);
+
+        let editor_pane = self.comment_editor.clone().map(|editor| {
+            let title = if self.editing_annotation.is_some() {
+                "Edit Comment"
+            } else {
+                "New Comment"
+            };
+            let annotations_pending = self
+                .annotations
+                .as_ref()
+                .is_some_and(|annotations| annotations.revision() > self.annotation_saved_revision);
+            let save_status = if self.comment_draft_dirty
+                || self.comment_autosave_task.is_some()
+                || annotations_pending
+            {
+                "Saving…"
+            } else if self.editing_annotation.is_some() {
+                "Saved"
+            } else {
+                "Auto-save"
+            };
+            let editor_error = self.annotation_error.clone().map(|message| {
+                div()
+                    .mx_4()
+                    .mt_3()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(UI_ERROR_SOFT))
+                    .text_xs()
+                    .line_height(px(18.0))
+                    .text_color(rgb(UI_ERROR))
+                    .child(message)
+            });
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(SIDEBAR_WIDTH * (1.0 - progress)))
+                .w_full()
+                .flex()
+                .flex_col()
+                .rounded_xl()
+                .bg(rgb(UI_SURFACE))
+                .child(
+                    div()
+                        .h(px(54.0))
+                        .flex_none()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(rgb(UI_SEPARATOR))
+                        .child(Self::chrome_button(
+                            "fluid-comment-back",
+                            "‹ Back",
+                            ChromeButtonStyle::Ghost,
+                            true,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.return_to_comment_list(window, cx)
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .px_2()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .max_w(px(150.0))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(if save_status == "Saved" {
+                                            0x2f7d4a
+                                        } else {
+                                            UI_TEXT_SECONDARY
+                                        }))
+                                        .child(save_status),
+                                ),
+                        )
+                        .child(Self::chrome_button(
+                            "fluid-close-comment-editor",
+                            "Close",
+                            ChromeButtonStyle::Ghost,
+                            true,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.toggle_sidebar(SidePanel::Comments, window, cx)
+                            }),
+                        )),
+                )
+                .children(editor_error)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .child(editor),
+                )
+        });
+
+        div()
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .rounded_xl()
+            .bg(rgb(UI_SURFACE))
+            .text_color(rgb(UI_TEXT))
+            .child(list_pane)
+            .children(editor_pane)
+            .into_any_element()
+    }
+
+    fn render_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match self.view_mode {
+            ReaderView::Classic => self.render_classic_comments_panel(cx),
+            ReaderView::Fluid => self.render_fluid_comments_panel(cx),
+        }
+    }
+
+    fn render_classic_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let error = self.annotation_error.clone();
+        let editor_open = self.comment_editor.is_some();
+        let can_add_comment = annotation_actions_enabled(
+            self.context_range().is_some(),
+            self.annotations_loading,
+            self.annotation_persistence_blocked,
+            editor_open,
+        );
+        let context_has_comment = self.context_has_comment();
+        let annotations_pending = self
+            .annotations
+            .as_ref()
+            .is_some_and(|annotations| annotations.revision() > self.annotation_saved_revision);
+        let save_status = if self.comment_draft_dirty
+            || self.comment_autosave_task.is_some()
+            || annotations_pending
+        {
+            "Saving…"
+        } else if editor_open && self.editing_annotation.is_some() {
+            "Saved"
+        } else {
+            "Auto-save"
+        };
+        let title = if editor_open {
+            if self.editing_annotation.is_some() {
+                "Edit Comment"
+            } else {
+                "New Comment"
+            }
+        } else {
+            "Comments"
+        };
+        let header = div()
+            .h(px(54.0))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(rgb(UI_SEPARATOR))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(editor_open, |heading| {
+                        heading.child(Self::chrome_button(
+                            "classic-comment-back",
+                            "‹ Back",
+                            ChromeButtonStyle::Ghost,
+                            true,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.return_to_comment_list(window, cx)
+                            }),
+                        ))
+                    })
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .when(editor_open, |heading| {
+                        heading.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_full()
+                                .bg(rgb(if save_status == "Saved" {
+                                    0xe8f5ec
+                                } else {
+                                    UI_ACCENT_SOFT
+                                }))
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(if save_status == "Saved" {
+                                    0x2f7d4a
+                                } else {
+                                    UI_ACCENT
+                                }))
+                                .child(save_status),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .when(!editor_open, |actions| {
+                        actions.child(Self::chrome_button(
+                            "add-comment",
+                            if context_has_comment { "Edit" } else { "+ New" },
+                            ChromeButtonStyle::Neutral,
+                            can_add_comment,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.comment_on_context(window, cx)
+                            }),
+                        ))
+                    })
+                    .child(Self::chrome_button(
+                        "close-comments",
+                        "Close",
+                        ChromeButtonStyle::Ghost,
+                        true,
+                        cx.listener(|reader, _, window, cx| {
+                            reader.toggle_sidebar(SidePanel::Comments, window, cx)
+                        }),
+                    )),
+            );
+
+        let body = if let Some(editor) = self.comment_editor.clone() {
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .p_4()
+                .flex()
+                .flex_col()
+                .child(editor)
+                .into_any_element()
+        } else if self.comment_order.is_empty() {
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_6()
+                .text_center()
+                .child(
+                    div()
+                        .size(px(38.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(rgb(UI_ACCENT_SOFT))
+                        .text_color(rgb(UI_ACCENT))
+                        .text_lg()
+                        .child("✎"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(UI_TEXT))
+                        .child(if self.annotations_loading {
+                            "Loading comments…"
+                        } else if self.annotation_persistence_blocked {
+                            "Comments unavailable"
+                        } else {
+                            "No comments yet"
+                        }),
+                )
+                .child(
+                    div()
+                        .max_w(px(248.0))
+                        .text_xs()
+                        .line_height(px(18.0))
+                        .text_color(rgb(UI_TEXT_SECONDARY))
+                        .child(if self.annotation_persistence_blocked {
+                            "Resolve the annotation sidecar problem before adding comments."
+                        } else {
+                            "Select text in the document, then choose New Comment."
+                        }),
+                )
+                .into_any_element()
+        } else {
+            uniform_list(
+                "comment-list",
+                self.comment_order.len(),
+                cx.processor(|reader, range: std::ops::Range<usize>, _window, cx| {
+                    range
+                        .filter_map(|index| {
+                            let id = *reader.comment_order.get(index)?;
+                            let annotation = reader.annotations.as_ref()?.get(id)?;
+                            let page = annotation.range().start().page;
+                            let markdown = annotation.comment_markdown().unwrap_or("");
+                            let preview = RichTextBuffer::try_from_markdown(markdown)
+                                .map(|buffer| compact_preview(buffer.text(), 96))
+                                .unwrap_or_else(|_| compact_preview(markdown, 96));
+                            let preview: SharedString = preview.into();
+                            let color = match annotation.highlight() {
+                                Some(HighlightColor::Yellow) => rgb(0xffd447),
+                                Some(HighlightColor::Green) => rgb(0x55d987),
+                                Some(HighlightColor::Blue) => rgb(0x5aa7ff),
+                                Some(HighlightColor::Pink) => rgb(0xff75b7),
+                                Some(HighlightColor::Purple) => rgb(0xb98cff),
+                                None => rgb(0xf0a53b),
+                            };
+                            let active = reader.active_annotation == Some(id);
+                            Some(
+                                div().h(px(104.0)).w_full().px_3().py_1().child(
+                                    div()
+                                        .id(("comment", index))
+                                        .size_full()
+                                        .overflow_hidden()
+                                        .flex()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(if active {
+                                            0xb8d5f4
+                                        } else {
+                                            UI_SEPARATOR
+                                        }))
+                                        .bg(rgb(if active { UI_ACCENT_SOFT } else { UI_SURFACE }))
+                                        .cursor_pointer()
+                                        .hover(move |row| {
+                                            row.bg(rgb(if active {
+                                                0xdbeafd
+                                            } else {
+                                                UI_SURFACE_SUBTLE
+                                            }))
+                                        })
+                                        .on_click(cx.listener(move |reader, _, window, cx| {
+                                            reader.open_comment_from_list(id, window, cx);
+                                        }))
+                                        .child(div().w(px(4.0)).h_full().flex_none().bg(color))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .px_3()
+                                                .py_2()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .child(
+                                                            div()
+                                                                .text_color(if active {
+                                                                    rgb(UI_ACCENT)
+                                                                } else {
+                                                                    rgb(UI_TEXT_SECONDARY)
+                                                                })
+                                                                .child(format!(
+                                                                    "PAGE {}",
+                                                                    page + 1
+                                                                )),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id(("edit-comment", index))
+                                                                .px_2()
+                                                                .py_1()
+                                                                .overflow_hidden()
+                                                                .rounded_md()
+                                                                .text_color(rgb(UI_ACCENT))
+                                                                .hover(|button| {
+                                                                    button.bg(rgb(UI_ACCENT_SOFT))
+                                                                })
+                                                                .on_click(cx.listener(
+                                                                    move |reader, _, window, cx| {
+                                                                        reader.edit_comment(
+                                                                            id, window, cx,
+                                                                        )
+                                                                    },
+                                                                ))
+                                                                .child("Edit"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .h(px(44.0))
+                                                        .overflow_hidden()
+                                                        .text_sm()
+                                                        .line_height(px(20.0))
+                                                        .text_color(rgb(UI_TEXT))
+                                                        .child(preview),
+                                                ),
+                                        ),
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(self.comment_list_scroll.clone())
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .bg(rgb(UI_SURFACE_SUBTLE))
+            .into_any_element()
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(UI_SURFACE))
+            .text_color(rgb(UI_TEXT))
+            .child(header)
+            .children(error.map(|message| {
+                div()
+                    .mx_4()
+                    .mt_3()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(UI_ERROR_SOFT))
+                    .text_xs()
+                    .line_height(px(18.0))
+                    .text_color(rgb(UI_ERROR))
+                    .child(message)
+            }))
+            .child(body)
+            .into_any_element()
     }
 
     fn paint_document(snapshot: PaintSnapshot, bounds: Bounds<Pixels>, window: &mut Window) {
@@ -1405,7 +5467,21 @@ impl PdfReader {
             width: snapshot.viewport_width,
             height: snapshot.viewport_height,
         };
-        for page in snapshot.pages {
+        let mut pages = snapshot.pages;
+        pages.sort_by_key(|page| {
+            let has_active_annotation = page
+                .annotations
+                .iter()
+                .any(|annotation| Some(annotation.id) == snapshot.active_annotation);
+            let has_active_search = snapshot
+                .active_search
+                .is_some_and(|active| active.page == page.index);
+            !(has_active_annotation || has_active_search)
+        });
+        let mut annotation_budget = PaintBudget::new(MAX_VISIBLE_ANNOTATION_QUADS);
+        let mut search_budget = PaintBudget::new(MAX_VISIBLE_SEARCH_HIGHLIGHT_RUNS);
+        let mut selection_budget = PaintBudget::new(MAX_VISIBLE_SELECTION_QUADS);
+        for page in pages {
             let rect = page.rect;
             let page_bounds = Bounds::new(
                 point(
@@ -1415,13 +5491,13 @@ impl PdfReader {
                 size(px(rect.width), px(rect.height)),
             );
             let shadow_bounds = Bounds::new(
-                page_bounds.origin + point(px(0.0), px(3.0)),
-                page_bounds.size + size(px(0.0), px(5.0)),
+                page_bounds.origin + point(px(0.0), px(4.0)),
+                page_bounds.size + size(px(0.0), px(8.0)),
             );
             window.paint_quad(quad(
                 shadow_bounds,
-                px(3.0),
-                rgba(0x0b101833),
+                px(5.0),
+                rgba(0x090c1252),
                 px(0.0),
                 gpui::transparent_black(),
                 Default::default(),
@@ -1431,7 +5507,7 @@ impl PdfReader {
                 px(2.0),
                 gpui::white(),
                 px(1.0),
-                rgb(0xc8ccd3),
+                rgb(0xd8dadd),
                 Default::default(),
             ));
 
@@ -1455,7 +5531,111 @@ impl PdfReader {
                 );
             }
 
+            if let Some(chars) = page.text.as_ref() {
+                window.with_content_mask(
+                    Some(ContentMask {
+                        bounds: page_bounds,
+                    }),
+                    |window| {
+                        for annotation in &page.annotations {
+                            if annotation_budget.exhausted() {
+                                break;
+                            }
+                            let Some(range) =
+                                annotation.range.indices_on_page(page.index, chars.len())
+                            else {
+                                continue;
+                            };
+                            let active = Some(annotation.id) == snapshot.active_annotation;
+                            let color = match annotation.color {
+                                Some(HighlightColor::Yellow) if active => rgba(0xffd44788),
+                                Some(HighlightColor::Yellow) => rgba(0xffd44761),
+                                Some(HighlightColor::Green) if active => rgba(0x55d98788),
+                                Some(HighlightColor::Green) => rgba(0x55d98761),
+                                Some(HighlightColor::Blue) if active => rgba(0x5aa7ff88),
+                                Some(HighlightColor::Blue) => rgba(0x5aa7ff61),
+                                Some(HighlightColor::Pink) if active => rgba(0xff75b788),
+                                Some(HighlightColor::Pink) => rgba(0xff75b761),
+                                Some(HighlightColor::Purple) if active => rgba(0xb98cff88),
+                                Some(HighlightColor::Purple) => rgba(0xb98cff61),
+                                None if active => rgba(0xf0a53b78),
+                                None if annotation.has_comment => rgba(0xf0a53b3d),
+                                None => continue,
+                            };
+                            let exhausted = chars.for_each_visible_in_range_while(
+                                rect,
+                                content_viewport,
+                                range,
+                                |_, highlight| {
+                                    if !annotation_budget.take() {
+                                        return false;
+                                    }
+                                    window.paint_quad(quad(
+                                        content_rect_to_bounds(bounds, highlight, snapshot.scroll),
+                                        px(1.0),
+                                        color,
+                                        px(0.0),
+                                        gpui::transparent_black(),
+                                        Default::default(),
+                                    ));
+                                    !annotation_budget.exhausted()
+                                },
+                            );
+                            if !exhausted {
+                                break;
+                            }
+                        }
+                    },
+                );
+            }
+
+            if let Some(matches) = page.search.as_ref() {
+                window.with_content_mask(
+                    Some(ContentMask {
+                        bounds: page_bounds,
+                    }),
+                    |window| {
+                        let active = snapshot.active_search;
+                        for result in matches
+                            .iter()
+                            .filter(|result| !is_inactive(result.id, active))
+                            .chain(
+                                matches
+                                    .iter()
+                                    .filter(|result| is_inactive(result.id, active)),
+                            )
+                        {
+                            let is_active = !is_inactive(result.id, active);
+                            for run in &result.highlight_runs {
+                                if search_budget.exhausted() {
+                                    return;
+                                }
+                                let highlight = normalized_bounds_in_page(rect, *run);
+                                if !highlight.intersects(content_viewport) {
+                                    continue;
+                                }
+                                let painted = search_budget.take();
+                                debug_assert!(painted, "exhaustion checked above");
+                                window.paint_quad(quad(
+                                    content_rect_to_bounds(bounds, highlight, snapshot.scroll),
+                                    px(1.0),
+                                    if is_active {
+                                        rgba(0xff8a2b88)
+                                    } else {
+                                        rgba(0xf5c54255)
+                                    },
+                                    px(0.0),
+                                    gpui::transparent_black(),
+                                    Default::default(),
+                                ));
+                            }
+                        }
+                    },
+                );
+            }
+
             if let (Some(selection), Some(chars)) = (snapshot.selection, page.text)
+                && !selection_budget.exhausted()
                 && let Some(range) = selection.indices_on_page(page.index, chars.len())
             {
                 // Dense text pages are indexed once on the worker. Paint only
@@ -1466,11 +5646,14 @@ impl PdfReader {
                         bounds: page_bounds,
                     }),
                     |window| {
-                        chars.for_each_visible_in_range(
+                        chars.for_each_visible_in_range_while(
                             rect,
                             content_viewport,
                             range,
                             |_, highlight| {
+                                if !selection_budget.take() {
+                                    return false;
+                                }
                                 let highlight_bounds =
                                     content_rect_to_bounds(bounds, highlight, snapshot.scroll);
                                 window.paint_quad(quad(
@@ -1481,6 +5664,7 @@ impl PdfReader {
                                     gpui::transparent_black(),
                                     Default::default(),
                                 ));
+                                !selection_budget.exhausted()
                             },
                         );
                     },
@@ -1503,17 +5687,18 @@ impl PdfReader {
             window.paint_quad(quad(
                 thumb,
                 px(2.5),
-                rgba(0x4c586e99),
+                rgba(0xdce2eb8f),
                 px(0.0),
                 gpui::transparent_black(),
                 Default::default(),
             ));
         }
 
-        let max_x = (snapshot.layout.content_width - snapshot.viewport_width).max(0.0);
+        let max_x = snapshot.max_scroll_x;
         if max_x > 0.0 {
+            let effective_content_width = snapshot.viewport_width + max_x;
             let thumb_width = (snapshot.viewport_width * snapshot.viewport_width
-                / snapshot.layout.content_width)
+                / effective_content_width)
                 .max(38.0)
                 .min(snapshot.viewport_width);
             let travel = snapshot.viewport_width - thumb_width - 12.0;
@@ -1525,7 +5710,7 @@ impl PdfReader {
             window.paint_quad(quad(
                 thumb,
                 px(2.5),
-                rgba(0x4c586e99),
+                rgba(0xdce2eb8f),
                 px(0.0),
                 gpui::transparent_black(),
                 Default::default(),
@@ -1544,6 +5729,9 @@ impl Render for PdfReader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_viewport(window);
         self.request_visible_tiles(window);
+        let full_width = f32::from(window.viewport_size().width).max(1.0);
+        let compact_toolbar = full_width < 920.0;
+        let very_compact_toolbar = full_width < 800.0;
 
         let page_count = self
             .document
@@ -1562,8 +5750,25 @@ impl Render for PdfReader {
             .unwrap_or_else(|| "GPUI PDF Reader".into());
         let zoom_label: SharedString = format!("{}%", (self.zoom * 100.0).round() as u32).into();
         let status_text = self.status_text();
+        let document_open = page_count > 0;
+        let (zoom_out_enabled, zoom_in_enabled) = zoom_controls_enabled(document_open, self.zoom);
+        let editor_open = self.comment_editor.is_some();
+        let comments_label =
+            comments_toolbar_label(editor_open, compact_toolbar, very_compact_toolbar);
+        let has_annotation_context = self.context_range().is_some();
+        let show_annotation_tools = has_annotation_context && !editor_open;
+        let annotation_tools_enabled = annotation_actions_enabled(
+            has_annotation_context,
+            self.annotations_loading,
+            self.annotation_persistence_blocked,
+            editor_open,
+        );
+        let search_selected = self.sidebar.panel == SidePanel::Search && self.sidebar.target > 0.5;
+        let comments_selected =
+            self.sidebar.panel == SidePanel::Comments && self.sidebar.target > 0.5;
+        let show_status = !matches!(status_text.as_ref(), "Ready" | "Open a PDF to begin");
 
-        let toolbar = div()
+        let classic_toolbar = div()
             .h(px(TOOLBAR_HEIGHT))
             .flex_none()
             .w_full()
@@ -1571,61 +5776,316 @@ impl Render for PdfReader {
             .items_center()
             .gap_2()
             .px_3()
-            .bg(rgb(0x171d27))
+            .bg(rgb(UI_CHROME))
             .border_b_1()
-            .border_color(rgb(0x303949))
-            .text_color(rgb(0xd9dde5))
-            .child(Self::toolbar_button(
+            .border_color(rgb(UI_SEPARATOR))
+            .text_color(rgb(UI_TEXT))
+            .child(
+                div()
+                    .h_full()
+                    .w(px(TITLEBAR_CONTROL_INSET))
+                    .flex_none()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .child(Self::chrome_button(
                 "open-document",
-                "Open",
+                if very_compact_toolbar {
+                    "Open"
+                } else {
+                    "Open…"
+                },
+                ChromeButtonStyle::Ghost,
+                true,
                 cx.listener(|reader, _, window, cx| reader.open_dialog(&OpenDocument, window, cx)),
-            ))
-            .child(div().w(px(1.0)).h(px(24.0)).bg(rgb(0x394354)))
-            .child(Self::toolbar_button(
-                "zoom-out",
-                "−",
-                cx.listener(|reader, _, window, cx| reader.zoom_out(&ZoomOut, window, cx)),
-            ))
-            .child(div().w(px(58.0)).text_center().text_sm().child(zoom_label))
-            .child(Self::toolbar_button(
-                "zoom-in",
-                "+",
-                cx.listener(|reader, _, window, cx| reader.zoom_in(&ZoomIn, window, cx)),
-            ))
-            .child(Self::toolbar_button(
-                "fit-width",
-                "Fit",
-                cx.listener(|reader, _, window, cx| reader.fit_width(&FitWidth, window, cx)),
             ))
             .child(
                 div()
-                    .ml_2()
-                    .px_2()
-                    .h(px(30.0))
+                    .h(px(32.0))
                     .flex()
                     .items_center()
+                    .overflow_hidden()
                     .rounded_md()
-                    .bg(rgb(0x10151d))
-                    .text_sm()
-                    .child(if page_count == 0 {
-                        "No document".to_owned()
-                    } else {
-                        format!("Page {current_page} / {page_count}")
+                    .border_1()
+                    .border_color(rgb(UI_SEPARATOR))
+                    .bg(rgb(UI_CONTROL))
+                    .child(Self::segment_button(
+                        "zoom-out",
+                        "−",
+                        zoom_out_enabled,
+                        cx.listener(|reader, _, window, cx| reader.zoom_out(&ZoomOut, window, cx)),
+                    ))
+                    .child(
+                        div()
+                            .h_full()
+                            .min_w(px(54.0))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .border_l_1()
+                            .border_r_1()
+                            .border_color(rgb(UI_SEPARATOR))
+                            .text_sm()
+                            .text_color(rgb(if document_open {
+                                UI_TEXT
+                            } else {
+                                UI_TEXT_TERTIARY
+                            }))
+                            .child(zoom_label.clone()),
+                    )
+                    .child(Self::segment_button(
+                        "zoom-in",
+                        "+",
+                        zoom_in_enabled,
+                        cx.listener(|reader, _, window, cx| reader.zoom_in(&ZoomIn, window, cx)),
+                    ))
+                    .when(!very_compact_toolbar, |controls| {
+                        controls
+                            .child(div().h_full().w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+                            .child(Self::segment_button(
+                                "fit-width",
+                                if compact_toolbar { "Fit" } else { "Fit Width" },
+                                document_open,
+                                cx.listener(|reader, _, window, cx| {
+                                    reader.fit_width(&FitWidth, window, cx)
+                                }),
+                            ))
                     }),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
-                    .px_3()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_sm()
-                    .text_color(rgb(0xaeb6c5))
-                    .child(filename),
+                    .h_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .window_control_area(WindowControlArea::Drag)
+                    .when(!compact_toolbar, |title| {
+                        title.child(
+                            div()
+                                .min_w(px(0.0))
+                                .max_w(px(260.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(filename.clone()),
+                        )
+                    })
+                    .when(document_open && !very_compact_toolbar, |title| {
+                        title.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_full()
+                                .bg(rgb(UI_CONTROL_HOVER))
+                                .text_xs()
+                                .text_color(rgb(UI_TEXT_SECONDARY))
+                                .child(format!("{current_page} / {page_count}")),
+                        )
+                    })
+                    .when(show_status, |title| {
+                        title.child(
+                            div()
+                                .max_w(px(180.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .text_color(rgb(UI_TEXT_SECONDARY))
+                                .child(status_text.clone()),
+                        )
+                    }),
             )
-            .child(div().text_xs().text_color(rgb(0x8f9aab)).child(status_text));
+            .when(show_annotation_tools, |toolbar| {
+                toolbar.child(
+                    div()
+                        .h(px(34.0))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(UI_SEPARATOR))
+                        .bg(rgb(UI_CONTROL))
+                        .when(!compact_toolbar, |palette| {
+                            palette.child(
+                                div()
+                                    .pl_2()
+                                    .pr_1()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(UI_TEXT_SECONDARY))
+                                    .child("Highlight"),
+                            )
+                        })
+                        .children(
+                            [
+                                "highlight-yellow",
+                                "highlight-green",
+                                "highlight-blue",
+                                "highlight-pink",
+                                "highlight-purple",
+                            ]
+                            .into_iter()
+                            .zip(HighlightColor::ALL)
+                            .map(|(id, color)| {
+                                Self::highlight_button(
+                                    id,
+                                    color,
+                                    annotation_tools_enabled,
+                                    cx.listener(move |reader, _, _, cx| {
+                                        reader.add_highlight(color, cx)
+                                    }),
+                                )
+                            }),
+                        )
+                        .child(div().h(px(22.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+                        .child(Self::segment_button(
+                            "add-selection-comment",
+                            if self.context_has_comment() {
+                                if very_compact_toolbar {
+                                    "Edit"
+                                } else {
+                                    "Edit Comment"
+                                }
+                            } else if very_compact_toolbar {
+                                "Note"
+                            } else {
+                                "Comment"
+                            },
+                            annotation_tools_enabled,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.comment_on_context(window, cx)
+                            }),
+                        )),
+                )
+            })
+            .when(
+                !(very_compact_toolbar && show_annotation_tools),
+                |toolbar| {
+                    toolbar
+                        .child(Self::chrome_button(
+                            "toggle-search",
+                            if compact_toolbar { "Find" } else { "Search" },
+                            if search_selected {
+                                ChromeButtonStyle::Selected
+                            } else {
+                                ChromeButtonStyle::Ghost
+                            },
+                            document_open,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.find_document(&Find, window, cx)
+                            }),
+                        ))
+                        .child(Self::chrome_button(
+                            "toggle-comments",
+                            comments_label,
+                            if comments_selected {
+                                ChromeButtonStyle::Selected
+                            } else {
+                                ChromeButtonStyle::Ghost
+                            },
+                            document_open,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.toggle_comments(&ToggleComments, window, cx)
+                            }),
+                        ))
+                },
+            );
+
+        let fluid_toolbar = div()
+            .h(px(TOOLBAR_HEIGHT))
+            .flex_none()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .bg(rgb(UI_CHROME))
+            .border_b_1()
+            .border_color(rgb(UI_SEPARATOR))
+            .text_color(rgb(UI_TEXT))
+            .child(
+                div()
+                    .h_full()
+                    .w(px(TITLEBAR_CONTROL_INSET))
+                    .flex_none()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .child(Self::chrome_button(
+                "fluid-open-document",
+                "Open…",
+                ChromeButtonStyle::Ghost,
+                true,
+                cx.listener(|reader, _, window, cx| reader.open_dialog(&OpenDocument, window, cx)),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(
+                        div()
+                            .max_w(px(320.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(filename.clone()),
+                    )
+                    .when(document_open, |title| {
+                        title.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_full()
+                                .bg(rgb(UI_CONTROL_HOVER))
+                                .text_xs()
+                                .text_color(rgb(UI_TEXT_SECONDARY))
+                                .child(format!("{current_page} / {page_count}")),
+                        )
+                    })
+                    .when(show_status && !compact_toolbar, |title| {
+                        title.child(
+                            div()
+                                .max_w(px(180.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .text_color(rgb(UI_TEXT_SECONDARY))
+                                .child(status_text.clone()),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_full()
+                    .bg(rgb(UI_ACCENT_SOFT))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(UI_ACCENT))
+                    .child("Fluid"),
+            );
+
+        let toolbar = match self.view_mode {
+            ReaderView::Classic => classic_toolbar.into_any_element(),
+            ReaderView::Fluid => fluid_toolbar.into_any_element(),
+        };
 
         let content = if let Some(layout) = self.layout() {
             let visible = layout.visible_pages(
@@ -1637,11 +6097,31 @@ impl Render for PdfReader {
                 .filter_map(|index| {
                     let rect = layout.page_rect(index)?;
                     let desired = desired_raster_size(rect, window.scale_factor());
+                    let mut paint_annotations: Vec<_> = self
+                        .annotations
+                        .as_ref()
+                        .map(|annotations| {
+                            annotations
+                                .on_page(index)
+                                .map(|annotation| PaintAnnotation {
+                                    id: annotation.id(),
+                                    range: annotation.range(),
+                                    color: annotation.highlight(),
+                                    has_comment: annotation.comment_markdown().is_some(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    paint_annotations.sort_by_key(|annotation| {
+                        is_inactive(annotation.id, self.active_annotation)
+                    });
                     Some(PaintPage {
                         index,
                         rect,
                         tiles: self.paint_tiles_for_page(index, rect, desired),
                         text: self.page_text.get(&index).cloned(),
+                        annotations: paint_annotations,
+                        search: self.search.pages.get(&index).cloned(),
                     })
                 })
                 .collect();
@@ -1650,15 +6130,19 @@ impl Render for PdfReader {
                 pages,
                 scroll: self.scroll,
                 selection: self.selection,
+                active_annotation: self.active_annotation,
+                active_search: self.search.active,
                 viewport_width: self.viewport_width,
                 viewport_height: self.viewport_height,
+                max_scroll_x: self.max_scroll_x(layout),
             };
             div()
                 .id("document-viewport")
-                .flex_1()
-                .w_full()
+                .flex_none()
+                .h_full()
+                .w(px(self.viewport_width))
                 .overflow_hidden()
-                .bg(rgb(0x454d59))
+                .bg(rgb(UI_CANVAS))
                 .cursor(if self.pan.is_some() {
                     CursorStyle::ClosedHand
                 } else {
@@ -1683,26 +6167,52 @@ impl Render for PdfReader {
         } else {
             div()
                 .id("empty-state")
-                .flex_1()
-                .w_full()
+                .flex_none()
+                .h_full()
+                .w(px(self.viewport_width))
                 .flex()
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap_4()
-                .bg(rgb(0x343c48))
-                .text_color(rgb(0xe7eaf0))
-                .child(div().text_3xl().child("GPUI PDF Reader"))
+                .gap_3()
+                .bg(rgb(UI_CANVAS_EMPTY))
+                .text_color(rgb(0xf7f8fa))
                 .child(
                     div()
-                        .max_w(px(520.0))
-                        .text_center()
-                        .text_color(rgb(0xaeb7c5))
-                        .child("Fast native PDF reading with smooth two-axis scrolling, zoom, and selectable text."),
+                        .mb_2()
+                        .size(px(58.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgba(0xffffff26))
+                        .bg(rgba(0xffffff12))
+                        .shadow_sm()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("PDF"),
                 )
-                .child(Self::toolbar_button(
+                .child(
+                    div()
+                        .text_2xl()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Open a document"),
+                )
+                .child(
+                    div()
+                        .max_w(px(430.0))
+                        .text_center()
+                        .text_sm()
+                        .line_height(px(21.0))
+                        .text_color(rgb(0xbac1cc))
+                        .child("Read, search, highlight, and comment with a fast native PDF workspace."),
+                )
+                .child(Self::chrome_button(
                     "empty-open-document",
-                    "Open a PDF",
+                    "Choose PDF…",
+                    ChromeButtonStyle::Primary,
+                    true,
                     cx.listener(|reader, _, window, cx| {
                         reader.open_dialog(&OpenDocument, window, cx)
                     }),
@@ -1711,10 +6221,129 @@ impl Render for PdfReader {
                     div()
                         .mt_2()
                         .text_xs()
-                        .text_color(rgb(0x8894a6))
-                        .child("Trackpad or wheel to scroll • Pinch or ⌘-wheel to zoom • Middle-drag to pan"),
+                        .text_color(rgb(0x8f99a7))
+                        .child("⌘O to open  ·  Pinch or ⌘-scroll to zoom"),
                 )
                 .into_any_element()
+        };
+
+        let sidebar_content = match self.sidebar.panel {
+            SidePanel::Comments => self.render_comments_panel(cx),
+            SidePanel::Search => self.render_search_panel(cx),
+        };
+        let workspace = match self.view_mode {
+            ReaderView::Classic => {
+                let sidebar_width = self.sidebar.available_width(full_width);
+                let sidebar_inner_width =
+                    SIDEBAR_WIDTH.min((full_width - MIN_DOCUMENT_VIEWPORT_WIDTH).max(0.0));
+                let sidebar = div()
+                    .id("reader-sidebar")
+                    .h_full()
+                    .w(px(sidebar_width))
+                    .flex_none()
+                    .overflow_hidden()
+                    .bg(rgb(UI_SURFACE))
+                    .border_l_1()
+                    .border_color(rgb(UI_SEPARATOR))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(px(sidebar_inner_width))
+                            .child(sidebar_content),
+                    );
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .flex()
+                    .child(content)
+                    .child(sidebar)
+                    .into_any_element()
+            }
+            ReaderView::Fluid => {
+                let panel_width = self.fluid_panel_width();
+                let panel_reveal = self.fluid_panel_occlusion();
+                let available_width = (self.viewport_width - panel_reveal).max(1.0);
+                let main_pill = self.render_fluid_main_pill(
+                    FluidPillState {
+                        available_width,
+                        document_open,
+                        zoom_out_enabled,
+                        zoom_in_enabled,
+                        zoom_label,
+                        search_selected,
+                        comments_selected,
+                    },
+                    cx,
+                );
+                let has_stable_selection = self
+                    .selection
+                    .is_some_and(|selection| selection.anchor != selection.focus);
+                let show_context_pill = !self.selecting
+                    && self.comment_editor.is_none()
+                    && (has_stable_selection || self.active_annotation.is_some());
+                let context_enabled = show_context_pill
+                    && !self.annotations_loading
+                    && !self.annotation_persistence_blocked;
+                let context_pill = show_context_pill
+                    .then(|| self.context_anchor_in_viewport())
+                    .flatten()
+                    .map(|anchor| {
+                        let position = floating_pill_position(
+                            anchor,
+                            available_width,
+                            self.viewport_height,
+                            FLUID_CONTEXT_PILL_WIDTH,
+                            FLUID_CONTEXT_PILL_HEIGHT,
+                        );
+                        self.render_fluid_context_pill(position, context_enabled, cx)
+                    });
+                let sidebar = div()
+                    .id("fluid-sidebar-reveal")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(panel_reveal))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id("reader-sidebar")
+                            .occlude()
+                            .absolute()
+                            .top(px(FLUID_PANEL_VERTICAL_MARGIN))
+                            .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
+                            .right(px(FLUID_PANEL_HORIZONTAL_MARGIN))
+                            .w(px(panel_width))
+                            .overflow_hidden()
+                            .rounded_xl()
+                            .border_1()
+                            .border_color(rgba(0x00000020))
+                            .bg(rgb(UI_SURFACE))
+                            .shadow_sm()
+                            .child(sidebar_content),
+                    );
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .overflow_hidden()
+                    .child(content)
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(14.0))
+                            .left_0()
+                            .w(px(available_width))
+                            .flex()
+                            .justify_center()
+                            .child(main_pill),
+                    )
+                    .children(context_pill)
+                    .child(sidebar)
+                    .into_any_element()
+            }
         };
 
         let error_bar = if let ReaderStatus::Error(message) = &self.status {
@@ -1726,8 +6355,8 @@ impl Render for PdfReader {
                     .flex()
                     .items_center()
                     .px_3()
-                    .bg(rgb(0x6f2730))
-                    .text_color(rgb(0xffe8eb))
+                    .bg(rgb(UI_ERROR_SOFT))
+                    .text_color(rgb(UI_ERROR))
                     .text_sm()
                     .child(message.clone()),
             )
@@ -1741,7 +6370,7 @@ impl Render for PdfReader {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x343c48))
+            .bg(rgb(UI_CANVAS))
             .on_action(cx.listener(Self::open_dialog))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
@@ -1749,6 +6378,10 @@ impl Render for PdfReader {
             .on_action(cx.listener(Self::fit_width))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::edit_copy))
+            .on_action(cx.listener(Self::edit_cut))
+            .on_action(cx.listener(Self::edit_paste))
+            .on_action(cx.listener(Self::edit_select_all))
             .on_action(cx.listener(Self::scroll_up))
             .on_action(cx.listener(Self::scroll_down))
             .on_action(cx.listener(Self::scroll_left))
@@ -1757,9 +6390,17 @@ impl Render for PdfReader {
             .on_action(cx.listener(Self::page_down))
             .on_action(cx.listener(Self::first_page))
             .on_action(cx.listener(Self::last_page))
+            .on_action(cx.listener(Self::find_document))
+            .on_action(cx.listener(Self::toggle_comments))
+            .on_action(cx.listener(Self::add_comment))
+            .on_action(cx.listener(Self::next_search_result))
+            .on_action(cx.listener(Self::previous_search_result))
+            .on_action(cx.listener(Self::use_classic_view))
+            .on_action(cx.listener(Self::use_fluid_view))
+            .on_action(cx.listener(Self::quit_application))
             .child(toolbar)
             .children(error_bar)
-            .child(content)
+            .child(workspace)
     }
 }
 
@@ -1769,6 +6410,16 @@ struct PaintPage {
     rect: Rect,
     tiles: Vec<PaintTile>,
     text: Option<Arc<TextLayer>>,
+    annotations: Vec<PaintAnnotation>,
+    search: Option<Arc<[SearchMatch]>>,
+}
+
+#[derive(Clone, Copy)]
+struct PaintAnnotation {
+    id: AnnotationId,
+    range: TextRange,
+    color: Option<HighlightColor>,
+    has_comment: bool,
 }
 
 #[derive(Clone)]
@@ -1784,8 +6435,54 @@ struct PaintSnapshot {
     pages: Vec<PaintPage>,
     scroll: Offset,
     selection: Option<TextSelection>,
+    active_annotation: Option<AnnotationId>,
+    active_search: Option<SearchMatchId>,
     viewport_width: f32,
     viewport_height: f32,
+    max_scroll_x: f32,
+}
+
+fn normalized_bounds_in_page(page: Rect, bounds: TextBounds) -> Rect {
+    Rect {
+        x: page.x + bounds.left * page.width,
+        y: page.y + bounds.top * page.height,
+        width: (bounds.right - bounds.left).max(0.0) * page.width,
+        height: (bounds.bottom - bounds.top).max(0.0) * page.height,
+    }
+}
+
+fn compact_preview(text: &str, max_characters: usize) -> String {
+    let mut result = String::new();
+    let mut previous_space = true;
+    let mut character_count = 0;
+    for value in text.chars() {
+        if value.is_whitespace() {
+            if !previous_space {
+                result.push(' ');
+                previous_space = true;
+                character_count += 1;
+            }
+        } else {
+            if character_count >= max_characters {
+                break;
+            }
+            result.push(value);
+            previous_space = false;
+            character_count += 1;
+        }
+    }
+    while result.ends_with(' ') {
+        result.pop();
+    }
+    if text.chars().filter(|value| !value.is_whitespace()).count()
+        > result
+            .chars()
+            .filter(|value| !value.is_whitespace())
+            .count()
+    {
+        result.push('…');
+    }
+    result
 }
 
 fn desired_raster_size(page_rect: Rect, scale_factor: f32) -> RasterSize {
@@ -2050,6 +6747,33 @@ fn content_rect_to_bounds(canvas: Bounds<Pixels>, rect: Rect, scroll: Offset) ->
 mod tests {
     use super::*;
 
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "gpui-pdf-reader-reader-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn letter_pages(count: usize) -> Vec<PageSize> {
         vec![
             PageSize {
@@ -2058,6 +6782,116 @@ mod tests {
             };
             count
         ]
+    }
+
+    #[test]
+    fn annotation_controls_enable_for_any_writable_text_context_without_an_open_editor() {
+        assert!(annotation_actions_enabled(true, false, false, false));
+        assert!(!annotation_actions_enabled(false, false, false, false));
+        assert!(!annotation_actions_enabled(true, true, false, false));
+        assert!(!annotation_actions_enabled(true, false, true, false));
+        assert!(!annotation_actions_enabled(true, false, false, true));
+    }
+
+    #[test]
+    fn zoom_controls_disable_without_a_document_and_at_their_exact_limits() {
+        assert_eq!(zoom_controls_enabled(false, 1.0), (false, false));
+        assert_eq!(zoom_controls_enabled(true, MIN_ZOOM), (false, true));
+        assert_eq!(zoom_controls_enabled(true, 1.0), (true, true));
+        assert_eq!(zoom_controls_enabled(true, MAX_ZOOM), (true, false));
+    }
+
+    #[test]
+    fn only_a_modified_open_comment_requires_discard_confirmation() {
+        assert!(!comment_draft_needs_confirmation(false, false));
+        assert!(!comment_draft_needs_confirmation(false, true));
+        assert!(!comment_draft_needs_confirmation(true, false));
+        assert!(comment_draft_needs_confirmation(true, true));
+    }
+
+    #[test]
+    fn hidden_comment_editor_remains_visible_in_the_responsive_toolbar_label() {
+        assert_eq!(comments_toolbar_label(false, false, false), "Comments");
+        assert_eq!(comments_toolbar_label(false, true, true), "Notes");
+        assert_eq!(
+            comments_toolbar_label(true, false, false),
+            "Comments · Editing"
+        );
+        assert_eq!(comments_toolbar_label(true, true, false), "Notes •");
+        assert_eq!(comments_toolbar_label(true, true, true), "Notes •");
+    }
+
+    #[test]
+    fn fluid_context_pill_stays_on_screen_and_prefers_below_the_selection() {
+        let below = floating_pill_position(
+            Rect {
+                x: 160.0,
+                y: 120.0,
+                width: 80.0,
+                height: 18.0,
+            },
+            500.0,
+            600.0,
+            FLUID_CONTEXT_PILL_WIDTH,
+            FLUID_CONTEXT_PILL_HEIGHT,
+        );
+        assert_eq!(below.y, 148.0);
+        assert!((below.x - 93.0).abs() < f32::EPSILON);
+
+        let clamped_left = floating_pill_position(
+            Rect {
+                x: -200.0,
+                y: 20.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            500.0,
+            600.0,
+            FLUID_CONTEXT_PILL_WIDTH,
+            FLUID_CONTEXT_PILL_HEIGHT,
+        );
+        assert_eq!(clamped_left.x, 12.0);
+
+        let above = floating_pill_position(
+            Rect {
+                x: 450.0,
+                y: 570.0,
+                width: 30.0,
+                height: 18.0,
+            },
+            500.0,
+            600.0,
+            FLUID_CONTEXT_PILL_WIDTH,
+            FLUID_CONTEXT_PILL_HEIGHT,
+        );
+        assert_eq!(above.x, 274.0);
+        assert_eq!(above.y, 520.0);
+    }
+
+    #[test]
+    fn comment_pane_slides_both_directions_and_only_closes_after_back_finishes() {
+        let mut pane = CommentPaneState::default();
+        pane.show_editor(true);
+        assert_eq!(pane.target, 1.0);
+        assert!(!pane.close_editor_on_finish);
+        for _ in 0..240 {
+            pane.advance(1.0 / 60.0);
+        }
+        assert_eq!(pane.progress, 1.0);
+        assert!(!pane.is_animating());
+
+        pane.show_list(true);
+        assert_eq!(pane.target, 0.0);
+        assert!(pane.close_editor_on_finish);
+        pane.advance(1.0 / 60.0);
+        assert!(pane.progress > 0.0);
+        assert!(pane.is_animating());
+        for _ in 0..240 {
+            pane.advance(1.0 / 60.0);
+        }
+        assert_eq!(pane.progress, 0.0);
+        assert!(!pane.is_animating());
+        assert!(pane.close_editor_on_finish);
     }
 
     #[test]
@@ -2262,5 +7096,339 @@ mod tests {
         assert!((maximum - 1.5_f32.exp()).abs() < f32::EPSILON);
         assert!((minimum - (-1.5_f32).exp()).abs() < f32::EPSILON);
         assert!(minimum > 0.0 && maximum.is_finite());
+    }
+
+    #[test]
+    fn sidebar_animation_opens_closes_reverses_and_clamps_width() {
+        let mut sidebar = SidebarState::default();
+        assert_eq!(sidebar.available_width(1_200.0), 0.0);
+        sidebar.toggle(SidePanel::Comments);
+        assert_eq!(sidebar.target, 1.0);
+
+        let mut previous = sidebar.progress;
+        for _ in 0..240 {
+            sidebar.advance(1.0 / 60.0);
+            assert!(sidebar.progress >= previous);
+            assert!((0.0..=1.0).contains(&sidebar.progress));
+            previous = sidebar.progress;
+        }
+        assert_eq!(sidebar.progress, 1.0);
+        assert_eq!(sidebar.available_width(1_200.0), SIDEBAR_WIDTH);
+        assert_eq!(sidebar.available_width(500.0), 200.0);
+        assert_eq!(sidebar.available_width(250.0), 0.0);
+
+        sidebar.toggle(SidePanel::Comments);
+        sidebar.advance(1.0 / 60.0);
+        let closing_progress = sidebar.progress;
+        assert!(closing_progress < 1.0);
+        sidebar.toggle(SidePanel::Comments);
+        assert_eq!(sidebar.target, 1.0);
+        sidebar.advance(1.0 / 60.0);
+        assert!(sidebar.progress > closing_progress);
+
+        sidebar.toggle(SidePanel::Comments);
+        for _ in 0..240 {
+            sidebar.advance(1.0 / 60.0);
+        }
+        assert_eq!(sidebar.progress, 0.0);
+        assert!(!sidebar.is_animating());
+    }
+
+    #[test]
+    fn paint_budget_is_hard_and_active_items_sort_first() {
+        let mut budget = PaintBudget::new(3);
+        assert!(!budget.exhausted());
+        assert!(budget.take());
+        assert!(budget.take());
+        assert!(budget.take());
+        assert!(budget.exhausted());
+        assert!(!budget.take());
+        assert!(!budget.take());
+
+        let mut ids = [AnnotationId(3), AnnotationId(1), AnnotationId(2)];
+        ids.sort_by_key(|id| is_inactive(*id, Some(AnnotationId(2))));
+        assert_eq!(ids[0], AnnotationId(2));
+        assert!(ids[1..].contains(&AnnotationId(1)));
+        assert!(ids[1..].contains(&AnnotationId(3)));
+    }
+
+    #[test]
+    fn switching_sidebar_panels_keeps_the_sidebar_open() {
+        let mut sidebar = SidebarState::default();
+        sidebar.toggle(SidePanel::Comments);
+        for _ in 0..240 {
+            sidebar.advance(1.0 / 60.0);
+        }
+        sidebar.toggle(SidePanel::Search);
+        assert_eq!(sidebar.panel, SidePanel::Search);
+        assert_eq!(sidebar.target, 1.0);
+        assert_eq!(sidebar.progress, 1.0);
+    }
+
+    #[test]
+    fn search_navigation_handles_initial_stale_and_wrapped_results() {
+        let first = SearchMatchId {
+            page: 0,
+            start: 2,
+            end: 5,
+        };
+        let second = SearchMatchId {
+            page: 2,
+            start: 7,
+            end: 10,
+        };
+        let stale = SearchMatchId {
+            page: 9,
+            start: 0,
+            end: 0,
+        };
+        let results = [first, second];
+
+        assert_eq!(next_search_match_id(&[], None, true), None);
+        assert_eq!(next_search_match_id(&results, None, true), Some(first));
+        assert_eq!(next_search_match_id(&results, None, false), Some(second));
+        assert_eq!(
+            next_search_match_id(&results, Some(first), true),
+            Some(second)
+        );
+        assert_eq!(
+            next_search_match_id(&results, Some(second), true),
+            Some(first)
+        );
+        assert_eq!(
+            next_search_match_id(&results, Some(first), false),
+            Some(second)
+        );
+        assert_eq!(
+            next_search_match_id(&results, Some(stale), true),
+            Some(first)
+        );
+        assert_eq!(
+            next_search_match_id(&results, Some(stale), false),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn pending_document_open_waits_opens_or_cancels_without_losing_its_path() {
+        let first = PathBuf::from("next.pdf");
+        let mut pending = Some(first.clone());
+
+        assert_eq!(
+            transition_pending_open(&mut pending, Some(6), 5, false),
+            PendingOpenTransition::Waiting
+        );
+        assert_eq!(pending, Some(first.clone()));
+        assert_eq!(
+            transition_pending_open(&mut pending, Some(6), 6, false),
+            PendingOpenTransition::Open(first)
+        );
+        assert_eq!(pending, None);
+
+        let replacement = PathBuf::from("replacement.pdf");
+        pending = Some(replacement.clone());
+        assert_eq!(
+            transition_pending_open(&mut pending, Some(1), 0, true),
+            PendingOpenTransition::Cancelled(replacement)
+        );
+        assert_eq!(pending, None);
+        assert_eq!(
+            transition_pending_open(&mut pending, None, 0, false),
+            PendingOpenTransition::None
+        );
+    }
+
+    #[test]
+    fn comment_previews_collapse_whitespace_and_truncate_by_unicode_character() {
+        assert_eq!(compact_preview("  Café\n\t日本語  ", 32), "Café 日本語");
+        assert_eq!(compact_preview("😀😀😀😀", 3), "😀😀😀…");
+        assert_eq!(compact_preview("one   two three", 7), "one two…");
+        assert_eq!(compact_preview("", 3), "");
+    }
+
+    #[test]
+    fn annotation_io_revalidates_pdf_identity_immediately_before_save() {
+        let directory = TestDirectory::new("identity-recheck");
+        let pdf = directory.path().join("document.pdf");
+        std::fs::write(&pdf, b"original pdf bytes").unwrap();
+        let identity = DocumentIdentity::from_pdf(&pdf, 1).unwrap();
+        let mut annotations = AnnotationSet::new(1);
+        annotations
+            .add(
+                TextRange::new(
+                    TextPosition { page: 0, index: 0 },
+                    TextPosition { page: 0, index: 4 },
+                ),
+                Some(HighlightColor::Yellow),
+                None,
+            )
+            .unwrap();
+
+        std::fs::write(&pdf, b"changed pdf bytes that invalidate identity").unwrap();
+        let (io, events) = AnnotationIo::start();
+        assert!(io.save(7, pdf.clone(), identity, 0, annotations));
+        let event = events.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            event,
+            AnnotationIoEvent::Failed {
+                generation: 7,
+                operation: AnnotationIoOperation::Save,
+                revision: Some(1),
+                ..
+            }
+        ));
+        assert!(!crate::annotations::sidecar_path(&pdf).unwrap().exists());
+    }
+
+    #[test]
+    fn annotation_io_queued_revisions_leave_the_latest_snapshot_on_disk() {
+        let directory = TestDirectory::new("latest-revision");
+        let pdf = directory.path().join("document.pdf");
+        std::fs::write(&pdf, b"stable pdf bytes").unwrap();
+        let identity = DocumentIdentity::from_pdf(&pdf, 1).unwrap();
+        let range = TextRange::new(
+            TextPosition { page: 0, index: 1 },
+            TextPosition { page: 0, index: 3 },
+        );
+        let mut revision_one = AnnotationSet::new(1);
+        revision_one
+            .add(range, Some(HighlightColor::Green), None)
+            .unwrap();
+        let mut revision_two = revision_one.clone();
+        revision_two
+            .add(
+                TextRange::new(
+                    TextPosition { page: 0, index: 8 },
+                    TextPosition { page: 0, index: 12 },
+                ),
+                None,
+                Some("**persisted** comment".into()),
+            )
+            .unwrap();
+
+        let (io, events) = AnnotationIo::start();
+        assert!(io.save(3, pdf.clone(), identity.clone(), 0, revision_one));
+        assert!(io.save(3, pdf.clone(), identity.clone(), 0, revision_two.clone()));
+        let mut revisions = Vec::new();
+        loop {
+            match events.recv_timeout(Duration::from_secs(2)).unwrap() {
+                AnnotationIoEvent::Saved { revision, .. } => {
+                    revisions.push(revision);
+                    if revision == 2 {
+                        break;
+                    }
+                }
+                AnnotationIoEvent::Failed { message, .. } => panic!("save failed: {message}"),
+                AnnotationIoEvent::Loaded { .. } => panic!("unexpected load event"),
+            }
+        }
+        assert!(matches!(revisions.as_slice(), [2] | [1, 2]));
+        assert_eq!(load_sidecar(&pdf, &identity).unwrap(), revision_two);
+    }
+
+    #[test]
+    fn annotation_io_rejects_a_stale_second_writer_without_overwriting_disk() {
+        let directory = TestDirectory::new("concurrent-writers");
+        let pdf = directory.path().join("document.pdf");
+        std::fs::write(&pdf, b"stable pdf bytes").unwrap();
+        let identity = DocumentIdentity::from_pdf(&pdf, 1).unwrap();
+
+        let (first_writer, first_events) = AnnotationIo::start();
+        let (second_writer, second_events) = AnnotationIo::start();
+        assert!(first_writer.load(11, pdf.clone(), 1));
+        assert!(second_writer.load(22, pdf.clone(), 1));
+        for events in [&first_events, &second_events] {
+            match events.recv_timeout(Duration::from_secs(2)).unwrap() {
+                AnnotationIoEvent::Loaded { annotations, .. } => {
+                    assert_eq!(annotations.revision(), 0)
+                }
+                AnnotationIoEvent::Saved { .. } => panic!("unexpected save event during load"),
+                AnnotationIoEvent::Failed { message, .. } => {
+                    panic!("initial sidecar load failed: {message}")
+                }
+            }
+        }
+
+        let first_range = TextRange::new(
+            TextPosition { page: 0, index: 1 },
+            TextPosition { page: 0, index: 3 },
+        );
+        let mut first_revision = AnnotationSet::new(1);
+        first_revision
+            .add(first_range, Some(HighlightColor::Green), None)
+            .unwrap();
+        assert!(first_writer.save(11, pdf.clone(), identity.clone(), 0, first_revision.clone(),));
+        assert!(matches!(
+            first_events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AnnotationIoEvent::Saved {
+                generation: 11,
+                revision: 1
+            }
+        ));
+
+        let mut first_latest = first_revision;
+        first_latest
+            .add(
+                TextRange::new(
+                    TextPosition { page: 0, index: 8 },
+                    TextPosition { page: 0, index: 12 },
+                ),
+                None,
+                Some("first writer's comment".into()),
+            )
+            .unwrap();
+        // The deliberately stale fallback proves that a successful local save
+        // advanced the worker's observed on-disk revision from 0 to 1.
+        assert!(first_writer.save(11, pdf.clone(), identity.clone(), 0, first_latest.clone(),));
+        assert!(matches!(
+            first_events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AnnotationIoEvent::Saved {
+                generation: 11,
+                revision: 2
+            }
+        ));
+
+        let mut stale_second_writer = AnnotationSet::new(1);
+        stale_second_writer
+            .add(first_range, Some(HighlightColor::Purple), None)
+            .unwrap();
+        assert!(second_writer.save(22, pdf.clone(), identity.clone(), 0, stale_second_writer,));
+        match second_events.recv_timeout(Duration::from_secs(2)).unwrap() {
+            AnnotationIoEvent::Failed {
+                generation: 22,
+                operation: AnnotationIoOperation::Save,
+                revision: Some(1),
+                message,
+            } => {
+                assert!(message.contains("expected revision 0"));
+                assert!(message.contains("found revision 2"));
+            }
+            AnnotationIoEvent::Saved { .. } => {
+                panic!("a stale second writer overwrote the sidecar")
+            }
+            AnnotationIoEvent::Loaded { .. } => panic!("unexpected load event during save"),
+            AnnotationIoEvent::Failed { message, .. } => {
+                panic!("unexpected conflict shape: {message}")
+            }
+        }
+        assert_eq!(load_sidecar(&pdf, &identity).unwrap(), first_latest);
+    }
+
+    #[test]
+    fn pdf_file_lock_serializes_the_sidecar_compare_and_replace_section() {
+        let directory = TestDirectory::new("sidecar-file-lock");
+        let pdf = directory.path().join("document.pdf");
+        std::fs::write(&pdf, b"stable pdf bytes").unwrap();
+        let first = File::open(&pdf).unwrap();
+        let second = File::open(&pdf).unwrap();
+
+        first.lock().unwrap();
+        assert!(matches!(
+            second.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        first.unlock().unwrap();
+        second.lock().unwrap();
+        second.unlock().unwrap();
     }
 }

@@ -8,6 +8,8 @@ description = "A fast native PDF reader built with GPUI and PDFium"
 [dependencies]
 image = { version = "0.25.1", default-features = false }
 pdfium-render = { version = "=0.9.2", default-features = false, features = ["pdfium_7763"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "0.6.2", default-features = false, features = ["std"] }
@@ -16,6 +18,10 @@ gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "m
 
 [patch.crates-io]
 pdfium-render = { path = "vendor/pdfium-render-tile" }
+# GPUI 0.2.2 predates zed-industries/zed#38269. Backport that upstream
+# Apache-2.0 fix so a macOS screen change also synchronizes the CAMetalLayer's
+# scale factor and drawable size instead of leaving stale display state.
+gpui = { path = "vendor/gpui-0.2.2-display-fix" }
 # GPUI 0.2.2 declares MPL-licensed cbindgen even when its Blade renderer makes
 # the generator unreachable. This tiny, original compatibility crate supplies
 # the compile-time API only; none of it runs in the selected configuration.
