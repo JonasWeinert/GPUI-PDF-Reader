@@ -133,9 +133,9 @@ been implemented yet.
 
 The comment editor displays formatted content directly while storing Markdown.
 Its hovering formatting pill provides bold, italic, inline code, bulleted-list,
-and numbered-list controls. Classic uses `Command-Enter` to save or `Escape` to
-cancel. Fluid auto-saves after edits and uses Back to return to the animated
-comments list.
+and numbered-list controls. Both views auto-save edits; `Escape` or Back returns
+to the comments list. Classic keeps this workflow in its docked sidebar, while
+Fluid animates between panes in its floating panel.
 
 Keyboard scrolling is animated. Precise trackpad deltas are applied directly,
 and zoom gestures preserve the document position beneath the pointer.

@@ -68,7 +68,7 @@ assert_feature_report() {
   assert_report=$2
   assert_common_report "$assert_name" "$assert_report"
   case "$assert_report" in
-    *"sidebar=1.000/1 "*"annotations=6 "*"highlights=5 "*"highlight_colors=5 "*"comments=1 "*"annotation_revision=6/6/6 "*"search_pages=3 "*"active_search=2 "*"search_complete=1 "*) ;;
+    *"view=Classic "*"sidebar=1.000/1 "*"comment_editor=0 "*"comment_dirty=0 "*"autosave_pending=0 "*"annotations=6 "*"highlights=5 "*"highlight_colors=5 "*"comments=1 "*"annotation_revision=6/6/6 "*"search_pages=3 "*"active_search=2 "*"search_complete=1 "*) ;;
     *) fail_case "$assert_name" "feature counts or final navigation state were unexpected" ;;
   esac
 

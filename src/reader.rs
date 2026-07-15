@@ -121,12 +121,12 @@ fn is_inactive<T: Copy + PartialEq>(candidate: T, active: Option<T>) -> bool {
 }
 
 fn annotation_actions_enabled(
-    has_selection: bool,
+    has_context: bool,
     annotations_loading: bool,
     persistence_blocked: bool,
     comment_editor_open: bool,
 ) -> bool {
-    has_selection && !annotations_loading && !persistence_blocked && !comment_editor_open
+    has_context && !annotations_loading && !persistence_blocked && !comment_editor_open
 }
 
 fn zoom_controls_enabled(document_open: bool, zoom: f32) -> (bool, bool) {
@@ -149,7 +149,7 @@ fn comments_toolbar_label(
         if compact_toolbar {
             "Notes •"
         } else {
-            "Comments · Draft"
+            "Comments · Editing"
         }
     } else if very_compact_toolbar {
         "Notes"
@@ -245,7 +245,6 @@ enum ChromeButtonStyle {
 #[derive(Clone, Debug)]
 enum DraftDiscardAction {
     Open(PathBuf),
-    CancelComment,
     Quit,
     CloseWindow,
 }
@@ -257,8 +256,8 @@ enum QaFeaturePhase {
     WaitCommentEditor,
     WaitCommentEdited,
     WaitCommentSaved,
-    WaitCommentCancelEditor,
-    WaitCommentCanceled,
+    WaitCommentBack,
+    WaitCommentList,
     WaitCommentsOpen,
     WaitCommentsClosed,
     WaitSearchOpen,
@@ -1225,9 +1224,9 @@ impl PdfReader {
                     }
                     self.warning = None;
                     // Exercise the same native key/input path a person uses:
-                    // multiword text (including Space), selection, formatting,
-                    // and save. This catches keymap precedence regressions that
-                    // buffer-only tests cannot see.
+                    // multiword text (including Space), selection, and
+                    // formatting. The shared debounce must persist it without
+                    // an explicit save command.
                     Self::qa_defer_keystrokes(
                         &[
                             "i", "m", "p", "o", "r", "t", "a", "n", "t", "space", "c", "o", "p",
@@ -1249,7 +1248,6 @@ impl PdfReader {
                 if editor.read(cx).markdown() != "**important copy check**" {
                     return Ok(false);
                 }
-                Self::qa_defer_keystrokes(&["cmd-enter"], window, cx)?;
                 self.qa_feature_phase = QaFeaturePhase::WaitCommentSaved;
             }
             QaFeaturePhase::WaitCommentSaved => {
@@ -1261,34 +1259,32 @@ impl PdfReader {
                     return Ok(false);
                 }
                 if self.comment_draft_dirty {
-                    return Err("saved comment incorrectly remained a dirty draft".to_owned());
+                    return Ok(false);
                 }
-                let (comment_id, comment) = annotations
+                if self.comment_editor.is_none() {
+                    return Err("Classic autosave closed the comment editor".to_owned());
+                }
+                let comment = annotations
                     .iter()
-                    .find_map(|annotation| {
-                        annotation
-                            .comment_markdown()
-                            .map(|markdown| (annotation.id(), markdown.to_owned()))
-                    })
+                    .find_map(|annotation| annotation.comment_markdown().map(ToOwned::to_owned))
                     .ok_or_else(|| "native comment save produced no Markdown".to_owned())?;
                 if comment != "**important copy check**" {
                     return Err(format!(
                         "native comment input/formatting produced unexpected Markdown: {comment:?}"
                     ));
                 }
-                self.edit_comment(comment_id, window, cx);
-                self.qa_feature_phase = QaFeaturePhase::WaitCommentCancelEditor;
+                self.qa_feature_phase = QaFeaturePhase::WaitCommentBack;
             }
-            QaFeaturePhase::WaitCommentCancelEditor => {
+            QaFeaturePhase::WaitCommentBack => {
                 let Some(editor) = self.comment_editor.clone() else {
-                    return Err("comment editor disappeared before cancel QA".to_owned());
+                    return Err("comment editor disappeared before Back QA".to_owned());
                 };
                 if editor.read(cx).qa_has_painted() {
                     Self::qa_defer_keystrokes(&["escape"], window, cx)?;
-                    self.qa_feature_phase = QaFeaturePhase::WaitCommentCanceled;
+                    self.qa_feature_phase = QaFeaturePhase::WaitCommentList;
                 }
             }
-            QaFeaturePhase::WaitCommentCanceled => {
+            QaFeaturePhase::WaitCommentList => {
                 if self.comment_editor.is_some() {
                     return Ok(false);
                 }
@@ -1300,8 +1296,69 @@ impl PdfReader {
                     .iter()
                     .find_map(|annotation| annotation.comment_markdown());
                 if annotations.revision() != 6 || comment != Some("**important copy check**") {
-                    return Err("cancel changed the persisted comment".to_owned());
+                    return Err("Back changed the persisted comment".to_owned());
                 }
+                let annotation = annotations
+                    .iter()
+                    .find(|annotation| annotation.comment_markdown().is_some())
+                    .ok_or_else(|| "Classic comment vanished before parity checks".to_owned())?;
+                let id = annotation.id();
+                let start = annotation.range().start();
+                let page = self
+                    .layout()
+                    .and_then(|layout| layout.page_rect(start.page))
+                    .ok_or_else(|| "Classic hit-test page is not laid out".to_owned())?;
+                let bounds = self
+                    .page_text
+                    .get(&start.page)
+                    .and_then(|text| text.get(start.index))
+                    .and_then(|character| character.bounds)
+                    .ok_or_else(|| "Classic hit-test character has no bounds".to_owned())?;
+                let pointer = point(
+                    px(page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x),
+                    px(self.content_top()
+                        + page.y
+                        + (bounds.top + bounds.bottom) * page.height * 0.5
+                        - self.scroll.y),
+                );
+                self.active_annotation = None;
+                self.on_mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: pointer,
+                        click_count: 1,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                self.on_mouse_up(
+                    &MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: pointer,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                if self.active_annotation != Some(id)
+                    || self.selection.is_some()
+                    || !self.context_has_comment()
+                {
+                    return Err(
+                        "clicking a Classic highlight did not expose its toolbar context".into(),
+                    );
+                }
+                self.comment_on_context(window, cx);
+                if self.comment_editor.is_none() || self.editing_annotation != Some(id) {
+                    return Err("Classic toolbar Edit Comment did not open the annotation".into());
+                }
+                self.return_to_comment_list(window, cx);
+                self.open_comment_from_list(id, window, cx);
+                if self.comment_editor.is_none() || self.editing_annotation != Some(id) {
+                    return Err("Classic comment-list row did not open the editor".into());
+                }
+                self.return_to_comment_list(window, cx);
                 self.qa_feature_phase = QaFeaturePhase::WaitCommentsOpen;
             }
             QaFeaturePhase::WaitCommentsOpen => {
@@ -1593,10 +1650,7 @@ impl PdfReader {
                     self.qa_fluid_phase = QaFluidPhase::Complete;
                     return Ok(true);
                 }
-                // This is the exact two-command behavior attached to a Fluid
-                // comment-list row: reposition the PDF and slide to editor.
-                self.navigate_annotation(id, window, cx);
-                self.edit_comment(id, window, cx);
+                self.open_comment_from_list(id, window, cx);
                 self.qa_fluid_phase = QaFluidPhase::WaitReopenedEditor;
             }
             QaFluidPhase::WaitReopenedEditor => {
@@ -2324,7 +2378,7 @@ impl PdfReader {
         self.sidebar_anchor = None;
         self.clamp_scroll();
         self.request_visible_tiles(window);
-        if mode == ReaderView::Fluid && self.comment_draft_dirty {
+        if self.comment_draft_dirty {
             self.schedule_comment_autosave(window, cx);
         }
         cx.notify();
@@ -2873,12 +2927,9 @@ impl PdfReader {
             window,
             |reader, _, event, window, cx| match event {
                 CommentEditorEvent::Changed => reader.comment_editor_changed(window, cx),
-                CommentEditorEvent::Save(markdown) if reader.view_mode == ReaderView::Fluid => {
-                    reader.cancel_comment_autosave();
-                    let _ = reader.write_comment(markdown.clone(), false, window, cx);
-                }
                 CommentEditorEvent::Save(markdown) => {
-                    reader.save_comment(markdown.clone(), window, cx)
+                    reader.cancel_comment_autosave();
+                    let _ = reader.write_comment(markdown.clone(), cx);
                 }
                 CommentEditorEvent::Cancel => reader.cancel_comment_editor(window, cx),
             },
@@ -2917,17 +2968,7 @@ impl PdfReader {
         self.open_comment_editor(range, Some(id), markdown, window, cx);
     }
 
-    fn save_comment(&mut self, markdown: String, window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.write_comment(markdown, true, window, cx);
-    }
-
-    fn write_comment(
-        &mut self,
-        markdown: String,
-        close_after_save: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    fn write_comment(&mut self, markdown: String, cx: &mut Context<Self>) -> bool {
         if markdown.trim().is_empty() {
             self.annotation_error = Some("A comment cannot be empty".into());
             cx.notify();
@@ -2968,11 +3009,6 @@ impl PdfReader {
                 self.refresh_comment_order();
                 self.comment_draft_dirty = false;
                 self.editing_annotation = Some(id);
-                if close_after_save {
-                    self.comment_pane.show_list(false);
-                    self.finish_comment_editor_close();
-                    window.focus(&self.focus_handle);
-                }
                 cx.notify();
                 true
             }
@@ -2986,9 +3022,7 @@ impl PdfReader {
 
     fn comment_editor_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.comment_draft_dirty = true;
-        if self.view_mode == ReaderView::Fluid {
-            self.schedule_comment_autosave(window, cx);
-        }
+        self.schedule_comment_autosave(window, cx);
         cx.notify();
     }
 
@@ -3000,13 +3034,11 @@ impl PdfReader {
             cx.background_executor()
                 .timer(COMMENT_AUTOSAVE_DEBOUNCE)
                 .await;
-            let _ = cx.update(|window, cx| {
+            let _ = cx.update(|_, cx| {
                 weak.update(cx, |reader, cx| {
-                    if reader.view_mode == ReaderView::Fluid
-                        && reader.comment_autosave_revision == revision
-                    {
+                    if reader.comment_autosave_revision == revision {
                         reader.comment_autosave_task = None;
-                        let _ = reader.flush_comment_autosave(window, cx);
+                        let _ = reader.flush_comment_autosave(cx);
                     }
                 })
                 .ok();
@@ -3019,7 +3051,7 @@ impl PdfReader {
         self.comment_autosave_task = None;
     }
 
-    fn flush_comment_autosave(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn flush_comment_autosave(&mut self, cx: &mut Context<Self>) -> bool {
         self.cancel_comment_autosave();
         if !self.comment_draft_dirty {
             return true;
@@ -3031,7 +3063,7 @@ impl PdfReader {
         if markdown.trim().is_empty() {
             return false;
         }
-        self.write_comment(markdown, false, window, cx)
+        self.write_comment(markdown, cx)
     }
 
     fn return_to_comment_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3039,30 +3071,24 @@ impl PdfReader {
             .comment_editor
             .as_ref()
             .is_none_or(|editor| editor.read(cx).is_blank());
-        if self.comment_draft_dirty
-            && !markdown_is_blank
-            && !self.flush_comment_autosave(window, cx)
-        {
+        if self.comment_draft_dirty && !markdown_is_blank && !self.flush_comment_autosave(cx) {
             return;
         }
         self.cancel_comment_autosave();
         self.comment_draft_dirty = false;
-        self.comment_pane.show_list(true);
         window.focus(&self.focus_handle);
-        self.start_animation(window, cx);
+        if self.view_mode == ReaderView::Fluid {
+            self.comment_pane.show_list(true);
+            self.start_animation(window, cx);
+        } else {
+            self.comment_pane.show_list(false);
+            self.finish_comment_editor_close();
+        }
         cx.notify();
     }
 
     fn cancel_comment_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.view_mode == ReaderView::Fluid {
-            self.return_to_comment_list(window, cx);
-            return;
-        }
-        if self.comment_draft_needs_confirmation() {
-            self.confirm_discard_comment(DraftDiscardAction::CancelComment, window, cx);
-        } else {
-            self.discard_comment_editor(window, cx);
-        }
+        self.return_to_comment_list(window, cx);
     }
 
     fn discard_comment_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3101,11 +3127,6 @@ impl PdfReader {
                 "Opening another PDF will permanently discard the unsaved comment.",
                 "Discard and Open",
             ),
-            DraftDiscardAction::CancelComment => (
-                "Discard changes to this comment?",
-                "Your unsaved changes will be permanently discarded.",
-                "Discard Changes",
-            ),
             DraftDiscardAction::Quit => (
                 "Quit with an unsaved comment?",
                 "The comment draft will be permanently discarded.",
@@ -3141,7 +3162,6 @@ impl PdfReader {
                                 DraftDiscardAction::Open(path) => {
                                     reader.open_path_after_comment_guard(path, window, cx)
                                 }
-                                DraftDiscardAction::CancelComment => {}
                                 DraftDiscardAction::Quit => cx.quit(),
                                 DraftDiscardAction::CloseWindow => window.remove_window(),
                             }
@@ -3220,6 +3240,16 @@ impl PdfReader {
         self.clamp_scroll();
         self.start_animation(window, cx);
         cx.notify();
+    }
+
+    fn open_comment_from_list(
+        &mut self,
+        id: AnnotationId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_annotation(id, window, cx);
+        self.edit_comment(id, window, cx);
     }
 
     fn content_top(&self) -> f32 {
@@ -3759,7 +3789,7 @@ impl PdfReader {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        if self.view_mode == ReaderView::Fluid && !event.modifiers.shift && event.click_count == 1 {
+        if !event.modifiers.shift && event.click_count == 1 {
             self.pending_annotation_click = self
                 .hit_test_text(event.position, false)
                 .and_then(|position| self.annotation_at_text_position(position));
@@ -4902,8 +4932,7 @@ impl PdfReader {
                                             }))
                                         })
                                         .on_click(cx.listener(move |reader, _, window, cx| {
-                                            reader.navigate_annotation(id, window, cx);
-                                            reader.edit_comment(id, window, cx);
+                                            reader.open_comment_from_list(id, window, cx);
                                         }))
                                         .child(div().w(px(4.0)).h_full().flex_none().bg(color))
                                         .child(
@@ -5116,16 +5145,27 @@ impl PdfReader {
     fn render_classic_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let error = self.annotation_error.clone();
         let editor_open = self.comment_editor.is_some();
-        let editor_is_blank = self
-            .comment_editor
-            .as_ref()
-            .is_none_or(|editor| editor.read(cx).is_blank());
         let can_add_comment = annotation_actions_enabled(
-            self.selection.is_some(),
+            self.context_range().is_some(),
             self.annotations_loading,
             self.annotation_persistence_blocked,
             editor_open,
         );
+        let context_has_comment = self.context_has_comment();
+        let annotations_pending = self
+            .annotations
+            .as_ref()
+            .is_some_and(|annotations| annotations.revision() > self.annotation_saved_revision);
+        let save_status = if self.comment_draft_dirty
+            || self.comment_autosave_task.is_some()
+            || annotations_pending
+        {
+            "Saving…"
+        } else if editor_open && self.editing_annotation.is_some() {
+            "Saved"
+        } else {
+            "Auto-save"
+        };
         let title = if editor_open {
             if self.editing_annotation.is_some() {
                 "Edit Comment"
@@ -5149,6 +5189,17 @@ impl PdfReader {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .when(editor_open, |heading| {
+                        heading.child(Self::chrome_button(
+                            "classic-comment-back",
+                            "‹ Back",
+                            ChromeButtonStyle::Ghost,
+                            true,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.return_to_comment_list(window, cx)
+                            }),
+                        ))
+                    })
                     .child(
                         div()
                             .text_lg()
@@ -5161,11 +5212,19 @@ impl PdfReader {
                                 .px_2()
                                 .py_1()
                                 .rounded_full()
-                                .bg(rgb(UI_ACCENT_SOFT))
+                                .bg(rgb(if save_status == "Saved" {
+                                    0xe8f5ec
+                                } else {
+                                    UI_ACCENT_SOFT
+                                }))
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(UI_ACCENT))
-                                .child("Draft"),
+                                .text_color(rgb(if save_status == "Saved" {
+                                    0x2f7d4a
+                                } else {
+                                    UI_ACCENT
+                                }))
+                                .child(save_status),
                         )
                     }),
             )
@@ -5177,11 +5236,11 @@ impl PdfReader {
                     .when(!editor_open, |actions| {
                         actions.child(Self::chrome_button(
                             "add-comment",
-                            "+ New",
+                            if context_has_comment { "Edit" } else { "+ New" },
                             ChromeButtonStyle::Neutral,
                             can_add_comment,
                             cx.listener(|reader, _, window, cx| {
-                                reader.add_comment(&AddComment, window, cx)
+                                reader.comment_on_context(window, cx)
                             }),
                         ))
                     })
@@ -5203,37 +5262,7 @@ impl PdfReader {
                 .p_4()
                 .flex()
                 .flex_col()
-                .gap_3()
                 .child(editor)
-                .child(
-                    div()
-                        .pt_1()
-                        .flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(Self::chrome_button(
-                            "cancel-comment",
-                            "Cancel",
-                            ChromeButtonStyle::Ghost,
-                            true,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.cancel_comment_editor(window, cx)
-                            }),
-                        ))
-                        .child(Self::chrome_button(
-                            "save-comment",
-                            "Save comment",
-                            ChromeButtonStyle::Primary,
-                            !editor_is_blank,
-                            cx.listener(|reader, _, _window, cx| {
-                                if let Some(editor) = reader.comment_editor.clone() {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.request_save(cx);
-                                    });
-                                }
-                            }),
-                        )),
-                )
                 .into_any_element()
         } else if self.comment_order.is_empty() {
             div()
@@ -5332,7 +5361,7 @@ impl PdfReader {
                                             }))
                                         })
                                         .on_click(cx.listener(move |reader, _, window, cx| {
-                                            reader.navigate_annotation(id, window, cx)
+                                            reader.open_comment_from_list(id, window, cx);
                                         }))
                                         .child(div().w(px(4.0)).h_full().flex_none().bg(color))
                                         .child(
@@ -5726,9 +5755,10 @@ impl Render for PdfReader {
         let editor_open = self.comment_editor.is_some();
         let comments_label =
             comments_toolbar_label(editor_open, compact_toolbar, very_compact_toolbar);
-        let show_annotation_tools = self.selection.is_some() && !editor_open;
+        let has_annotation_context = self.context_range().is_some();
+        let show_annotation_tools = has_annotation_context && !editor_open;
         let annotation_tools_enabled = annotation_actions_enabled(
-            self.selection.is_some(),
+            has_annotation_context,
             self.annotations_loading,
             self.annotation_persistence_blocked,
             editor_open,
@@ -5918,14 +5948,20 @@ impl Render for PdfReader {
                         .child(div().h(px(22.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
                         .child(Self::segment_button(
                             "add-selection-comment",
-                            if very_compact_toolbar {
+                            if self.context_has_comment() {
+                                if very_compact_toolbar {
+                                    "Edit"
+                                } else {
+                                    "Edit Comment"
+                                }
+                            } else if very_compact_toolbar {
                                 "Note"
                             } else {
                                 "Comment"
                             },
                             annotation_tools_enabled,
                             cx.listener(|reader, _, window, cx| {
-                                reader.add_comment(&AddComment, window, cx)
+                                reader.comment_on_context(window, cx)
                             }),
                         )),
                 )
@@ -6749,7 +6785,7 @@ mod tests {
     }
 
     #[test]
-    fn annotation_controls_only_enable_for_a_writable_selection_without_an_open_draft() {
+    fn annotation_controls_enable_for_any_writable_text_context_without_an_open_editor() {
         assert!(annotation_actions_enabled(true, false, false, false));
         assert!(!annotation_actions_enabled(false, false, false, false));
         assert!(!annotation_actions_enabled(true, true, false, false));
@@ -6779,7 +6815,7 @@ mod tests {
         assert_eq!(comments_toolbar_label(false, true, true), "Notes");
         assert_eq!(
             comments_toolbar_label(true, false, false),
-            "Comments · Draft"
+            "Comments · Editing"
         );
         assert_eq!(comments_toolbar_label(true, true, false), "Notes •");
         assert_eq!(comments_toolbar_label(true, true, true), "Notes •");
