@@ -88,6 +88,13 @@ impl<'a> PdfBookmark<'a> {
 
     /// Returns the title of this [PdfBookmark], if any.
     pub fn title(&self) -> Option<String> {
+        self.title_with_limit(usize::MAX)
+    }
+
+    /// Returns the title of this [PdfBookmark] if its UTF-16LE buffer does not
+    /// exceed `maximum_bytes`. This lets callers safely inspect outlines from
+    /// untrusted documents without allocating an attacker-controlled buffer.
+    pub fn title_with_limit(&self, maximum_bytes: usize) -> Option<String> {
         // Retrieving the bookmark title from Pdfium is a two-step operation. First, we call
         // FPDFBookmark_GetTitle() with a null buffer; this will retrieve the length of
         // the bookmark title in bytes. If the length is zero, then there is no title.
@@ -101,7 +108,7 @@ impl<'a> PdfBookmark<'a> {
                 .FPDFBookmark_GetTitle(self.bookmark_handle, std::ptr::null_mut(), 0)
         };
 
-        if buffer_length == 0 {
+        if buffer_length == 0 || buffer_length as usize > maximum_bytes {
             // No title is defined.
 
             return None;
@@ -117,7 +124,9 @@ impl<'a> PdfBookmark<'a> {
             )
         };
 
-        assert_eq!(result, buffer_length);
+        if result != buffer_length {
+            return None;
+        }
 
         get_string_from_pdfium_utf16le_bytes(buffer)
     }

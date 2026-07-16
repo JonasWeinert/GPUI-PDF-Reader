@@ -1,7 +1,7 @@
 %PDF-1.7
 %‚„œ”
 1 0 obj
-<< /Type /Catalog /Pages 2 0 R >>
+<< /Type /Catalog /Pages 2 0 R /Outlines 14 0 R /PageMode /UseOutlines >>
 endobj
 2 0 obj
 << /Type /Pages /Count 3 /Kids [3 0 R 5 0 R 7 0 R] /Resources << /Font << /F1 9 0 R /F2 10 0 R >> >> >>
@@ -101,24 +101,44 @@ endobj
 13 0 obj
 << /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [-166 -225 1000 931] /ItalicAngle 0 /Ascent 718 /Descent -207 /CapHeight 718 /StemV 80 >>
 endobj
+14 0 obj
+<< /Type /Outlines /First 15 0 R /Last 18 0 R /Count 4 >>
+endobj
+15 0 obj
+<< /Title (Getting Started) /Parent 14 0 R /Next 17 0 R /First 16 0 R /Last 16 0 R /Count 1 /Dest [3 0 R /FitH 760] >>
+endobj
+16 0 obj
+<< /Title (Selecting text) /Parent 15 0 R /Dest [3 0 R /XYZ 54 530 null] >>
+endobj
+17 0 obj
+<< /Title (Page 2 - Rotate 90) /Parent 14 0 R /Prev 15 0 R /Next 18 0 R /A << /S /GoTo /D [5 0 R /Fit] >> >>
+endobj
+18 0 obj
+<< /Title (Wide documents) /Parent 14 0 R /Prev 17 0 R /Dest [7 0 R /FitH 396] >>
+endobj
 xref
-0 14
+0 19
 0000000000 65535 f 
 0000000015 00000 n 
-0000000064 00000 n 
-0000000183 00000 n 
-0000000270 00000 n 
-0000000869 00000 n 
-0000000967 00000 n 
-0000001434 00000 n 
-0000001546 00000 n 
-0000001934 00000 n 
-0000002031 00000 n 
-0000002168 00000 n 
-0000002374 00000 n 
-0000002856 00000 n 
+0000000104 00000 n 
+0000000223 00000 n 
+0000000310 00000 n 
+0000000909 00000 n 
+0000001007 00000 n 
+0000001474 00000 n 
+0000001586 00000 n 
+0000001974 00000 n 
+0000002071 00000 n 
+0000002208 00000 n 
+0000002414 00000 n 
+0000002896 00000 n 
+0000003068 00000 n 
+0000003142 00000 n 
+0000003277 00000 n 
+0000003369 00000 n 
+0000003494 00000 n 
 trailer
-<< /Size 14 /Root 1 0 R >>
+<< /Size 19 /Root 1 0 R >>
 startxref
-3028
+3592
 %%EOF

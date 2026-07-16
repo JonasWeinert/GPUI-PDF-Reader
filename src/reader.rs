@@ -4,11 +4,15 @@ use crate::annotations::{
 };
 use crate::backend::{PdfWorker, RenderAppearance, RenderColor, TileRequest, WorkerEvent};
 use crate::comment_editor::{CommentEditor, CommentEditorEvent, RichTextBuffer};
+#[cfg(test)]
+use crate::model::TextChar;
 use crate::model::{
     DocumentLayout, PageAnchor, PageSize, PixelRect, RasterSize, Rect, TextBounds, TextLayer,
-    TextPosition, TextSelection, TileKey, append_selected_page_text,
+    TextPosition, TextSelection, TileKey, TocEntry, append_selected_page_text,
 };
-use crate::search::{MAX_SEARCH_QUERY_BYTES, SearchMatch, SearchMatchId, SearchQuery};
+use crate::search::{
+    MAX_SEARCH_QUERY_BYTES, SearchMatch, SearchMatchId, SearchPageOutcome, SearchQuery, search_page,
+};
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::theme::{self, ReaderPalette, ThemePreference};
 use crate::{
@@ -63,6 +67,14 @@ const FLUID_PANEL_HORIZONTAL_MARGIN: f32 = 12.0;
 const FLUID_PANEL_VERTICAL_MARGIN: f32 = 18.0;
 const FLUID_CONTEXT_PILL_WIDTH: f32 = 214.0;
 const FLUID_CONTEXT_PILL_HEIGHT: f32 = 40.0;
+const TOC_RAIL_WIDTH: f32 = 54.0;
+const TOC_MARKER_LEFT: f32 = 8.0;
+const TOC_STACK_MARGIN: f32 = 22.0;
+const TOC_STACK_SPACING: f32 = 12.0;
+const TOC_CASCADE_RADIUS: f32 = 5.0;
+const TOC_CARD_HEIGHT: f32 = 82.0;
+const TOC_DESTINATION_CONTEXT: f32 = 42.0;
+const MAX_TOC_HEADING_MATCHES: usize = 16;
 
 fn render_appearance_from_theme(theme: &Theme, pdf_dark_mode_enabled: bool) -> RenderAppearance {
     if !theme.is_dark() || !pdf_dark_mode_enabled {
@@ -179,10 +191,137 @@ fn floating_pill_position(
     Offset { x, y }
 }
 
+fn toc_scroll_target(
+    layout: &DocumentLayout,
+    page: usize,
+    destination_y: Option<f32>,
+    viewport_height: f32,
+) -> Option<f32> {
+    let page = layout.page_rect(page)?;
+    let maximum = (layout.content_height - viewport_height).max(0.0);
+    let destination = destination_y
+        .filter(|value| value.is_finite())
+        .map_or(page.y, |value| {
+            page.y + page.height * value.clamp(0.0, 1.0) - TOC_DESTINATION_CONTEXT
+        });
+    Some(destination.clamp(0.0, maximum))
+}
+
+fn toc_title_match_y(title: &str, text: &TextLayer) -> Option<f32> {
+    let query = SearchQuery::new(title).ok()?;
+    let SearchPageOutcome::Complete(results) =
+        search_page(0, text.as_slice(), &query, MAX_TOC_HEADING_MATCHES, || {
+            false
+        })
+    else {
+        return None;
+    };
+    let mut best: Option<(f32, f32)> = None;
+    for result in results.matches {
+        let Some(top) = result
+            .highlight_runs
+            .iter()
+            .map(|bounds| bounds.top)
+            .min_by(f32::total_cmp)
+        else {
+            continue;
+        };
+        let Some(height) = result
+            .highlight_runs
+            .iter()
+            .map(|bounds| (bounds.bottom - bounds.top).max(0.0))
+            .max_by(f32::total_cmp)
+        else {
+            continue;
+        };
+        if best.is_none_or(|(best_height, best_top)| {
+            height > best_height + 0.0001
+                || ((height - best_height).abs() <= 0.0001 && top < best_top)
+        }) {
+            best = Some((height, top));
+        }
+    }
+    best.map(|(_, top)| top.clamp(0.0, 1.0))
+}
+
+fn toc_stack_geometry(viewport_height: f32, count: usize) -> Option<(f32, f32)> {
+    if count == 0 || !viewport_height.is_finite() || viewport_height <= 0.0 {
+        return None;
+    }
+    if count == 1 {
+        return Some((viewport_height * 0.5, 0.0));
+    }
+    let available = (viewport_height - TOC_STACK_MARGIN * 2.0).max(1.0);
+    let spacing = (available / (count - 1) as f32).min(TOC_STACK_SPACING);
+    let height = spacing * (count - 1) as f32;
+    Some(((viewport_height - height) * 0.5, spacing))
+}
+
+fn toc_cascade_amount(index: usize, hover_position: f32, hover_strength: f32) -> f32 {
+    if !hover_position.is_finite() || !hover_strength.is_finite() {
+        return 0.0;
+    }
+    let distance = (index as f32 - hover_position).abs();
+    (1.0 - distance / TOC_CASCADE_RADIUS).clamp(0.0, 1.0) * hover_strength.clamp(0.0, 1.0)
+}
+
+fn toc_hover_state_is_animating(position: f32, strength: f32, target: Option<usize>) -> bool {
+    let target_strength = if target.is_some() { 1.0 } else { 0.0 };
+    let strength_is_animating = (target_strength - strength).abs() > 0.002;
+    let position_is_animating = target.is_some_and(|index| (index as f32 - position).abs() > 0.002);
+    strength_is_animating || position_is_animating
+}
+
+fn advance_toc_hover_state(
+    position: &mut f32,
+    strength: &mut f32,
+    target: Option<usize>,
+    blend: f32,
+) {
+    if let Some(index) = target {
+        *position += (index as f32 - *position) * blend;
+    }
+    let target_strength = if target.is_some() { 1.0 } else { 0.0 };
+    *strength += (target_strength - *strength) * blend;
+    if !toc_hover_state_is_animating(*position, *strength, target) {
+        *strength = target_strength;
+        if let Some(index) = target {
+            *position = index as f32;
+        }
+    }
+}
+
+fn active_toc_index(entries: &[TocEntry], current_page: usize) -> Option<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, entry)| (entry.page <= current_page).then_some(index))
+        .or((!entries.is_empty()).then_some(0))
+}
+
+fn toc_breadcrumb(entries: &[TocEntry], index: usize) -> Option<String> {
+    let current = entries.get(index)?;
+    let mut path = vec![current.title.as_str()];
+    let mut expected_depth = current.depth;
+    for entry in entries[..index].iter().rev() {
+        let Some(parent_depth) = expected_depth.checked_sub(1) else {
+            break;
+        };
+        if entry.depth == parent_depth {
+            path.push(entry.title.as_str());
+            expected_depth = parent_depth;
+        }
+    }
+    path.reverse();
+    Some(format!("Document  ›  {}", path.join("  ›  ")))
+}
+
 #[derive(Debug)]
 struct DocumentState {
     path: PathBuf,
     pages: Vec<PageSize>,
+    toc: Vec<TocEntry>,
 }
 
 #[derive(Clone)]
@@ -751,6 +890,10 @@ pub struct PdfReader {
     selection: Option<TextSelection>,
     selecting: bool,
     pending_annotation_click: Option<AnnotationId>,
+    toc_hovered: Option<usize>,
+    toc_hover_position: f32,
+    toc_hover_strength: f32,
+    pending_toc_navigation: Option<usize>,
     pan: Option<PanState>,
     animation_active: bool,
     animation_frame_queued: bool,
@@ -767,6 +910,8 @@ pub struct PdfReader {
     qa_sidebar_transitions: usize,
     #[cfg(debug_assertions)]
     qa_max_sidebar_anchor_error: f32,
+    #[cfg(debug_assertions)]
+    qa_toc_text_matches: usize,
     zoom_render_revision: u64,
     render_debounce_until: Option<Instant>,
     zoom_render_task: Option<Task<()>>,
@@ -848,6 +993,10 @@ impl PdfReader {
                 selection: None,
                 selecting: false,
                 pending_annotation_click: None,
+                toc_hovered: None,
+                toc_hover_position: 0.0,
+                toc_hover_strength: 0.0,
+                pending_toc_navigation: None,
                 pan: None,
                 animation_active: false,
                 animation_frame_queued: false,
@@ -864,6 +1013,8 @@ impl PdfReader {
                 qa_sidebar_transitions: 0,
                 #[cfg(debug_assertions)]
                 qa_max_sidebar_anchor_error: 0.0,
+                #[cfg(debug_assertions)]
+                qa_toc_text_matches: 0,
                 zoom_render_revision: 0,
                 render_debounce_until: None,
                 zoom_render_task: None,
@@ -948,7 +1099,7 @@ impl PdfReader {
             .map(|name| name.as_ref())
             .unwrap_or_else(|| self.theme_preference.name());
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_complete={} status={:?}",
             self.view_mode,
             theme_name,
             if matches!(
@@ -960,6 +1111,12 @@ impl PdfReader {
                 "normal"
             },
             u8::from(self.pdf_dark_mode_enabled),
+            self.document
+                .as_ref()
+                .map_or(0, |document| document.toc.len()),
+            self.toc_hovered.map_or(0, |index| index + 1),
+            self.toc_hover_strength,
+            self.qa_toc_text_matches,
             self.zoom,
             self.rendered.len(),
             cached_bytes,
@@ -1018,6 +1175,46 @@ impl PdfReader {
     }
 
     #[cfg(debug_assertions)]
+    pub fn qa_set_toc_hovered(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let count = self
+            .document
+            .as_ref()
+            .map_or(0, |document| document.toc.len());
+        if index >= count {
+            return Err(format!(
+                "TOC hover index {index} is outside {count} entries"
+            ));
+        }
+        self.set_toc_hovered(index, true, window, cx);
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn qa_navigate_toc(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let count = self
+            .document
+            .as_ref()
+            .map_or(0, |document| document.toc.len());
+        if index >= count {
+            return Err(format!(
+                "TOC navigation index {index} is outside {count} entries"
+            ));
+        }
+        self.navigate_toc(index, window, cx);
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
     pub fn qa_select_theme(
         &mut self,
         name: &str,
@@ -1059,6 +1256,8 @@ impl PdfReader {
                 && (!self.search.complete || self.search_debounce_task.is_some()))
             || self.sidebar.is_animating()
             || self.comment_pane.is_animating()
+            || self.toc_hover_is_animating()
+            || self.pending_toc_navigation.is_some()
             || self.comment_autosave_task.is_some()
         {
             return false;
@@ -1909,6 +2108,7 @@ impl PdfReader {
                 generation,
                 path,
                 pages,
+                toc,
             } if generation == self.generation => {
                 self.drop_all_images(window, cx);
                 let page_count = pages.len();
@@ -1925,6 +2125,7 @@ impl PdfReader {
                 self.document = Some(DocumentState {
                     path: path.clone(),
                     pages,
+                    toc,
                 });
                 self.page_text.clear();
                 self.pending.clear();
@@ -2012,6 +2213,7 @@ impl PdfReader {
                 self.page_text.entry(page).or_insert(text);
                 self.text_pending.remove(&page);
                 self.continue_pending_copy(cx);
+                self.complete_pending_toc_navigation(page, window, cx);
                 self.evict_distant_text();
             }
             WorkerEvent::TextFailed {
@@ -2028,6 +2230,7 @@ impl PdfReader {
                 self.text_pending.remove(&page);
                 self.warning = Some(message.into());
                 self.continue_pending_copy(cx);
+                self.complete_pending_toc_navigation(page, window, cx);
                 self.evict_distant_text();
             }
             WorkerEvent::SearchPageResults {
@@ -2322,6 +2525,10 @@ impl PdfReader {
         self.warning = None;
         self.selection = None;
         self.pending_annotation_click = None;
+        self.toc_hovered = None;
+        self.toc_hover_position = 0.0;
+        self.toc_hover_strength = 0.0;
+        self.pending_toc_navigation = None;
         self.scroll = Offset::default();
         self.scroll_target = Offset::default();
         self.animation_active = false;
@@ -2332,6 +2539,7 @@ impl PdfReader {
             self.qa_sidebar_anchor_reference = None;
             self.qa_sidebar_transitions = 0;
             self.qa_max_sidebar_anchor_error = 0.0;
+            self.qa_toc_text_matches = 0;
         }
         let name = path
             .file_name()
@@ -3611,7 +3819,9 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ui_is_animating = self.sidebar.is_animating() || self.comment_pane.is_animating();
+        let ui_is_animating = self.sidebar.is_animating()
+            || self.comment_pane.is_animating()
+            || self.toc_hover_is_animating();
         self.sidebar_anchor = None;
         #[cfg(debug_assertions)]
         {
@@ -3650,6 +3860,14 @@ impl PdfReader {
         self.animation_active = true;
         self.last_animation_tick = Instant::now();
         self.queue_animation_frame(window, cx);
+    }
+
+    fn toc_hover_is_animating(&self) -> bool {
+        toc_hover_state_is_animating(
+            self.toc_hover_position,
+            self.toc_hover_strength,
+            self.toc_hovered,
+        )
     }
 
     fn queue_animation_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3699,13 +3917,23 @@ impl PdfReader {
                 self.finish_comment_editor_close();
             }
         }
+        advance_toc_hover_state(
+            &mut self.toc_hover_position,
+            &mut self.toc_hover_strength,
+            self.toc_hovered,
+            blend,
+        );
         if self.sidebar_anchor.is_none() {
             self.scroll.x += (self.scroll_target.x - self.scroll.x) * blend;
             self.scroll.y += (self.scroll_target.y - self.scroll.y) * blend;
         }
         let distance = (self.scroll_target.x - self.scroll.x).abs()
             + (self.scroll_target.y - self.scroll.y).abs();
-        if distance < 0.35 && !self.sidebar.is_animating() && !self.comment_pane.is_animating() {
+        if distance < 0.35
+            && !self.sidebar.is_animating()
+            && !self.comment_pane.is_animating()
+            && !self.toc_hover_is_animating()
+        {
             self.scroll = self.scroll_target;
             self.animation_active = false;
         }
@@ -3932,8 +4160,9 @@ impl PdfReader {
                 }
             }
             MouseButton::Middle => {
-                let ui_is_animating =
-                    self.sidebar.is_animating() || self.comment_pane.is_animating();
+                let ui_is_animating = self.sidebar.is_animating()
+                    || self.comment_pane.is_animating()
+                    || self.toc_hover_is_animating();
                 self.sidebar_anchor = None;
                 #[cfg(debug_assertions)]
                 {
@@ -4437,6 +4666,263 @@ impl PdfReader {
                     .border_color(palette.text.opacity(0.14))
                     .bg(dot),
             )
+    }
+
+    fn set_toc_hovered(
+        &mut self,
+        index: usize,
+        hovered: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if hovered {
+            if self.toc_hovered.is_none() && self.toc_hover_strength <= 0.002 {
+                self.toc_hover_position = index as f32;
+            }
+            self.toc_hovered = Some(index);
+        } else if self.toc_hovered == Some(index) {
+            self.toc_hovered = None;
+        }
+        self.start_animation(window, cx);
+    }
+
+    fn navigate_toc(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((page, title, destination_y)) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.toc.get(index))
+            .map(|entry| (entry.page, entry.title.clone(), entry.destination_y))
+        else {
+            return;
+        };
+        self.sidebar_anchor = None;
+        self.selection = None;
+        self.active_annotation = None;
+        self.pending_toc_navigation = None;
+
+        if let Some(destination_y) = destination_y {
+            self.scroll_to_toc_destination(page, Some(destination_y), window, cx);
+            return;
+        }
+        if let Some(text) = self.page_text.get(&page) {
+            let matched_y = toc_title_match_y(&title, text);
+            #[cfg(debug_assertions)]
+            if matched_y.is_some() {
+                self.qa_toc_text_matches += 1;
+            }
+            self.scroll_to_toc_destination(page, matched_y, window, cx);
+            return;
+        }
+
+        self.pending_toc_navigation = Some(index);
+        if self.text_pending.insert(page) && !self.worker.extract_text(self.generation, page) {
+            self.text_pending.remove(&page);
+            self.pending_toc_navigation = None;
+            self.scroll_to_toc_destination(page, None, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn complete_pending_toc_navigation(
+        &mut self,
+        page: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.pending_toc_navigation else {
+            return;
+        };
+        let Some((entry_page, title)) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.toc.get(index))
+            .map(|entry| (entry.page, entry.title.clone()))
+        else {
+            self.pending_toc_navigation = None;
+            return;
+        };
+        if entry_page != page {
+            return;
+        }
+        self.pending_toc_navigation = None;
+        let matched_y = self
+            .page_text
+            .get(&page)
+            .and_then(|text| toc_title_match_y(&title, text));
+        #[cfg(debug_assertions)]
+        if matched_y.is_some() {
+            self.qa_toc_text_matches += 1;
+        }
+        self.scroll_to_toc_destination(page, matched_y, window, cx);
+    }
+
+    fn scroll_to_toc_destination(
+        &mut self,
+        page: usize,
+        destination_y: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.layout().and_then(|layout| {
+            toc_scroll_target(layout, page, destination_y, self.viewport_height)
+        }) else {
+            return;
+        };
+        self.scroll_target.y = target;
+        self.clamp_scroll();
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
+    fn render_toc_navigation(
+        &mut self,
+        palette: ReaderPalette,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let document = self.document.as_ref()?;
+        let layout = self.layout()?;
+        if document.toc.is_empty() {
+            return None;
+        }
+
+        let (stack_top, marker_spacing) =
+            toc_stack_geometry(self.viewport_height, document.toc.len())?;
+        let marker_hit_height = if marker_spacing <= f32::EPSILON {
+            TOC_STACK_SPACING
+        } else {
+            marker_spacing.clamp(6.0, TOC_STACK_SPACING)
+        };
+        let current_page = layout.current_page(self.scroll.y, self.viewport_height);
+        let active = active_toc_index(&document.toc, current_page);
+        let hovered = self.toc_hovered.filter(|index| *index < document.toc.len());
+        let marker_data: Vec<_> = document
+            .toc
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let selected = active == Some(index);
+                let cascade =
+                    toc_cascade_amount(index, self.toc_hover_position, self.toc_hover_strength);
+                let baseline = (14.0 - f32::from(entry.depth.min(4))).max(10.0);
+                let width = baseline + (52.0 - baseline) * cascade;
+                (
+                    index,
+                    stack_top + index as f32 * marker_spacing,
+                    selected,
+                    hovered == Some(index),
+                    width,
+                )
+            })
+            .collect();
+        let detail = hovered.and_then(|index| {
+            let entry = document.toc.get(index)?;
+            let marker_y = stack_top + self.toc_hover_position * marker_spacing;
+            Some((
+                entry.title.clone(),
+                entry.page,
+                toc_breadcrumb(&document.toc, index),
+                marker_y,
+            ))
+        });
+
+        let markers = marker_data
+            .into_iter()
+            .map(|(index, y, selected, is_hovered, width)| {
+                div()
+                    .id(("toc-marker", index))
+                    .absolute()
+                    .top(px(y - marker_hit_height * 0.5))
+                    .left_0()
+                    .h(px(marker_hit_height))
+                    .w(px(TOC_RAIL_WIDTH))
+                    .flex()
+                    .items_center()
+                    .pl(px(TOC_MARKER_LEFT))
+                    .cursor_pointer()
+                    .on_hover(cx.listener(move |reader, hovered, window, cx| {
+                        reader.set_toc_hovered(index, *hovered, window, cx)
+                    }))
+                    .on_click(cx.listener(move |reader, _, window, cx| {
+                        reader.navigate_toc(index, window, cx)
+                    }))
+                    .child(
+                        div()
+                            .h(px(if is_hovered { 3.0 } else { 2.0 }))
+                            .w(px(width))
+                            .rounded_full()
+                            .bg(if is_hovered {
+                                palette.text
+                            } else if hovered.is_none() && selected {
+                                palette.text.opacity(0.88)
+                            } else {
+                                palette.text_tertiary.opacity(0.48)
+                            }),
+                    )
+            });
+        let card_width = (self.viewport_width - TOC_RAIL_WIDTH - 28.0).clamp(190.0, 310.0);
+        let detail_card = detail.map(|(title, page, breadcrumb, marker_y)| {
+            let card_y = (marker_y - TOC_CARD_HEIGHT * 0.5).clamp(
+                10.0,
+                (self.viewport_height - TOC_CARD_HEIGHT - 10.0).max(10.0),
+            );
+            div()
+                .id("toc-hover-detail")
+                .block_mouse_except_scroll()
+                .absolute()
+                .top(px(card_y))
+                .left(px(TOC_RAIL_WIDTH + 6.0))
+                .w(px(card_width))
+                .min_h(px(TOC_CARD_HEIGHT))
+                .px_4()
+                .py_3()
+                .overflow_hidden()
+                .rounded_xl()
+                .border_1()
+                .border_color(palette.text.opacity(0.13))
+                .bg(palette.surface)
+                .shadow_sm()
+                .text_color(palette.text)
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .when_some(breadcrumb, |card, breadcrumb| {
+                    card.child(
+                        div()
+                            .mt_1()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(palette.text_secondary)
+                            .child(breadcrumb),
+                    )
+                })
+                .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(palette.text_tertiary)
+                        .child(format!("Page {}", page + 1)),
+                )
+        });
+
+        Some(
+            div()
+                .id("toc-navigation-rail")
+                .block_mouse_except_scroll()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(px(TOC_RAIL_WIDTH))
+                .children(markers)
+                .children(detail_card)
+                .into_any_element(),
+        )
     }
 
     fn render_fluid_main_pill(
@@ -6303,6 +6789,7 @@ impl Render for PdfReader {
             ReaderView::Classic => classic_toolbar.into_any_element(),
             ReaderView::Fluid => fluid_toolbar.into_any_element(),
         };
+        let toc_navigation = self.render_toc_navigation(palette, cx);
 
         let content = if let Some(layout) = self.layout() {
             let visible = layout.visible_pages(
@@ -6356,6 +6843,7 @@ impl Render for PdfReader {
             };
             div()
                 .id("document-viewport")
+                .relative()
                 .flex_none()
                 .h_full()
                 .w(px(self.viewport_width))
@@ -6381,6 +6869,7 @@ impl Render for PdfReader {
                     )
                     .size_full(),
                 )
+                .children(toc_navigation)
                 .into_any_element()
         } else {
             div()
@@ -6968,6 +7457,130 @@ fn content_rect_to_bounds(canvas: Bounds<Pixels>, rect: Rect, scroll: Offset) ->
 mod tests {
     use super::*;
     use gpui_component::{ThemeColor, ThemeMode};
+
+    #[test]
+    fn toc_helpers_center_the_stack_cascade_hover_and_preserve_navigation() {
+        let entries = vec![
+            TocEntry {
+                title: "Part one".to_owned(),
+                page: 0,
+                depth: 0,
+                destination_y: Some(0.25),
+            },
+            TocEntry {
+                title: "Details".to_owned(),
+                page: 1,
+                depth: 1,
+                destination_y: None,
+            },
+            TocEntry {
+                title: "Part two".to_owned(),
+                page: 2,
+                depth: 0,
+                destination_y: None,
+            },
+        ];
+        let layout = DocumentLayout::new(
+            &[
+                PageSize {
+                    width: 612.0,
+                    height: 792.0,
+                },
+                PageSize {
+                    width: 612.0,
+                    height: 792.0,
+                },
+                PageSize {
+                    width: 612.0,
+                    height: 792.0,
+                },
+            ],
+            1.0,
+            900.0,
+        );
+
+        assert_eq!(active_toc_index(&entries, 0), Some(0));
+        assert_eq!(active_toc_index(&entries, 1), Some(1));
+        assert_eq!(active_toc_index(&entries, 2), Some(2));
+        assert_eq!(
+            toc_breadcrumb(&entries, 1).as_deref(),
+            Some("Document  ›  Part one  ›  Details")
+        );
+        assert_eq!(
+            toc_breadcrumb(&entries, 2).as_deref(),
+            Some("Document  ›  Part two")
+        );
+
+        assert_eq!(toc_stack_geometry(600.0, 3), Some((288.0, 12.0)));
+        assert_eq!(toc_stack_geometry(600.0, 1), Some((300.0, 0.0)));
+        let (dense_top, dense_spacing) = toc_stack_geometry(100.0, 100).unwrap();
+        assert!((dense_top - TOC_STACK_MARGIN).abs() < 0.001);
+        assert!(dense_spacing < 1.0);
+
+        assert_eq!(toc_cascade_amount(4, 4.0, 1.0), 1.0);
+        assert!((toc_cascade_amount(3, 4.0, 1.0) - 0.8).abs() < 0.001);
+        assert!((toc_cascade_amount(2, 4.0, 0.5) - 0.3).abs() < 0.001);
+        assert_eq!(toc_cascade_amount(9, 4.0, 1.0), 0.0);
+        assert!((toc_cascade_amount(4, 4.5, 1.0) - 0.9).abs() < 0.001);
+        assert!((toc_cascade_amount(5, 4.5, 1.0) - 0.9).abs() < 0.001);
+
+        let mut hover_position = 3.0;
+        let mut hover_strength = 1.0;
+        advance_toc_hover_state(&mut hover_position, &mut hover_strength, Some(7), 0.5);
+        assert_eq!(hover_position, 5.0);
+        assert_eq!(hover_strength, 1.0);
+        assert!(toc_hover_state_is_animating(
+            hover_position,
+            hover_strength,
+            Some(7)
+        ));
+        advance_toc_hover_state(&mut hover_position, &mut hover_strength, None, 0.5);
+        assert_eq!(hover_position, 5.0);
+        assert_eq!(hover_strength, 0.5);
+        assert!(toc_hover_state_is_animating(
+            hover_position,
+            hover_strength,
+            None
+        ));
+        assert_eq!(
+            toc_scroll_target(&layout, 2, None, 600.0),
+            Some(layout.page_rect(2).unwrap().y)
+        );
+        let page = layout.page_rect(1).unwrap();
+        assert_eq!(
+            toc_scroll_target(&layout, 1, Some(0.5), 600.0),
+            Some(page.y + page.height * 0.5 - TOC_DESTINATION_CONTEXT)
+        );
+    }
+
+    #[test]
+    fn toc_title_matching_prefers_the_largest_exact_page_match() {
+        let source = "Methods body Methods";
+        let characters = source
+            .chars()
+            .enumerate()
+            .map(|(index, value)| {
+                let second_heading = index >= 13;
+                let top = if second_heading { 0.62 } else { 0.12 };
+                let height = if second_heading { 0.06 } else { 0.02 };
+                TextChar {
+                    value,
+                    bounds: (!value.is_whitespace()).then_some(TextBounds {
+                        left: index as f32 * 0.02,
+                        top,
+                        right: index as f32 * 0.02 + 0.015,
+                        bottom: top + height,
+                    }),
+                }
+            })
+            .collect();
+        let text = TextLayer::new(characters);
+        assert!(
+            (toc_title_match_y("methods", &text).expect("heading should match") - 0.62).abs()
+                < 0.001
+        );
+        assert_eq!(toc_title_match_y("missing heading", &text), None);
+    }
 
     #[test]
     fn pdf_render_appearance_follows_theme_mode_and_colors() {

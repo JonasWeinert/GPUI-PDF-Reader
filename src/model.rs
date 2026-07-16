@@ -12,6 +12,16 @@ pub struct PageSize {
     pub height: f32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TocEntry {
+    pub title: String,
+    pub page: usize,
+    pub depth: u16,
+    /// Normalized device-space y coordinate with a top-left origin when the
+    /// PDF destination supplies an explicit vertical position.
+    pub destination_y: Option<f32>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,
