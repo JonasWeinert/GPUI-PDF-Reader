@@ -9,11 +9,13 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, StyledText,
     TextLayout, TextRun, UTF16Selection, UnderlineStyle, Window, actions, canvas, div, font, point,
-    prelude::*, px, quad, rgb, rgba, size,
+    prelude::*, px, quad, size,
 };
+use gpui_component::{Icon, IconName, Theme};
 use std::{collections::HashMap, fmt, ops::Range};
 
 use crate::annotations::MAX_COMMENT_BYTES;
+use crate::theme::ReaderPalette;
 use crate::{EditCopy, EditCut, EditPaste, EditSelectAll};
 
 const COMMENT_TOO_LONG_MESSAGE: &str = "Comment is too long (1 MiB Markdown limit).";
@@ -1029,8 +1031,9 @@ impl CommentEditor {
     }
 
     fn format_button(
+        palette: ReaderPalette,
         id: &'static str,
-        label: &'static str,
+        label: impl IntoElement,
         active: bool,
         handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
@@ -1044,13 +1047,21 @@ impl CommentEditor {
             .justify_center()
             .overflow_hidden()
             .rounded_md()
-            .bg(if active { rgb(0xe7f1fd) } else { rgb(0xffffff) })
-            .text_color(if active { rgb(0x0a78e3) } else { rgb(0x41444a) })
+            .bg(if active {
+                palette.accent_soft
+            } else {
+                palette.surface
+            })
+            .text_color(if active {
+                palette.accent
+            } else {
+                palette.text_secondary
+            })
             .text_sm()
             .font_weight(FontWeight::MEDIUM)
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(0xeaeaec)))
-            .active(|style| style.bg(rgb(0xdedee2)))
+            .hover(move |style| style.bg(palette.control_hover))
+            .active(move |style| style.bg(palette.control_pressed))
             .on_click(handler)
             .child(label)
     }
@@ -1159,14 +1170,16 @@ impl EntityInputHandler for CommentEditor {
 
 impl Render for CommentEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = ReaderPalette::from_theme(Theme::global(cx));
         let focused = self.focus_handle.is_focused(window);
         self.projection = DisplayProjection::new(&self.buffer);
-        let runs = display_text_runs(&self.buffer, &self.projection);
+        let runs = display_text_runs(&self.buffer, &self.projection, palette);
         let styled = StyledText::new(self.projection.text.clone()).with_runs(runs);
         self.layout = styled.layout().clone();
 
         let editor = cx.entity();
         let focus = self.focus_handle.clone();
+        let caret = palette.accent;
         let overlay = canvas(
             |bounds, _, _| bounds,
             move |bounds, _, window, cx| {
@@ -1184,7 +1197,7 @@ impl Render for CommentEditor {
                         window.paint_quad(quad(
                             Bounds::new(position, size(px(1.5), state.layout.line_height())),
                             px(0.0),
-                            rgb(0x0a78e3),
+                            caret,
                             px(0.0),
                             gpui::transparent_black(),
                             Default::default(),
@@ -1202,7 +1215,7 @@ impl Render for CommentEditor {
                 .id("comment-validation-message")
                 .mt_1()
                 .text_xs()
-                .text_color(rgb(0xb42318))
+                .text_color(palette.error)
                 .child(message)
         });
         let text_area = div()
@@ -1217,14 +1230,14 @@ impl Render for CommentEditor {
             .rounded_lg()
             .border_1()
             .border_color(if self.validation_message.is_some() {
-                rgb(0xb42318)
+                palette.error
             } else if focused {
-                rgb(0x0a78e3)
+                palette.accent
             } else {
-                rgb(0xd8d8dc)
+                palette.separator
             })
-            .bg(rgb(0xffffff))
-            .text_color(rgb(0x202124))
+            .bg(palette.surface)
+            .text_color(palette.text)
             .text_sm()
             .line_height(px(22.0))
             .cursor(CursorStyle::IBeam)
@@ -1236,7 +1249,7 @@ impl Render for CommentEditor {
                 element.child(
                     div()
                         .absolute()
-                        .text_color(rgb(0x92939a))
+                        .text_color(palette.text_tertiary)
                         .child("Write a comment…"),
                 )
             })
@@ -1260,10 +1273,11 @@ impl Render for CommentEditor {
                     .overflow_hidden()
                     .rounded_xl()
                     .border_1()
-                    .border_color(rgb(0xd8d8dc))
-                    .bg(rgb(0xffffff))
+                    .border_color(palette.separator)
+                    .bg(palette.surface)
                     .shadow_sm()
                     .child(Self::format_button(
+                        palette,
                         "comment-bold",
                         "B",
                         self.buffer.bold_active(),
@@ -1272,6 +1286,7 @@ impl Render for CommentEditor {
                         }),
                     ))
                     .child(Self::format_button(
+                        palette,
                         "comment-italic",
                         "I",
                         self.buffer.italic_active(),
@@ -1280,23 +1295,26 @@ impl Render for CommentEditor {
                         }),
                     ))
                     .child(Self::format_button(
+                        palette,
                         "comment-code",
-                        "{ }",
+                        Icon::new(IconName::SquareTerminal),
                         self.buffer.code_active(),
                         cx.listener(|editor, _, window, cx| {
                             editor.toggle_code(&CommentToggleCode, window, cx)
                         }),
                     ))
-                    .child(div().mx_1().h(px(20.0)).w(px(1.0)).bg(rgb(0xd8d8dc)))
+                    .child(div().mx_1().h(px(20.0)).w(px(1.0)).bg(palette.separator))
                     .child(Self::format_button(
+                        palette,
                         "comment-bullets",
-                        "•",
+                        Icon::new(IconName::Menu),
                         self.buffer.bulleted_list_active(),
                         cx.listener(|editor, _, window, cx| {
                             editor.toggle_bulleted_list(&CommentToggleBulletedList, window, cx)
                         }),
                     ))
                     .child(Self::format_button(
+                        palette,
                         "comment-numbers",
                         "1.",
                         self.buffer.numbered_list_active(),
@@ -1467,7 +1485,11 @@ impl DisplayProjection {
     }
 }
 
-fn display_text_runs(buffer: &RichTextBuffer, projection: &DisplayProjection) -> Vec<TextRun> {
+fn display_text_runs(
+    buffer: &RichTextBuffer,
+    projection: &DisplayProjection,
+    palette: ReaderPalette,
+) -> Vec<TextRun> {
     let mut result = Vec::new();
     for span in &projection.spans {
         if let Some(model) = &span.model {
@@ -1500,7 +1522,13 @@ fn display_text_runs(buffer: &RichTextBuffer, projection: &DisplayProjection) ->
                     .marked_range
                     .as_ref()
                     .is_some_and(|range| start < range.end && end > range.start);
-                result.push(make_text_run(end - start, span.style, selected, marked));
+                result.push(make_text_run(
+                    end - start,
+                    span.style,
+                    selected,
+                    marked,
+                    palette,
+                ));
             }
         } else {
             result.push(make_text_run(
@@ -1508,13 +1536,20 @@ fn display_text_runs(buffer: &RichTextBuffer, projection: &DisplayProjection) ->
                 span.style,
                 false,
                 false,
+                palette,
             ));
         }
     }
     result
 }
 
-fn make_text_run(len: usize, style: InlineStyle, selected: bool, marked: bool) -> TextRun {
+fn make_text_run(
+    len: usize,
+    style: InlineStyle,
+    selected: bool,
+    marked: bool,
+    palette: ReaderPalette,
+) -> TextRun {
     let mut selected_font = if style.code() {
         font(".ZedMono")
     } else {
@@ -1529,17 +1564,17 @@ fn make_text_run(len: usize, style: InlineStyle, selected: bool, marked: bool) -
     TextRun {
         len,
         font: selected_font,
-        color: rgb(0x1d2939).into(),
+        color: palette.text,
         background_color: if selected {
-            Some(rgba(0x2e90fa55).into())
+            Some(palette.selection)
         } else if style.code() {
-            Some(rgba(0xe4e7ecff).into())
+            Some(palette.surface_subtle)
         } else {
             None
         },
         underline: marked.then_some(UnderlineStyle {
             thickness: px(1.0),
-            color: Some(rgb(0x175cd3).into()),
+            color: Some(palette.accent),
             wavy: false,
         }),
         strikethrough: None,

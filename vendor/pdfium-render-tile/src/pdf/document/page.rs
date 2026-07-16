@@ -22,8 +22,8 @@ mod flatten; // Keep internal flatten operation private.
 use object::ownership::PdfPageObjectOwnership;
 
 use crate::bindgen::{
-    FLATTEN_FAIL, FLATTEN_NOTHINGTODO, FLATTEN_SUCCESS, FLAT_PRINT, FPDF_DOCUMENT, FPDF_FORMHANDLE,
-    FPDF_PAGE,
+    FLATTEN_FAIL, FLATTEN_NOTHINGTODO, FLATTEN_SUCCESS, FLAT_PRINT, FPDF_BOOL, FPDF_DOCUMENT,
+    FPDF_FORMHANDLE, FPDF_PAGE, FPDF_RENDER_DONE, FPDF_RENDER_TOBECONTINUED, IFSDK_PAUSE,
 };
 use crate::bindings::PdfiumLibraryBindings;
 use crate::create_transform_setters;
@@ -695,7 +695,7 @@ impl<'a> PdfPage<'a> {
             // Render the PDF page into the bitmap buffer, ignoring any custom transformation matrix.
             // (Custom transforms cannot be applied to the rendering of form fields.)
 
-            self.render_page_and_form_data_into_bitmap(bitmap, &settings, 0, 0);
+            self.render_page_and_form_data_into_bitmap(bitmap, &settings, 0, 0)?;
         } else {
             // Render the PDF page into the bitmap buffer, applying any custom transformation matrix.
 
@@ -744,7 +744,7 @@ impl<'a> PdfPage<'a> {
             }
         }
 
-        self.render_page_and_form_data_into_bitmap(bitmap, &settings, -tile_left, -tile_top);
+        self.render_page_and_form_data_into_bitmap(bitmap, &settings, -tile_left, -tile_top)?;
         bitmap.set_byte_order_from_render_settings(&settings);
 
         Ok(())
@@ -785,20 +785,58 @@ impl<'a> PdfPage<'a> {
         settings: &PdfPageRenderSettings,
         start_x: Pixels,
         start_y: Pixels,
-    ) {
+    ) -> Result<(), PdfiumError> {
         let bitmap_handle = bitmap.handle();
 
-        unsafe {
-            self.bindings().FPDF_RenderPageBitmap(
-                bitmap_handle,
-                self.page_handle,
-                start_x,
-                start_y,
-                settings.width,
-                settings.height,
-                settings.rotate,
-                settings.render_flags,
-            );
+        if let Some(color_scheme) = settings.color_scheme.as_ref() {
+            unsafe extern "C" fn never_pause(_: *mut IFSDK_PAUSE) -> FPDF_BOOL {
+                0
+            }
+
+            let mut pause = IFSDK_PAUSE {
+                version: 1,
+                NeedToPauseNow: Some(never_pause),
+                user: std::ptr::null_mut(),
+            };
+            let mut status = unsafe {
+                self.bindings().FPDF_RenderPageBitmapWithColorScheme_Start(
+                    bitmap_handle,
+                    self.page_handle,
+                    start_x,
+                    start_y,
+                    settings.width,
+                    settings.height,
+                    settings.rotate,
+                    settings.render_flags,
+                    color_scheme,
+                    &mut pause,
+                )
+            };
+            while status == FPDF_RENDER_TOBECONTINUED as i32 {
+                status = unsafe {
+                    self.bindings()
+                        .FPDF_RenderPage_Continue(self.page_handle, &mut pause)
+                };
+            }
+            unsafe {
+                self.bindings().FPDF_RenderPage_Close(self.page_handle);
+            }
+            if status != FPDF_RENDER_DONE as i32 {
+                return Err(PdfiumError::PageRenderProgressiveFailure);
+            }
+        } else {
+            unsafe {
+                self.bindings().FPDF_RenderPageBitmap(
+                    bitmap_handle,
+                    self.page_handle,
+                    start_x,
+                    start_y,
+                    settings.width,
+                    settings.height,
+                    settings.rotate,
+                    settings.render_flags,
+                );
+            }
         }
 
         if let Some(form_handle) = self.form_handle {
@@ -833,6 +871,8 @@ impl<'a> PdfPage<'a> {
                 );
             }
         }
+
+        Ok(())
     }
 
     /// Applies the given transformation, expressed as six values representing the six configurable

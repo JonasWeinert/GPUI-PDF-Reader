@@ -3,11 +3,13 @@ use gpui::{
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, StyledText,
     TextLayout, TextRun, UTF16Selection, UnderlineStyle, Window, actions, canvas, div, font, point,
-    prelude::*, px, quad, rgb, rgba, size,
+    prelude::*, px, quad, size,
 };
+use gpui_component::Theme;
 use std::ops::Range;
 use std::{error::Error, fmt};
 
+use crate::theme::ReaderPalette;
 use crate::{EditCopy, EditCut, EditPaste, EditSelectAll};
 
 actions!(
@@ -542,18 +544,20 @@ impl EntityInputHandler for TextField {
 
 impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = ReaderPalette::from_theme(Theme::global(cx));
         let focused = self.focus_handle.is_focused(window);
         let display: SharedString = if self.buffer.text.is_empty() {
             " ".into()
         } else {
             self.buffer.text.clone().into()
         };
-        let runs = field_runs(&self.buffer, display.len());
+        let runs = field_runs(&self.buffer, display.len(), palette);
         let styled = StyledText::new(display).with_runs(runs);
         self.layout = styled.layout().clone();
 
         let entity: Entity<Self> = cx.entity();
         let focus = self.focus_handle.clone();
+        let caret = palette.accent;
         let overlay = canvas(
             |bounds, _, _| bounds,
             move |bounds, _, window, cx| {
@@ -567,7 +571,7 @@ impl Render for TextField {
                     window.paint_quad(quad(
                         Bounds::new(position, size(px(1.5), field.layout.line_height())),
                         px(0.0),
-                        rgb(0x0a78e3),
+                        caret,
                         px(0.0),
                         gpui::transparent_black(),
                         Default::default(),
@@ -591,9 +595,13 @@ impl Render for TextField {
             .items_center()
             .rounded_md()
             .border_1()
-            .border_color(rgb(if focused { 0x0a78e3 } else { 0xd8d8dc }))
-            .bg(rgb(0xf8f8fa))
-            .text_color(rgb(0x202124))
+            .border_color(if focused {
+                palette.accent
+            } else {
+                palette.separator
+            })
+            .bg(palette.surface_subtle)
+            .text_color(palette.text)
             .text_sm()
             .line_height(px(22.0))
             .cursor(CursorStyle::IBeam)
@@ -624,7 +632,7 @@ impl Render for TextField {
                     div()
                         .absolute()
                         .left_3()
-                        .text_color(rgb(0x92939a))
+                        .text_color(palette.text_tertiary)
                         .child(self.placeholder.clone()),
                 )
             })
@@ -633,12 +641,16 @@ impl Render for TextField {
     }
 }
 
-fn field_runs(buffer: &TextFieldBuffer, display_len: usize) -> Vec<TextRun> {
+fn field_runs(
+    buffer: &TextFieldBuffer,
+    display_len: usize,
+    palette: ReaderPalette,
+) -> Vec<TextRun> {
     if buffer.text.is_empty() {
         return vec![TextRun {
             len: display_len,
             font: font(".SystemUIFont"),
-            color: rgba(0x00000000).into(),
+            color: palette.surface.opacity(0.0),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -662,18 +674,18 @@ fn field_runs(buffer: &TextFieldBuffer, display_len: usize) -> Vec<TextRun> {
             (!range.is_empty()).then(|| TextRun {
                 len: range.len(),
                 font: font(".SystemUIFont"),
-                color: rgb(0x202124).into(),
+                color: palette.text,
                 background_color: (!buffer.selection.is_empty()
                     && range.start < buffer.selection.end
                     && range.end > buffer.selection.start)
-                    .then_some(rgba(0x0a78e34a).into()),
+                    .then_some(palette.selection),
                 underline: buffer
                     .marked
                     .as_ref()
                     .is_some_and(|marked| range.start < marked.end && range.end > marked.start)
                     .then_some(UnderlineStyle {
                         thickness: px(1.0),
-                        color: Some(rgb(0x0a78e3).into()),
+                        color: Some(palette.accent),
                         wavy: false,
                     }),
                 strikethrough: None,

@@ -6,7 +6,7 @@ Keep them with redistributed source and binary bundles.
 
 ## Rust dependency graph
 
-The supported `aarch64-apple-darwin` normal/build graph currently contains 451
+The supported `aarch64-apple-darwin` normal/build graph currently contains 511
 unique packages. Every active package declares MIT, Apache-2.0, or a
 more-permissive option: BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0,
 CC0-1.0, MIT-0, Unlicense, BSL-1.0, or Apache-2.0 with LLVM exception. No active
@@ -23,6 +23,7 @@ Key direct components include:
 | Component | License used/available |
 |---|---|
 | `gpui` 0.2.2 and Zed support crates | Apache-2.0 |
+| `gpui-component` and its icon assets 0.5.1 | Apache-2.0 |
 | `pdfium-render` 0.9.2 plus GPUI PDF Reader tile patch | MIT (upstream also offers Apache-2.0) |
 | `image` 0.25 | MIT OR Apache-2.0 |
 | `block2` | MIT |
@@ -32,6 +33,11 @@ Exact versions and sources are in `Cargo.lock`. Some dependency licenses
 require preserving their copyright or notice text. A release bundle must
 therefore include a complete generated license bundle for the active Cargo
 graph; this summary and `Cargo.lock` alone are not that bundle.
+
+The bundled named themes are the official gpui-component theme collection,
+combined without changing their values. Their exact source revision and the
+retained Apache-2.0 license are recorded in
+[`assets/themes/README.md`](assets/themes/README.md).
 
 ## PDFium binary
 

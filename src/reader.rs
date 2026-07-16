@@ -2,7 +2,7 @@ use crate::annotations::{
     AnnotationId, AnnotationSet, DocumentIdentity, HighlightColor, MAX_TEXT_CHARACTER_INDEX,
     TextRange, load_sidecar, save_sidecar,
 };
-use crate::backend::{PdfWorker, TileRequest, WorkerEvent};
+use crate::backend::{PdfWorker, RenderAppearance, RenderColor, TileRequest, WorkerEvent};
 use crate::comment_editor::{CommentEditor, CommentEditorEvent, RichTextBuffer};
 use crate::model::{
     DocumentLayout, PageAnchor, PageSize, PixelRect, RasterSize, Rect, TextBounds, TextLayer,
@@ -10,21 +10,23 @@ use crate::model::{
 };
 use crate::search::{MAX_SEARCH_QUERY_BYTES, SearchMatch, SearchMatchId, SearchQuery};
 use crate::text_field::{TextField, TextFieldEvent};
+use crate::theme::{self, ReaderPalette, ThemePreference};
 use crate::{
     ActualSize, AddComment, ClassicView, CopySelection, EditCopy, EditCut, EditPaste,
     EditSelectAll, Find, FirstPage, FitWidth, FluidView, LastPage, NextSearchResult, OpenDocument,
     PageDown, PageUp, PreviousSearchResult, Quit, ScrollDown, ScrollLeft, ScrollRight, ScrollUp,
-    SelectAll, ToggleComments, ZoomIn, ZoomOut,
+    SelectAll, SelectTheme, ToggleComments, ZoomIn, ZoomOut,
 };
 use gpui::{
     App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners, CursorStyle, Entity,
     FocusHandle, Focusable, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, Point, PromptButton, PromptLevel, Render, RenderImage,
     ScrollStrategy, ScrollWheelEvent, SharedString, Task, UniformListScrollHandle, Window,
-    WindowControlArea, canvas, div, point, prelude::*, px, quad, rgb, rgba, size, uniform_list,
+    WindowControlArea, canvas, div, point, prelude::*, px, quad, size, uniform_list,
 };
 #[cfg(debug_assertions)]
 use gpui::{Keystroke, Modifiers, ScrollDelta, TouchPhase};
+use gpui_component::{Icon, IconName, Theme};
 use image::{Frame, RgbaImage};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -62,25 +64,25 @@ const FLUID_PANEL_VERTICAL_MARGIN: f32 = 18.0;
 const FLUID_CONTEXT_PILL_WIDTH: f32 = 214.0;
 const FLUID_CONTEXT_PILL_HEIGHT: f32 = 40.0;
 
-// A deliberately small visual system keeps the reader chrome consistent and
-// makes future light/dark variants a token change instead of another rewrite.
-const UI_CHROME: u32 = 0xf5f5f7;
-const UI_SURFACE: u32 = 0xffffff;
-const UI_SURFACE_SUBTLE: u32 = 0xf8f8fa;
-const UI_CONTROL: u32 = 0xffffff;
-const UI_CONTROL_HOVER: u32 = 0xeaeaec;
-const UI_CONTROL_PRESSED: u32 = 0xdedee2;
-const UI_SEPARATOR: u32 = 0xd8d8dc;
-const UI_TEXT: u32 = 0x202124;
-const UI_TEXT_SECONDARY: u32 = 0x6e6e73;
-const UI_TEXT_TERTIARY: u32 = 0x92939a;
-const UI_ACCENT: u32 = 0x0a78e3;
-const UI_ACCENT_HOVER: u32 = 0x0068cc;
-const UI_ACCENT_SOFT: u32 = 0xe7f1fd;
-const UI_ERROR: u32 = 0xb42318;
-const UI_ERROR_SOFT: u32 = 0xffebe9;
-const UI_CANVAS: u32 = 0x3c4148;
-const UI_CANVAS_EMPTY: u32 = 0x343941;
+fn render_appearance_from_theme(theme: &Theme, pdf_dark_mode_enabled: bool) -> RenderAppearance {
+    if !theme.is_dark() || !pdf_dark_mode_enabled {
+        return RenderAppearance::Normal;
+    }
+
+    let to_render_color = |color| {
+        let color = gpui::Rgba::from(color);
+        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        RenderColor {
+            red: channel(color.r),
+            green: channel(color.g),
+            blue: channel(color.b),
+        }
+    };
+    RenderAppearance::ForcedColors {
+        background: to_render_color(theme::pdf_paper_color(theme, true)),
+        foreground: to_render_color(theme.foreground),
+    }
+}
 
 #[cfg(target_os = "macos")]
 const TITLEBAR_CONTROL_INSET: f32 = 76.0;
@@ -734,6 +736,10 @@ pub struct PdfReader {
     comment_list_scroll: UniformListScrollHandle,
     status: ReaderStatus,
     view_mode: ReaderView,
+    theme_preference: ThemePreference,
+    selected_theme: Option<SharedString>,
+    render_appearance: RenderAppearance,
+    pdf_dark_mode_enabled: bool,
     warning: Option<SharedString>,
     focus_handle: FocusHandle,
     zoom: f32,
@@ -827,6 +833,10 @@ impl PdfReader {
                 comment_list_scroll: UniformListScrollHandle::new(),
                 status: ReaderStatus::Initializing,
                 view_mode: ReaderView::Classic,
+                theme_preference: ThemePreference::System,
+                selected_theme: None,
+                render_appearance: render_appearance_from_theme(Theme::global(cx), true),
+                pdf_dark_mode_enabled: true,
                 warning: None,
                 focus_handle: cx.focus_handle(),
                 zoom: 1.0,
@@ -863,6 +873,15 @@ impl PdfReader {
         Self::listen_for_worker_events(&entity, events, window, cx);
         Self::listen_for_annotation_events(&entity, annotation_events, window, cx);
         Self::listen_for_native_pinch(&entity, window, cx);
+        entity.update(cx, |_, cx| {
+            cx.observe_window_appearance(window, |reader, window, cx| {
+                if reader.theme_preference == ThemePreference::System {
+                    Theme::sync_system_appearance(Some(window), cx);
+                    reader.update_render_appearance(window, cx);
+                }
+            })
+            .detach();
+        });
         let weak = entity.downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             weak.update(cx, |reader, cx| reader.should_close_window(window, cx))
@@ -923,9 +942,24 @@ impl PdfReader {
             .active
             .and_then(|active| self.search.order.iter().position(|id| *id == active))
             .map_or(0, |index| index + 1);
+        let theme_name = self
+            .selected_theme
+            .as_ref()
+            .map(|name| name.as_ref())
+            .unwrap_or_else(|| self.theme_preference.name());
         format!(
-            "GPUI_PDF_READER_QA view={:?} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_complete={} status={:?}",
             self.view_mode,
+            theme_name,
+            if matches!(
+                self.render_appearance,
+                RenderAppearance::ForcedColors { .. }
+            ) {
+                "forced"
+            } else {
+                "normal"
+            },
+            u8::from(self.pdf_dark_mode_enabled),
             self.zoom,
             self.rendered.len(),
             cached_bytes,
@@ -970,6 +1004,45 @@ impl PdfReader {
     #[cfg(debug_assertions)]
     pub fn qa_use_fluid_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_view_mode(ReaderView::Fluid, window, cx);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn qa_set_pdf_dark_mode(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pdf_dark_mode_enabled = enabled;
+        self.update_render_appearance(window, cx);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn qa_select_theme(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if name != "system"
+            && !theme::bundled_themes()
+                .iter()
+                .any(|theme| theme.name == name)
+        {
+            return false;
+        }
+        self.select_theme(
+            &SelectTheme {
+                name: if name == "system" {
+                    SharedString::default()
+                } else {
+                    name.to_owned().into()
+                },
+            },
+            window,
+            cx,
+        );
+        true
     }
 
     #[cfg(debug_assertions)]
@@ -1877,13 +1950,14 @@ impl PdfReader {
             }
             WorkerEvent::TileRendered {
                 generation,
+                appearance,
                 key,
                 core_rect,
                 render_rect,
                 width,
                 height,
                 bgra,
-            } if generation == self.generation => {
+            } if generation == self.generation && appearance == self.render_appearance => {
                 let page = key.page;
                 self.pending.remove(&key);
 
@@ -1923,9 +1997,10 @@ impl PdfReader {
             }
             WorkerEvent::TileFailed {
                 generation,
+                appearance,
                 key,
                 message,
-            } if generation == self.generation => {
+            } if generation == self.generation && appearance == self.render_appearance => {
                 self.pending.remove(&key);
                 self.warning = Some(message.into());
             }
@@ -2390,6 +2465,34 @@ impl PdfReader {
 
     fn use_fluid_view(&mut self, _: &FluidView, window: &mut Window, cx: &mut Context<Self>) {
         self.set_view_mode(ReaderView::Fluid, window, cx);
+    }
+
+    fn select_theme(&mut self, action: &SelectTheme, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_theme = theme::apply_selection(action.name.as_ref(), window, cx);
+        self.theme_preference = if self.selected_theme.is_some() {
+            ThemePreference::Named
+        } else {
+            ThemePreference::System
+        };
+        self.update_render_appearance(window, cx);
+    }
+
+    fn update_render_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let appearance =
+            render_appearance_from_theme(Theme::global(cx), self.pdf_dark_mode_enabled);
+        if appearance != self.render_appearance {
+            self.render_appearance = appearance;
+            self.drop_all_images(window, cx);
+            self.pending.clear();
+            self.render_viewport.clear();
+            self.request_visible_tiles(window);
+        }
+        cx.notify();
+    }
+
+    fn toggle_pdf_dark_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pdf_dark_mode_enabled = !self.pdf_dark_mode_enabled;
+        self.update_render_appearance(window, cx);
     }
 
     fn toggle_sidebar(&mut self, panel: SidePanel, window: &mut Window, cx: &mut Context<Self>) {
@@ -3339,6 +3442,7 @@ impl PdfReader {
                 .collect();
             if self.worker.render_viewport(
                 self.generation,
+                self.render_appearance,
                 &tile_requests,
                 visible_tile_count,
                 &text_pages,
@@ -3693,7 +3797,10 @@ impl PdfReader {
             self.render_viewport.clear();
             self.text_viewport.clear();
             self.pending.clear();
-            if !self.worker.render_viewport(self.generation, &[], 0, &[]) {
+            if !self
+                .worker
+                .render_viewport(self.generation, self.render_appearance, &[], 0, &[])
+            {
                 self.status = ReaderStatus::Error("The PDF renderer is unavailable".into());
                 return;
             }
@@ -4180,40 +4287,49 @@ impl PdfReader {
     }
 
     fn chrome_button(
+        palette: ReaderPalette,
         id: &'static str,
-        label: impl Into<SharedString>,
+        label: impl IntoElement,
         style: ChromeButtonStyle,
         enabled: bool,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
         let (background, border, text, hover, pressed) = match style {
             ChromeButtonStyle::Neutral => (
-                UI_CONTROL,
-                UI_SEPARATOR,
-                UI_TEXT,
-                UI_CONTROL_HOVER,
-                UI_CONTROL_PRESSED,
+                palette.control,
+                palette.separator,
+                palette.text,
+                palette.control_hover,
+                palette.control_pressed,
             ),
             ChromeButtonStyle::Ghost => (
-                UI_CHROME,
-                UI_CHROME,
-                UI_TEXT_SECONDARY,
-                UI_CONTROL_HOVER,
-                UI_CONTROL_PRESSED,
+                palette.chrome,
+                palette.chrome,
+                palette.text_secondary,
+                palette.control_hover,
+                palette.control_pressed,
             ),
             ChromeButtonStyle::Floating => (
-                UI_SURFACE,
-                UI_SURFACE,
-                UI_TEXT_SECONDARY,
-                0xf0f0f2,
-                0xe4e4e8,
+                palette.surface,
+                palette.surface,
+                palette.text_secondary,
+                palette.control_hover,
+                palette.control_pressed,
             ),
-            ChromeButtonStyle::Selected => {
-                (UI_ACCENT_SOFT, 0xb8d5f4, UI_ACCENT, 0xdbeafd, 0xc9e0f8)
-            }
-            ChromeButtonStyle::Primary => {
-                (UI_ACCENT, UI_ACCENT, 0xffffff, UI_ACCENT_HOVER, 0x005cad)
-            }
+            ChromeButtonStyle::Selected => (
+                palette.accent_soft,
+                palette.accent_border,
+                palette.accent,
+                palette.accent_soft_hover,
+                palette.control_pressed,
+            ),
+            ChromeButtonStyle::Primary => (
+                palette.accent,
+                palette.accent,
+                palette.accent_foreground,
+                palette.accent_hover,
+                palette.accent_active,
+            ),
         };
         div()
             .id(id)
@@ -4226,25 +4342,36 @@ impl PdfReader {
             .overflow_hidden()
             .rounded_md()
             .border_1()
-            .border_color(rgb(border))
-            .bg(rgb(background))
-            .text_color(rgb(text))
+            .border_color(border)
+            .bg(background)
+            .text_color(text)
             .text_sm()
             .font_weight(FontWeight::MEDIUM)
             .when(enabled, |button| {
                 button
                     .cursor_pointer()
-                    .hover(move |button| button.bg(rgb(hover)))
-                    .active(move |button| button.bg(rgb(pressed)))
+                    .hover(move |button| button.bg(hover))
+                    .active(move |button| button.bg(pressed))
                     .on_click(handler)
             })
             .when(!enabled, |button| button.opacity(0.42))
-            .child(label.into())
+            .child(label)
+    }
+
+    fn icon_label(icon: IconName, label: impl IntoElement) -> gpui::AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(Icon::new(icon))
+            .child(label)
+            .into_any_element()
     }
 
     fn segment_button(
+        palette: ReaderPalette,
         id: &'static str,
-        label: impl Into<SharedString>,
+        label: impl IntoElement,
         enabled: bool,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
@@ -4258,31 +4385,32 @@ impl PdfReader {
             .justify_center()
             .overflow_hidden()
             .rounded_md()
-            .text_color(rgb(UI_TEXT))
+            .text_color(palette.text)
             .text_sm()
             .when(enabled, |button| {
                 button
                     .cursor_pointer()
-                    .hover(|button| button.bg(rgb(UI_CONTROL_HOVER)))
-                    .active(|button| button.bg(rgb(UI_CONTROL_PRESSED)))
+                    .hover(|button| button.bg(palette.control_hover))
+                    .active(|button| button.bg(palette.control_pressed))
                     .on_click(handler)
             })
             .when(!enabled, |button| button.opacity(0.38))
-            .child(label.into())
+            .child(label)
     }
 
     fn highlight_button(
+        palette: ReaderPalette,
         id: &'static str,
         color: HighlightColor,
         enabled: bool,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
         let dot = match color {
-            HighlightColor::Yellow => rgb(0xffd447),
-            HighlightColor::Green => rgb(0x55d987),
-            HighlightColor::Blue => rgb(0x5aa7ff),
-            HighlightColor::Pink => rgb(0xff75b7),
-            HighlightColor::Purple => rgb(0xb98cff),
+            HighlightColor::Yellow => palette.yellow,
+            HighlightColor::Green => palette.green,
+            HighlightColor::Blue => palette.blue,
+            HighlightColor::Pink => palette.pink,
+            HighlightColor::Purple => palette.purple,
         };
         div()
             .id(id)
@@ -4296,8 +4424,8 @@ impl PdfReader {
             .when(enabled, |button| {
                 button
                     .cursor_pointer()
-                    .hover(|button| button.bg(rgb(UI_CONTROL_HOVER)))
-                    .active(|button| button.bg(rgb(UI_CONTROL_PRESSED)))
+                    .hover(|button| button.bg(palette.control_hover))
+                    .active(|button| button.bg(palette.control_pressed))
                     .on_click(handler)
             })
             .when(!enabled, |button| button.opacity(0.34))
@@ -4306,7 +4434,7 @@ impl PdfReader {
                     .size(px(14.0))
                     .rounded_full()
                     .border_1()
-                    .border_color(rgba(0x00000024))
+                    .border_color(palette.text.opacity(0.14))
                     .bg(dot),
             )
     }
@@ -4316,6 +4444,7 @@ impl PdfReader {
         state: FluidPillState,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let palette = ReaderPalette::from_theme(Theme::global(cx));
         let compact = state.available_width < 700.0;
         let has_context = self.context_range().is_some() && self.comment_editor.is_none();
         // When a side panel leaves a narrow document strip, the local pill
@@ -4324,12 +4453,17 @@ impl PdfReader {
         let show_context_in_main = has_context && state.available_width >= 520.0;
         let context_actions_enabled =
             has_context && !self.annotations_loading && !self.annotation_persistence_blocked;
-        let comment_label = if self.context_has_comment() {
-            if compact { "✎" } else { "Edit note" }
-        } else if compact {
-            "+"
+        let comment_label = if compact {
+            Icon::new(if self.context_has_comment() {
+                IconName::BookOpen
+            } else {
+                IconName::Plus
+            })
+            .into_any_element()
+        } else if self.context_has_comment() {
+            "Edit note".into_any_element()
         } else {
-            "Add note"
+            "Add note".into_any_element()
         };
 
         div()
@@ -4344,13 +4478,14 @@ impl PdfReader {
             .overflow_hidden()
             .rounded_full()
             .border_1()
-            .border_color(rgba(0x00000022))
-            .bg(rgb(UI_SURFACE))
+            .border_color(palette.text.opacity(0.13))
+            .bg(palette.surface)
             .shadow_sm()
-            .text_color(rgb(UI_TEXT))
+            .text_color(palette.text)
             .child(Self::segment_button(
+                palette,
                 "fluid-zoom-out",
-                "−",
+                Icon::new(IconName::Minus),
                 state.zoom_out_enabled,
                 cx.listener(|reader, _, window, cx| reader.zoom_out(&ZoomOut, window, cx)),
             ))
@@ -4364,21 +4499,23 @@ impl PdfReader {
                     .justify_center()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(if state.document_open {
-                        UI_TEXT
+                    .text_color(if state.document_open {
+                        palette.text
                     } else {
-                        UI_TEXT_TERTIARY
-                    }))
+                        palette.text_tertiary
+                    })
                     .child(state.zoom_label),
             )
             .child(Self::segment_button(
+                palette,
                 "fluid-zoom-in",
-                "+",
+                Icon::new(IconName::Plus),
                 state.zoom_in_enabled,
                 cx.listener(|reader, _, window, cx| reader.zoom_in(&ZoomIn, window, cx)),
             ))
             .when(!compact, |pill| {
                 pill.child(Self::segment_button(
+                    palette,
                     "fluid-fit-width",
                     "Fit",
                     state.document_open,
@@ -4386,7 +4523,7 @@ impl PdfReader {
                 ))
             })
             .when(show_context_in_main, |pill| {
-                pill.child(div().h(px(24.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+                pill.child(div().h(px(24.0)).w(px(1.0)).bg(palette.separator))
                     .children(
                         [
                             "fluid-main-highlight-yellow",
@@ -4399,6 +4536,7 @@ impl PdfReader {
                         .zip(HighlightColor::ALL)
                         .map(|(id, color)| {
                             Self::highlight_button(
+                                palette,
                                 id,
                                 color,
                                 context_actions_enabled,
@@ -4409,16 +4547,22 @@ impl PdfReader {
                         }),
                     )
                     .child(Self::segment_button(
+                        palette,
                         "fluid-main-context-comment",
                         comment_label,
                         context_actions_enabled,
                         cx.listener(|reader, _, window, cx| reader.comment_on_context(window, cx)),
                     ))
             })
-            .child(div().h(px(24.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+            .child(div().h(px(24.0)).w(px(1.0)).bg(palette.separator))
             .child(Self::chrome_button(
+                palette,
                 "fluid-toggle-search",
-                if compact { "⌕" } else { "Search" },
+                if compact {
+                    Icon::new(IconName::Search).into_any_element()
+                } else {
+                    "Search".into_any_element()
+                },
                 if state.search_selected {
                     ChromeButtonStyle::Selected
                 } else {
@@ -4428,8 +4572,13 @@ impl PdfReader {
                 cx.listener(|reader, _, window, cx| reader.find_document(&Find, window, cx)),
             ))
             .child(Self::chrome_button(
+                palette,
                 "fluid-toggle-comments",
-                if compact { "☰" } else { "Comments" },
+                if compact {
+                    Icon::new(IconName::PanelRight).into_any_element()
+                } else {
+                    "Comments".into_any_element()
+                },
                 if state.comments_selected {
                     ChromeButtonStyle::Selected
                 } else {
@@ -4440,6 +4589,19 @@ impl PdfReader {
                     reader.toggle_comments(&ToggleComments, window, cx)
                 }),
             ))
+            .when(Theme::global(cx).is_dark(), |pill| {
+                pill.child(Self::segment_button(
+                    palette,
+                    "fluid-toggle-pdf-dark-mode",
+                    Icon::new(if self.pdf_dark_mode_enabled {
+                        IconName::Moon
+                    } else {
+                        IconName::Sun
+                    }),
+                    true,
+                    cx.listener(|reader, _, window, cx| reader.toggle_pdf_dark_mode(window, cx)),
+                ))
+            })
             .into_any_element()
     }
 
@@ -4449,10 +4611,11 @@ impl PdfReader {
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let palette = ReaderPalette::from_theme(Theme::global(cx));
         let comment_label = if self.context_has_comment() {
-            "✎"
+            Icon::new(IconName::BookOpen)
         } else {
-            "+"
+            Icon::new(IconName::Plus)
         };
         div()
             .id("fluid-context-pill")
@@ -4469,8 +4632,8 @@ impl PdfReader {
             .gap_1()
             .rounded_full()
             .border_1()
-            .border_color(rgba(0x00000026))
-            .bg(rgb(UI_SURFACE))
+            .border_color(palette.text.opacity(0.15))
+            .bg(palette.surface)
             .shadow_sm()
             .children(
                 [
@@ -4484,6 +4647,7 @@ impl PdfReader {
                 .zip(HighlightColor::ALL)
                 .map(|(id, color)| {
                     Self::highlight_button(
+                        palette,
                         id,
                         color,
                         enabled,
@@ -4491,8 +4655,9 @@ impl PdfReader {
                     )
                 }),
             )
-            .child(div().h(px(22.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+            .child(div().h(px(22.0)).w(px(1.0)).bg(palette.separator))
             .child(Self::segment_button(
+                palette,
                 "fluid-context-comment",
                 comment_label,
                 enabled,
@@ -4502,6 +4667,7 @@ impl PdfReader {
     }
 
     fn render_search_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let palette = ReaderPalette::from_theme(Theme::global(cx));
         let fluid = self.view_mode == ReaderView::Fluid;
         let result_count = self.search.order.len();
         let input_error = self.search.input_error.clone();
@@ -4573,16 +4739,16 @@ impl PdfReader {
                         .items_center()
                         .justify_center()
                         .rounded_full()
-                        .bg(rgb(UI_ACCENT_SOFT))
-                        .text_color(rgb(UI_ACCENT))
+                        .bg(palette.accent_soft)
+                        .text_color(palette.accent)
                         .text_lg()
-                        .child("⌕"),
+                        .child(Icon::new(IconName::Search)),
                 )
                 .child(
                     div()
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(UI_TEXT))
+                        .text_color(palette.text)
                         .child(empty_title),
                 )
                 .child(
@@ -4590,7 +4756,7 @@ impl PdfReader {
                         .max_w(px(240.0))
                         .text_xs()
                         .line_height(px(18.0))
-                        .text_color(rgb(UI_TEXT_SECONDARY))
+                        .text_color(palette.text_secondary)
                         .child(empty_detail),
                 )
                 .into_any_element()
@@ -4598,7 +4764,7 @@ impl PdfReader {
             uniform_list(
                 "search-results",
                 result_count,
-                cx.processor(|reader, range: std::ops::Range<usize>, _window, cx| {
+                cx.processor(move |reader, range: std::ops::Range<usize>, _window, cx| {
                     range
                         .filter_map(|index| {
                             let id = *reader.search.order.get(index)?;
@@ -4619,19 +4785,23 @@ impl PdfReader {
                                         .flex()
                                         .rounded_md()
                                         .border_1()
-                                        .border_color(rgb(if active {
-                                            0xb8d5f4
+                                        .border_color(if active {
+                                            palette.accent_border
                                         } else {
-                                            UI_SEPARATOR
-                                        }))
-                                        .bg(rgb(if active { UI_ACCENT_SOFT } else { UI_SURFACE }))
+                                            palette.separator
+                                        })
+                                        .bg(if active {
+                                            palette.accent_soft
+                                        } else {
+                                            palette.surface
+                                        })
                                         .cursor_pointer()
                                         .hover(move |row| {
-                                            row.bg(rgb(if active {
-                                                0xdbeafd
+                                            row.bg(if active {
+                                                palette.accent_soft_hover
                                             } else {
-                                                UI_SURFACE_SUBTLE
-                                            }))
+                                                palette.surface_subtle
+                                            })
                                         })
                                         .on_click(cx.listener(move |reader, _, window, cx| {
                                             reader.activate_search_match(id, window, cx)
@@ -4642,7 +4812,7 @@ impl PdfReader {
                                                     .w(px(3.0))
                                                     .h_full()
                                                     .flex_none()
-                                                    .bg(rgb(UI_ACCENT)),
+                                                    .bg(palette.accent),
                                             )
                                         })
                                         .child(
@@ -4662,9 +4832,9 @@ impl PdfReader {
                                                         .text_xs()
                                                         .font_weight(FontWeight::MEDIUM)
                                                         .text_color(if active {
-                                                            rgb(UI_ACCENT)
+                                                            palette.accent
                                                         } else {
-                                                            rgb(UI_TEXT_SECONDARY)
+                                                            palette.text_secondary
                                                         })
                                                         .child(format!("PAGE {}", id.page + 1))
                                                         .child(format!("{}", index + 1)),
@@ -4675,7 +4845,7 @@ impl PdfReader {
                                                         .overflow_hidden()
                                                         .text_sm()
                                                         .line_height(px(19.0))
-                                                        .text_color(rgb(UI_TEXT))
+                                                        .text_color(palette.text)
                                                         .child(preview),
                                                 ),
                                         ),
@@ -4689,7 +4859,7 @@ impl PdfReader {
             .flex_1()
             .min_h(px(0.0))
             .w_full()
-            .bg(rgb(UI_SURFACE_SUBTLE))
+            .bg(palette.surface_subtle)
             .when(fluid, |list| list.rounded_b_xl())
             .into_any_element()
         };
@@ -4699,8 +4869,8 @@ impl PdfReader {
             .flex()
             .flex_col()
             .when(fluid, |panel| panel.rounded_xl())
-            .bg(rgb(UI_SURFACE))
-            .text_color(rgb(UI_TEXT))
+            .bg(palette.surface)
+            .text_color(palette.text)
             .child(
                 div()
                     .h(px(54.0))
@@ -4710,7 +4880,7 @@ impl PdfReader {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(UI_SEPARATOR))
+                    .border_color(palette.separator)
                     .child(
                         div()
                             .text_lg()
@@ -4718,6 +4888,7 @@ impl PdfReader {
                             .child("Find in Document"),
                     )
                     .child(Self::chrome_button(
+                        palette,
                         "close-search",
                         "Close",
                         ChromeButtonStyle::Ghost,
@@ -4736,7 +4907,7 @@ impl PdfReader {
                     .flex_col()
                     .gap_2()
                     .border_b_1()
-                    .border_color(rgb(UI_SEPARATOR))
+                    .border_color(palette.separator)
                     .child(self.search_field.clone())
                     .child(
                         div()
@@ -4748,9 +4919,9 @@ impl PdfReader {
                                 div()
                                     .text_xs()
                                     .text_color(if input_error.is_some() {
-                                        rgb(UI_ERROR)
+                                        palette.error
                                     } else {
-                                        rgb(UI_TEXT_SECONDARY)
+                                        palette.text_secondary
                                     })
                                     .child(if let Some(index) = active_index {
                                         format!("{} of {}", index + 1, result_count).into()
@@ -4763,8 +4934,9 @@ impl PdfReader {
                                     .flex()
                                     .gap_1()
                                     .child(Self::chrome_button(
+                                        palette,
                                         "previous-search-result",
-                                        "↑",
+                                        Icon::new(IconName::ArrowUp),
                                         ChromeButtonStyle::Ghost,
                                         navigation_enabled,
                                         cx.listener(|reader, _, window, cx| {
@@ -4772,8 +4944,9 @@ impl PdfReader {
                                         }),
                                     ))
                                     .child(Self::chrome_button(
+                                        palette,
                                         "next-search-result",
-                                        "↓",
+                                        Icon::new(IconName::ArrowDown),
                                         ChromeButtonStyle::Ghost,
                                         navigation_enabled,
                                         cx.listener(|reader, _, window, cx| {
@@ -4788,6 +4961,7 @@ impl PdfReader {
     }
 
     fn render_fluid_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let palette = ReaderPalette::from_theme(Theme::global(cx));
         let editor_open = self.comment_editor.is_some();
         let can_add_comment = annotation_actions_enabled(
             self.selection.is_some(),
@@ -4803,7 +4977,7 @@ impl PdfReader {
             .items_center()
             .justify_between()
             .border_b_1()
-            .border_color(rgb(UI_SEPARATOR))
+            .border_color(palette.separator)
             .child(
                 div()
                     .text_lg()
@@ -4816,6 +4990,7 @@ impl PdfReader {
                     .items_center()
                     .gap_1()
                     .child(Self::chrome_button(
+                        palette,
                         "fluid-add-comment",
                         "+ New",
                         ChromeButtonStyle::Neutral,
@@ -4825,6 +5000,7 @@ impl PdfReader {
                         }),
                     ))
                     .child(Self::chrome_button(
+                        palette,
                         "fluid-close-comments",
                         "Close",
                         ChromeButtonStyle::Ghost,
@@ -4853,16 +5029,16 @@ impl PdfReader {
                         .items_center()
                         .justify_center()
                         .rounded_full()
-                        .bg(rgb(UI_ACCENT_SOFT))
-                        .text_color(rgb(UI_ACCENT))
+                        .bg(palette.accent_soft)
+                        .text_color(palette.accent)
                         .text_lg()
-                        .child("✎"),
+                        .child(Icon::new(IconName::BookOpen)),
                 )
                 .child(
                     div()
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(UI_TEXT))
+                        .text_color(palette.text)
                         .child(if self.annotations_loading {
                             "Loading comments…"
                         } else if self.annotation_persistence_blocked {
@@ -4876,7 +5052,7 @@ impl PdfReader {
                         .max_w(px(248.0))
                         .text_xs()
                         .line_height(px(18.0))
-                        .text_color(rgb(UI_TEXT_SECONDARY))
+                        .text_color(palette.text_secondary)
                         .child(if self.annotation_persistence_blocked {
                             "Resolve the annotation sidecar problem before adding comments."
                         } else {
@@ -4888,7 +5064,7 @@ impl PdfReader {
             uniform_list(
                 "fluid-comment-list",
                 self.comment_order.len(),
-                cx.processor(|reader, range: std::ops::Range<usize>, _window, cx| {
+                cx.processor(move |reader, range: std::ops::Range<usize>, _window, cx| {
                     range
                         .filter_map(|index| {
                             let id = *reader.comment_order.get(index)?;
@@ -4900,12 +5076,12 @@ impl PdfReader {
                                 .unwrap_or_else(|_| compact_preview(markdown, 96));
                             let preview: SharedString = preview.into();
                             let color = match annotation.highlight() {
-                                Some(HighlightColor::Yellow) => rgb(0xffd447),
-                                Some(HighlightColor::Green) => rgb(0x55d987),
-                                Some(HighlightColor::Blue) => rgb(0x5aa7ff),
-                                Some(HighlightColor::Pink) => rgb(0xff75b7),
-                                Some(HighlightColor::Purple) => rgb(0xb98cff),
-                                None => rgb(0xf0a53b),
+                                Some(HighlightColor::Yellow) => palette.yellow,
+                                Some(HighlightColor::Green) => palette.green,
+                                Some(HighlightColor::Blue) => palette.blue,
+                                Some(HighlightColor::Pink) => palette.pink,
+                                Some(HighlightColor::Purple) => palette.purple,
+                                None => palette.warning,
                             };
                             let active = reader.active_annotation == Some(id);
                             Some(
@@ -4917,19 +5093,23 @@ impl PdfReader {
                                         .flex()
                                         .rounded_md()
                                         .border_1()
-                                        .border_color(rgb(if active {
-                                            0xb8d5f4
+                                        .border_color(if active {
+                                            palette.accent_border
                                         } else {
-                                            UI_SEPARATOR
-                                        }))
-                                        .bg(rgb(if active { UI_ACCENT_SOFT } else { UI_SURFACE }))
+                                            palette.separator
+                                        })
+                                        .bg(if active {
+                                            palette.accent_soft
+                                        } else {
+                                            palette.surface
+                                        })
                                         .cursor_pointer()
                                         .hover(move |row| {
-                                            row.bg(rgb(if active {
-                                                0xdbeafd
+                                            row.bg(if active {
+                                                palette.accent_soft_hover
                                             } else {
-                                                UI_SURFACE_SUBTLE
-                                            }))
+                                                palette.surface_subtle
+                                            })
                                         })
                                         .on_click(cx.listener(move |reader, _, window, cx| {
                                             reader.open_comment_from_list(id, window, cx);
@@ -4952,12 +5132,15 @@ impl PdfReader {
                                                         .text_xs()
                                                         .font_weight(FontWeight::MEDIUM)
                                                         .text_color(if active {
-                                                            rgb(UI_ACCENT)
+                                                            palette.accent
                                                         } else {
-                                                            rgb(UI_TEXT_SECONDARY)
+                                                            palette.text_secondary
                                                         })
                                                         .child(format!("PAGE {}", page + 1))
-                                                        .child("Open →"),
+                                                        .child(Self::icon_label(
+                                                            IconName::ArrowRight,
+                                                            "Open",
+                                                        )),
                                                 )
                                                 .child(
                                                     div()
@@ -4965,7 +5148,7 @@ impl PdfReader {
                                                         .overflow_hidden()
                                                         .text_sm()
                                                         .line_height(px(20.0))
-                                                        .text_color(rgb(UI_TEXT))
+                                                        .text_color(palette.text)
                                                         .child(preview),
                                                 ),
                                         ),
@@ -4979,7 +5162,7 @@ impl PdfReader {
             .flex_1()
             .min_h(px(0.0))
             .w_full()
-            .bg(rgb(UI_SURFACE_SUBTLE))
+            .bg(palette.surface_subtle)
             .rounded_b_xl()
             .into_any_element()
         };
@@ -4990,10 +5173,10 @@ impl PdfReader {
                 .mt_3()
                 .p_3()
                 .rounded_md()
-                .bg(rgb(UI_ERROR_SOFT))
+                .bg(palette.error_soft)
                 .text_xs()
                 .line_height(px(18.0))
-                .text_color(rgb(UI_ERROR))
+                .text_color(palette.error)
                 .child(message)
         });
         let progress = self.comment_pane.progress;
@@ -5006,7 +5189,7 @@ impl PdfReader {
             .flex()
             .flex_col()
             .rounded_xl()
-            .bg(rgb(UI_SURFACE))
+            .bg(palette.surface)
             .child(list_header)
             .children(list_error)
             .child(list_body);
@@ -5037,10 +5220,10 @@ impl PdfReader {
                     .mt_3()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(UI_ERROR_SOFT))
+                    .bg(palette.error_soft)
                     .text_xs()
                     .line_height(px(18.0))
-                    .text_color(rgb(UI_ERROR))
+                    .text_color(palette.error)
                     .child(message)
             });
             div()
@@ -5052,7 +5235,7 @@ impl PdfReader {
                 .flex()
                 .flex_col()
                 .rounded_xl()
-                .bg(rgb(UI_SURFACE))
+                .bg(palette.surface)
                 .child(
                     div()
                         .h(px(54.0))
@@ -5062,10 +5245,11 @@ impl PdfReader {
                         .items_center()
                         .justify_between()
                         .border_b_1()
-                        .border_color(rgb(UI_SEPARATOR))
+                        .border_color(palette.separator)
                         .child(Self::chrome_button(
+                            palette,
                             "fluid-comment-back",
-                            "‹ Back",
+                            Self::icon_label(IconName::ChevronLeft, "Back"),
                             ChromeButtonStyle::Ghost,
                             true,
                             cx.listener(|reader, _, window, cx| {
@@ -5093,15 +5277,16 @@ impl PdfReader {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(if save_status == "Saved" {
-                                            0x2f7d4a
+                                        .text_color(if save_status == "Saved" {
+                                            palette.green
                                         } else {
-                                            UI_TEXT_SECONDARY
-                                        }))
+                                            palette.text_secondary
+                                        })
                                         .child(save_status),
                                 ),
                         )
                         .child(Self::chrome_button(
+                            palette,
                             "fluid-close-comment-editor",
                             "Close",
                             ChromeButtonStyle::Ghost,
@@ -5128,8 +5313,8 @@ impl PdfReader {
             .size_full()
             .overflow_hidden()
             .rounded_xl()
-            .bg(rgb(UI_SURFACE))
-            .text_color(rgb(UI_TEXT))
+            .bg(palette.surface)
+            .text_color(palette.text)
             .child(list_pane)
             .children(editor_pane)
             .into_any_element()
@@ -5143,6 +5328,7 @@ impl PdfReader {
     }
 
     fn render_classic_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let palette = ReaderPalette::from_theme(Theme::global(cx));
         let error = self.annotation_error.clone();
         let editor_open = self.comment_editor.is_some();
         let can_add_comment = annotation_actions_enabled(
@@ -5183,7 +5369,7 @@ impl PdfReader {
             .items_center()
             .justify_between()
             .border_b_1()
-            .border_color(rgb(UI_SEPARATOR))
+            .border_color(palette.separator)
             .child(
                 div()
                     .flex()
@@ -5191,8 +5377,9 @@ impl PdfReader {
                     .gap_2()
                     .when(editor_open, |heading| {
                         heading.child(Self::chrome_button(
+                            palette,
                             "classic-comment-back",
-                            "‹ Back",
+                            Self::icon_label(IconName::ChevronLeft, "Back"),
                             ChromeButtonStyle::Ghost,
                             true,
                             cx.listener(|reader, _, window, cx| {
@@ -5212,18 +5399,18 @@ impl PdfReader {
                                 .px_2()
                                 .py_1()
                                 .rounded_full()
-                                .bg(rgb(if save_status == "Saved" {
-                                    0xe8f5ec
+                                .bg(if save_status == "Saved" {
+                                    palette.green.opacity(0.12)
                                 } else {
-                                    UI_ACCENT_SOFT
-                                }))
+                                    palette.accent_soft
+                                })
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(rgb(if save_status == "Saved" {
-                                    0x2f7d4a
+                                .text_color(if save_status == "Saved" {
+                                    palette.green
                                 } else {
-                                    UI_ACCENT
-                                }))
+                                    palette.accent
+                                })
                                 .child(save_status),
                         )
                     }),
@@ -5235,6 +5422,7 @@ impl PdfReader {
                     .gap_1()
                     .when(!editor_open, |actions| {
                         actions.child(Self::chrome_button(
+                            palette,
                             "add-comment",
                             if context_has_comment { "Edit" } else { "+ New" },
                             ChromeButtonStyle::Neutral,
@@ -5245,6 +5433,7 @@ impl PdfReader {
                         ))
                     })
                     .child(Self::chrome_button(
+                        palette,
                         "close-comments",
                         "Close",
                         ChromeButtonStyle::Ghost,
@@ -5282,16 +5471,16 @@ impl PdfReader {
                         .items_center()
                         .justify_center()
                         .rounded_full()
-                        .bg(rgb(UI_ACCENT_SOFT))
-                        .text_color(rgb(UI_ACCENT))
+                        .bg(palette.accent_soft)
+                        .text_color(palette.accent)
                         .text_lg()
-                        .child("✎"),
+                        .child(Icon::new(IconName::BookOpen)),
                 )
                 .child(
                     div()
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(UI_TEXT))
+                        .text_color(palette.text)
                         .child(if self.annotations_loading {
                             "Loading comments…"
                         } else if self.annotation_persistence_blocked {
@@ -5305,7 +5494,7 @@ impl PdfReader {
                         .max_w(px(248.0))
                         .text_xs()
                         .line_height(px(18.0))
-                        .text_color(rgb(UI_TEXT_SECONDARY))
+                        .text_color(palette.text_secondary)
                         .child(if self.annotation_persistence_blocked {
                             "Resolve the annotation sidecar problem before adding comments."
                         } else {
@@ -5317,7 +5506,7 @@ impl PdfReader {
             uniform_list(
                 "comment-list",
                 self.comment_order.len(),
-                cx.processor(|reader, range: std::ops::Range<usize>, _window, cx| {
+                cx.processor(move |reader, range: std::ops::Range<usize>, _window, cx| {
                     range
                         .filter_map(|index| {
                             let id = *reader.comment_order.get(index)?;
@@ -5329,12 +5518,12 @@ impl PdfReader {
                                 .unwrap_or_else(|_| compact_preview(markdown, 96));
                             let preview: SharedString = preview.into();
                             let color = match annotation.highlight() {
-                                Some(HighlightColor::Yellow) => rgb(0xffd447),
-                                Some(HighlightColor::Green) => rgb(0x55d987),
-                                Some(HighlightColor::Blue) => rgb(0x5aa7ff),
-                                Some(HighlightColor::Pink) => rgb(0xff75b7),
-                                Some(HighlightColor::Purple) => rgb(0xb98cff),
-                                None => rgb(0xf0a53b),
+                                Some(HighlightColor::Yellow) => palette.yellow,
+                                Some(HighlightColor::Green) => palette.green,
+                                Some(HighlightColor::Blue) => palette.blue,
+                                Some(HighlightColor::Pink) => palette.pink,
+                                Some(HighlightColor::Purple) => palette.purple,
+                                None => palette.warning,
                             };
                             let active = reader.active_annotation == Some(id);
                             Some(
@@ -5346,19 +5535,23 @@ impl PdfReader {
                                         .flex()
                                         .rounded_md()
                                         .border_1()
-                                        .border_color(rgb(if active {
-                                            0xb8d5f4
+                                        .border_color(if active {
+                                            palette.accent_border
                                         } else {
-                                            UI_SEPARATOR
-                                        }))
-                                        .bg(rgb(if active { UI_ACCENT_SOFT } else { UI_SURFACE }))
+                                            palette.separator
+                                        })
+                                        .bg(if active {
+                                            palette.accent_soft
+                                        } else {
+                                            palette.surface
+                                        })
                                         .cursor_pointer()
                                         .hover(move |row| {
-                                            row.bg(rgb(if active {
-                                                0xdbeafd
+                                            row.bg(if active {
+                                                palette.accent_soft_hover
                                             } else {
-                                                UI_SURFACE_SUBTLE
-                                            }))
+                                                palette.surface_subtle
+                                            })
                                         })
                                         .on_click(cx.listener(move |reader, _, window, cx| {
                                             reader.open_comment_from_list(id, window, cx);
@@ -5383,9 +5576,9 @@ impl PdfReader {
                                                         .child(
                                                             div()
                                                                 .text_color(if active {
-                                                                    rgb(UI_ACCENT)
+                                                                    palette.accent
                                                                 } else {
-                                                                    rgb(UI_TEXT_SECONDARY)
+                                                                    palette.text_secondary
                                                                 })
                                                                 .child(format!(
                                                                     "PAGE {}",
@@ -5399,9 +5592,9 @@ impl PdfReader {
                                                                 .py_1()
                                                                 .overflow_hidden()
                                                                 .rounded_md()
-                                                                .text_color(rgb(UI_ACCENT))
+                                                                .text_color(palette.accent)
                                                                 .hover(|button| {
-                                                                    button.bg(rgb(UI_ACCENT_SOFT))
+                                                                    button.bg(palette.accent_soft)
                                                                 })
                                                                 .on_click(cx.listener(
                                                                     move |reader, _, window, cx| {
@@ -5419,7 +5612,7 @@ impl PdfReader {
                                                         .overflow_hidden()
                                                         .text_sm()
                                                         .line_height(px(20.0))
-                                                        .text_color(rgb(UI_TEXT))
+                                                        .text_color(palette.text)
                                                         .child(preview),
                                                 ),
                                         ),
@@ -5433,7 +5626,7 @@ impl PdfReader {
             .flex_1()
             .min_h(px(0.0))
             .w_full()
-            .bg(rgb(UI_SURFACE_SUBTLE))
+            .bg(palette.surface_subtle)
             .into_any_element()
         };
 
@@ -5441,8 +5634,8 @@ impl PdfReader {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(UI_SURFACE))
-            .text_color(rgb(UI_TEXT))
+            .bg(palette.surface)
+            .text_color(palette.text)
             .child(header)
             .children(error.map(|message| {
                 div()
@@ -5450,10 +5643,10 @@ impl PdfReader {
                     .mt_3()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(UI_ERROR_SOFT))
+                    .bg(palette.error_soft)
                     .text_xs()
                     .line_height(px(18.0))
-                    .text_color(rgb(UI_ERROR))
+                    .text_color(palette.error)
                     .child(message)
             }))
             .child(body)
@@ -5461,6 +5654,7 @@ impl PdfReader {
     }
 
     fn paint_document(snapshot: PaintSnapshot, bounds: Bounds<Pixels>, window: &mut Window) {
+        let palette = snapshot.palette;
         let content_viewport = Rect {
             x: snapshot.scroll.x,
             y: snapshot.scroll.y,
@@ -5497,7 +5691,7 @@ impl PdfReader {
             window.paint_quad(quad(
                 shadow_bounds,
                 px(5.0),
-                rgba(0x090c1252),
+                palette.overlay.opacity(0.32),
                 px(0.0),
                 gpui::transparent_black(),
                 Default::default(),
@@ -5505,9 +5699,9 @@ impl PdfReader {
             window.paint_quad(quad(
                 page_bounds,
                 px(2.0),
-                gpui::white(),
+                palette.paper,
                 px(1.0),
-                rgb(0xd8dadd),
+                palette.paper_border,
                 Default::default(),
             ));
 
@@ -5548,18 +5742,24 @@ impl PdfReader {
                             };
                             let active = Some(annotation.id) == snapshot.active_annotation;
                             let color = match annotation.color {
-                                Some(HighlightColor::Yellow) if active => rgba(0xffd44788),
-                                Some(HighlightColor::Yellow) => rgba(0xffd44761),
-                                Some(HighlightColor::Green) if active => rgba(0x55d98788),
-                                Some(HighlightColor::Green) => rgba(0x55d98761),
-                                Some(HighlightColor::Blue) if active => rgba(0x5aa7ff88),
-                                Some(HighlightColor::Blue) => rgba(0x5aa7ff61),
-                                Some(HighlightColor::Pink) if active => rgba(0xff75b788),
-                                Some(HighlightColor::Pink) => rgba(0xff75b761),
-                                Some(HighlightColor::Purple) if active => rgba(0xb98cff88),
-                                Some(HighlightColor::Purple) => rgba(0xb98cff61),
-                                None if active => rgba(0xf0a53b78),
-                                None if annotation.has_comment => rgba(0xf0a53b3d),
+                                Some(HighlightColor::Yellow) if active => {
+                                    palette.yellow.opacity(0.53)
+                                }
+                                Some(HighlightColor::Yellow) => palette.yellow.opacity(0.38),
+                                Some(HighlightColor::Green) if active => {
+                                    palette.green.opacity(0.53)
+                                }
+                                Some(HighlightColor::Green) => palette.green.opacity(0.38),
+                                Some(HighlightColor::Blue) if active => palette.blue.opacity(0.53),
+                                Some(HighlightColor::Blue) => palette.blue.opacity(0.38),
+                                Some(HighlightColor::Pink) if active => palette.pink.opacity(0.53),
+                                Some(HighlightColor::Pink) => palette.pink.opacity(0.38),
+                                Some(HighlightColor::Purple) if active => {
+                                    palette.purple.opacity(0.53)
+                                }
+                                Some(HighlightColor::Purple) => palette.purple.opacity(0.38),
+                                None if active => palette.warning.opacity(0.47),
+                                None if annotation.has_comment => palette.warning.opacity(0.24),
                                 None => continue,
                             };
                             let exhausted = chars.for_each_visible_in_range_while(
@@ -5620,9 +5820,9 @@ impl PdfReader {
                                     content_rect_to_bounds(bounds, highlight, snapshot.scroll),
                                     px(1.0),
                                     if is_active {
-                                        rgba(0xff8a2b88)
+                                        palette.warning.opacity(0.53)
                                     } else {
-                                        rgba(0xf5c54255)
+                                        palette.yellow.opacity(0.33)
                                     },
                                     px(0.0),
                                     gpui::transparent_black(),
@@ -5659,7 +5859,7 @@ impl PdfReader {
                                 window.paint_quad(quad(
                                     highlight_bounds,
                                     px(1.0),
-                                    rgba(0x2575e650),
+                                    palette.selection,
                                     px(0.0),
                                     gpui::transparent_black(),
                                     Default::default(),
@@ -5687,7 +5887,7 @@ impl PdfReader {
             window.paint_quad(quad(
                 thumb,
                 px(2.5),
-                rgba(0xdce2eb8f),
+                palette.text_secondary.opacity(0.56),
                 px(0.0),
                 gpui::transparent_black(),
                 Default::default(),
@@ -5710,7 +5910,7 @@ impl PdfReader {
             window.paint_quad(quad(
                 thumb,
                 px(2.5),
-                rgba(0xdce2eb8f),
+                palette.text_secondary.opacity(0.56),
                 px(0.0),
                 gpui::transparent_black(),
                 Default::default(),
@@ -5727,6 +5927,14 @@ impl Focusable for PdfReader {
 
 impl Render for PdfReader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_theme = Theme::global(cx);
+        let mut palette = ReaderPalette::from_theme(active_theme);
+        let forced_dark = matches!(
+            self.render_appearance,
+            RenderAppearance::ForcedColors { .. }
+        );
+        palette.paper = theme::pdf_paper_color(active_theme, forced_dark);
+        palette.paper_border = theme::pdf_paper_border(active_theme, forced_dark);
         self.update_viewport(window);
         self.request_visible_tiles(window);
         let full_width = f32::from(window.viewport_size().width).max(1.0);
@@ -5776,10 +5984,10 @@ impl Render for PdfReader {
             .items_center()
             .gap_2()
             .px_3()
-            .bg(rgb(UI_CHROME))
+            .bg(palette.chrome)
             .border_b_1()
-            .border_color(rgb(UI_SEPARATOR))
-            .text_color(rgb(UI_TEXT))
+            .border_color(palette.separator)
+            .text_color(palette.text)
             .child(
                 div()
                     .h_full()
@@ -5788,6 +5996,7 @@ impl Render for PdfReader {
                     .window_control_area(WindowControlArea::Drag),
             )
             .child(Self::chrome_button(
+                palette,
                 "open-document",
                 if very_compact_toolbar {
                     "Open"
@@ -5806,11 +6015,12 @@ impl Render for PdfReader {
                     .overflow_hidden()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(UI_SEPARATOR))
-                    .bg(rgb(UI_CONTROL))
+                    .border_color(palette.separator)
+                    .bg(palette.control)
                     .child(Self::segment_button(
+                        palette,
                         "zoom-out",
-                        "−",
+                        Icon::new(IconName::Minus),
                         zoom_out_enabled,
                         cx.listener(|reader, _, window, cx| reader.zoom_out(&ZoomOut, window, cx)),
                     ))
@@ -5824,25 +6034,27 @@ impl Render for PdfReader {
                             .justify_center()
                             .border_l_1()
                             .border_r_1()
-                            .border_color(rgb(UI_SEPARATOR))
+                            .border_color(palette.separator)
                             .text_sm()
-                            .text_color(rgb(if document_open {
-                                UI_TEXT
+                            .text_color(if document_open {
+                                palette.text
                             } else {
-                                UI_TEXT_TERTIARY
-                            }))
+                                palette.text_tertiary
+                            })
                             .child(zoom_label.clone()),
                     )
                     .child(Self::segment_button(
+                        palette,
                         "zoom-in",
-                        "+",
+                        Icon::new(IconName::Plus),
                         zoom_in_enabled,
                         cx.listener(|reader, _, window, cx| reader.zoom_in(&ZoomIn, window, cx)),
                     ))
                     .when(!very_compact_toolbar, |controls| {
                         controls
-                            .child(div().h_full().w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+                            .child(div().h_full().w(px(1.0)).bg(palette.separator))
                             .child(Self::segment_button(
+                                palette,
                                 "fit-width",
                                 if compact_toolbar { "Fit" } else { "Fit Width" },
                                 document_open,
@@ -5882,9 +6094,9 @@ impl Render for PdfReader {
                                 .px_2()
                                 .py_1()
                                 .rounded_full()
-                                .bg(rgb(UI_CONTROL_HOVER))
+                                .bg(palette.control_hover)
                                 .text_xs()
-                                .text_color(rgb(UI_TEXT_SECONDARY))
+                                .text_color(palette.text_secondary)
                                 .child(format!("{current_page} / {page_count}")),
                         )
                     })
@@ -5896,7 +6108,7 @@ impl Render for PdfReader {
                                 .whitespace_nowrap()
                                 .text_ellipsis()
                                 .text_xs()
-                                .text_color(rgb(UI_TEXT_SECONDARY))
+                                .text_color(palette.text_secondary)
                                 .child(status_text.clone()),
                         )
                     }),
@@ -5911,16 +6123,16 @@ impl Render for PdfReader {
                         .px_1()
                         .rounded_md()
                         .border_1()
-                        .border_color(rgb(UI_SEPARATOR))
-                        .bg(rgb(UI_CONTROL))
-                        .when(!compact_toolbar, |palette| {
-                            palette.child(
+                        .border_color(palette.separator)
+                        .bg(palette.control)
+                        .when(!compact_toolbar, |controls| {
+                            controls.child(
                                 div()
                                     .pl_2()
                                     .pr_1()
                                     .text_xs()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(UI_TEXT_SECONDARY))
+                                    .text_color(palette.text_secondary)
                                     .child("Highlight"),
                             )
                         })
@@ -5936,6 +6148,7 @@ impl Render for PdfReader {
                             .zip(HighlightColor::ALL)
                             .map(|(id, color)| {
                                 Self::highlight_button(
+                                    palette,
                                     id,
                                     color,
                                     annotation_tools_enabled,
@@ -5945,8 +6158,9 @@ impl Render for PdfReader {
                                 )
                             }),
                         )
-                        .child(div().h(px(22.0)).w(px(1.0)).bg(rgb(UI_SEPARATOR)))
+                        .child(div().h(px(22.0)).w(px(1.0)).bg(palette.separator))
                         .child(Self::segment_button(
+                            palette,
                             "add-selection-comment",
                             if self.context_has_comment() {
                                 if very_compact_toolbar {
@@ -5971,6 +6185,7 @@ impl Render for PdfReader {
                 |toolbar| {
                     toolbar
                         .child(Self::chrome_button(
+                            palette,
                             "toggle-search",
                             if compact_toolbar { "Find" } else { "Search" },
                             if search_selected {
@@ -5984,6 +6199,7 @@ impl Render for PdfReader {
                             }),
                         ))
                         .child(Self::chrome_button(
+                            palette,
                             "toggle-comments",
                             comments_label,
                             if comments_selected {
@@ -6007,10 +6223,10 @@ impl Render for PdfReader {
             .items_center()
             .gap_2()
             .px_3()
-            .bg(rgb(UI_CHROME))
+            .bg(palette.chrome)
             .border_b_1()
-            .border_color(rgb(UI_SEPARATOR))
-            .text_color(rgb(UI_TEXT))
+            .border_color(palette.separator)
+            .text_color(palette.text)
             .child(
                 div()
                     .h_full()
@@ -6019,6 +6235,7 @@ impl Render for PdfReader {
                     .window_control_area(WindowControlArea::Drag),
             )
             .child(Self::chrome_button(
+                palette,
                 "fluid-open-document",
                 "Open…",
                 ChromeButtonStyle::Ghost,
@@ -6051,9 +6268,9 @@ impl Render for PdfReader {
                                 .px_2()
                                 .py_1()
                                 .rounded_full()
-                                .bg(rgb(UI_CONTROL_HOVER))
+                                .bg(palette.control_hover)
                                 .text_xs()
-                                .text_color(rgb(UI_TEXT_SECONDARY))
+                                .text_color(palette.text_secondary)
                                 .child(format!("{current_page} / {page_count}")),
                         )
                     })
@@ -6065,7 +6282,7 @@ impl Render for PdfReader {
                                 .whitespace_nowrap()
                                 .text_ellipsis()
                                 .text_xs()
-                                .text_color(rgb(UI_TEXT_SECONDARY))
+                                .text_color(palette.text_secondary)
                                 .child(status_text.clone()),
                         )
                     }),
@@ -6075,10 +6292,10 @@ impl Render for PdfReader {
                     .px_2()
                     .py_1()
                     .rounded_full()
-                    .bg(rgb(UI_ACCENT_SOFT))
+                    .bg(palette.accent_soft)
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(UI_ACCENT))
+                    .text_color(palette.accent)
                     .child("Fluid"),
             );
 
@@ -6126,6 +6343,7 @@ impl Render for PdfReader {
                 })
                 .collect();
             let snapshot = PaintSnapshot {
+                palette,
                 layout: self.layout.as_ref().unwrap().clone(),
                 pages,
                 scroll: self.scroll,
@@ -6142,7 +6360,7 @@ impl Render for PdfReader {
                 .h_full()
                 .w(px(self.viewport_width))
                 .overflow_hidden()
-                .bg(rgb(UI_CANVAS))
+                .bg(palette.canvas)
                 .cursor(if self.pan.is_some() {
                     CursorStyle::ClosedHand
                 } else {
@@ -6175,8 +6393,8 @@ impl Render for PdfReader {
                 .items_center()
                 .justify_center()
                 .gap_3()
-                .bg(rgb(UI_CANVAS_EMPTY))
-                .text_color(rgb(0xf7f8fa))
+                .bg(palette.canvas_empty)
+                .text_color(palette.text)
                 .child(
                     div()
                         .mb_2()
@@ -6186,8 +6404,8 @@ impl Render for PdfReader {
                         .justify_center()
                         .rounded_lg()
                         .border_1()
-                        .border_color(rgba(0xffffff26))
-                        .bg(rgba(0xffffff12))
+                        .border_color(palette.text.opacity(0.15))
+                        .bg(palette.surface.opacity(0.07))
                         .shadow_sm()
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
@@ -6205,10 +6423,11 @@ impl Render for PdfReader {
                         .text_center()
                         .text_sm()
                         .line_height(px(21.0))
-                        .text_color(rgb(0xbac1cc))
+                        .text_color(palette.text_secondary)
                         .child("Read, search, highlight, and comment with a fast native PDF workspace."),
                 )
                 .child(Self::chrome_button(
+                    palette,
                     "empty-open-document",
                     "Choose PDF…",
                     ChromeButtonStyle::Primary,
@@ -6221,7 +6440,7 @@ impl Render for PdfReader {
                     div()
                         .mt_2()
                         .text_xs()
-                        .text_color(rgb(0x8f99a7))
+                        .text_color(palette.text_tertiary)
                         .child("⌘O to open  ·  Pinch or ⌘-scroll to zoom"),
                 )
                 .into_any_element()
@@ -6242,9 +6461,9 @@ impl Render for PdfReader {
                     .w(px(sidebar_width))
                     .flex_none()
                     .overflow_hidden()
-                    .bg(rgb(UI_SURFACE))
+                    .bg(palette.surface)
                     .border_l_1()
-                    .border_color(rgb(UI_SEPARATOR))
+                    .border_color(palette.separator)
                     .child(
                         div()
                             .h_full()
@@ -6318,8 +6537,8 @@ impl Render for PdfReader {
                             .overflow_hidden()
                             .rounded_xl()
                             .border_1()
-                            .border_color(rgba(0x00000020))
-                            .bg(rgb(UI_SURFACE))
+                            .border_color(palette.text.opacity(0.13))
+                            .bg(palette.surface)
                             .shadow_sm()
                             .child(sidebar_content),
                     );
@@ -6355,8 +6574,8 @@ impl Render for PdfReader {
                     .flex()
                     .items_center()
                     .px_3()
-                    .bg(rgb(UI_ERROR_SOFT))
-                    .text_color(rgb(UI_ERROR))
+                    .bg(palette.error_soft)
+                    .text_color(palette.error)
                     .text_sm()
                     .child(message.clone()),
             )
@@ -6370,7 +6589,7 @@ impl Render for PdfReader {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(UI_CANVAS))
+            .bg(palette.canvas)
             .on_action(cx.listener(Self::open_dialog))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
@@ -6397,6 +6616,7 @@ impl Render for PdfReader {
             .on_action(cx.listener(Self::previous_search_result))
             .on_action(cx.listener(Self::use_classic_view))
             .on_action(cx.listener(Self::use_fluid_view))
+            .on_action(cx.listener(Self::select_theme))
             .on_action(cx.listener(Self::quit_application))
             .child(toolbar)
             .children(error_bar)
@@ -6431,6 +6651,7 @@ struct PaintTile {
 
 #[derive(Clone)]
 struct PaintSnapshot {
+    palette: ReaderPalette,
     layout: Arc<DocumentLayout>,
     pages: Vec<PaintPage>,
     scroll: Offset,
@@ -6746,6 +6967,41 @@ fn content_rect_to_bounds(canvas: Bounds<Pixels>, rect: Rect, scroll: Offset) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_component::{ThemeColor, ThemeMode};
+
+    #[test]
+    fn pdf_render_appearance_follows_theme_mode_and_colors() {
+        let light = Theme::from(ThemeColor::light().as_ref());
+        assert_eq!(
+            render_appearance_from_theme(&light, true),
+            RenderAppearance::Normal
+        );
+
+        let mut dark = Theme::from(ThemeColor::dark().as_ref());
+        dark.mode = ThemeMode::Dark;
+        let expected_background = gpui::Rgba::from(theme::pdf_paper_color(&dark, true));
+        let expected_foreground = gpui::Rgba::from(dark.foreground);
+        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        assert_eq!(
+            render_appearance_from_theme(&dark, true),
+            RenderAppearance::ForcedColors {
+                background: RenderColor {
+                    red: channel(expected_background.r),
+                    green: channel(expected_background.g),
+                    blue: channel(expected_background.b),
+                },
+                foreground: RenderColor {
+                    red: channel(expected_foreground.r),
+                    green: channel(expected_foreground.g),
+                    blue: channel(expected_foreground.b),
+                },
+            }
+        );
+        assert_eq!(
+            render_appearance_from_theme(&dark, false),
+            RenderAppearance::Normal
+        );
+    }
 
     struct TestDirectory(PathBuf);
 

@@ -21,6 +21,32 @@ const AUTOMATIC_TEXT_IDLE_DELAY: Duration = Duration::from_millis(200);
 const MAX_SEARCH_HIGHLIGHT_RUNS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl RenderColor {
+    fn as_pdfium(self) -> PdfColor {
+        // pdfium-render's PdfColor encoder stores colors in Pdfium's native
+        // ABGR integer order. Swap the semantic red/blue inputs so PDFium's
+        // forced-color and bitmap-clear APIs receive the intended RGB value.
+        PdfColor::new(self.blue, self.green, self.red, 255)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RenderAppearance {
+    #[default]
+    Normal,
+    ForcedColors {
+        background: RenderColor,
+        foreground: RenderColor,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TileRequest {
     pub key: TileKey,
     pub core_rect: PixelRect,
@@ -37,6 +63,7 @@ pub enum WorkerEvent {
     },
     TileRendered {
         generation: u64,
+        appearance: RenderAppearance,
         key: TileKey,
         core_rect: PixelRect,
         render_rect: PixelRect,
@@ -46,6 +73,7 @@ pub enum WorkerEvent {
     },
     TileFailed {
         generation: u64,
+        appearance: RenderAppearance,
         key: TileKey,
         message: String,
     },
@@ -137,6 +165,7 @@ impl PdfWorker {
     pub fn render_viewport(
         &self,
         generation: u64,
+        appearance: RenderAppearance,
         tiles: &[TileRequest],
         visible_tile_count: usize,
         text_pages: &[usize],
@@ -147,6 +176,7 @@ impl PdfWorker {
             .enumerate()
             .map(|(priority, tile)| RenderRequest {
                 generation,
+                appearance,
                 tile,
                 priority,
                 prefetch: priority >= visible_tile_count,
@@ -227,6 +257,7 @@ enum WorkerCommand {
 #[derive(Clone, Debug)]
 struct RenderRequest {
     generation: u64,
+    appearance: RenderAppearance,
     tile: TileRequest,
     priority: usize,
     prefetch: bool,
@@ -427,6 +458,7 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
                     if events
                         .send(WorkerEvent::TileRendered {
                             generation: request.generation,
+                            appearance: request.appearance,
                             key: request.tile.key,
                             core_rect: request.tile.core_rect,
                             render_rect: request.tile.render_rect,
@@ -443,6 +475,7 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
                     if events
                         .send(WorkerEvent::TileFailed {
                             generation: request.generation,
+                            appearance: request.appearance,
                             key: request.tile.key,
                             message: format!(
                                 "Could not render page {}: {message}",
@@ -1195,7 +1228,12 @@ fn should_publish_completed_render(
     request: &RenderRequest,
     pending: &mut HashMap<TileKey, RenderRequest>,
 ) -> bool {
-    let still_demanded = pending.remove(&request.tile.key).is_some();
+    let still_demanded = pending
+        .get(&request.tile.key)
+        .is_some_and(|latest| latest.appearance == request.appearance);
+    if still_demanded {
+        pending.remove(&request.tile.key);
+    }
     current_generation == Some(request.generation) && still_demanded
 }
 
@@ -1232,6 +1270,9 @@ fn initialize_pdfium() -> Result<&'static Pdfium, String> {
                 Ok(bindings) => {
                     return Ok(Box::leak(Box::new(Pdfium::new(bindings))));
                 }
+                Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => {
+                    return Ok(Box::leak(Box::new(Pdfium::default())));
+                }
                 Err(error) => failures.push(format!("{} ({error})", candidate.display())),
             }
         }
@@ -1239,6 +1280,9 @@ fn initialize_pdfium() -> Result<&'static Pdfium, String> {
 
     match Pdfium::bind_to_system_library() {
         Ok(bindings) => Ok(Box::leak(Box::new(Pdfium::new(bindings)))),
+        Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => {
+            Ok(Box::leak(Box::new(Pdfium::default())))
+        }
         Err(error) => {
             let detail = if failures.is_empty() {
                 String::new()
@@ -1308,7 +1352,7 @@ fn render_tile(state: &mut WorkerState, request: &RenderRequest) -> Result<Rende
         i32::try_from(request.tile.render_rect.width).map_err(|_| "tile width is too large")?;
     let render_height =
         i32::try_from(request.tile.render_rect.height).map_err(|_| "tile height is too large")?;
-    let config = PdfRenderConfig::new()
+    let mut config = PdfRenderConfig::new()
         .set_fixed_size(full_width, full_height)
         // GPUI's RenderImage upload path expects BGRA on macOS. Keeping
         // PDFium's native byte order avoids a tile-wide channel conversion.
@@ -1316,6 +1360,19 @@ fn render_tile(state: &mut WorkerState, request: &RenderRequest) -> Result<Rende
         .render_annotations(true)
         .limit_render_image_cache_size(true)
         .render_form_data(true);
+    if let RenderAppearance::ForcedColors {
+        background,
+        foreground,
+    } = request.appearance
+    {
+        let foreground = foreground.as_pdfium();
+        config = config
+            .set_clear_color(background.as_pdfium())
+            .set_color_scheme(PdfPageRenderColorScheme::new(
+                foreground, foreground, foreground, foreground,
+            ))
+            .render_fills_as_strokes(true);
+    }
     let bitmap = page
         .render_tile_with_config(
             &config,
@@ -1571,8 +1628,13 @@ fn normalized_text_bounds(
 mod tests {
     use super::*;
 
+    static PDFIUM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn pdfium_opens_renders_and_extracts_the_integration_fixture() {
+        let _pdfium_guard = PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let pdfium = initialize_pdfium().expect("the pinned PDFium binary should load");
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/interaction.pdf");
         let (document, pages) = open_document(pdfium, &path).expect("fixture should open");
@@ -1638,6 +1700,7 @@ mod tests {
             let (width, height) = [(612, 792), (612, 792), (612, 340)][page];
             let request = RenderRequest {
                 generation: 1,
+                appearance: RenderAppearance::Normal,
                 tile: TileRequest {
                     key: TileKey {
                         page,
@@ -1755,6 +1818,7 @@ mod tests {
 
         let high_resolution_tile = RenderRequest {
             generation: 1,
+            appearance: RenderAppearance::Normal,
             tile: TileRequest {
                 key: TileKey {
                     page: 0,
@@ -1874,6 +1938,7 @@ mod tests {
             };
             RenderRequest {
                 generation: 7,
+                appearance: RenderAppearance::Normal,
                 tile: TileRequest {
                     key,
                     core_rect: PixelRect {
@@ -1931,6 +1996,32 @@ mod tests {
         ));
         assert!(pending.is_empty(), "a completion must publish only once");
 
+        let forced_colors = RenderAppearance::ForcedColors {
+            background: RenderColor {
+                red: 24,
+                green: 24,
+                blue: 24,
+            },
+            foreground: RenderColor {
+                red: 224,
+                green: 224,
+                blue: 224,
+            },
+        };
+        let mut dark_replacement = in_flight.clone();
+        dark_replacement.appearance = forced_colors;
+        replace_render_demand(Some(7), 7, vec![dark_replacement.clone()], &mut pending);
+        assert!(
+            !should_publish_completed_render(Some(7), &in_flight, &mut pending),
+            "an in-flight light tile must not satisfy replacement dark demand"
+        );
+        assert_eq!(pending.len(), 1, "stale completion must retain new demand");
+        assert!(should_publish_completed_render(
+            Some(7),
+            &dark_replacement,
+            &mut pending
+        ));
+
         replace_render_demand(Some(7), 7, vec![in_flight.clone()], &mut pending);
         assert!(
             !should_publish_completed_render(Some(8), &in_flight, &mut pending),
@@ -1945,6 +2036,90 @@ mod tests {
             automatic_text,
             VecDeque::from([9, 3]),
             "a new viewport must replace stale pages while preserving priority"
+        );
+    }
+
+    #[test]
+    fn pdfium_forced_colors_render_dark_background_and_light_content() {
+        let _pdfium_guard = PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let pdfium = initialize_pdfium().expect("the pinned PDFium binary should load");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/interaction.pdf");
+        let (document, pages) = open_document(pdfium, &fixture).expect("fixture should open");
+        let mut state = WorkerState {
+            document: Some(document),
+            generation: Some(1),
+            text_cache: HashMap::new(),
+            partial_text: HashMap::new(),
+            automatic_text_needs_quiet: false,
+            page_count: pages.len(),
+            search: None,
+            latest_search_revision: None,
+            search_partial: None,
+        };
+        let key = TileKey {
+            page: 0,
+            raster: RasterSize {
+                width: 612,
+                height: 792,
+            },
+            column: 0,
+            row: 0,
+        };
+        let tile = TileRequest {
+            key,
+            core_rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 612,
+                height: 792,
+            },
+            render_rect: PixelRect {
+                x: 0,
+                y: 0,
+                width: 612,
+                height: 792,
+            },
+        };
+        let normal = RenderRequest {
+            generation: 1,
+            appearance: RenderAppearance::Normal,
+            tile,
+            priority: 0,
+            prefetch: false,
+        };
+        let dark = RenderRequest {
+            appearance: RenderAppearance::ForcedColors {
+                background: RenderColor {
+                    red: 18,
+                    green: 52,
+                    blue: 86,
+                },
+                foreground: RenderColor {
+                    red: 171,
+                    green: 205,
+                    blue: 239,
+                },
+            },
+            ..normal.clone()
+        };
+        let (_, _, normal_bgra) = render_tile(&mut state, &normal).expect("normal tile renders");
+        let (_, _, dark_bgra) = render_tile(&mut state, &dark).expect("dark tile renders");
+
+        assert_ne!(dark_bgra, normal_bgra);
+        let dark_background = dark_bgra
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3] == [86, 52, 18])
+            .count();
+        let light_content = dark_bgra
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3] == [239, 205, 171])
+            .count();
+        assert!(dark_background > 300_000, "most of the page should be dark");
+        assert!(
+            light_content > 100,
+            "forced text/path pixels should be light"
         );
     }
 

@@ -2,10 +2,10 @@
 //! the rendering of [PdfBitmap] objects from one or more [PdfPage] objects.
 
 use crate::bindgen::{
-    FPDF_ANNOT, FPDF_CONVERT_FILL_TO_STROKE, FPDF_DWORD, FPDF_GRAYSCALE, FPDF_LCD_TEXT,
-    FPDF_NO_NATIVETEXT, FPDF_PRINTING, FPDF_RENDER_FORCEHALFTONE, FPDF_RENDER_LIMITEDIMAGECACHE,
-    FPDF_RENDER_NO_SMOOTHIMAGE, FPDF_RENDER_NO_SMOOTHPATH, FPDF_RENDER_NO_SMOOTHTEXT,
-    FPDF_REVERSE_BYTE_ORDER, FS_MATRIX, FS_RECTF,
+    FPDF_ANNOT, FPDF_COLORSCHEME, FPDF_CONVERT_FILL_TO_STROKE, FPDF_DWORD, FPDF_GRAYSCALE,
+    FPDF_LCD_TEXT, FPDF_NO_NATIVETEXT, FPDF_PRINTING, FPDF_RENDER_FORCEHALFTONE,
+    FPDF_RENDER_LIMITEDIMAGECACHE, FPDF_RENDER_NO_SMOOTHIMAGE, FPDF_RENDER_NO_SMOOTHPATH,
+    FPDF_RENDER_NO_SMOOTHTEXT, FPDF_REVERSE_BYTE_ORDER, FS_MATRIX, FS_RECTF,
 };
 use crate::create_transform_setters;
 use crate::error::PdfiumError;
@@ -17,6 +17,41 @@ use crate::pdf::document::page::{PdfPage, PdfPageOrientation, PdfPageRenderRotat
 use crate::pdf::matrix::{PdfMatrix, PdfMatrixValue};
 use crate::pdf::points::PdfPoints;
 use std::os::raw::c_int;
+
+/// Colors applied by Pdfium's forced-color renderer to text and vector paths.
+/// Raster image objects keep their original pixels.
+#[derive(Debug, Copy, Clone)]
+pub struct PdfPageRenderColorScheme {
+    path_fill: PdfColor,
+    path_stroke: PdfColor,
+    text_fill: PdfColor,
+    text_stroke: PdfColor,
+}
+
+impl PdfPageRenderColorScheme {
+    pub const fn new(
+        path_fill: PdfColor,
+        path_stroke: PdfColor,
+        text_fill: PdfColor,
+        text_stroke: PdfColor,
+    ) -> Self {
+        Self {
+            path_fill,
+            path_stroke,
+            text_fill,
+            text_stroke,
+        }
+    }
+
+    fn as_pdfium(self) -> FPDF_COLORSCHEME {
+        FPDF_COLORSCHEME {
+            path_fill_color: self.path_fill.as_pdfium_color(),
+            path_stroke_color: self.path_stroke.as_pdfium_color(),
+            text_fill_color: self.text_fill.as_pdfium_color(),
+            text_stroke_color: self.text_stroke.as_pdfium_color(),
+        }
+    }
+}
 
 /// Configures the scaling, rotation, and rendering settings that should be applied to
 /// a [PdfPage] to create a [PdfBitmap] for that page. [PdfRenderConfig] can accommodate pages of
@@ -48,6 +83,7 @@ pub struct PdfRenderConfig {
     format: PdfBitmapFormat,
     do_clear_bitmap_before_rendering: bool,
     clear_color: PdfColor,
+    color_scheme: Option<PdfPageRenderColorScheme>,
     do_render_form_data: bool,
     form_field_highlight: Option<Vec<(PdfFormFieldType, PdfColor)>>,
     transformation_matrix: PdfMatrix,
@@ -89,6 +125,7 @@ impl PdfRenderConfig {
             format: PdfBitmapFormat::default(),
             do_clear_bitmap_before_rendering: true,
             clear_color: PdfColor::WHITE,
+            color_scheme: None,
             do_render_form_data: true,
             form_field_highlight: None,
             transformation_matrix: PdfMatrix::IDENTITY,
@@ -375,6 +412,16 @@ impl PdfRenderConfig {
     #[inline]
     pub fn set_clear_color(mut self, color: PdfColor) -> Self {
         self.clear_color = color;
+
+        self
+    }
+
+    /// Applies a forced color scheme while Pdfium renders page text and vector paths.
+    /// Embedded raster images are not recolored. This uses Pdfium's experimental
+    /// progressive color-scheme API.
+    #[inline]
+    pub fn set_color_scheme(mut self, color_scheme: PdfPageRenderColorScheme) -> Self {
+        self.color_scheme = Some(color_scheme);
 
         self
     }
@@ -870,6 +917,7 @@ impl PdfRenderConfig {
             rotate: target_rotation.as_pdfium(),
             do_clear_bitmap_before_rendering: self.do_clear_bitmap_before_rendering,
             clear_color: self.clear_color.as_pdfium_color(),
+            color_scheme: self.color_scheme.map(|scheme| scheme.as_pdfium()),
             do_render_form_data: self.do_render_form_data,
             form_field_highlight: if !self.do_render_form_data
                 || self.form_field_highlight.is_none()
@@ -931,6 +979,7 @@ pub(crate) struct PdfPageRenderSettings {
     pub(crate) rotate: c_int,
     pub(crate) do_clear_bitmap_before_rendering: bool,
     pub(crate) clear_color: FPDF_DWORD,
+    pub(crate) color_scheme: Option<FPDF_COLORSCHEME>,
     pub(crate) do_render_form_data: bool,
     pub(crate) form_field_highlight: Option<Vec<(c_int, (FPDF_DWORD, u8))>>,
     pub(crate) matrix: FS_MATRIX,
@@ -986,6 +1035,35 @@ mod tests {
         assert_eq!(render_settings.width, 2976);
         assert_eq!(render_settings.height, 4209);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_forced_color_scheme_reaches_pdfium_render_settings() -> Result<(), PdfiumError> {
+        let scheme = PdfPageRenderColorScheme::new(
+            PdfColor::RED,
+            PdfColor::GREEN,
+            PdfColor::BLUE,
+            PdfColor::WHITE,
+        );
+        let render_settings = get_render_settings_from_config(
+            PdfRenderConfig::new()
+                .set_color_scheme(scheme)
+                .render_fills_as_strokes(true),
+        )?;
+        let actual = render_settings
+            .color_scheme
+            .expect("forced color scheme should be retained");
+
+        assert_eq!(actual.path_fill_color, PdfColor::RED.as_pdfium_color());
+        assert_eq!(actual.path_stroke_color, PdfColor::GREEN.as_pdfium_color());
+        assert_eq!(actual.text_fill_color, PdfColor::BLUE.as_pdfium_color());
+        assert_eq!(actual.text_stroke_color, PdfColor::WHITE.as_pdfium_color());
+        assert_ne!(
+            render_settings.render_flags
+                & crate::bindgen::FPDF_CONVERT_FILL_TO_STROKE as i32,
+            0
+        );
         Ok(())
     }
 

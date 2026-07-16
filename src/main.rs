@@ -6,6 +6,7 @@ mod native_gestures;
 mod reader;
 mod search;
 mod text_field;
+mod theme;
 
 use comment_editor::{
     CommentBackspace, CommentCancel, CommentDelete, CommentDown, CommentEnd, CommentHome,
@@ -18,8 +19,8 @@ use gpui::Keystroke;
 #[cfg(target_os = "macos")]
 use gpui::TitlebarOptions;
 use gpui::{
-    App, Application, Bounds, KeyBinding, Menu, MenuItem, Point, WindowBounds, WindowOptions,
-    actions, px, size,
+    App, Application, Bounds, KeyBinding, Menu, MenuItem, Point, SharedString, WindowBounds,
+    WindowOptions, actions, px, size,
 };
 use std::path::PathBuf;
 #[cfg(debug_assertions)]
@@ -64,10 +65,18 @@ actions!(
     ]
 );
 
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(namespace = gpui_pdf_reader, no_json)]
+pub struct SelectTheme {
+    pub name: SharedString,
+}
+
 fn main() {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
 
-    Application::new().run(move |cx: &mut App| {
+    let application = Application::new().with_assets(gpui_component_assets::Assets);
+    application.run(move |cx: &mut App| {
+        gpui_component::init(cx);
         bind_keys(cx);
         cx.set_menus(vec![
             Menu {
@@ -98,6 +107,8 @@ fn main() {
                 items: vec![
                     MenuItem::action("Classic View", ClassicView),
                     MenuItem::action("Fluid View", FluidView),
+                    MenuItem::separator(),
+                    theme::theme_menu(),
                     MenuItem::separator(),
                     MenuItem::action("Zoom In", ZoomIn),
                     MenuItem::action("Zoom Out", ZoomOut),
@@ -155,6 +166,28 @@ fn main() {
                 window
                     .update(cx, |reader, window, cx| {
                         reader.qa_use_fluid_view(window, cx);
+                    })
+                    .ok();
+            }
+            if let Ok(theme_name) = std::env::var("GPUI_PDF_READER_QA_THEME") {
+                window
+                    .update(cx, |reader, window, cx| {
+                        assert!(
+                            reader.qa_select_theme(&theme_name, window, cx),
+                            "unknown GPUI_PDF_READER_QA_THEME: {theme_name}"
+                        );
+                    })
+                    .ok();
+            }
+            if let Ok(pdf_dark) = std::env::var("GPUI_PDF_READER_QA_PDF_DARK") {
+                let enabled = match pdf_dark.as_str() {
+                    "on" | "1" | "true" => true,
+                    "off" | "0" | "false" => false,
+                    _ => panic!("invalid GPUI_PDF_READER_QA_PDF_DARK: {pdf_dark}"),
+                };
+                window
+                    .update(cx, |reader, window, cx| {
+                        reader.qa_set_pdf_dark_mode(enabled, window, cx);
                     })
                     .ok();
             }
@@ -439,7 +472,8 @@ fn bind_keys(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::READER_NAVIGATION_CONTEXT;
-    use gpui::{KeyBindingContextPredicate, KeyContext};
+    use gpui::{AssetSource, KeyBindingContextPredicate, KeyContext};
+    use gpui_component::{IconName, IconNamed};
 
     #[test]
     fn reader_navigation_context_excludes_both_text_editors() {
@@ -451,5 +485,31 @@ mod tests {
         assert_eq!(predicate.depth_of(std::slice::from_ref(&reader)), Some(1));
         assert_eq!(predicate.depth_of(&[reader.clone(), search]), None);
         assert_eq!(predicate.depth_of(&[reader, comment]), None);
+    }
+
+    #[test]
+    fn every_reader_icon_is_present_in_the_component_asset_bundle() {
+        let assets = gpui_component_assets::Assets;
+        for icon in [
+            IconName::ArrowDown,
+            IconName::ArrowRight,
+            IconName::ArrowUp,
+            IconName::BookOpen,
+            IconName::ChevronLeft,
+            IconName::Menu,
+            IconName::Minus,
+            IconName::Moon,
+            IconName::PanelRight,
+            IconName::Plus,
+            IconName::Search,
+            IconName::SquareTerminal,
+            IconName::Sun,
+        ] {
+            let path = icon.path();
+            assert!(
+                assets.load(path.as_ref()).unwrap().is_some(),
+                "missing gpui-component icon asset: {path:?}"
+            );
+        }
     }
 }
