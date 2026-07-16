@@ -23,10 +23,17 @@ fi
 run_case() {
   case_name=$1
   case_theme=$2
+  case_pdf_render=${3:-}
+  case_pdf_dark=${4:-on}
+  case_pdf_dark_report=1
+  if [ "$case_pdf_dark" = "off" ]; then
+    case_pdf_dark_report=0
+  fi
   case_log="$tmp_dir/$case_name.log"
   case_timeout="$tmp_dir/$case_name.timeout"
 
   GPUI_PDF_READER_QA_THEME="$case_theme" \
+  GPUI_PDF_READER_QA_PDF_DARK="$case_pdf_dark" \
   GPUI_PDF_READER_QA_TIMEOUT_MS=30000 \
   GPUI_PDF_READER_QA_REPORT=1 \
   GPUI_PDF_READER_QA_EXIT=1 \
@@ -73,11 +80,28 @@ run_case() {
       exit 1
       ;;
   esac
+  if [ -n "$case_pdf_render" ]; then
+    case "$report" in
+      *"pdf_render=$case_pdf_render "*) ;;
+      *)
+        printf 'E2E %s used the wrong PDF render appearance: %s\n' "$case_name" "$report" >&2
+        exit 1
+        ;;
+    esac
+  fi
+  case "$report" in
+    *"pdf_dark_enabled=$case_pdf_dark_report "*) ;;
+    *)
+      printf 'E2E %s reported the wrong PDF dark-mode preference: %s\n' "$case_name" "$report" >&2
+      exit 1
+      ;;
+  esac
   printf 'E2E %s: %s\n' "$case_name" "$report"
 }
 
 cd "$root"
 cargo build --locked
 run_case theme_system system
-run_case theme_light "Catppuccin Latte"
-run_case theme_dark "Tokyo Night"
+run_case theme_light "Catppuccin Latte" normal
+run_case theme_dark "Tokyo Night" forced
+run_case theme_dark_pdf_light "Tokyo Night" normal off

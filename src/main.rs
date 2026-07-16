@@ -179,6 +179,18 @@ fn main() {
                     })
                     .ok();
             }
+            if let Ok(pdf_dark) = std::env::var("GPUI_PDF_READER_QA_PDF_DARK") {
+                let enabled = match pdf_dark.as_str() {
+                    "on" | "1" | "true" => true,
+                    "off" | "0" | "false" => false,
+                    _ => panic!("invalid GPUI_PDF_READER_QA_PDF_DARK: {pdf_dark}"),
+                };
+                window
+                    .update(cx, |reader, window, cx| {
+                        reader.qa_set_pdf_dark_mode(enabled, window, cx);
+                    })
+                    .ok();
+            }
             let keystrokes: Vec<_> = std::env::var("GPUI_PDF_READER_QA_KEYS")
                 .unwrap_or_default()
                 .split_whitespace()
@@ -486,10 +498,12 @@ mod tests {
             IconName::ChevronLeft,
             IconName::Menu,
             IconName::Minus,
+            IconName::Moon,
             IconName::PanelRight,
             IconName::Plus,
             IconName::Search,
             IconName::SquareTerminal,
+            IconName::Sun,
         ] {
             let path = icon.path();
             assert!(

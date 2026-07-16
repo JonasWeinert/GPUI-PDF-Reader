@@ -1,5 +1,5 @@
 use crate::SelectTheme;
-use gpui::{App, Hsla, Menu, MenuItem, SharedString, Window};
+use gpui::{App, Hsla, Menu, MenuItem, Rgba, SharedString, Window};
 use gpui_component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry, ThemeSet};
 use std::{rc::Rc, sync::LazyLock};
 
@@ -89,6 +89,30 @@ pub fn apply_selection(name: &str, window: &mut Window, cx: &mut App) -> Option<
     Some(config.name.clone())
 }
 
+/// Returns the page backing used by both GPUI and PDFium. Dark paper is a
+/// subtle, opaque lift toward the theme foreground, keeping the page visibly
+/// separate from the workspace without introducing an unrelated color.
+pub fn pdf_paper_color(theme: &Theme, forced_dark: bool) -> Hsla {
+    if !forced_dark || !theme.is_dark() {
+        return gpui_component::ThemeColor::light().background;
+    }
+
+    let background = Rgba::from(theme.background);
+    let mut foreground = Rgba::from(theme.foreground);
+    foreground.a = 0.06;
+    let mut paper = background.blend(foreground);
+    paper.a = 1.0;
+    paper.into()
+}
+
+pub fn pdf_paper_border(theme: &Theme, forced_dark: bool) -> Hsla {
+    if forced_dark && theme.is_dark() {
+        theme.border
+    } else {
+        gpui_component::ThemeColor::light().border
+    }
+}
+
 /// Semantic colors used by the PDF workspace. Every value is sourced from the
 /// active gpui-component theme; alpha changes preserve that theme's hue.
 #[derive(Clone, Copy, Debug)]
@@ -158,8 +182,8 @@ impl ReaderPalette {
             pink: theme.magenta,
             purple: theme.chart_4,
             warning: theme.warning,
-            paper: gpui_component::ThemeColor::light().background,
-            paper_border: gpui_component::ThemeColor::light().border,
+            paper: pdf_paper_color(theme, theme.is_dark()),
+            paper_border: pdf_paper_border(theme, theme.is_dark()),
         }
     }
 }
@@ -228,9 +252,33 @@ mod tests {
     }
 
     #[test]
+    fn dark_pdf_paper_is_opaque_and_distinct_from_every_bundled_workspace() {
+        for config in bundled_themes()
+            .iter()
+            .filter(|config| config.mode.is_dark())
+        {
+            let mut theme = Theme::from(ThemeColor::dark().as_ref());
+            theme.apply_config(&Rc::new(config.clone()));
+            theme.mode = config.mode;
+            let paper = Rgba::from(pdf_paper_color(&theme, true));
+            let pane = Rgba::from(theme.tiles);
+            let distance =
+                (paper.r - pane.r).abs() + (paper.g - pane.g).abs() + (paper.b - pane.b).abs();
+
+            assert_eq!(paper.a, 1.0, "{}", config.name);
+            assert!(
+                distance >= 3.0 / 255.0,
+                "theme {} produced indistinguishable PDF paper and pane colors: {paper:?} vs {pane:?}",
+                config.name
+            );
+        }
+    }
+
+    #[test]
     fn palette_tracks_both_component_theme_palettes() {
         let light = Theme::from(ThemeColor::light().as_ref());
-        let dark = Theme::from(ThemeColor::dark().as_ref());
+        let mut dark = Theme::from(ThemeColor::dark().as_ref());
+        dark.mode = ThemeMode::Dark;
         let light_palette = ReaderPalette::from_theme(&light);
         let dark_palette = ReaderPalette::from_theme(&dark);
 
@@ -238,6 +286,9 @@ mod tests {
         assert_eq!(dark_palette.surface, dark.background);
         assert_eq!(light_palette.accent, light.primary);
         assert_eq!(dark_palette.accent, dark.primary);
+        assert_eq!(light_palette.paper, ThemeColor::light().background);
+        assert_eq!(dark_palette.paper, pdf_paper_color(&dark, true));
+        assert_ne!(dark_palette.paper, dark_palette.canvas);
         assert_ne!(light_palette.surface, dark_palette.surface);
         assert_ne!(light_palette.text, dark_palette.text);
     }

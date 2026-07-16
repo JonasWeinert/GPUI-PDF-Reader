@@ -44,7 +44,10 @@ are macOS-specific today.
   the document.
 - Thirty-seven bundled gpui-component themes, selectable from View → Theme,
   plus a system-following mode. All reader chrome and icons use shared semantic
-  theme tokens; PDF page pixels are never recolored.
+  theme tokens. Dark themes use PDFium forced-color rendering for dark paper
+  and readable text/vector content while preserving embedded image pixels.
+  The PDF paper stays distinct from the workspace, and Fluid view provides a
+  moon/sun control to show the original light PDF without changing app theme.
 - Animated comments and search panels. Classic makes room for them; Fluid
   floats near-full-height panels over the PDF while extending horizontal reach
   so covered content remains accessible.

@@ -2,7 +2,7 @@ use crate::annotations::{
     AnnotationId, AnnotationSet, DocumentIdentity, HighlightColor, MAX_TEXT_CHARACTER_INDEX,
     TextRange, load_sidecar, save_sidecar,
 };
-use crate::backend::{PdfWorker, TileRequest, WorkerEvent};
+use crate::backend::{PdfWorker, RenderAppearance, RenderColor, TileRequest, WorkerEvent};
 use crate::comment_editor::{CommentEditor, CommentEditorEvent, RichTextBuffer};
 use crate::model::{
     DocumentLayout, PageAnchor, PageSize, PixelRect, RasterSize, Rect, TextBounds, TextLayer,
@@ -63,6 +63,26 @@ const FLUID_PANEL_HORIZONTAL_MARGIN: f32 = 12.0;
 const FLUID_PANEL_VERTICAL_MARGIN: f32 = 18.0;
 const FLUID_CONTEXT_PILL_WIDTH: f32 = 214.0;
 const FLUID_CONTEXT_PILL_HEIGHT: f32 = 40.0;
+
+fn render_appearance_from_theme(theme: &Theme, pdf_dark_mode_enabled: bool) -> RenderAppearance {
+    if !theme.is_dark() || !pdf_dark_mode_enabled {
+        return RenderAppearance::Normal;
+    }
+
+    let to_render_color = |color| {
+        let color = gpui::Rgba::from(color);
+        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        RenderColor {
+            red: channel(color.r),
+            green: channel(color.g),
+            blue: channel(color.b),
+        }
+    };
+    RenderAppearance::ForcedColors {
+        background: to_render_color(theme::pdf_paper_color(theme, true)),
+        foreground: to_render_color(theme.foreground),
+    }
+}
 
 #[cfg(target_os = "macos")]
 const TITLEBAR_CONTROL_INSET: f32 = 76.0;
@@ -718,6 +738,8 @@ pub struct PdfReader {
     view_mode: ReaderView,
     theme_preference: ThemePreference,
     selected_theme: Option<SharedString>,
+    render_appearance: RenderAppearance,
+    pdf_dark_mode_enabled: bool,
     warning: Option<SharedString>,
     focus_handle: FocusHandle,
     zoom: f32,
@@ -813,6 +835,8 @@ impl PdfReader {
                 view_mode: ReaderView::Classic,
                 theme_preference: ThemePreference::System,
                 selected_theme: None,
+                render_appearance: render_appearance_from_theme(Theme::global(cx), true),
+                pdf_dark_mode_enabled: true,
                 warning: None,
                 focus_handle: cx.focus_handle(),
                 zoom: 1.0,
@@ -853,7 +877,7 @@ impl PdfReader {
             cx.observe_window_appearance(window, |reader, window, cx| {
                 if reader.theme_preference == ThemePreference::System {
                     Theme::sync_system_appearance(Some(window), cx);
-                    cx.notify();
+                    reader.update_render_appearance(window, cx);
                 }
             })
             .detach();
@@ -924,9 +948,18 @@ impl PdfReader {
             .map(|name| name.as_ref())
             .unwrap_or_else(|| self.theme_preference.name());
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_complete={} status={:?}",
             self.view_mode,
             theme_name,
+            if matches!(
+                self.render_appearance,
+                RenderAppearance::ForcedColors { .. }
+            ) {
+                "forced"
+            } else {
+                "normal"
+            },
+            u8::from(self.pdf_dark_mode_enabled),
             self.zoom,
             self.rendered.len(),
             cached_bytes,
@@ -971,6 +1004,17 @@ impl PdfReader {
     #[cfg(debug_assertions)]
     pub fn qa_use_fluid_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_view_mode(ReaderView::Fluid, window, cx);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn qa_set_pdf_dark_mode(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pdf_dark_mode_enabled = enabled;
+        self.update_render_appearance(window, cx);
     }
 
     #[cfg(debug_assertions)]
@@ -1906,13 +1950,14 @@ impl PdfReader {
             }
             WorkerEvent::TileRendered {
                 generation,
+                appearance,
                 key,
                 core_rect,
                 render_rect,
                 width,
                 height,
                 bgra,
-            } if generation == self.generation => {
+            } if generation == self.generation && appearance == self.render_appearance => {
                 let page = key.page;
                 self.pending.remove(&key);
 
@@ -1952,9 +1997,10 @@ impl PdfReader {
             }
             WorkerEvent::TileFailed {
                 generation,
+                appearance,
                 key,
                 message,
-            } if generation == self.generation => {
+            } if generation == self.generation && appearance == self.render_appearance => {
                 self.pending.remove(&key);
                 self.warning = Some(message.into());
             }
@@ -2428,7 +2474,25 @@ impl PdfReader {
         } else {
             ThemePreference::System
         };
+        self.update_render_appearance(window, cx);
+    }
+
+    fn update_render_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let appearance =
+            render_appearance_from_theme(Theme::global(cx), self.pdf_dark_mode_enabled);
+        if appearance != self.render_appearance {
+            self.render_appearance = appearance;
+            self.drop_all_images(window, cx);
+            self.pending.clear();
+            self.render_viewport.clear();
+            self.request_visible_tiles(window);
+        }
         cx.notify();
+    }
+
+    fn toggle_pdf_dark_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pdf_dark_mode_enabled = !self.pdf_dark_mode_enabled;
+        self.update_render_appearance(window, cx);
     }
 
     fn toggle_sidebar(&mut self, panel: SidePanel, window: &mut Window, cx: &mut Context<Self>) {
@@ -3378,6 +3442,7 @@ impl PdfReader {
                 .collect();
             if self.worker.render_viewport(
                 self.generation,
+                self.render_appearance,
                 &tile_requests,
                 visible_tile_count,
                 &text_pages,
@@ -3732,7 +3797,10 @@ impl PdfReader {
             self.render_viewport.clear();
             self.text_viewport.clear();
             self.pending.clear();
-            if !self.worker.render_viewport(self.generation, &[], 0, &[]) {
+            if !self
+                .worker
+                .render_viewport(self.generation, self.render_appearance, &[], 0, &[])
+            {
                 self.status = ReaderStatus::Error("The PDF renderer is unavailable".into());
                 return;
             }
@@ -4521,6 +4589,19 @@ impl PdfReader {
                     reader.toggle_comments(&ToggleComments, window, cx)
                 }),
             ))
+            .when(Theme::global(cx).is_dark(), |pill| {
+                pill.child(Self::segment_button(
+                    palette,
+                    "fluid-toggle-pdf-dark-mode",
+                    Icon::new(if self.pdf_dark_mode_enabled {
+                        IconName::Moon
+                    } else {
+                        IconName::Sun
+                    }),
+                    true,
+                    cx.listener(|reader, _, window, cx| reader.toggle_pdf_dark_mode(window, cx)),
+                ))
+            })
             .into_any_element()
     }
 
@@ -5846,7 +5927,14 @@ impl Focusable for PdfReader {
 
 impl Render for PdfReader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
+        let active_theme = Theme::global(cx);
+        let mut palette = ReaderPalette::from_theme(active_theme);
+        let forced_dark = matches!(
+            self.render_appearance,
+            RenderAppearance::ForcedColors { .. }
+        );
+        palette.paper = theme::pdf_paper_color(active_theme, forced_dark);
+        palette.paper_border = theme::pdf_paper_border(active_theme, forced_dark);
         self.update_viewport(window);
         self.request_visible_tiles(window);
         let full_width = f32::from(window.viewport_size().width).max(1.0);
@@ -6879,6 +6967,41 @@ fn content_rect_to_bounds(canvas: Bounds<Pixels>, rect: Rect, scroll: Offset) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_component::{ThemeColor, ThemeMode};
+
+    #[test]
+    fn pdf_render_appearance_follows_theme_mode_and_colors() {
+        let light = Theme::from(ThemeColor::light().as_ref());
+        assert_eq!(
+            render_appearance_from_theme(&light, true),
+            RenderAppearance::Normal
+        );
+
+        let mut dark = Theme::from(ThemeColor::dark().as_ref());
+        dark.mode = ThemeMode::Dark;
+        let expected_background = gpui::Rgba::from(theme::pdf_paper_color(&dark, true));
+        let expected_foreground = gpui::Rgba::from(dark.foreground);
+        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        assert_eq!(
+            render_appearance_from_theme(&dark, true),
+            RenderAppearance::ForcedColors {
+                background: RenderColor {
+                    red: channel(expected_background.r),
+                    green: channel(expected_background.g),
+                    blue: channel(expected_background.b),
+                },
+                foreground: RenderColor {
+                    red: channel(expected_foreground.r),
+                    green: channel(expected_foreground.g),
+                    blue: channel(expected_foreground.b),
+                },
+            }
+        );
+        assert_eq!(
+            render_appearance_from_theme(&dark, false),
+            RenderAppearance::Normal
+        );
+    }
 
     struct TestDirectory(PathBuf);
 

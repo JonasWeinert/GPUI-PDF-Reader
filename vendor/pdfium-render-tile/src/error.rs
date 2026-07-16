@@ -140,6 +140,10 @@ pub enum PdfiumError {
     /// rectangle, so configurations using either are rejected rather than rendered incorrectly.
     PageRenderTileUnsupportedConfiguration,
 
+    /// Pdfium's progressive forced-color page renderer reported failure or an
+    /// unexpected terminal status.
+    PageRenderProgressiveFailure,
+
     /// Pdfium does not safely support moving page object ownership from one document to another.
     CannotMoveObjectAcrossDocuments,
 
