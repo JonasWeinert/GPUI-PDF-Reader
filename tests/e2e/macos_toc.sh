@@ -27,6 +27,7 @@ cargo build --locked
 GPUI_PDF_READER_QA_FLUID_VIEW=1 \
 GPUI_PDF_READER_QA_THEME="Catppuccin Latte" \
 GPUI_PDF_READER_QA_TOC_HOVER=1 \
+GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD=1 \
 GPUI_PDF_READER_QA_TOC_NAVIGATE=2 \
 GPUI_PDF_READER_QA_TIMEOUT_MS=30000 \
 GPUI_PDF_READER_QA_REPORT=1 \
@@ -69,15 +70,15 @@ if [ "$(printf '%s\n' "$report" | wc -l | tr -d ' ')" -ne 1 ]; then
   exit 1
 fi
 case "$report" in
-  *"view=Fluid "*"toc=4 "*"toc_hover=2 "*"toc_hover_strength=1.000 "*"toc_text_matches=1 "*"pending=0 "*"debouncing=0 "*"status=Ready") ;;
+  *"view=Fluid "*"toc=4 "*"toc_hover=2 "*"toc_hover_strength=1.000 "*"toc_text_matches=1 "*"toc_callout_holds=1 "*"pending=0 "*"debouncing=0 "*"status=Ready") ;;
   *)
     printf 'TOC E2E did not settle with the hover card and title-matched navigation: %s\n' "$report" >&2
     exit 1
     ;;
 esac
 scroll_y=$(printf '%s\n' "$report" | sed -n 's/.*scroll=([^,]*,\([^)]*\)).*/\1/p')
-awk -v scroll_y="$scroll_y" 'BEGIN { if (scroll_y <= 100) exit 1 }' || {
-  printf 'TOC E2E did not animate away from the first page: %s\n' "$report" >&2
+awk -v scroll_y="$scroll_y" 'BEGIN { if (scroll_y <= 100 || scroll_y >= 1400) exit 1 }' || {
+  printf 'TOC E2E did not center the matched second-page heading: %s\n' "$report" >&2
   exit 1
 }
 
