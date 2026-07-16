@@ -5,6 +5,10 @@ use crate::annotations::{
 use crate::backend::{PdfWorker, RenderAppearance, RenderColor, TileRequest, WorkerEvent};
 use crate::comment_editor::{CommentEditor, CommentEditorEvent, RichTextBuffer};
 use crate::document_jump::DocumentJump;
+use crate::link_preview::{
+    LinkPreviewEvent, LinkPreviewFetcher, LinkPreviewSession, WebsitePreviewState,
+};
+use crate::link_resolution::{ResolvedInternalLink, resolve_internal_link};
 #[cfg(test)]
 use crate::model::TextChar;
 use crate::model::{
@@ -31,7 +35,7 @@ use gpui::{
     FocusHandle, Focusable, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, Point, PromptButton, PromptLevel, Render, RenderImage,
     ScrollStrategy, ScrollWheelEvent, SharedString, Task, UniformListScrollHandle, Window,
-    WindowControlArea, canvas, div, point, prelude::*, px, quad, size, uniform_list,
+    WindowControlArea, canvas, div, img, point, prelude::*, px, quad, size, uniform_list,
 };
 #[cfg(debug_assertions)]
 use gpui::{Keystroke, Modifiers, ScrollDelta, TouchPhase};
@@ -80,6 +84,10 @@ const TOC_CASCADE_RADIUS: f32 = 5.0;
 const TOC_CARD_MIN_HEIGHT: f32 = 82.0;
 const TOC_HOVER_LEAVE_DELAY: Duration = Duration::from_millis(120);
 const MAX_TOC_HEADING_MATCHES: usize = 16;
+const LINK_CARD_WIDTH: f32 = 340.0;
+const LINK_CARD_MARGIN: f32 = 12.0;
+const LINK_CARD_GAP: f32 = 8.0;
+const LINK_HOVER_LEAVE_DELAY: Duration = Duration::from_millis(140);
 
 fn render_appearance_from_theme(theme: &Theme, pdf_dark_mode_enabled: bool) -> RenderAppearance {
     if !theme.is_dark() || !pdf_dark_mode_enabled {
@@ -361,6 +369,52 @@ fn toc_callout_width(breadcrumbs: &[(usize, String)], maximum_width: f32) -> f32
         .sum::<usize>()
         .saturating_add(breadcrumbs.len().saturating_sub(1) * 3);
     (character_count as f32 * 6.5 + 42.0).clamp(190.0, maximum_width.max(190.0))
+}
+
+fn link_section_title(
+    entries: &[TocEntry],
+    page: usize,
+    y_fraction: Option<f32>,
+) -> Option<String> {
+    let target_y = y_fraction.unwrap_or(0.0).clamp(0.0, 1.0);
+    entries
+        .iter()
+        .filter(|entry| entry.page == page)
+        .filter(|entry| entry.destination_y.unwrap_or(0.0) <= target_y + 0.025)
+        .max_by(|left, right| {
+            left.destination_y
+                .unwrap_or(0.0)
+                .total_cmp(&right.destination_y.unwrap_or(0.0))
+                .then(left.depth.cmp(&right.depth))
+        })
+        .or_else(|| entries.iter().find(|entry| entry.page == page))
+        .map(|entry| entry.title.clone())
+}
+
+fn link_card_position(
+    anchor: Rect,
+    viewport_width: f32,
+    viewport_height: f32,
+    card_width: f32,
+    estimated_height: f32,
+) -> Offset {
+    let maximum_x = (viewport_width - card_width - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN);
+    let x = (anchor.x + anchor.width * 0.5 - card_width * 0.5).clamp(LINK_CARD_MARGIN, maximum_x);
+    let below = anchor.bottom() + LINK_CARD_GAP;
+    let y = if below + estimated_height <= viewport_height - LINK_CARD_MARGIN {
+        below
+    } else {
+        anchor.y - estimated_height - LINK_CARD_GAP
+    }
+    .clamp(
+        LINK_CARD_MARGIN,
+        (viewport_height - estimated_height - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN),
+    );
+    Offset { x, y }
+}
+
+fn link_preview_should_close(source_hovered: bool, card_hovered: bool) -> bool {
+    !source_hovered && !card_hovered
 }
 
 #[derive(Debug)]
@@ -901,6 +955,8 @@ enum ReaderStatus {
 pub struct PdfReader {
     worker: PdfWorker,
     annotation_io: AnnotationIo,
+    link_preview_fetcher: LinkPreviewFetcher,
+    link_preview_session: Option<LinkPreviewSession>,
     generation: u64,
     document: Option<DocumentState>,
     layout: Option<Arc<DocumentLayout>>,
@@ -953,7 +1009,12 @@ pub struct PdfReader {
     selecting: bool,
     pending_annotation_click: Option<AnnotationId>,
     hovered_link: Option<usize>,
+    link_source_hovered: bool,
+    link_card_hovered: bool,
+    previewed_link: Option<usize>,
+    link_hover_revision: u64,
     pending_link_click: Option<usize>,
+    pending_link_navigation: Option<usize>,
     toc_hovered: Option<usize>,
     toc_hover_position: f32,
     toc_hover_strength: f32,
@@ -993,6 +1054,7 @@ impl PdfReader {
     pub fn new(initial_path: Option<PathBuf>, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let (worker, events) = PdfWorker::start();
         let (annotation_io, annotation_events) = AnnotationIo::start();
+        let (link_preview_fetcher, link_preview_events) = LinkPreviewFetcher::new();
         let search_field =
             cx.new(|cx| TextField::new(cx, "Search document", MAX_SEARCH_QUERY_BYTES));
         let search_field_for_reader = search_field.clone();
@@ -1014,6 +1076,8 @@ impl PdfReader {
             Self {
                 worker,
                 annotation_io,
+                link_preview_fetcher,
+                link_preview_session: None,
                 generation: 0,
                 document: None,
                 layout: None,
@@ -1066,7 +1130,12 @@ impl PdfReader {
                 selecting: false,
                 pending_annotation_click: None,
                 hovered_link: None,
+                link_source_hovered: false,
+                link_card_hovered: false,
+                previewed_link: None,
+                link_hover_revision: 0,
                 pending_link_click: None,
+                pending_link_navigation: None,
                 toc_hovered: None,
                 toc_hover_position: 0.0,
                 toc_hover_strength: 0.0,
@@ -1105,6 +1174,7 @@ impl PdfReader {
 
         Self::listen_for_worker_events(&entity, events, window, cx);
         Self::listen_for_annotation_events(&entity, annotation_events, window, cx);
+        Self::listen_for_link_preview_events(&entity, link_preview_events, window, cx);
         Self::listen_for_native_pinch(&entity, window, cx);
         entity.update(cx, |_, cx| {
             cx.observe_window_appearance(window, |reader, window, cx| {
@@ -1180,8 +1250,42 @@ impl PdfReader {
             .as_ref()
             .map(|name| name.as_ref())
             .unwrap_or_else(|| self.theme_preference.name());
+        let (link_preview, link_preview_state) = self
+            .previewed_link
+            .and_then(|id| {
+                let link = self
+                    .document
+                    .as_ref()?
+                    .links
+                    .iter()
+                    .find(|link| link.id == id)?;
+                let state = match &link.target {
+                    PdfLinkTarget::Internal { .. } => {
+                        self.resolved_internal_link(id)
+                            .map_or("internal-loading", |resolved| {
+                                if resolved.matched_source {
+                                    "internal-matched"
+                                } else {
+                                    "internal-fallback"
+                                }
+                            })
+                    }
+                    PdfLinkTarget::External { url } => match self
+                        .link_preview_session
+                        .as_ref()
+                        .and_then(|session| session.website(url))
+                    {
+                        Some(WebsitePreviewState::Loading) => "external-loading",
+                        Some(WebsitePreviewState::Ready(_)) => "external-ready",
+                        Some(WebsitePreviewState::Failed(_)) => "external-failed",
+                        None => "external-unavailable",
+                    },
+                };
+                Some((id + 1, state))
+            })
+            .unwrap_or((0, "none"));
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} link_preview_state={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
             self.view_mode,
             theme_name,
             if matches!(
@@ -1200,6 +1304,8 @@ impl PdfReader {
                 .as_ref()
                 .map_or(0, |document| document.links.len()),
             self.qa_link_navigations,
+            link_preview,
+            link_preview_state,
             self.toc_hovered.map_or(0, |index| index + 1),
             self.toc_hover_strength,
             self.qa_toc_text_matches,
@@ -1325,6 +1431,50 @@ impl PdfReader {
     }
 
     #[cfg(debug_assertions)]
+    pub fn qa_hover_link(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(id) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.links.get(index))
+            .map(|link| link.id)
+        else {
+            return Err(format!("link index {index} is unavailable"));
+        };
+        self.hovered_link = Some(id);
+        self.show_link_preview(id, window, cx);
+        self.hovered_link = None;
+        self.link_source_hovered = false;
+        self.schedule_link_preview_clear(window, cx);
+        self.set_link_card_hovered(true, window, cx);
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn qa_hover_internal_link(
+        &mut self,
+        ordinal: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(id) = self.document.as_ref().and_then(|document| {
+            document
+                .links
+                .iter()
+                .filter(|link| matches!(link.target, PdfLinkTarget::Internal { .. }))
+                .nth(ordinal)
+                .map(|link| link.id)
+        }) else {
+            return Err(format!("internal link ordinal {ordinal} is unavailable"));
+        };
+        self.qa_hover_link(id, window, cx)
+    }
+
+    #[cfg(debug_assertions)]
     pub fn qa_hold_toc_callout(
         &mut self,
         window: &mut Window,
@@ -1383,6 +1533,20 @@ impl PdfReader {
             || self.comment_pane.is_animating()
             || self.toc_hover_is_animating()
             || self.pending_toc_navigation.is_some()
+            || self.pending_link_navigation.is_some()
+            || self.previewed_link.is_some_and(|id| {
+                self.document
+                    .as_ref()
+                    .and_then(|document| document.links.iter().find(|link| link.id == id))
+                    .is_some_and(|link| match &link.target {
+                        PdfLinkTarget::Internal { .. } => self.resolved_internal_link(id).is_none(),
+                        PdfLinkTarget::External { url } => self
+                            .link_preview_session
+                            .as_ref()
+                            .and_then(|session| session.website(url))
+                            .is_some_and(|state| matches!(state, WebsitePreviewState::Loading)),
+                    })
+            })
             || self.navigation_focus.is_busy(Instant::now())
             || self.comment_autosave_task.is_some()
         {
@@ -2194,6 +2358,43 @@ impl PdfReader {
             .detach();
     }
 
+    fn listen_for_link_preview_events(
+        entity: &Entity<Self>,
+        events: mpsc::Receiver<LinkPreviewEvent>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let events = Arc::new(Mutex::new(events));
+        let weak = entity.downgrade();
+        window
+            .spawn(cx, async move |async_cx| {
+                loop {
+                    let events = events.clone();
+                    let receive = async_cx
+                        .background_executor()
+                        .spawn(async move { events.lock().unwrap().recv() });
+                    let Ok(event) = receive.await else {
+                        break;
+                    };
+                    let _ = async_cx.update(|_, cx| {
+                        weak.update(cx, |reader, cx| {
+                            if event.generation() != reader.generation {
+                                return;
+                            }
+                            let Some(session) = reader.link_preview_session.as_mut() else {
+                                return;
+                            };
+                            if session.apply(event) == Some(reader.generation) {
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    });
+                }
+            })
+            .detach();
+    }
+
     fn listen_for_native_pinch(entity: &Entity<Self>, window: &mut Window, cx: &mut App) {
         let receiver = Arc::new(Mutex::new(crate::native_gestures::install_pinch_monitor()));
         let weak = entity.downgrade();
@@ -2240,6 +2441,13 @@ impl PdfReader {
                 links,
             } if generation == self.generation => {
                 self.drop_all_images(window, cx);
+                self.link_preview_session = match LinkPreviewSession::new() {
+                    Ok(session) => Some(session),
+                    Err(error) => {
+                        self.warning = Some(error.into());
+                        None
+                    }
+                };
                 let page_count = pages.len();
                 self.annotations_loading = true;
                 if !self
@@ -2267,7 +2475,11 @@ impl PdfReader {
                 self.copy_pending = None;
                 self.selection = None;
                 self.hovered_link = None;
+                self.link_source_hovered = false;
+                self.link_card_hovered = false;
+                self.previewed_link = None;
                 self.pending_link_click = None;
+                self.pending_link_navigation = None;
                 self.scroll = Offset::default();
                 self.scroll_target = Offset::default();
                 self.status = ReaderStatus::Ready;
@@ -2346,6 +2558,7 @@ impl PdfReader {
                 self.text_pending.remove(&page);
                 self.continue_pending_copy(cx);
                 self.complete_pending_toc_navigation(page, window, cx);
+                self.complete_pending_link_navigation(window, cx);
                 self.evict_distant_text();
             }
             WorkerEvent::TextFailed {
@@ -2363,6 +2576,7 @@ impl PdfReader {
                 self.warning = Some(message.into());
                 self.continue_pending_copy(cx);
                 self.complete_pending_toc_navigation(page, window, cx);
+                self.complete_pending_link_navigation(window, cx);
                 self.evict_distant_text();
             }
             WorkerEvent::SearchPageResults {
@@ -2615,6 +2829,8 @@ impl PdfReader {
     fn begin_open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_open = None;
         self.generation = self.generation.wrapping_add(1);
+        self.link_preview_fetcher.begin_document(self.generation);
+        self.link_preview_session = None;
         self.drop_all_images(window, cx);
         self.document = None;
         self.layout = None;
@@ -2658,7 +2874,12 @@ impl PdfReader {
         self.selection = None;
         self.pending_annotation_click = None;
         self.hovered_link = None;
+        self.link_source_hovered = false;
+        self.link_card_hovered = false;
+        self.previewed_link = None;
+        self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
         self.pending_link_click = None;
+        self.pending_link_navigation = None;
         self.toc_hovered = None;
         self.toc_hover_position = 0.0;
         self.toc_hover_strength = 0.0;
@@ -3908,8 +4129,27 @@ impl PdfReader {
             .layout()
             .map(|layout| layout.current_page(self.scroll.y, self.viewport_height))
             .unwrap_or(0);
+        let protected_link_pages = self
+            .previewed_link
+            .or(self.pending_link_navigation)
+            .and_then(|id| {
+                self.document
+                    .as_ref()?
+                    .links
+                    .iter()
+                    .find(|link| link.id == id)
+                    .and_then(|link| match link.target {
+                        PdfLinkTarget::Internal { page, .. } => {
+                            Some([link.page, page].into_iter().collect::<HashSet<_>>())
+                        }
+                        PdfLinkTarget::External { .. } => None,
+                    })
+            })
+            .unwrap_or_default();
         let mut candidates: Vec<_> = self.page_text.keys().copied().collect();
-        candidates.retain(|page| !self.text_viewport.contains(page));
+        candidates.retain(|page| {
+            !self.text_viewport.contains(page) && !protected_link_pages.contains(page)
+        });
         candidates.sort_by_key(|page| std::cmp::Reverse(page.abs_diff(current_page)));
         for page in candidates {
             if self.page_text.len() <= MAX_CACHED_TEXT_PAGES {
@@ -4365,7 +4605,14 @@ impl PdfReader {
 
         let hovered_link = self.hit_test_link(event.position);
         if self.hovered_link != hovered_link {
+            let previous = self.hovered_link;
             self.hovered_link = hovered_link;
+            self.link_source_hovered = hovered_link.is_some();
+            if let Some(id) = hovered_link {
+                self.show_link_preview(id, window, cx);
+            } else if previous.is_some() {
+                self.schedule_link_preview_clear(window, cx);
+            }
             cx.notify();
         }
     }
@@ -4410,6 +4657,120 @@ impl PdfReader {
             })
     }
 
+    fn resolved_internal_link(&self, id: usize) -> Option<ResolvedInternalLink> {
+        let document = self.document.as_ref()?;
+        let link = document.links.iter().find(|link| link.id == id)?;
+        let PdfLinkTarget::Internal {
+            page,
+            x_fraction,
+            y_fraction,
+        } = link.target
+        else {
+            return None;
+        };
+        let source_text = self.page_text.get(&link.page)?;
+        let target_text = self.page_text.get(&page)?;
+        Some(resolve_internal_link(
+            source_text,
+            link.bounds,
+            target_text,
+            page,
+            x_fraction,
+            y_fraction,
+        ))
+    }
+
+    fn request_internal_link_text(&mut self, id: usize) -> bool {
+        let Some((source_page, target_page)) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.links.iter().find(|link| link.id == id))
+            .and_then(|link| match link.target {
+                PdfLinkTarget::Internal { page, .. } => Some((link.page, page)),
+                PdfLinkTarget::External { .. } => None,
+            })
+        else {
+            return false;
+        };
+        let pages = [source_page, target_page]
+            .into_iter()
+            .filter(|page| !self.page_text.contains_key(page))
+            .collect::<HashSet<_>>();
+        if pages.is_empty() {
+            return true;
+        }
+        self.text_pending.extend(pages.iter().copied());
+        let mut pages = pages.into_iter().collect::<Vec<_>>();
+        pages.sort_unstable();
+        if self
+            .worker
+            .ensure_text_pages(self.generation, pages.clone())
+        {
+            true
+        } else {
+            for page in pages {
+                self.text_pending.remove(&page);
+            }
+            false
+        }
+    }
+
+    fn perform_internal_link_jump(
+        &mut self,
+        page: usize,
+        rough_x: Option<f32>,
+        rough_y: Option<f32>,
+        resolved: Option<ResolvedInternalLink>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let x_fraction = resolved
+            .as_ref()
+            .and_then(|resolved| resolved.x_fraction)
+            .or(rough_x);
+        let y_fraction = resolved
+            .as_ref()
+            .and_then(|resolved| resolved.y_fraction)
+            .or(rough_y);
+        let focus_runs = resolved.map_or_else(Vec::new, |resolved| resolved.text_runs);
+        let jump = DocumentJump::new(page)
+            .position(x_fraction, y_fraction)
+            .center_horizontal(x_fraction.is_some())
+            .focus(
+                focus_runs,
+                NavigationFocusTone::Accent,
+                NavigationFocusMotion::Sweep,
+            );
+        self.perform_document_jump(jump, window, cx);
+    }
+
+    fn complete_pending_link_navigation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.pending_link_navigation else {
+            return;
+        };
+        let Some(resolved) = self.resolved_internal_link(id) else {
+            return;
+        };
+        let Some((page, rough_x, rough_y)) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.links.iter().find(|link| link.id == id))
+            .and_then(|link| match link.target {
+                PdfLinkTarget::Internal {
+                    page,
+                    x_fraction,
+                    y_fraction,
+                } => Some((page, x_fraction, y_fraction)),
+                PdfLinkTarget::External { .. } => None,
+            })
+        else {
+            self.pending_link_navigation = None;
+            return;
+        };
+        self.pending_link_navigation = None;
+        self.perform_internal_link_jump(page, rough_x, rough_y, Some(resolved), window, cx);
+    }
+
     fn activate_document_link(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target) = self
             .document
@@ -4425,15 +4786,23 @@ impl PdfReader {
                 x_fraction,
                 y_fraction,
             } => {
-                let jump = DocumentJump::new(page)
-                    .position(x_fraction, y_fraction)
-                    .center_horizontal(x_fraction.is_some())
-                    .focus(
-                        Vec::new(),
-                        NavigationFocusTone::Accent,
-                        NavigationFocusMotion::Sweep,
+                if let Some(resolved) = self.resolved_internal_link(id) {
+                    self.pending_link_navigation = None;
+                    self.perform_internal_link_jump(
+                        page,
+                        x_fraction,
+                        y_fraction,
+                        Some(resolved),
+                        window,
+                        cx,
                     );
-                self.perform_document_jump(jump, window, cx);
+                } else if self.request_internal_link_text(id) {
+                    self.pending_link_navigation = Some(id);
+                    cx.notify();
+                } else {
+                    self.pending_link_navigation = None;
+                    self.perform_internal_link_jump(page, x_fraction, y_fraction, None, window, cx);
+                }
             }
             PdfLinkTarget::External { url } => {
                 if let Err(error) = open::that_detached(&url) {
@@ -4878,6 +5247,79 @@ impl PdfReader {
             )
     }
 
+    fn show_link_preview(&mut self, id: usize, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.links.iter().find(|link| link.id == id))
+            .map(|link| link.target.clone())
+        else {
+            return;
+        };
+        self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
+        self.link_source_hovered = true;
+        self.previewed_link = Some(id);
+        match target {
+            PdfLinkTarget::Internal { .. } => {
+                self.request_internal_link_text(id);
+            }
+            PdfLinkTarget::External { url } => {
+                if let Some(session) = self.link_preview_session.as_mut() {
+                    session.request_website(&self.link_preview_fetcher, self.generation, &url);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_link_card_hovered(
+        &mut self,
+        hovered: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.link_card_hovered = hovered;
+        if hovered {
+            self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
+            cx.notify();
+        } else {
+            self.schedule_link_preview_clear(window, cx);
+        }
+    }
+
+    fn schedule_link_preview_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
+        let revision = self.link_hover_revision;
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                cx.background_executor().timer(LINK_HOVER_LEAVE_DELAY).await;
+                let _ = cx.update(|_, cx| {
+                    weak.update(cx, |reader, cx| {
+                        if reader.link_hover_revision == revision
+                            && link_preview_should_close(
+                                reader.link_source_hovered,
+                                reader.link_card_hovered,
+                            )
+                        {
+                            reader.previewed_link = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                });
+            })
+            .detach();
+    }
+
+    fn on_document_hover(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !hovered {
+            self.hovered_link = None;
+            self.link_source_hovered = false;
+            self.schedule_link_preview_clear(window, cx);
+        }
+    }
+
     fn set_toc_hovered(
         &mut self,
         index: usize,
@@ -5240,6 +5682,249 @@ impl PdfReader {
                 .w(px(TOC_RAIL_WIDTH))
                 .children(markers)
                 .children(detail_card)
+                .into_any_element(),
+        )
+    }
+
+    fn render_link_preview_card(
+        &mut self,
+        palette: ReaderPalette,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let id = self.previewed_link?;
+        let document = self.document.as_ref()?;
+        let layout = self.layout()?;
+        let link = document.links.iter().find(|link| link.id == id)?.clone();
+        let page_rect = layout.page_rect(link.page)?;
+        let mut anchor = normalized_bounds_in_page(page_rect, link.bounds);
+        anchor.x -= self.scroll.x;
+        anchor.y -= self.scroll.y;
+        let card_width =
+            LINK_CARD_WIDTH.min((self.viewport_width - LINK_CARD_MARGIN * 2.0).max(220.0));
+
+        let (estimated_height, content) = match &link.target {
+            PdfLinkTarget::Internal {
+                page, y_fraction, ..
+            } => {
+                let title = link_section_title(&document.toc, *page, *y_fraction)
+                    .unwrap_or_else(|| format!("Page {}", page + 1));
+                let resolved = self.resolved_internal_link(id);
+                let preview = resolved
+                    .as_ref()
+                    .map(|resolved| resolved.preview.clone())
+                    .filter(|preview| !preview.is_empty())
+                    .unwrap_or_else(|| "Loading section preview…".to_owned());
+                let jump_id = id;
+                let content = div()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.text)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(palette.text_tertiary)
+                            .child(format!("Page {}", page + 1)),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .max_h(px(84.0))
+                            .overflow_hidden()
+                            .text_sm()
+                            .text_color(palette.text_secondary)
+                            .child(preview),
+                    )
+                    .child(
+                        div()
+                            .id(("link-preview-jump", id))
+                            .mt_3()
+                            .h(px(30.0))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .rounded_md()
+                            .bg(palette.accent)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.accent_foreground)
+                            .cursor_pointer()
+                            .hover(|button| button.opacity(0.9))
+                            .active(|button| button.opacity(0.78))
+                            .on_click(cx.listener(move |reader, _, window, cx| {
+                                reader.activate_document_link(jump_id, window, cx);
+                                reader.previewed_link = None;
+                                cx.stop_propagation();
+                            }))
+                            .child(Icon::new(IconName::ArrowRight).size(px(14.0)))
+                            .child("Jump to section"),
+                    )
+                    .into_any_element();
+                (190.0, content)
+            }
+            PdfLinkTarget::External { url } => {
+                let parsed = url::Url::parse(url).ok();
+                let host = parsed
+                    .as_ref()
+                    .and_then(url::Url::host_str)
+                    .unwrap_or("External link")
+                    .to_owned();
+                let state = self
+                    .link_preview_session
+                    .as_ref()
+                    .and_then(|session| session.website(url))
+                    .cloned();
+                let (title, site_name, image_path, status) = match state {
+                    Some(WebsitePreviewState::Ready(preview)) => (
+                        preview.title.unwrap_or_else(|| host.clone()),
+                        preview.site_name,
+                        preview.image_path,
+                        None,
+                    ),
+                    Some(WebsitePreviewState::Failed(error)) => (
+                        host.clone(),
+                        None,
+                        None,
+                        Some(format!("Preview unavailable: {error}")),
+                    ),
+                    Some(WebsitePreviewState::Loading) => (
+                        host.clone(),
+                        None,
+                        None,
+                        Some("Loading website preview…".to_owned()),
+                    ),
+                    None => (
+                        host.clone(),
+                        None,
+                        None,
+                        Some("Website preview is unavailable".to_owned()),
+                    ),
+                };
+                let estimated_height = if image_path.is_some() { 274.0 } else { 156.0 };
+                let open_id = id;
+                let content = div()
+                    .when_some(image_path, |content, image_path| {
+                        content.child(
+                            div()
+                                .mb_3()
+                                .h(px(116.0))
+                                .w_full()
+                                .overflow_hidden()
+                                .rounded_lg()
+                                .bg(palette.canvas)
+                                .child(
+                                    img(image_path)
+                                        .size_full()
+                                        .object_fit(gpui::ObjectFit::Cover),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::new(IconName::Globe)
+                                    .size(px(15.0))
+                                    .text_color(palette.text_tertiary),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(palette.text)
+                                    .child(title),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(palette.text_tertiary)
+                            .child(site_name.unwrap_or(host)),
+                    )
+                    .when_some(status, |content, status| {
+                        content.child(
+                            div()
+                                .mt_2()
+                                .max_h(px(40.0))
+                                .overflow_hidden()
+                                .text_xs()
+                                .text_color(palette.text_secondary)
+                                .child(status),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(("link-preview-open", id))
+                            .mt_3()
+                            .h(px(30.0))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .rounded_md()
+                            .bg(palette.accent)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.accent_foreground)
+                            .cursor_pointer()
+                            .hover(|button| button.opacity(0.9))
+                            .active(|button| button.opacity(0.78))
+                            .on_click(cx.listener(move |reader, _, window, cx| {
+                                reader.activate_document_link(open_id, window, cx);
+                                reader.previewed_link = None;
+                                cx.stop_propagation();
+                            }))
+                            .child(Icon::new(IconName::ExternalLink).size(px(14.0)))
+                            .child("Open in browser"),
+                    )
+                    .into_any_element();
+                (estimated_height, content)
+            }
+        };
+        let position = link_card_position(
+            anchor,
+            self.viewport_width,
+            self.viewport_height,
+            card_width,
+            estimated_height,
+        );
+        Some(
+            div()
+                .id("link-preview-card")
+                .block_mouse_except_scroll()
+                .on_hover(cx.listener(|reader, hovered, window, cx| {
+                    reader.set_link_card_hovered(*hovered, window, cx)
+                }))
+                .absolute()
+                .top(px(position.y))
+                .left(px(position.x))
+                .w(px(card_width))
+                .max_h(px(
+                    (self.viewport_height - LINK_CARD_MARGIN * 2.0).max(120.0)
+                ))
+                .overflow_y_scroll()
+                .p_3()
+                .rounded_xl()
+                .border_1()
+                .border_color(palette.text.opacity(0.13))
+                .bg(palette.surface)
+                .shadow_sm()
+                .child(content)
                 .into_any_element(),
         )
     }
@@ -7125,6 +7810,7 @@ impl Render for PdfReader {
             ReaderView::Fluid => fluid_toolbar.into_any_element(),
         };
         let toc_navigation = self.render_toc_navigation(palette, cx);
+        let link_preview = self.render_link_preview_card(palette, cx);
 
         let content = if let Some(layout) = self.layout() {
             let visible = layout.visible_pages(
@@ -7196,6 +7882,7 @@ impl Render for PdfReader {
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                 .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
                 .on_mouse_move(cx.listener(Self::on_mouse_move))
+                .on_hover(cx.listener(Self::on_document_hover))
                 .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -7208,6 +7895,7 @@ impl Render for PdfReader {
                     .size_full(),
                 )
                 .children(toc_navigation)
+                .children(link_preview)
                 .into_any_element()
         } else {
             div()
@@ -8034,6 +8722,53 @@ mod tests {
             .resolve(&layout, 0.0, 800.0, 600.0, 0.0)
             .unwrap();
         assert_eq!(positioned.y, page.y + page.height * 0.5 - 300.0);
+    }
+
+    #[test]
+    fn link_preview_helpers_choose_destination_context_and_keep_cards_on_screen() {
+        let entries = vec![
+            TocEntry {
+                title: "Introduction".to_owned(),
+                page: 1,
+                depth: 0,
+                destination_y: Some(0.1),
+            },
+            TocEntry {
+                title: "Detailed results".to_owned(),
+                page: 1,
+                depth: 1,
+                destination_y: Some(0.62),
+            },
+        ];
+        assert_eq!(
+            link_section_title(&entries, 1, Some(0.7)).as_deref(),
+            Some("Detailed results")
+        );
+        assert_eq!(
+            link_section_title(&entries, 1, Some(0.2)).as_deref(),
+            Some("Introduction")
+        );
+
+        let position = link_card_position(
+            Rect {
+                x: 740.0,
+                y: 560.0,
+                width: 30.0,
+                height: 16.0,
+            },
+            800.0,
+            600.0,
+            340.0,
+            190.0,
+        );
+        assert!(position.x >= LINK_CARD_MARGIN);
+        assert!(position.x + 340.0 <= 800.0 - LINK_CARD_MARGIN + 0.001);
+        assert!(position.y >= LINK_CARD_MARGIN);
+        assert!(position.y + 190.0 <= 600.0 - LINK_CARD_MARGIN + 0.001);
+        assert!(!link_preview_should_close(true, false));
+        assert!(!link_preview_should_close(false, true));
+        assert!(!link_preview_should_close(true, true));
+        assert!(link_preview_should_close(false, false));
     }
 
     #[test]

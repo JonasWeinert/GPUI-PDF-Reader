@@ -347,6 +347,14 @@ fn highlight_runs(
     Some(runs)
 }
 
+pub(crate) fn text_runs_for_range(
+    characters: &[TextChar],
+    start: usize,
+    end: usize,
+) -> Vec<TextBounds> {
+    highlight_runs(characters, start, end, &mut || false).unwrap_or_default()
+}
+
 fn sanitize_bounds(bounds: TextBounds) -> Option<TextBounds> {
     if ![bounds.left, bounds.top, bounds.right, bounds.bottom]
         .into_iter()

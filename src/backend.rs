@@ -208,6 +208,12 @@ impl PdfWorker {
             .is_ok()
     }
 
+    pub fn ensure_text_pages(&self, generation: u64, pages: Vec<usize>) -> bool {
+        self.commands
+            .send(WorkerCommand::EnsureTextPages { generation, pages })
+            .is_ok()
+    }
+
     pub fn cancel_explicit_text(&self, generation: u64) -> bool {
         self.commands
             .send(WorkerCommand::CancelExplicitText { generation })
@@ -250,6 +256,10 @@ enum WorkerCommand {
     ExtractText {
         generation: u64,
         page: usize,
+    },
+    EnsureTextPages {
+        generation: u64,
+        pages: Vec<usize>,
     },
     CancelExplicitText {
         generation: u64,
@@ -1178,6 +1188,12 @@ fn accept_command(
             }
             true
         }
+        WorkerCommand::EnsureTextPages { generation, pages } => {
+            if state.generation == Some(generation) {
+                explicit_text.extend(pages.into_iter().filter(|page| *page < state.page_count));
+            }
+            true
+        }
         WorkerCommand::CancelExplicitText { generation } => {
             if state.generation == Some(generation) {
                 explicit_text.clear();
@@ -1207,6 +1223,7 @@ fn command_supersedes_text(
 ) -> bool {
     match command {
         WorkerCommand::ExtractText { page, .. } => *page != current_page,
+        WorkerCommand::EnsureTextPages { .. } => false,
         WorkerCommand::CancelExplicitText { .. } => current_is_explicit,
         WorkerCommand::Open { .. }
         | WorkerCommand::RenderViewport { .. }
@@ -1960,6 +1977,41 @@ mod tests {
             latest_search_revision: None,
             search_partial: None,
         };
+        let source_text = match extract_page_text(&state, 0, Vec::new(), || false)
+            .expect("fixture source text should extract")
+        {
+            TextExtraction::Complete(characters) => TextLayer::new(characters),
+            TextExtraction::Cancelled(_) => panic!("fixture source text unexpectedly cancelled"),
+        };
+        let target_text = match extract_page_text(&state, 2, Vec::new(), || false)
+            .expect("fixture target text should extract")
+        {
+            TextExtraction::Complete(characters) => TextLayer::new(characters),
+            TextExtraction::Cancelled(_) => panic!("fixture target text unexpectedly cancelled"),
+        };
+        let source = crate::link_resolution::link_source_text(&source_text, links[1].bounds);
+        let resolved = match links[1].target {
+            PdfLinkTarget::Internal {
+                page,
+                x_fraction,
+                y_fraction,
+            } => crate::link_resolution::resolve_internal_link(
+                &source_text,
+                links[1].bounds,
+                &target_text,
+                page,
+                x_fraction,
+                y_fraction,
+            ),
+            _ => panic!("fixture link should remain internal"),
+        };
+        assert!(
+            resolved.matched_source,
+            "PDFium link source {source:?} should resolve to its reference entry"
+        );
+        assert!(resolved.preview.starts_with("[12] Synthetic reference"));
+        assert!(resolved.preview.contains("Continued journal and DOI"));
+        assert!(!resolved.preview.contains("[13]"));
         assert!(matches!(
             extract_page_text(&state, 0, Vec::new(), || true),
             Ok(TextExtraction::Cancelled(_))
@@ -2505,6 +2557,13 @@ mod tests {
         assert!(command_supersedes_text(&replacement, 2, true));
         assert!(command_supersedes_text(&replacement, 2, false));
         assert!(!command_supersedes_text(&replacement, 4, true));
+
+        let ensure = WorkerCommand::EnsureTextPages {
+            generation: 7,
+            pages: vec![2, 4],
+        };
+        assert!(!command_supersedes_text(&ensure, 2, true));
+        assert!(!command_supersedes_text(&ensure, 3, true));
 
         let cancel = WorkerCommand::CancelExplicitText { generation: 7 };
         assert!(command_supersedes_text(&cancel, 2, true));

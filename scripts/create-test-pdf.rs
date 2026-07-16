@@ -33,7 +33,7 @@ BT /F1 16 Tf 54 550 Td (Page 1 - portrait - RGB blocks above) Tj ET
 BT /F1 13 Tf 54 510 Td (Select this sentence, copy it, and compare exactly.) Tj ET
 BT /F1 13 Tf 54 480 Td (Horizontal scrolling appears after zooming in.) Tj ET
 BT /F1 13 Tf 54 400 Td (Open example.com) Tj ET
-BT /F1 13 Tf 54 370 Td (Jump to destination) Tj ET
+BT /F1 13 Tf 54 370 Td ([12] Linked reference) Tj ET
 BT /F2 12 Tf 3 Tr 54 440 Td <004700500055004900200050004400460020005200650061006400650072002000A9002003A900204F60597D2014> Tj ET
 "#;
 
@@ -54,8 +54,11 @@ BT /F1 13 Tf 70 310 Td (Rotated text hit boxes must still align with these glyph
 0.18 0.35 0.72 rg 40 330 640 44 re f
 Q
 BT /F1 24 Tf 58 280 Td (Page 3 - wide CropBox) Tj ET
-BT /F1 14 Tf 58 240 Td (Only the region inside the blue outline should be visible.) Tj ET
-BT /F1 14 Tf 58 205 Td (Cross-page selection should preserve page order.) Tj ET
+BT /F1 14 Tf 58 240 Td ([12] Synthetic reference title and authors.) Tj ET
+BT /F1 14 Tf 58 215 Td (Continued journal and DOI information.) Tj ET
+BT /F1 14 Tf 58 180 Td ([13] Following synthetic reference.) Tj ET
+BT /F1 14 Tf 58 145 Td (Only the region inside the blue outline should be visible.) Tj ET
+BT /F1 14 Tf 58 110 Td (Cross-page selection should preserve page order.) Tj ET
 "#;
 
     let cmap = br#"/CIDInit /ProcSet findresource begin
@@ -103,7 +106,7 @@ end
         b"<< /Title (Page 2 - Rotate 90) /Parent 14 0 R /Prev 15 0 R /Next 18 0 R /A << /S /GoTo /D [5 0 R /Fit] >> >>".to_vec(),
         b"<< /Title (Wide documents) /Parent 14 0 R /Prev 17 0 R /Dest [7 0 R /FitH 396] >>".to_vec(),
         b"<< /Type /Annot /Subtype /Link /Rect [54 390 180 414] /Border [0 0 1] /A << /S /URI /URI (https://example.com/research?source=pdf) >> >>".to_vec(),
-        b"<< /Type /Annot /Subtype /Link /Rect [54 360 190 384] /Border [0 0 1] /A << /S /GoTo /D [7 0 R /XYZ 58 280 null] >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [54 360 82 384] /Border [0 0 1] /A << /S /GoTo /D [7 0 R /XYZ 58 280 null] >> >>".to_vec(),
     ];
 
     let mut pdf = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();

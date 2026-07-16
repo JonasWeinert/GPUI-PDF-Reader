@@ -2,6 +2,8 @@ mod annotations;
 mod backend;
 mod comment_editor;
 mod document_jump;
+mod link_preview;
+mod link_resolution;
 mod model;
 mod native_gestures;
 mod navigation_focus;
@@ -253,6 +255,21 @@ fn main() {
                         panic!("invalid GPUI_PDF_READER_QA_LINK_NAVIGATE: {value}")
                     })
                 });
+            let link_hover = std::env::var("GPUI_PDF_READER_QA_LINK_HOVER")
+                .ok()
+                .map(|value| {
+                    value.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("invalid GPUI_PDF_READER_QA_LINK_HOVER: {value}")
+                    })
+                });
+            let internal_link_hover =
+                std::env::var("GPUI_PDF_READER_QA_INTERNAL_LINK_HOVER")
+                    .ok()
+                    .map(|value| {
+                        value.parse::<usize>().unwrap_or_else(|_| {
+                            panic!("invalid GPUI_PDF_READER_QA_INTERNAL_LINK_HOVER: {value}")
+                        })
+                    });
             let toc_callout_hold =
                 std::env::var_os("GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD").is_some();
             if !keystrokes.is_empty()
@@ -264,6 +281,8 @@ fn main() {
                 || toc_hover.is_some()
                 || toc_navigate.is_some()
                 || link_navigate.is_some()
+                || link_hover.is_some()
+                || internal_link_hover.is_some()
                 || toc_callout_hold
             {
                 window
@@ -300,6 +319,8 @@ fn main() {
                                 if toc_hover.is_some()
                                     || toc_navigate.is_some()
                                     || link_navigate.is_some()
+                                    || link_hover.is_some()
+                                    || internal_link_hover.is_some()
                                     || toc_callout_hold
                                 {
                                     let outcome = cx
@@ -321,6 +342,14 @@ fn main() {
                                                 }
                                                 if let Some(index) = link_navigate {
                                                     reader.qa_navigate_link(index, window, cx)?;
+                                                }
+                                                if let Some(index) = link_hover {
+                                                    reader.qa_hover_link(index, window, cx)?;
+                                                }
+                                                if let Some(ordinal) = internal_link_hover {
+                                                    reader.qa_hover_internal_link(
+                                                        ordinal, window, cx,
+                                                    )?;
                                                 }
                                                 Ok(())
                                             })
@@ -562,6 +591,8 @@ mod tests {
             IconName::ArrowUp,
             IconName::BookOpen,
             IconName::ChevronLeft,
+            IconName::ExternalLink,
+            IconName::Globe,
             IconName::Menu,
             IconName::Minus,
             IconName::Moon,

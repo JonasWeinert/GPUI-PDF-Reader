@@ -7,3 +7,4 @@
 - Tile identity includes page, raster size, column, and row. Document generation rejects results from an older file.
 - Layout stores page sizes and an f64 height prefix once. Zoom rescaling shares that geometry and is O(1); visible-page queries are O(log n).
 - Keep rendering, text extraction, and UI failures separate. A failed tile or text layer is a warning, not a fatal document error.
+- Keep website preview networking outside the PDFium worker. Bound redirects, time, bytes, image dimensions, concurrency, and public-address resolution; store fetched share images in a per-document temporary directory whose drop removes the cache.
