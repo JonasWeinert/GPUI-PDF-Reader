@@ -358,6 +358,35 @@ fn bounded_get(
     Err("The link preview redirected too many times".to_owned())
 }
 
+pub(crate) fn fetch_public_json(url: &str, maximum_bytes: usize) -> Result<Vec<u8>, String> {
+    let url = validated_http_url(url)?;
+    let (_, response) = bounded_get(
+        url,
+        "application/json",
+        maximum_bytes,
+        NetworkPolicy::PublicOnly,
+    )
+    .map_err(|error| error.replace("link preview", "metadata request"))?;
+    if response
+        .content_type
+        .as_deref()
+        .is_some_and(|content_type| {
+            let content_type = content_type
+                .split(';')
+                .next()
+                .unwrap_or(content_type)
+                .trim()
+                .to_ascii_lowercase();
+            !content_type.starts_with("application/json")
+                && !content_type.ends_with("+json")
+                && !content_type.starts_with("text/json")
+        })
+    {
+        return Err("The metadata service did not return JSON".to_owned());
+    }
+    Ok(response.body)
+}
+
 fn resolve_url(
     url: &Url,
     network_policy: NetworkPolicy,

@@ -8,6 +8,8 @@ mod model;
 mod native_gestures;
 mod navigation_focus;
 mod reader;
+mod scholarly;
+mod scientific;
 mod search;
 mod text_field;
 mod theme;

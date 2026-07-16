@@ -406,7 +406,9 @@ fn line_start_index(text: &TextLayer, index: usize) -> usize {
 }
 
 fn source_numeric_marker(source: &str) -> Option<u32> {
-    let source = source.trim();
+    let source = source.trim().trim_start_matches(|value: char| {
+        value.is_whitespace() || matches!(value, '.' | ',' | ';' | ':' | '†' | '*')
+    });
     let mut values = source.char_indices().peekable();
     let opening = values
         .peek()
@@ -435,11 +437,18 @@ fn source_numeric_marker(source: &str) -> Option<u32> {
             '{' => '}',
             _ => unreachable!(),
         };
-        remainder.trim_start().starts_with(closing)
+        let remainder = remainder.trim_start();
+        remainder.starts_with(closing)
+            || (remainder
+                .chars()
+                .next()
+                .is_some_and(|value| matches!(value, ',' | '-' | '–' | '—'))
+                && remainder.contains(closing))
     } else {
         remainder.is_empty()
             || remainder.chars().next().is_some_and(|value| {
-                value.is_whitespace() || matches!(value, '.' | ':' | ')' | ']')
+                value.is_whitespace()
+                    || matches!(value, '.' | ':' | ')' | ']' | ',' | '-' | '–' | '—')
             })
     };
     valid_terminator
@@ -556,6 +565,16 @@ mod tests {
         );
         assert_eq!(source, "[12]");
         assert_eq!(source_numeric_marker(&source), Some(12));
+    }
+
+    #[test]
+    fn numeric_markers_accept_citation_ranges_and_lists() {
+        assert_eq!(source_numeric_marker("6-10"), Some(6));
+        assert_eq!(source_numeric_marker("6, 8"), Some(6));
+        assert_eq!(source_numeric_marker("[6–10]"), Some(6));
+        assert_eq!(source_numeric_marker("(6, 8)"), Some(6));
+        assert_eq!(source_numeric_marker(".9,10"), Some(9));
+        assert_eq!(source_numeric_marker("6authors"), None);
     }
 
     #[test]

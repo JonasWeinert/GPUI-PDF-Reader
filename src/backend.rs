@@ -4,6 +4,7 @@ use crate::model::{
 };
 #[cfg(test)]
 use crate::model::{RasterSize, TextPosition, TextSelection, selected_text};
+use crate::scientific::{ScientificAnalysis, ScientificAnalyzer};
 use crate::search::{
     MAX_SEARCH_RESULTS, SearchPageOutcome, SearchPageResults, SearchQuery, search_page,
 };
@@ -123,6 +124,10 @@ pub enum WorkerEvent {
         revision: u64,
         message: String,
     },
+    ScientificAnalysisComplete {
+        generation: u64,
+        analysis: ScientificAnalysis,
+    },
     Error {
         generation: Option<u64>,
         message: String,
@@ -145,6 +150,13 @@ struct SearchJob {
     total_highlight_runs: usize,
     skipped_pages: usize,
     truncated: bool,
+}
+
+struct ScientificJob {
+    generation: u64,
+    analyzer: ScientificAnalyzer,
+    next_page: usize,
+    partial: Option<(usize, Vec<TextChar>)>,
 }
 
 impl PdfWorker {
@@ -294,6 +306,7 @@ struct WorkerState {
     search: Option<SearchJob>,
     latest_search_revision: Option<u64>,
     search_partial: Option<(usize, Vec<TextChar>)>,
+    scientific: Option<ScientificJob>,
 }
 
 enum TextExtraction {
@@ -305,6 +318,7 @@ enum WorkerWork {
     Tile(TileKey),
     Text { page: usize, explicit: bool },
     Search,
+    Scientific,
 }
 
 fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<WorkerEvent>) {
@@ -332,6 +346,7 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
         search: None,
         latest_search_revision: None,
         search_partial: None,
+        scientific: None,
     };
     let mut pending = HashMap::<TileKey, RenderRequest>::new();
     let mut explicit_text = BTreeSet::<usize>::new();
@@ -342,6 +357,7 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
             && explicit_text.is_empty()
             && automatic_text.is_empty()
             && state.search.is_none()
+            && state.scientific.is_none()
         {
             match commands.recv() {
                 Ok(command) => {
@@ -437,6 +453,8 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
             .map(|(key, _)| *key)
         {
             WorkerWork::Tile(key)
+        } else if state.scientific.is_some() {
+            WorkerWork::Scientific
         } else {
             continue;
         };
@@ -514,6 +532,21 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
 
         if matches!(work, WorkerWork::Search) {
             if !process_search_work(
+                &commands,
+                pdfium,
+                &events,
+                &mut state,
+                &mut pending,
+                &mut explicit_text,
+                &mut automatic_text,
+            ) {
+                return;
+            }
+            continue;
+        }
+
+        if matches!(work, WorkerWork::Scientific) {
+            if !process_scientific_work(
                 &commands,
                 pdfium,
                 &events,
@@ -920,6 +953,100 @@ fn process_search_work(
     true
 }
 
+fn process_scientific_work(
+    commands: &mpsc::Receiver<WorkerCommand>,
+    pdfium: &'static Pdfium,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    state: &mut WorkerState,
+    pending: &mut HashMap<TileKey, RenderRequest>,
+    explicit_text: &mut BTreeSet<usize>,
+    automatic_text: &mut VecDeque<usize>,
+) -> bool {
+    let Some(job) = state.scientific.as_ref() else {
+        return true;
+    };
+    let generation = job.generation;
+    if state.generation != Some(generation) {
+        state.scientific = None;
+        return true;
+    }
+    let page = job.analyzer.page_order().get(job.next_page).copied();
+    let Some(page) = page else {
+        let analysis = state
+            .scientific
+            .take()
+            .expect("scientific job checked above")
+            .analyzer
+            .finish();
+        return events
+            .send(WorkerEvent::ScientificAnalysisComplete {
+                generation,
+                analysis,
+            })
+            .is_ok();
+    };
+
+    let text = if let Some(text) = state.text_cache.get(&page).cloned() {
+        text
+    } else {
+        let partial = state
+            .scientific
+            .as_mut()
+            .and_then(|job| job.partial.take())
+            .filter(|(partial_page, _)| *partial_page == page)
+            .map(|(_, partial)| partial)
+            .unwrap_or_default();
+        let mut deferred = Vec::new();
+        let mut connected = true;
+        let extracted = extract_page_text(state, page, partial, || {
+            connected &= collect_available_commands(commands, &mut deferred);
+            !connected || !deferred.is_empty()
+        });
+        if !connected {
+            return false;
+        }
+        if !accept_deferred_commands(
+            deferred,
+            pdfium,
+            events,
+            state,
+            pending,
+            explicit_text,
+            automatic_text,
+        ) {
+            return false;
+        }
+        if state.generation != Some(generation) || state.scientific.is_none() {
+            return true;
+        }
+        match extracted {
+            Ok(TextExtraction::Cancelled(partial)) => {
+                if let Some(job) = state.scientific.as_mut() {
+                    job.partial = Some((page, partial));
+                }
+                return true;
+            }
+            Ok(TextExtraction::Complete(characters)) => {
+                cache_completed_text(state, page, characters)
+            }
+            Err(_) => Arc::new(TextLayer::empty()),
+        }
+    };
+
+    let Some(job) = state.scientific.as_mut() else {
+        return true;
+    };
+    if job.generation != generation
+        || job.analyzer.page_order().get(job.next_page).copied() != Some(page)
+    {
+        return true;
+    }
+    job.analyzer.ingest_page(page, &text);
+    job.next_page += 1;
+    job.partial = None;
+    true
+}
+
 fn cap_search_highlight_runs(results: &mut SearchPageResults, remaining_runs: usize) -> usize {
     let mut added_runs = 0_usize;
     let mut retained = 0;
@@ -1112,6 +1239,7 @@ fn reset_search_for_open(state: &mut WorkerState) {
     state.search = None;
     state.latest_search_revision = None;
     state.search_partial = None;
+    state.scientific = None;
 }
 
 fn accept_command(
@@ -1140,6 +1268,12 @@ fn accept_command(
                     let toc = extract_table_of_contents(&document, &pages);
                     let links = extract_document_links(&document, &pages);
                     state.page_count = pages.len();
+                    state.scientific = Some(ScientificJob {
+                        generation,
+                        analyzer: ScientificAnalyzer::new(pages.len(), &links),
+                        next_page: 0,
+                        partial: None,
+                    });
                     state.document = Some(document);
                     if events
                         .send(WorkerEvent::Opened {
@@ -1976,6 +2110,7 @@ mod tests {
             search: None,
             latest_search_revision: None,
             search_partial: None,
+            scientific: None,
         };
         let source_text = match extract_page_text(&state, 0, Vec::new(), || false)
             .expect("fixture source text should extract")
@@ -2217,6 +2352,62 @@ mod tests {
     }
 
     #[test]
+    fn pdfium_scientific_analysis_recovers_unannotated_superscript_references() {
+        let _pdfium_guard = PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let pdfium = initialize_pdfium().expect("the pinned PDFium binary should load");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scientific-unlinked.pdf");
+        let (document, pages) = open_document(pdfium, &fixture).expect("fixture should open");
+        let links = extract_document_links(&document, &pages);
+        assert!(
+            links.is_empty(),
+            "the fixture must prove inferred references rather than authored links"
+        );
+        let state = WorkerState {
+            document: Some(document),
+            generation: Some(1),
+            text_cache: HashMap::new(),
+            partial_text: HashMap::new(),
+            automatic_text_needs_quiet: false,
+            page_count: pages.len(),
+            search: None,
+            latest_search_revision: None,
+            search_partial: None,
+            scientific: None,
+        };
+        let mut analyzer = ScientificAnalyzer::new(pages.len(), &links);
+        for page in analyzer.page_order().to_vec() {
+            let text = match extract_page_text(&state, page, Vec::new(), || false)
+                .expect("fixture text should extract")
+            {
+                TextExtraction::Complete(characters) => TextLayer::new(characters),
+                TextExtraction::Cancelled(_) => {
+                    panic!("fixture text extraction unexpectedly cancelled")
+                }
+            };
+            analyzer.ingest_page(page, &text);
+        }
+        let analysis = analyzer.finish();
+        assert!(analysis.is_scientific);
+        assert_eq!(analysis.signals.reference_entries, 8);
+        assert!(analysis.signals.doi_entries >= 2);
+        assert!(
+            analysis.signals.superscript_citations >= 4,
+            "signals were {:?}",
+            analysis.signals
+        );
+        assert_eq!(analysis.synthetic_links.len(), 4);
+        assert!(
+            analysis
+                .synthetic_links
+                .iter()
+                .all(|link| { matches!(link.target, PdfLinkTarget::Internal { page: 2, .. }) })
+        );
+    }
+
+    #[test]
     fn link_urls_accept_only_bounded_http_and_https_targets() {
         assert_eq!(
             validated_link_url("https://example.com/a b"),
@@ -2420,6 +2611,7 @@ mod tests {
             search: None,
             latest_search_revision: None,
             search_partial: None,
+            scientific: None,
         };
         let key = TileKey {
             page: 0,
@@ -2618,6 +2810,7 @@ mod tests {
             search: None,
             latest_search_revision: None,
             search_partial: None,
+            scientific: None,
         }
     }
 

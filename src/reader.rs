@@ -19,6 +19,11 @@ use crate::model::{
 use crate::navigation_focus::{
     NavigationFocusEffect, NavigationFocusFrame, NavigationFocusMotion, NavigationFocusTone,
 };
+use crate::scholarly::{
+    ScholarlyEvent, ScholarlyFetcher, ScholarlyMetadataState, ScholarlySession,
+};
+#[cfg(debug_assertions)]
+use crate::scientific::ScientificSignals;
 use crate::search::{
     MAX_SEARCH_QUERY_BYTES, SearchMatch, SearchMatchId, SearchPageOutcome, SearchQuery, search_page,
 };
@@ -957,6 +962,14 @@ pub struct PdfReader {
     annotation_io: AnnotationIo,
     link_preview_fetcher: LinkPreviewFetcher,
     link_preview_session: Option<LinkPreviewSession>,
+    scholarly_fetcher: ScholarlyFetcher,
+    scholarly_session: ScholarlySession,
+    scholarly_expanded: Option<String>,
+    #[cfg(debug_assertions)]
+    scientific_analysis_complete: bool,
+    scientific_document: bool,
+    #[cfg(debug_assertions)]
+    scientific_signals: ScientificSignals,
     generation: u64,
     document: Option<DocumentState>,
     layout: Option<Arc<DocumentLayout>>,
@@ -1055,6 +1068,7 @@ impl PdfReader {
         let (worker, events) = PdfWorker::start();
         let (annotation_io, annotation_events) = AnnotationIo::start();
         let (link_preview_fetcher, link_preview_events) = LinkPreviewFetcher::new();
+        let (scholarly_fetcher, scholarly_events) = ScholarlyFetcher::new();
         let search_field =
             cx.new(|cx| TextField::new(cx, "Search document", MAX_SEARCH_QUERY_BYTES));
         let search_field_for_reader = search_field.clone();
@@ -1078,6 +1092,14 @@ impl PdfReader {
                 annotation_io,
                 link_preview_fetcher,
                 link_preview_session: None,
+                scholarly_fetcher,
+                scholarly_session: ScholarlySession::default(),
+                scholarly_expanded: None,
+                #[cfg(debug_assertions)]
+                scientific_analysis_complete: false,
+                scientific_document: false,
+                #[cfg(debug_assertions)]
+                scientific_signals: ScientificSignals::default(),
                 generation: 0,
                 document: None,
                 layout: None,
@@ -1175,6 +1197,7 @@ impl PdfReader {
         Self::listen_for_worker_events(&entity, events, window, cx);
         Self::listen_for_annotation_events(&entity, annotation_events, window, cx);
         Self::listen_for_link_preview_events(&entity, link_preview_events, window, cx);
+        Self::listen_for_scholarly_events(&entity, scholarly_events, window, cx);
         Self::listen_for_native_pinch(&entity, window, cx);
         entity.update(cx, |_, cx| {
             cx.observe_window_appearance(window, |reader, window, cx| {
@@ -1284,8 +1307,17 @@ impl PdfReader {
                 Some((id + 1, state))
             })
             .unwrap_or((0, "none"));
+        let scholarly_state = self
+            .previewed_link
+            .and_then(|id| self.resolved_internal_link(id))
+            .and_then(|resolved| self.scholarly_session.state(&resolved.preview))
+            .map_or("none", |state| match state {
+                ScholarlyMetadataState::Loading => "loading",
+                ScholarlyMetadataState::Ready(_) => "ready",
+                ScholarlyMetadataState::Failed(_) => "failed",
+            });
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} link_preview_state={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
             self.view_mode,
             theme_name,
             if matches!(
@@ -1306,6 +1338,13 @@ impl PdfReader {
             self.qa_link_navigations,
             link_preview,
             link_preview_state,
+            scholarly_state,
+            u8::from(self.scientific_document),
+            u8::from(self.scientific_analysis_complete),
+            self.scientific_signals.reference_entries,
+            self.scientific_signals.doi_entries,
+            self.scientific_signals.bracket_citations,
+            self.scientific_signals.superscript_citations,
             self.toc_hovered.map_or(0, |index| index + 1),
             self.toc_hover_strength,
             self.qa_toc_text_matches,
@@ -1534,6 +1573,7 @@ impl PdfReader {
             || self.toc_hover_is_animating()
             || self.pending_toc_navigation.is_some()
             || self.pending_link_navigation.is_some()
+            || !self.scientific_analysis_complete
             || self.previewed_link.is_some_and(|id| {
                 self.document
                     .as_ref()
@@ -1547,6 +1587,11 @@ impl PdfReader {
                             .is_some_and(|state| matches!(state, WebsitePreviewState::Loading)),
                     })
             })
+            || self
+                .previewed_link
+                .and_then(|id| self.resolved_internal_link(id))
+                .and_then(|resolved| self.scholarly_session.state(&resolved.preview))
+                .is_some_and(|state| matches!(state, ScholarlyMetadataState::Loading))
             || self.navigation_focus.is_busy(Instant::now())
             || self.comment_autosave_task.is_some()
         {
@@ -2395,6 +2440,39 @@ impl PdfReader {
             .detach();
     }
 
+    fn listen_for_scholarly_events(
+        entity: &Entity<Self>,
+        events: mpsc::Receiver<ScholarlyEvent>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let events = Arc::new(Mutex::new(events));
+        let weak = entity.downgrade();
+        window
+            .spawn(cx, async move |async_cx| {
+                loop {
+                    let events = events.clone();
+                    let receive = async_cx
+                        .background_executor()
+                        .spawn(async move { events.lock().unwrap().recv() });
+                    let Ok(event) = receive.await else {
+                        break;
+                    };
+                    let _ = async_cx.update(|_, cx| {
+                        weak.update(cx, |reader, cx| {
+                            if event.generation() == reader.generation
+                                && reader.scholarly_session.apply(event) == Some(reader.generation)
+                            {
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    });
+                }
+            })
+            .detach();
+    }
+
     fn listen_for_native_pinch(entity: &Entity<Self>, window: &mut Window, cx: &mut App) {
         let receiver = Arc::new(Mutex::new(crate::native_gestures::install_pinch_monitor()));
         let weak = entity.downgrade();
@@ -2559,6 +2637,9 @@ impl PdfReader {
                 self.continue_pending_copy(cx);
                 self.complete_pending_toc_navigation(page, window, cx);
                 self.complete_pending_link_navigation(window, cx);
+                if let Some(id) = self.previewed_link {
+                    self.request_scholarly_for_link(id);
+                }
                 self.evict_distant_text();
             }
             WorkerEvent::TextFailed {
@@ -2577,6 +2658,9 @@ impl PdfReader {
                 self.continue_pending_copy(cx);
                 self.complete_pending_toc_navigation(page, window, cx);
                 self.complete_pending_link_navigation(window, cx);
+                if let Some(id) = self.previewed_link {
+                    self.request_scholarly_for_link(id);
+                }
                 self.evict_distant_text();
             }
             WorkerEvent::SearchPageResults {
@@ -2643,6 +2727,28 @@ impl PdfReader {
             } if generation == self.generation && revision == self.search.revision => {
                 self.search.complete = true;
                 self.warning = Some(message.into());
+            }
+            WorkerEvent::ScientificAnalysisComplete {
+                generation,
+                analysis,
+            } if generation == self.generation => {
+                #[cfg(debug_assertions)]
+                {
+                    self.scientific_analysis_complete = true;
+                    self.scientific_signals = analysis.signals;
+                }
+                self.scientific_document = analysis.is_scientific;
+                if let Some(document) = self.document.as_mut() {
+                    let mut next_id = document.links.len();
+                    for mut link in analysis.synthetic_links {
+                        link.id = next_id;
+                        next_id += 1;
+                        document.links.push(link);
+                    }
+                }
+                if let Some(id) = self.previewed_link {
+                    self.request_scholarly_for_link(id);
+                }
             }
             WorkerEvent::Error {
                 generation,
@@ -2830,7 +2936,16 @@ impl PdfReader {
         self.pending_open = None;
         self.generation = self.generation.wrapping_add(1);
         self.link_preview_fetcher.begin_document(self.generation);
+        self.scholarly_fetcher.begin_document(self.generation);
         self.link_preview_session = None;
+        self.scholarly_session = ScholarlySession::default();
+        self.scholarly_expanded = None;
+        #[cfg(debug_assertions)]
+        {
+            self.scientific_analysis_complete = false;
+            self.scientific_signals = ScientificSignals::default();
+        }
+        self.scientific_document = false;
         self.drop_all_images(window, cx);
         self.document = None;
         self.layout = None;
@@ -4715,6 +4830,21 @@ impl PdfReader {
         }
     }
 
+    fn request_scholarly_for_link(&mut self, id: usize) -> bool {
+        if !self.scientific_document {
+            return false;
+        }
+        let Some(reference) = self
+            .resolved_internal_link(id)
+            .map(|resolved| resolved.preview)
+            .filter(|reference| !reference.is_empty())
+        else {
+            return false;
+        };
+        self.scholarly_session
+            .request(&self.scholarly_fetcher, self.generation, &reference)
+    }
+
     fn perform_internal_link_jump(
         &mut self,
         page: usize,
@@ -5258,10 +5388,14 @@ impl PdfReader {
         };
         self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
         self.link_source_hovered = true;
+        if self.previewed_link != Some(id) {
+            self.scholarly_expanded = None;
+        }
         self.previewed_link = Some(id);
         match target {
             PdfLinkTarget::Internal { .. } => {
                 self.request_internal_link_text(id);
+                self.request_scholarly_for_link(id);
             }
             PdfLinkTarget::External { url } => {
                 if let Some(session) = self.link_preview_session.as_mut() {
@@ -5707,15 +5841,20 @@ impl PdfReader {
                 page, y_fraction, ..
             } => {
                 let title = link_section_title(&document.toc, *page, *y_fraction)
-                    .unwrap_or_else(|| format!("Page {}", page + 1));
+                    .unwrap_or_else(|| "Linked destination".to_owned());
                 let resolved = self.resolved_internal_link(id);
                 let preview = resolved
                     .as_ref()
                     .map(|resolved| resolved.preview.clone())
                     .filter(|preview| !preview.is_empty())
                     .unwrap_or_else(|| "Loading section preview…".to_owned());
+                let scholarly = resolved
+                    .as_ref()
+                    .and_then(|resolved| self.scholarly_session.state(&resolved.preview).cloned());
+                let abstract_expanded =
+                    self.scholarly_expanded.as_deref() == Some(preview.as_str());
                 let jump_id = id;
-                let content = div()
+                let mut content = div()
                     .child(
                         div()
                             .text_sm()
@@ -5737,7 +5876,7 @@ impl PdfReader {
                             .overflow_hidden()
                             .text_sm()
                             .text_color(palette.text_secondary)
-                            .child(preview),
+                            .child(preview.clone()),
                     )
                     .child(
                         div()
@@ -5764,9 +5903,212 @@ impl PdfReader {
                             }))
                             .child(Icon::new(IconName::ArrowRight).size(px(14.0)))
                             .child("Jump to section"),
-                    )
-                    .into_any_element();
-                (190.0, content)
+                    );
+                let mut estimated_height = 190.0;
+                match scholarly {
+                    Some(ScholarlyMetadataState::Loading) => {
+                        estimated_height += 42.0;
+                        content = content.child(
+                            div()
+                                .mt_3()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(palette.text.opacity(0.10))
+                                .text_xs()
+                                .text_color(palette.text_tertiary)
+                                .child("Looking up paper metadata…"),
+                        );
+                    }
+                    Some(ScholarlyMetadataState::Failed(error)) => {
+                        estimated_height += 52.0;
+                        content = content.child(
+                            div()
+                                .mt_3()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(palette.text.opacity(0.10))
+                                .text_xs()
+                                .text_color(palette.text_tertiary)
+                                .child(format!("Paper metadata unavailable: {error}")),
+                        );
+                    }
+                    Some(ScholarlyMetadataState::Ready(metadata)) => {
+                        estimated_height += if abstract_expanded { 300.0 } else { 210.0 };
+                        let source = metadata.source.label();
+                        let match_label = metadata
+                            .certainty
+                            .map(|certainty| certainty.label())
+                            .unwrap_or("DOI match");
+                        let authors =
+                            (!metadata.authors.is_empty()).then(|| metadata.authors.join(", "));
+                        let publication = match (metadata.journal.as_deref(), metadata.year) {
+                            (Some(journal), Some(year)) => Some(format!("{journal} · {year}")),
+                            (Some(journal), None) => Some(journal.to_owned()),
+                            (None, Some(year)) => Some(year.to_string()),
+                            (None, None) => None,
+                        };
+                        let abstract_text = metadata.abstract_text.clone();
+                        let can_expand = abstract_text
+                            .as_ref()
+                            .is_some_and(|abstract_text| abstract_text.chars().count() > 260);
+                        let full_text_url = metadata
+                            .full_text_url
+                            .clone()
+                            .or_else(|| metadata.landing_url.clone());
+                        let reference_key = preview.clone();
+                        content = content.child(
+                            div()
+                                .mt_3()
+                                .pt_3()
+                                .border_t_1()
+                                .border_color(palette.text.opacity(0.10))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .text_xs()
+                                        .text_color(palette.text_tertiary)
+                                        .child(format!("{source} · {match_label}"))
+                                        .when_some(metadata.open_access, |row, open_access| {
+                                            row.child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .rounded_full()
+                                                    .bg(if open_access {
+                                                        palette.green.opacity(0.12)
+                                                    } else {
+                                                        palette.control
+                                                    })
+                                                    .text_color(if open_access {
+                                                        palette.green
+                                                    } else {
+                                                        palette.text_tertiary
+                                                    })
+                                                    .child(if open_access {
+                                                        "Open access"
+                                                    } else {
+                                                        "Access varies"
+                                                    }),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .mt_2()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(palette.text)
+                                        .child(metadata.title),
+                                )
+                                .when_some(authors, |section, authors| {
+                                    section.child(
+                                        div()
+                                            .mt_1()
+                                            .max_h(px(38.0))
+                                            .overflow_hidden()
+                                            .text_xs()
+                                            .text_color(palette.text_secondary)
+                                            .child(authors),
+                                    )
+                                })
+                                .when_some(publication, |section, publication| {
+                                    section.child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(palette.text_tertiary)
+                                            .child(publication),
+                                    )
+                                })
+                                .when_some(abstract_text, |section, abstract_text| {
+                                    section
+                                        .child(
+                                            div()
+                                                .mt_2()
+                                                .max_h(px(if abstract_expanded {
+                                                    220.0
+                                                } else {
+                                                    70.0
+                                                }))
+                                                .overflow_hidden()
+                                                .text_xs()
+                                                .text_color(palette.text_secondary)
+                                                .child(abstract_text),
+                                        )
+                                        .when(can_expand, |section| {
+                                            section.child(
+                                                div()
+                                                    .id(("scholarly-abstract-toggle", id))
+                                                    .mt_1()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(palette.accent)
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(
+                                                        move |reader, _, _, cx| {
+                                                            if reader.scholarly_expanded.as_deref()
+                                                                == Some(reference_key.as_str())
+                                                            {
+                                                                reader.scholarly_expanded = None;
+                                                            } else {
+                                                                reader.scholarly_expanded =
+                                                                    Some(reference_key.clone());
+                                                            }
+                                                            cx.stop_propagation();
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                    .child(if abstract_expanded {
+                                                        "Show less"
+                                                    } else {
+                                                        "Show full abstract"
+                                                    }),
+                                            )
+                                        })
+                                })
+                                .when_some(full_text_url, |section, full_text_url| {
+                                    section.child(
+                                        div()
+                                            .id(("scholarly-open", id))
+                                            .mt_3()
+                                            .h(px(30.0))
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap_1()
+                                            .rounded_md()
+                                            .bg(palette.accent_soft)
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(palette.accent)
+                                            .cursor_pointer()
+                                            .hover(|button| button.opacity(0.86))
+                                            .active(|button| button.opacity(0.72))
+                                            .on_click(cx.listener(move |reader, _, _, cx| {
+                                                if let Err(error) =
+                                                    open::that_detached(&full_text_url)
+                                                {
+                                                    reader.warning = Some(
+                                                        format!("Could not open paper: {error}")
+                                                            .into(),
+                                                    );
+                                                }
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }))
+                                            .child(Icon::new(IconName::ExternalLink).size(px(14.0)))
+                                            .child("Open paper"),
+                                    )
+                                }),
+                        );
+                    }
+                    None => {}
+                }
+                (estimated_height, content.into_any_element())
             }
             PdfLinkTarget::External { url } => {
                 let parsed = url::Url::parse(url).ok();
