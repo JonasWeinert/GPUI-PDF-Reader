@@ -10,7 +10,10 @@ use crate::model::{
     DocumentLayout, PageAnchor, PageSize, PixelRect, RasterSize, Rect, TextBounds, TextLayer,
     TextPosition, TextSelection, TileKey, TocEntry, append_selected_page_text,
 };
-use crate::navigation_focus::{NavigationFocusEffect, NavigationFocusFrame, NavigationFocusTarget};
+use crate::navigation_focus::{
+    NavigationFocusEffect, NavigationFocusFrame, NavigationFocusMotion, NavigationFocusTarget,
+    NavigationFocusTone,
+};
 use crate::search::{
     MAX_SEARCH_QUERY_BYTES, SearchMatch, SearchMatchId, SearchPageOutcome, SearchQuery, search_page,
 };
@@ -852,6 +855,16 @@ fn next_search_match_id(
     Some(results[index])
 }
 
+fn search_navigation_focus_target(result: &SearchMatch) -> NavigationFocusTarget {
+    let y_fraction = result
+        .highlight_runs
+        .first()
+        .map_or(0.15, |run| (run.top + run.bottom) * 0.5);
+    NavigationFocusTarget::new(result.id.page, y_fraction, result.highlight_runs.clone())
+        .with_tone(NavigationFocusTone::SearchMatch)
+        .with_motion(NavigationFocusMotion::Pulse)
+}
+
 fn unsaved_annotation_revision(current: Option<u64>, saved: u64) -> Option<u64> {
     current.filter(|revision| *revision > saved)
 }
@@ -974,6 +987,8 @@ pub struct PdfReader {
     qa_toc_text_matches: usize,
     #[cfg(debug_assertions)]
     qa_toc_callout_holds: usize,
+    #[cfg(debug_assertions)]
+    qa_search_focuses: usize,
     zoom_render_revision: u64,
     render_debounce_until: Option<Instant>,
     zoom_render_task: Option<Task<()>>,
@@ -1081,6 +1096,8 @@ impl PdfReader {
                 qa_toc_text_matches: 0,
                 #[cfg(debug_assertions)]
                 qa_toc_callout_holds: 0,
+                #[cfg(debug_assertions)]
+                qa_search_focuses: 0,
                 zoom_render_revision: 0,
                 render_debounce_until: None,
                 zoom_render_task: None,
@@ -1165,7 +1182,7 @@ impl PdfReader {
             .map(|name| name.as_ref())
             .unwrap_or_else(|| self.theme_preference.name());
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
             self.view_mode,
             theme_name,
             if matches!(
@@ -1220,6 +1237,7 @@ impl PdfReader {
             self.search.searched_pages,
             self.search.total_highlight_runs,
             active_search,
+            self.qa_search_focuses,
             u8::from(self.search.complete),
             self.status,
         )
@@ -1511,6 +1529,7 @@ impl PdfReader {
         if self.search.order.len() < 3
             || !self.search.complete
             || self.search.total_highlight_runs == 0
+            || self.qa_search_focuses != 4
             || self
                 .search
                 .active
@@ -1518,10 +1537,11 @@ impl PdfReader {
                 != Some(1)
         {
             return Err(format!(
-                "unexpected search state: results={}, runs={}, active={:?}, complete={}",
+                "unexpected search state: results={}, runs={}, active={:?}, focuses={}, complete={}",
                 self.search.order.len(),
                 self.search.total_highlight_runs,
                 self.search.active,
+                self.qa_search_focuses,
                 self.search.complete
             ));
         }
@@ -2626,6 +2646,7 @@ impl PdfReader {
             self.qa_max_sidebar_anchor_error = 0.0;
             self.qa_toc_text_matches = 0;
             self.qa_toc_callout_holds = 0;
+            self.qa_search_focuses = 0;
         }
         let name = path
             .file_name()
@@ -2891,6 +2912,7 @@ impl PdfReader {
             return;
         }
         self.search.revision = self.search.revision.wrapping_add(1);
+        self.navigation_focus.cancel();
         self.search.query = query.clone();
         self.search.pages.clear();
         self.search.order.clear();
@@ -2954,6 +2976,7 @@ impl PdfReader {
         let Some(page_rect) = self.layout().and_then(|layout| layout.page_rect(id.page)) else {
             return;
         };
+        let focus_target = search_navigation_focus_target(result);
         let (x, y) = result
             .highlight_runs
             .first()
@@ -2978,6 +3001,11 @@ impl PdfReader {
             y: y - self.viewport_height * 0.35,
         };
         self.clamp_scroll();
+        self.navigation_focus.queue(focus_target);
+        #[cfg(debug_assertions)]
+        {
+            self.qa_search_focuses += 1;
+        }
         self.start_animation(window, cx);
         cx.notify();
     }
@@ -7383,6 +7411,10 @@ fn paint_navigation_focus(
     } else {
         frame.target.text_runs.as_slice()
     };
+    let focus_color = match frame.target.tone {
+        NavigationFocusTone::Accent => palette.accent,
+        NavigationFocusTone::SearchMatch => palette.warning,
+    };
 
     window.with_content_mask(
         Some(ContentMask {
@@ -7399,6 +7431,23 @@ fn paint_navigation_focus(
                     width: run.width + horizontal_padding * 2.0,
                     height: run.height + vertical_padding * 2.0,
                 };
+                if frame.target.motion == NavigationFocusMotion::Pulse {
+                    let scaled = Rect {
+                        x: expanded.x + expanded.width * (1.0 - frame.scale) * 0.5,
+                        y: expanded.y + expanded.height * (1.0 - frame.scale) * 0.5,
+                        width: expanded.width * frame.scale,
+                        height: expanded.height * frame.scale,
+                    };
+                    window.paint_quad(quad(
+                        content_rect_to_bounds(canvas, scaled, scroll),
+                        px((scaled.height * 0.22).clamp(2.0, 6.0)),
+                        focus_color.opacity(0.11 * frame.intensity),
+                        px(1.0),
+                        focus_color.opacity(0.22 * frame.intensity),
+                        Default::default(),
+                    ));
+                    continue;
+                }
                 let vertical = expanded.height > expanded.width * 1.5;
                 let swept_width = if vertical {
                     expanded.width
@@ -7422,7 +7471,7 @@ fn paint_navigation_focus(
                 window.paint_quad(quad(
                     content_rect_to_bounds(canvas, swept, scroll),
                     radius,
-                    palette.accent.opacity(0.105 * frame.intensity),
+                    focus_color.opacity(0.105 * frame.intensity),
                     px(0.0),
                     gpui::transparent_black(),
                     Default::default(),
@@ -7451,7 +7500,7 @@ fn paint_navigation_focus(
                 window.paint_quad(quad(
                     content_rect_to_bounds(canvas, head, scroll),
                     radius,
-                    palette.accent.opacity(0.24 * frame.intensity),
+                    focus_color.opacity(0.24 * frame.intensity),
                     px(0.0),
                     gpui::transparent_black(),
                     Default::default(),
@@ -8366,6 +8415,54 @@ mod tests {
         assert_eq!(sidebar.panel, SidePanel::Search);
         assert_eq!(sidebar.target, 1.0);
         assert_eq!(sidebar.progress, 1.0);
+    }
+
+    #[test]
+    fn search_focus_target_uses_result_geometry_and_a_bounded_fallback() {
+        let result = SearchMatch {
+            id: SearchMatchId {
+                page: 3,
+                start: 7,
+                end: 12,
+            },
+            preview: "result".to_owned(),
+            highlight_runs: vec![
+                TextBounds {
+                    left: 0.2,
+                    top: 0.4,
+                    right: 0.5,
+                    bottom: 0.46,
+                },
+                TextBounds {
+                    left: 0.2,
+                    top: 0.52,
+                    right: 0.42,
+                    bottom: 0.58,
+                },
+            ],
+        };
+
+        let target = search_navigation_focus_target(&result);
+        assert_eq!(target.page, 3);
+        assert!((target.y_fraction - 0.43).abs() < 0.001);
+        assert_eq!(target.text_runs, result.highlight_runs);
+        assert_eq!(target.tone, NavigationFocusTone::SearchMatch);
+        assert_eq!(target.motion, NavigationFocusMotion::Pulse);
+
+        let fallback = search_navigation_focus_target(&SearchMatch {
+            id: SearchMatchId {
+                page: 5,
+                start: 1,
+                end: 2,
+            },
+            preview: "unlocated".to_owned(),
+            highlight_runs: Vec::new(),
+        });
+        assert_eq!(fallback.page, 5);
+        assert_eq!(fallback.y_fraction, 0.15);
+        assert!(fallback.text_runs.is_empty());
+        assert_eq!(fallback.tone, NavigationFocusTone::SearchMatch);
+        assert_eq!(fallback.motion, NavigationFocusMotion::Pulse);
     }
 
     #[test]
