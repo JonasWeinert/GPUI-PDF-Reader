@@ -32,6 +32,8 @@ BT /F1 28 Tf 54 590 Td (GPUI PDF Reader integration fixture) Tj ET
 BT /F1 16 Tf 54 550 Td (Page 1 - portrait - RGB blocks above) Tj ET
 BT /F1 13 Tf 54 510 Td (Select this sentence, copy it, and compare exactly.) Tj ET
 BT /F1 13 Tf 54 480 Td (Horizontal scrolling appears after zooming in.) Tj ET
+BT /F1 13 Tf 54 400 Td (Open example.com) Tj ET
+BT /F1 13 Tf 54 370 Td (Jump to destination) Tj ET
 BT /F2 12 Tf 3 Tr 54 440 Td <004700500055004900200050004400460020005200650061006400650072002000A9002003A900204F60597D2014> Tj ET
 "#;
 
@@ -84,7 +86,7 @@ end
     let objects = vec![
         b"<< /Type /Catalog /Pages 2 0 R /Outlines 14 0 R /PageMode /UseOutlines >>".to_vec(),
         b"<< /Type /Pages /Count 3 /Kids [3 0 R 5 0 R 7 0 R] /Resources << /Font << /F1 9 0 R /F2 10 0 R >> >> >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Annots [19 0 R 20 0 R] >>".to_vec(),
         stream("", page_one),
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792 612] /Rotate 90 /Contents 6 0 R >>".to_vec(),
         stream("", page_two),
@@ -100,6 +102,8 @@ end
         b"<< /Title (Selecting text) /Parent 15 0 R /Dest [3 0 R /XYZ 54 530 null] >>".to_vec(),
         b"<< /Title (Page 2 - Rotate 90) /Parent 14 0 R /Prev 15 0 R /Next 18 0 R /A << /S /GoTo /D [5 0 R /Fit] >> >>".to_vec(),
         b"<< /Title (Wide documents) /Parent 14 0 R /Prev 17 0 R /Dest [7 0 R /FitH 396] >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [54 390 180 414] /Border [0 0 1] /A << /S /URI /URI (https://example.com/research?source=pdf) >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [54 360 190 384] /Border [0 0 1] /A << /S /GoTo /D [7 0 R /XYZ 58 280 null] >> >>".to_vec(),
     ];
 
     let mut pdf = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();

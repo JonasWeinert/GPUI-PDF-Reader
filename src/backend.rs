@@ -1,4 +1,7 @@
-use crate::model::{PageSize, PixelRect, TextBounds, TextChar, TextLayer, TileKey, TocEntry};
+use crate::model::{
+    PageSize, PdfLink as DocumentLink, PdfLinkTarget, PixelRect, TextBounds, TextChar, TextLayer,
+    TileKey, TocEntry,
+};
 #[cfg(test)]
 use crate::model::{RasterSize, TextPosition, TextSelection, selected_text};
 use crate::search::{
@@ -10,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
+use url::Url;
 
 const MAX_RASTER_DIMENSION: u32 = 65_536;
 const MAX_TILE_DIMENSION: u32 = 1_088;
@@ -22,6 +26,8 @@ const MAX_SEARCH_HIGHLIGHT_RUNS: usize = 100_000;
 const MAX_TOC_ENTRIES: usize = 512;
 const MAX_TOC_DEPTH: u16 = 32;
 const MAX_TOC_TITLE_UTF16_BYTES: usize = 2_048;
+const MAX_DOCUMENT_LINKS: usize = 20_000;
+const MAX_LINK_URI_BYTES: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderColor {
@@ -64,6 +70,7 @@ pub enum WorkerEvent {
         path: PathBuf,
         pages: Vec<PageSize>,
         toc: Vec<TocEntry>,
+        links: Vec<DocumentLink>,
     },
     TileRendered {
         generation: u64,
@@ -1121,6 +1128,7 @@ fn accept_command(
             match open_document(pdfium, &path) {
                 Ok((document, pages)) => {
                     let toc = extract_table_of_contents(&document, &pages);
+                    let links = extract_document_links(&document, &pages);
                     state.page_count = pages.len();
                     state.document = Some(document);
                     if events
@@ -1129,6 +1137,7 @@ fn accept_command(
                             path,
                             pages,
                             toc,
+                            links,
                         })
                         .is_err()
                     {
@@ -1339,7 +1348,7 @@ fn toc_destination_data(
     document: &PdfDocument<'_>,
     destination: &PdfDestination<'_>,
     page_count: usize,
-) -> Option<(usize, Option<f32>)> {
+) -> Option<DestinationData> {
     let page = destination
         .page_index()
         .ok()
@@ -1347,12 +1356,14 @@ fn toc_destination_data(
         .filter(|page| *page < page_count)?;
     let page_index = i32::try_from(page).ok()?;
     let pdf_page = document.pages().get(page_index).ok()?;
-    let left = pdf_page
+    let boundary = pdf_page
         .boundaries()
         .crop()
         .or_else(|_| pdf_page.boundaries().media())
-        .map(|boundary| boundary.bounds.left())
-        .unwrap_or(PdfPoints::ZERO);
+        .map(|boundary| boundary.bounds)
+        .unwrap_or_else(|_| pdf_page.page_size());
+    let left = boundary.left();
+    let bottom = boundary.bottom();
     let point = match destination.view_settings().ok() {
         Some(PdfDestinationViewSettings::SpecificCoordinatesAndZoom(x, Some(y), _)) => {
             Some((x.unwrap_or(left), y))
@@ -1364,17 +1375,44 @@ fn toc_destination_data(
         Some(PdfDestinationViewSettings::FitPageToRectangle(rect)) => {
             Some((rect.left(), rect.top()))
         }
+        Some(PdfDestinationViewSettings::FitPageVerticallyToWindow(Some(x)))
+        | Some(PdfDestinationViewSettings::FitBoundsVerticallyToWindow(Some(x))) => {
+            Some((x, bottom))
+        }
         _ => None,
     };
-    let destination_y = point.and_then(|(x, y)| {
+    let (x_fraction, y_fraction) = point.map_or((None, None), |(x, y)| {
         let (width, height) =
             precision_text_raster(pdf_page.width().value, pdf_page.height().value);
         let config = PdfRenderConfig::new().set_fixed_size(width, height);
-        let (_, device_y) = pdf_page.points_to_pixels(x, y, &config).ok()?;
-        let normalized = device_y as f32 / height as f32;
-        normalized.is_finite().then_some(normalized.clamp(0.0, 1.0))
+        let Ok((device_x, device_y)) = pdf_page.points_to_pixels(x, y, &config) else {
+            return (None, None);
+        };
+        (
+            normalized_device_coordinate(device_x, width),
+            normalized_device_coordinate(device_y, height),
+        )
     });
-    Some((page, destination_y))
+    Some(DestinationData {
+        page,
+        x_fraction,
+        y_fraction,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DestinationData {
+    page: usize,
+    x_fraction: Option<f32>,
+    y_fraction: Option<f32>,
+}
+
+fn normalized_device_coordinate(value: i32, extent: i32) -> Option<f32> {
+    if extent <= 0 {
+        return None;
+    }
+    let normalized = value as f32 / extent as f32;
+    normalized.is_finite().then_some(normalized.clamp(0.0, 1.0))
 }
 
 fn extract_table_of_contents(document: &PdfDocument<'_>, pages: &[PageSize]) -> Vec<TocEntry> {
@@ -1416,17 +1454,118 @@ fn extract_table_of_contents(document: &PdfDocument<'_>, pages: &[PageSize]) -> 
                 let destination = action.as_local_destination_action()?.destination().ok()?;
                 toc_destination_data(document, &destination, pages.len())
             });
-        if let Some((page, destination_y)) = destination {
+        if let Some(destination) = destination {
             entries.push(TocEntry {
                 title,
-                page,
+                page: destination.page,
                 depth,
-                destination_y,
+                destination_y: destination.y_fraction,
             });
         }
     }
 
     entries
+}
+
+fn extract_document_links(document: &PdfDocument<'_>, pages: &[PageSize]) -> Vec<DocumentLink> {
+    let mut result = Vec::new();
+    for page_index in 0..pages.len() {
+        if result.len() >= MAX_DOCUMENT_LINKS {
+            break;
+        }
+        let Ok(pdf_page_index) = i32::try_from(page_index) else {
+            break;
+        };
+        let Ok(page) = document.pages().get(pdf_page_index) else {
+            continue;
+        };
+        let (width, height) = precision_text_raster(page.width().value, page.height().value);
+        let config = PdfRenderConfig::new().set_fixed_size(width, height);
+        for link in page
+            .links()
+            .iter()
+            .take(MAX_DOCUMENT_LINKS.saturating_sub(result.len()))
+        {
+            let Some(bounds) = link
+                .rect()
+                .ok()
+                .and_then(|rect| normalized_link_bounds(&page, rect, &config, width, height))
+            else {
+                continue;
+            };
+            let destination = link
+                .destination()
+                .and_then(|destination| toc_destination_data(document, &destination, pages.len()));
+            let target = destination
+                .or_else(|| {
+                    let action = link.action()?;
+                    let destination = action.as_local_destination_action()?.destination().ok()?;
+                    toc_destination_data(document, &destination, pages.len())
+                })
+                .map(|destination| PdfLinkTarget::Internal {
+                    page: destination.page,
+                    x_fraction: destination.x_fraction,
+                    y_fraction: destination.y_fraction,
+                })
+                .or_else(|| {
+                    let action = link.action()?;
+                    let uri = action.as_uri_action()?.uri().ok()?;
+                    validated_link_url(&uri).map(|url| PdfLinkTarget::External { url })
+                });
+            let Some(target) = target else {
+                continue;
+            };
+            result.push(DocumentLink {
+                id: result.len(),
+                page: page_index,
+                bounds,
+                target,
+            });
+        }
+    }
+    result
+}
+
+fn normalized_link_bounds(
+    page: &PdfPage<'_>,
+    rect: PdfRect,
+    config: &PdfRenderConfig,
+    width: i32,
+    height: i32,
+) -> Option<TextBounds> {
+    let points = [
+        (rect.left(), rect.top()),
+        (rect.right(), rect.top()),
+        (rect.right(), rect.bottom()),
+        (rect.left(), rect.bottom()),
+    ];
+    let mut left = f32::INFINITY;
+    let mut top = f32::INFINITY;
+    let mut right = f32::NEG_INFINITY;
+    let mut bottom = f32::NEG_INFINITY;
+    for (x, y) in points {
+        let (device_x, device_y) = page.points_to_pixels(x, y, config).ok()?;
+        let normalized_x = normalized_device_coordinate(device_x, width)?;
+        let normalized_y = normalized_device_coordinate(device_y, height)?;
+        left = left.min(normalized_x);
+        top = top.min(normalized_y);
+        right = right.max(normalized_x);
+        bottom = bottom.max(normalized_y);
+    }
+    (right > left && bottom > top).then_some(TextBounds {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
+fn validated_link_url(uri: &str) -> Option<String> {
+    if uri.len() > MAX_LINK_URI_BYTES {
+        return None;
+    }
+    let parsed = Url::parse(uri).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
 }
 
 type RenderOutput = (u32, u32, Vec<u8>);
@@ -1786,6 +1925,29 @@ mod tests {
         );
         assert_eq!(toc[2].destination_y, None);
         assert!(toc[3].destination_y.is_some());
+        let links = extract_document_links(&document, &pages);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].page, 0);
+        assert!(links[0].bounds.left < links[0].bounds.right);
+        assert_eq!(
+            links[0].target,
+            PdfLinkTarget::External {
+                url: "https://example.com/research?source=pdf".to_owned(),
+            }
+        );
+        assert_eq!(links[1].page, 0);
+        match links[1].target {
+            PdfLinkTarget::Internal {
+                page,
+                x_fraction,
+                y_fraction,
+            } => {
+                assert_eq!(page, 2);
+                assert!(x_fraction.is_some_and(|value| (0.0..=1.0).contains(&value)));
+                assert!(y_fraction.is_some_and(|value| (0.0..=1.0).contains(&value)));
+            }
+            _ => panic!("second fixture link should be internal"),
+        }
 
         let mut state = WorkerState {
             document: Some(document),
@@ -2000,6 +2162,24 @@ mod tests {
         assert!(copied.contains("Page 3 - wide CropBox"));
         assert!(copied.matches("\n\n").count() >= 2);
         assert!(!copied.contains('\0'));
+    }
+
+    #[test]
+    fn link_urls_accept_only_bounded_http_and_https_targets() {
+        assert_eq!(
+            validated_link_url("https://example.com/a b"),
+            Some("https://example.com/a%20b".to_owned())
+        );
+        assert_eq!(
+            validated_link_url("http://example.com"),
+            Some("http://example.com/".to_owned())
+        );
+        assert_eq!(validated_link_url("javascript:alert(1)"), None);
+        assert_eq!(validated_link_url("file:///etc/passwd"), None);
+        assert_eq!(
+            validated_link_url(&"https://example.com/".repeat(600)),
+            None
+        );
     }
 
     #[test]

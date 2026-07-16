@@ -4,15 +4,16 @@ use crate::annotations::{
 };
 use crate::backend::{PdfWorker, RenderAppearance, RenderColor, TileRequest, WorkerEvent};
 use crate::comment_editor::{CommentEditor, CommentEditorEvent, RichTextBuffer};
+use crate::document_jump::DocumentJump;
 #[cfg(test)]
 use crate::model::TextChar;
 use crate::model::{
-    DocumentLayout, PageAnchor, PageSize, PixelRect, RasterSize, Rect, TextBounds, TextLayer,
-    TextPosition, TextSelection, TileKey, TocEntry, append_selected_page_text,
+    DocumentLayout, PageAnchor, PageSize, PdfLink, PdfLinkTarget, PixelRect, RasterSize, Rect,
+    TextBounds, TextLayer, TextPosition, TextSelection, TileKey, TocEntry,
+    append_selected_page_text,
 };
 use crate::navigation_focus::{
-    NavigationFocusEffect, NavigationFocusFrame, NavigationFocusMotion, NavigationFocusTarget,
-    NavigationFocusTone,
+    NavigationFocusEffect, NavigationFocusFrame, NavigationFocusMotion, NavigationFocusTone,
 };
 use crate::search::{
     MAX_SEARCH_QUERY_BYTES, SearchMatch, SearchMatchId, SearchPageOutcome, SearchQuery, search_page,
@@ -195,22 +196,6 @@ fn floating_pill_position(
     Offset { x, y }
 }
 
-fn toc_scroll_target(
-    layout: &DocumentLayout,
-    page: usize,
-    destination_y: Option<f32>,
-    viewport_height: f32,
-) -> Option<f32> {
-    let page = layout.page_rect(page)?;
-    let maximum = (layout.content_height - viewport_height).max(0.0);
-    let destination = destination_y
-        .filter(|value| value.is_finite())
-        .map_or(page.y, |value| {
-            page.y + page.height * value.clamp(0.0, 1.0) - viewport_height * 0.5
-        });
-    Some(destination.clamp(0.0, maximum))
-}
-
 #[derive(Clone, Debug, PartialEq)]
 struct TocTitleMatch {
     y: f32,
@@ -383,6 +368,7 @@ struct DocumentState {
     path: PathBuf,
     pages: Vec<PageSize>,
     toc: Vec<TocEntry>,
+    links: Vec<PdfLink>,
 }
 
 #[derive(Clone)]
@@ -855,14 +841,19 @@ fn next_search_match_id(
     Some(results[index])
 }
 
-fn search_navigation_focus_target(result: &SearchMatch) -> NavigationFocusTarget {
-    let y_fraction = result
-        .highlight_runs
-        .first()
-        .map_or(0.15, |run| (run.top + run.bottom) * 0.5);
-    NavigationFocusTarget::new(result.id.page, y_fraction, result.highlight_runs.clone())
-        .with_tone(NavigationFocusTone::SearchMatch)
-        .with_motion(NavigationFocusMotion::Pulse)
+fn search_document_jump(result: &SearchMatch) -> DocumentJump {
+    let (x_fraction, y_fraction) = result.highlight_runs.first().map_or((0.5, 0.15), |run| {
+        ((run.left + run.right) * 0.5, (run.top + run.bottom) * 0.5)
+    });
+    DocumentJump::new(result.id.page)
+        .position(Some(x_fraction), Some(y_fraction))
+        .viewport_anchor_y(0.35)
+        .center_horizontal(true)
+        .focus(
+            result.highlight_runs.clone(),
+            NavigationFocusTone::SearchMatch,
+            NavigationFocusMotion::Pulse,
+        )
 }
 
 fn unsaved_annotation_revision(current: Option<u64>, saved: u64) -> Option<u64> {
@@ -961,6 +952,8 @@ pub struct PdfReader {
     selection: Option<TextSelection>,
     selecting: bool,
     pending_annotation_click: Option<AnnotationId>,
+    hovered_link: Option<usize>,
+    pending_link_click: Option<usize>,
     toc_hovered: Option<usize>,
     toc_hover_position: f32,
     toc_hover_strength: f32,
@@ -989,6 +982,8 @@ pub struct PdfReader {
     qa_toc_callout_holds: usize,
     #[cfg(debug_assertions)]
     qa_search_focuses: usize,
+    #[cfg(debug_assertions)]
+    qa_link_navigations: usize,
     zoom_render_revision: u64,
     render_debounce_until: Option<Instant>,
     zoom_render_task: Option<Task<()>>,
@@ -1070,6 +1065,8 @@ impl PdfReader {
                 selection: None,
                 selecting: false,
                 pending_annotation_click: None,
+                hovered_link: None,
+                pending_link_click: None,
                 toc_hovered: None,
                 toc_hover_position: 0.0,
                 toc_hover_strength: 0.0,
@@ -1098,6 +1095,8 @@ impl PdfReader {
                 qa_toc_callout_holds: 0,
                 #[cfg(debug_assertions)]
                 qa_search_focuses: 0,
+                #[cfg(debug_assertions)]
+                qa_link_navigations: 0,
                 zoom_render_revision: 0,
                 render_debounce_until: None,
                 zoom_render_task: None,
@@ -1182,7 +1181,7 @@ impl PdfReader {
             .map(|name| name.as_ref())
             .unwrap_or_else(|| self.theme_preference.name());
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
             self.view_mode,
             theme_name,
             if matches!(
@@ -1197,6 +1196,10 @@ impl PdfReader {
             self.document
                 .as_ref()
                 .map_or(0, |document| document.toc.len()),
+            self.document
+                .as_ref()
+                .map_or(0, |document| document.links.len()),
+            self.qa_link_navigations,
             self.toc_hovered.map_or(0, |index| index + 1),
             self.toc_hover_strength,
             self.qa_toc_text_matches,
@@ -1296,6 +1299,28 @@ impl PdfReader {
             ));
         }
         self.navigate_toc(index, window, cx);
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn qa_navigate_link(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(link) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.links.get(index))
+        else {
+            return Err(format!("link index {index} is unavailable"));
+        };
+        if !matches!(link.target, PdfLinkTarget::Internal { .. }) {
+            return Err(format!("link index {index} is not an internal destination"));
+        }
+        self.activate_document_link(link.id, window, cx);
+        self.qa_link_navigations += 1;
         Ok(())
     }
 
@@ -2212,6 +2237,7 @@ impl PdfReader {
                 path,
                 pages,
                 toc,
+                links,
             } if generation == self.generation => {
                 self.drop_all_images(window, cx);
                 let page_count = pages.len();
@@ -2229,6 +2255,7 @@ impl PdfReader {
                     path: path.clone(),
                     pages,
                     toc,
+                    links,
                 });
                 self.page_text.clear();
                 self.pending.clear();
@@ -2239,6 +2266,8 @@ impl PdfReader {
                 self.text_pending.clear();
                 self.copy_pending = None;
                 self.selection = None;
+                self.hovered_link = None;
+                self.pending_link_click = None;
                 self.scroll = Offset::default();
                 self.scroll_target = Offset::default();
                 self.status = ReaderStatus::Ready;
@@ -2628,6 +2657,8 @@ impl PdfReader {
         self.warning = None;
         self.selection = None;
         self.pending_annotation_click = None;
+        self.hovered_link = None;
+        self.pending_link_click = None;
         self.toc_hovered = None;
         self.toc_hover_position = 0.0;
         self.toc_hover_strength = 0.0;
@@ -2647,6 +2678,7 @@ impl PdfReader {
             self.qa_toc_text_matches = 0;
             self.qa_toc_callout_holds = 0;
             self.qa_search_focuses = 0;
+            self.qa_link_navigations = 0;
         }
         let name = path
             .file_name()
@@ -2973,41 +3005,17 @@ impl PdfReader {
         else {
             return;
         };
-        let Some(page_rect) = self.layout().and_then(|layout| layout.page_rect(id.page)) else {
-            return;
-        };
-        let focus_target = search_navigation_focus_target(result);
-        let (x, y) = result
-            .highlight_runs
-            .first()
-            .map(|run| {
-                (
-                    page_rect.x + (run.left + run.right) * 0.5 * page_rect.width,
-                    page_rect.y + (run.top + run.bottom) * 0.5 * page_rect.height,
-                )
-            })
-            .unwrap_or((
-                page_rect.x + page_rect.width * 0.5,
-                page_rect.y + page_rect.height * 0.15,
-            ));
+        let jump = search_document_jump(result);
         self.search.active = Some(id);
         if let Some(index) = self.search.order.iter().position(|result| *result == id) {
             self.search_list_scroll
                 .scroll_to_item(index, ScrollStrategy::Center);
         }
-        self.sidebar_anchor = None;
-        self.scroll_target = Offset {
-            x: x - self.viewport_width * 0.5,
-            y: y - self.viewport_height * 0.35,
-        };
-        self.clamp_scroll();
-        self.navigation_focus.queue(focus_target);
+        self.perform_document_jump(jump, window, cx);
         #[cfg(debug_assertions)]
         {
             self.qa_search_focuses += 1;
         }
-        self.start_animation(window, cx);
-        cx.notify();
     }
 
     fn navigate_search(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -4245,7 +4253,14 @@ impl PdfReader {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        if !event.modifiers.shift && event.click_count == 1 {
+        self.pending_link_click =
+            (event.button == MouseButton::Left && !event.modifiers.shift && event.click_count == 1)
+                .then(|| self.hit_test_link(event.position))
+                .flatten();
+        if self.pending_link_click.is_some() {
+            self.pending_annotation_click = None;
+            self.active_annotation = None;
+        } else if !event.modifiers.shift && event.click_count == 1 {
             self.pending_annotation_click = self
                 .hit_test_text(event.position, false)
                 .and_then(|position| self.annotation_at_text_position(position));
@@ -4257,7 +4272,10 @@ impl PdfReader {
         }
         match event.button {
             MouseButton::Left => {
-                if let Some(position) = self.hit_test_text(event.position, false) {
+                if self.pending_link_click.is_some() {
+                    self.selection = None;
+                    self.selecting = false;
+                } else if let Some(position) = self.hit_test_text(event.position, false) {
                     if event.click_count >= 2 {
                         self.select_word(position);
                     } else if event.modifiers.shift {
@@ -4342,11 +4360,28 @@ impl PdfReader {
                 self.scroll_by(0.0, 28.0, true, window, cx);
             }
             cx.notify();
+            return;
+        }
+
+        let hovered_link = self.hit_test_link(event.position);
+        if self.hovered_link != hovered_link {
+            self.hovered_link = hovered_link;
+            cx.notify();
         }
     }
 
-    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if event.button == MouseButton::Left
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let activated_link = if event.button == MouseButton::Left
+            && let Some(id) = self.pending_link_click.take()
+            && self.hit_test_link(event.position) == Some(id)
+        {
+            self.activate_document_link(id, window, cx);
+            true
+        } else {
+            false
+        };
+        if !activated_link
+            && event.button == MouseButton::Left
             && let Some(id) = self.pending_annotation_click.take()
         {
             self.active_annotation = Some(id);
@@ -4355,6 +4390,58 @@ impl PdfReader {
         self.selecting = false;
         self.pan = None;
         cx.notify();
+    }
+
+    fn hit_test_link(&self, position: Point<Pixels>) -> Option<usize> {
+        let layout = self.layout()?;
+        let document = self.document.as_ref()?;
+        let x = self.scroll.x + f32::from(position.x);
+        let y = self.scroll.y + f32::from(position.y) - self.content_top();
+        let page = layout.page_at_content_point(x, y)?;
+        let page_rect = layout.page_rect(page)?;
+        document
+            .links
+            .iter()
+            .rev()
+            .filter(|link| link.page == page)
+            .find_map(|link| {
+                let bounds = normalized_bounds_in_page(page_rect, link.bounds);
+                bounds.contains(x, y).then_some(link.id)
+            })
+    }
+
+    fn activate_document_link(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.links.iter().find(|link| link.id == id))
+            .map(|link| link.target.clone())
+        else {
+            return;
+        };
+        match target {
+            PdfLinkTarget::Internal {
+                page,
+                x_fraction,
+                y_fraction,
+            } => {
+                let jump = DocumentJump::new(page)
+                    .position(x_fraction, y_fraction)
+                    .center_horizontal(x_fraction.is_some())
+                    .focus(
+                        Vec::new(),
+                        NavigationFocusTone::Accent,
+                        NavigationFocusMotion::Sweep,
+                    );
+                self.perform_document_jump(jump, window, cx);
+            }
+            PdfLinkTarget::External { url } => {
+                if let Err(error) = open::that_detached(&url) {
+                    self.warning = Some(format!("Could not open link: {error}").into());
+                    cx.notify();
+                }
+            }
+        }
     }
 
     fn hit_test_text(&self, position: Point<Pixels>, nearest: bool) -> Option<TextPosition> {
@@ -4921,17 +5008,40 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(target) = self.layout().and_then(|layout| {
-            toc_scroll_target(layout, page, destination_y, self.viewport_height)
+        let jump = DocumentJump::new(page).position(None, destination_y).focus(
+            focus_runs,
+            NavigationFocusTone::Accent,
+            NavigationFocusMotion::Sweep,
+        );
+        self.perform_document_jump(jump, window, cx);
+    }
+
+    fn perform_document_jump(
+        &mut self,
+        jump: DocumentJump,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(resolved) = self.layout().and_then(|layout| {
+            jump.resolve(
+                layout,
+                self.scroll.x,
+                self.viewport_width,
+                self.viewport_height,
+                self.max_scroll_x(layout),
+            )
         }) else {
             return;
         };
-        self.navigation_focus.queue(NavigationFocusTarget::new(
-            page,
-            destination_y.unwrap_or(0.0),
-            focus_runs,
-        ));
-        self.scroll_target.y = target;
+        self.sidebar_anchor = None;
+        self.navigation_focus.cancel();
+        if let Some(focus) = resolved.focus {
+            self.navigation_focus.queue(focus);
+        }
+        self.scroll_target = Offset {
+            x: resolved.x,
+            y: resolved.y,
+        };
         self.clamp_scroll();
         self.start_animation(window, cx);
         cx.notify();
@@ -7077,6 +7187,8 @@ impl Render for PdfReader {
                 .bg(palette.canvas)
                 .cursor(if self.pan.is_some() {
                     CursorStyle::ClosedHand
+                } else if self.hovered_link.is_some() {
+                    CursorStyle::PointingHand
                 } else {
                     CursorStyle::IBeam
                 })
@@ -7912,15 +8024,16 @@ mod tests {
             hover_strength,
             None
         ));
-        assert_eq!(
-            toc_scroll_target(&layout, 2, None, 600.0),
-            Some(layout.page_rect(2).unwrap().y)
-        );
+        let page_only = DocumentJump::new(2)
+            .resolve(&layout, 0.0, 800.0, 600.0, 0.0)
+            .unwrap();
+        assert_eq!(page_only.y, layout.page_rect(2).unwrap().y);
         let page = layout.page_rect(1).unwrap();
-        assert_eq!(
-            toc_scroll_target(&layout, 1, Some(0.5), 600.0),
-            Some(page.y + page.height * 0.5 - 300.0)
-        );
+        let positioned = DocumentJump::new(1)
+            .position(None, Some(0.5))
+            .resolve(&layout, 0.0, 800.0, 600.0, 0.0)
+            .unwrap();
+        assert_eq!(positioned.y, page.y + page.height * 0.5 - 300.0);
     }
 
     #[test]
@@ -8418,7 +8531,7 @@ mod tests {
     }
 
     #[test]
-    fn search_focus_target_uses_result_geometry_and_a_bounded_fallback() {
+    fn search_jump_uses_result_geometry_and_a_bounded_fallback() {
         let result = SearchMatch {
             id: SearchMatchId {
                 page: 3,
@@ -8442,14 +8555,26 @@ mod tests {
             ],
         };
 
-        let target = search_navigation_focus_target(&result);
+        let layout = DocumentLayout::new(
+            &[PageSize {
+                width: 600.0,
+                height: 800.0,
+            }; 6],
+            1.0,
+            900.0,
+        );
+        let target = search_document_jump(&result)
+            .resolve(&layout, 0.0, 500.0, 400.0, 500.0)
+            .unwrap()
+            .focus
+            .unwrap();
         assert_eq!(target.page, 3);
         assert!((target.y_fraction - 0.43).abs() < 0.001);
         assert_eq!(target.text_runs, result.highlight_runs);
         assert_eq!(target.tone, NavigationFocusTone::SearchMatch);
         assert_eq!(target.motion, NavigationFocusMotion::Pulse);
 
-        let fallback = search_navigation_focus_target(&SearchMatch {
+        let fallback = search_document_jump(&SearchMatch {
             id: SearchMatchId {
                 page: 5,
                 start: 1,
@@ -8457,7 +8582,11 @@ mod tests {
             },
             preview: "unlocated".to_owned(),
             highlight_runs: Vec::new(),
-        });
+        })
+        .resolve(&layout, 0.0, 500.0, 400.0, 500.0)
+        .unwrap()
+        .focus
+        .unwrap();
         assert_eq!(fallback.page, 5);
         assert_eq!(fallback.y_fraction, 0.15);
         assert!(fallback.text_runs.is_empty());

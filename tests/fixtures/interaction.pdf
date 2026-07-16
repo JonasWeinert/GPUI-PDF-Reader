@@ -7,10 +7,10 @@ endobj
 << /Type /Pages /Count 3 /Kids [3 0 R 5 0 R 7 0 R] /Resources << /Font << /F1 9 0 R /F2 10 0 R >> >> >>
 endobj
 3 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Annots [19 0 R 20 0 R] >>
 endobj
 4 0 obj
-<<  /Length 547 >>
+<<  /Length 646 >>
 stream
 q
 1 0 0 rg 48 650 150 70 re f
@@ -22,6 +22,8 @@ BT /F1 28 Tf 54 590 Td (GPUI PDF Reader integration fixture) Tj ET
 BT /F1 16 Tf 54 550 Td (Page 1 - portrait - RGB blocks above) Tj ET
 BT /F1 13 Tf 54 510 Td (Select this sentence, copy it, and compare exactly.) Tj ET
 BT /F1 13 Tf 54 480 Td (Horizontal scrolling appears after zooming in.) Tj ET
+BT /F1 13 Tf 54 400 Td (Open example.com) Tj ET
+BT /F1 13 Tf 54 370 Td (Jump to destination) Tj ET
 BT /F2 12 Tf 3 Tr 54 440 Td <004700500055004900200050004400460020005200650061006400650072002000A9002003A900204F60597D2014> Tj ET
 
 endstream
@@ -116,29 +118,37 @@ endobj
 18 0 obj
 << /Title (Wide documents) /Parent 14 0 R /Prev 17 0 R /Dest [7 0 R /FitH 396] >>
 endobj
+19 0 obj
+<< /Type /Annot /Subtype /Link /Rect [54 390 180 414] /Border [0 0 1] /A << /S /URI /URI (https://example.com/research?source=pdf) >> >>
+endobj
+20 0 obj
+<< /Type /Annot /Subtype /Link /Rect [54 360 190 384] /Border [0 0 1] /A << /S /GoTo /D [7 0 R /XYZ 58 280 null] >> >>
+endobj
 xref
-0 19
+0 21
 0000000000 65535 f 
 0000000015 00000 n 
 0000000104 00000 n 
 0000000223 00000 n 
-0000000310 00000 n 
-0000000909 00000 n 
-0000001007 00000 n 
-0000001474 00000 n 
-0000001586 00000 n 
-0000001974 00000 n 
-0000002071 00000 n 
-0000002208 00000 n 
-0000002414 00000 n 
-0000002896 00000 n 
-0000003068 00000 n 
-0000003142 00000 n 
-0000003277 00000 n 
-0000003369 00000 n 
-0000003494 00000 n 
+0000000334 00000 n 
+0000001032 00000 n 
+0000001130 00000 n 
+0000001597 00000 n 
+0000001709 00000 n 
+0000002097 00000 n 
+0000002194 00000 n 
+0000002331 00000 n 
+0000002537 00000 n 
+0000003019 00000 n 
+0000003191 00000 n 
+0000003265 00000 n 
+0000003400 00000 n 
+0000003492 00000 n 
+0000003617 00000 n 
+0000003715 00000 n 
+0000003868 00000 n 
 trailer
-<< /Size 19 /Root 1 0 R >>
+<< /Size 21 /Root 1 0 R >>
 startxref
-3592
+4003
 %%EOF

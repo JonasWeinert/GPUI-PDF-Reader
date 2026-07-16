@@ -1,6 +1,7 @@
 mod annotations;
 mod backend;
 mod comment_editor;
+mod document_jump;
 mod model;
 mod native_gestures;
 mod navigation_focus;
@@ -245,6 +246,13 @@ fn main() {
                         panic!("invalid GPUI_PDF_READER_QA_TOC_NAVIGATE: {value}")
                     })
                 });
+            let link_navigate = std::env::var("GPUI_PDF_READER_QA_LINK_NAVIGATE")
+                .ok()
+                .map(|value| {
+                    value.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("invalid GPUI_PDF_READER_QA_LINK_NAVIGATE: {value}")
+                    })
+                });
             let toc_callout_hold =
                 std::env::var_os("GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD").is_some();
             if !keystrokes.is_empty()
@@ -255,6 +263,7 @@ fn main() {
                 || fluid_scenario
                 || toc_hover.is_some()
                 || toc_navigate.is_some()
+                || link_navigate.is_some()
                 || toc_callout_hold
             {
                 window
@@ -288,7 +297,11 @@ fn main() {
                                         .timer(Duration::from_millis(25))
                                         .await;
                                 }
-                                if toc_hover.is_some() || toc_navigate.is_some() || toc_callout_hold {
+                                if toc_hover.is_some()
+                                    || toc_navigate.is_some()
+                                    || link_navigate.is_some()
+                                    || toc_callout_hold
+                                {
                                     let outcome = cx
                                         .update(|window, cx| {
                                             let Some(Some(reader)) =
@@ -305,6 +318,9 @@ fn main() {
                                                 }
                                                 if let Some(index) = toc_navigate {
                                                     reader.qa_navigate_toc(index, window, cx)?;
+                                                }
+                                                if let Some(index) = link_navigate {
+                                                    reader.qa_navigate_link(index, window, cx)?;
                                                 }
                                                 Ok(())
                                             })

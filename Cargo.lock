@@ -2315,9 +2315,11 @@ dependencies = [
  "gpui-component-assets",
  "image",
  "objc2-app-kit",
+ "open",
  "pdfium-render",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

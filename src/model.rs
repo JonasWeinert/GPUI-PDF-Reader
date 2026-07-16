@@ -22,6 +22,26 @@ pub struct TocEntry {
     pub destination_y: Option<f32>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PdfLink {
+    pub id: usize,
+    pub page: usize,
+    pub bounds: TextBounds,
+    pub target: PdfLinkTarget,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PdfLinkTarget {
+    Internal {
+        page: usize,
+        x_fraction: Option<f32>,
+        y_fraction: Option<f32>,
+    },
+    External {
+        url: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,
