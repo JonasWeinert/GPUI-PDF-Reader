@@ -2,13 +2,39 @@ use crate::model::TextBounds;
 use std::time::{Duration, Instant};
 
 pub const NAVIGATION_FOCUS_DURATION: Duration = Duration::from_millis(500);
+pub const NAVIGATION_FOCUS_PULSE_DURATION: Duration = Duration::from_millis(360);
 const MAX_NAVIGATION_FOCUS_RUNS: usize = 64;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NavigationFocusTone {
+    #[default]
+    Accent,
+    SearchMatch,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NavigationFocusMotion {
+    #[default]
+    Sweep,
+    Pulse,
+}
+
+impl NavigationFocusMotion {
+    fn duration(self) -> Duration {
+        match self {
+            Self::Sweep => NAVIGATION_FOCUS_DURATION,
+            Self::Pulse => NAVIGATION_FOCUS_PULSE_DURATION,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NavigationFocusTarget {
     pub page: usize,
     pub y_fraction: f32,
     pub text_runs: Vec<TextBounds>,
+    pub tone: NavigationFocusTone,
+    pub motion: NavigationFocusMotion,
 }
 
 impl NavigationFocusTarget {
@@ -43,7 +69,19 @@ impl NavigationFocusTarget {
             page,
             y_fraction,
             text_runs,
+            tone: NavigationFocusTone::Accent,
+            motion: NavigationFocusMotion::Sweep,
         }
+    }
+
+    pub fn with_tone(mut self, tone: NavigationFocusTone) -> Self {
+        self.tone = tone;
+        self
+    }
+
+    pub fn with_motion(mut self, motion: NavigationFocusMotion) -> Self {
+        self.motion = motion;
+        self
     }
 }
 
@@ -103,6 +141,7 @@ pub struct NavigationFocusFrame {
     pub target: NavigationFocusTarget,
     pub sweep: f32,
     pub intensity: f32,
+    pub scale: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -132,7 +171,7 @@ impl NavigationFocusEffect {
     pub fn is_busy(&self, now: Instant) -> bool {
         self.pending.is_some()
             || self.active.as_ref().is_some_and(|active| {
-                now.saturating_duration_since(active.started_at) < NAVIGATION_FOCUS_DURATION
+                now.saturating_duration_since(active.started_at) < active.target.motion.duration()
             })
     }
 
@@ -149,7 +188,7 @@ impl NavigationFocusEffect {
             });
         }
         if self.active.as_ref().is_some_and(|active| {
-            now.saturating_duration_since(active.started_at) >= NAVIGATION_FOCUS_DURATION
+            now.saturating_duration_since(active.started_at) >= active.target.motion.duration()
         }) {
             self.active = None;
         }
@@ -161,17 +200,43 @@ impl NavigationFocusEffect {
         let progress = (now
             .saturating_duration_since(active.started_at)
             .as_secs_f32()
-            / NAVIGATION_FOCUS_DURATION.as_secs_f32())
+            / active.target.motion.duration().as_secs_f32())
         .clamp(0.0, 1.0);
         let sweep_progress = (progress / 0.72).clamp(0.0, 1.0);
         let sweep = 1.0 - (1.0 - sweep_progress).powi(3);
-        let fade_in = (progress / 0.12).clamp(0.0, 1.0);
-        let fade_out = ((1.0 - progress) / 0.45).clamp(0.0, 1.0);
+        let (intensity, scale) = match active.target.motion {
+            NavigationFocusMotion::Sweep => {
+                let fade_in = (progress / 0.12).clamp(0.0, 1.0);
+                let fade_out = ((1.0 - progress) / 0.45).clamp(0.0, 1.0);
+                (fade_in.min(fade_out), 1.0)
+            }
+            NavigationFocusMotion::Pulse => (
+                (std::f32::consts::PI * progress).sin().max(0.0).powf(0.72),
+                pulse_scale(progress),
+            ),
+        };
         Some(NavigationFocusFrame {
             target: active.target.clone(),
             sweep,
-            intensity: fade_in.min(fade_out),
+            intensity,
+            scale,
         })
+    }
+}
+
+fn pulse_scale(progress: f32) -> f32 {
+    let progress = progress.clamp(0.0, 1.0);
+    if progress < 0.34 {
+        let phase = progress / 0.34;
+        1.0 + 0.04 * (1.0 - (1.0 - phase).powi(3))
+    } else if progress < 0.72 {
+        let phase = (progress - 0.34) / 0.38;
+        let eased = phase * phase * (3.0 - 2.0 * phase);
+        1.04 + (0.995 - 1.04) * eased
+    } else {
+        let phase = (progress - 0.72) / 0.28;
+        let eased = 1.0 - (1.0 - phase).powi(2);
+        0.995 + (1.0 - 0.995) * eased
     }
 }
 
@@ -205,6 +270,7 @@ mod tests {
         assert_eq!(frame.target, target);
         assert!(frame.sweep > 0.8);
         assert!(frame.intensity > 0.5);
+        assert_eq!(frame.scale, 1.0);
 
         let end = start + NAVIGATION_FOCUS_DURATION;
         assert!(!effect.advance(end, true));
@@ -362,5 +428,44 @@ mod tests {
             ],
         );
         assert_eq!(multiline.text_runs.len(), 2);
+    }
+
+    #[test]
+    fn focus_targets_default_to_swept_accent_and_accept_semantics() {
+        let accent = NavigationFocusTarget::new(0, 0.2, Vec::new());
+        assert_eq!(accent.tone, NavigationFocusTone::Accent);
+        assert_eq!(accent.motion, NavigationFocusMotion::Sweep);
+
+        let search = accent
+            .with_tone(NavigationFocusTone::SearchMatch)
+            .with_motion(NavigationFocusMotion::Pulse);
+        assert_eq!(search.tone, NavigationFocusTone::SearchMatch);
+        assert_eq!(search.motion, NavigationFocusMotion::Pulse);
+    }
+
+    #[test]
+    fn pulse_scales_out_settles_back_and_uses_the_shorter_duration() {
+        let start = Instant::now();
+        let mut effect = NavigationFocusEffect::default();
+        effect.queue(
+            NavigationFocusTarget::new(0, 0.2, Vec::new())
+                .with_motion(NavigationFocusMotion::Pulse),
+        );
+        assert!(effect.advance(start, true));
+
+        let expanded = effect
+            .frame(start + Duration::from_millis(120))
+            .expect("pulse should be visible");
+        assert!(expanded.scale > 1.035);
+        assert!(expanded.intensity > 0.8);
+
+        let settling = effect
+            .frame(start + Duration::from_millis(260))
+            .expect("pulse should still be settling");
+        assert!(settling.scale < 1.0);
+
+        let end = start + NAVIGATION_FOCUS_PULSE_DURATION;
+        assert!(!effect.advance(end, true));
+        assert_eq!(effect.frame(end), None);
     }
 }
