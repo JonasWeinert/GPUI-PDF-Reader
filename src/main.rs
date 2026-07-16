@@ -3,6 +3,7 @@ mod backend;
 mod comment_editor;
 mod model;
 mod native_gestures;
+mod navigation_focus;
 mod reader;
 mod search;
 mod text_field;
@@ -244,6 +245,8 @@ fn main() {
                         panic!("invalid GPUI_PDF_READER_QA_TOC_NAVIGATE: {value}")
                     })
                 });
+            let toc_callout_hold =
+                std::env::var_os("GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD").is_some();
             if !keystrokes.is_empty()
                 || !wheel_deltas.is_empty()
                 || report
@@ -252,6 +255,7 @@ fn main() {
                 || fluid_scenario
                 || toc_hover.is_some()
                 || toc_navigate.is_some()
+                || toc_callout_hold
             {
                 window
                     .update(cx, |_, window, cx| {
@@ -284,7 +288,7 @@ fn main() {
                                         .timer(Duration::from_millis(25))
                                         .await;
                                 }
-                                if toc_hover.is_some() || toc_navigate.is_some() {
+                                if toc_hover.is_some() || toc_navigate.is_some() || toc_callout_hold {
                                     let outcome = cx
                                         .update(|window, cx| {
                                             let Some(Some(reader)) =
@@ -295,6 +299,9 @@ fn main() {
                                             reader.update(cx, |reader, cx| {
                                                 if let Some(index) = toc_hover {
                                                     reader.qa_set_toc_hovered(index, window, cx)?;
+                                                }
+                                                if toc_callout_hold {
+                                                    reader.qa_hold_toc_callout(window, cx)?;
                                                 }
                                                 if let Some(index) = toc_navigate {
                                                     reader.qa_navigate_toc(index, window, cx)?;
