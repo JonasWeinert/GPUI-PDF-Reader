@@ -74,7 +74,7 @@ run_case() {
     exit 1
   fi
   case "$report" in
-    *"theme=$case_theme "*"pending=0 "*"debouncing=0 "*"status=Ready") ;;
+    *"theme=$case_theme "*"toc=4 "*"pending=0 "*"debouncing=0 "*"status=Ready") ;;
     *)
       printf 'E2E %s theme was not applied in a settled reader: %s\n' "$case_name" "$report" >&2
       exit 1

@@ -1,8 +1,9 @@
 //! Creates a deterministic PDF used for integration and visual testing.
 //!
 //! This intentionally uses only the Rust standard library. The fixture covers
-//! different page sizes, inherited rotation, a CropBox, RGB primaries, and a
-//! ToUnicode map so PDFium's raster and text paths are exercised together.
+//! different page sizes, inherited rotation, a CropBox, RGB primaries, a
+//! nested outline, and a ToUnicode map so PDFium's document, raster, and text
+//! paths are exercised together.
 
 use std::env;
 use std::fs;
@@ -81,7 +82,7 @@ end
 
     // Object numbers are intentionally stable so the fixture is reproducible.
     let objects = vec![
-        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Catalog /Pages 2 0 R /Outlines 14 0 R /PageMode /UseOutlines >>".to_vec(),
         b"<< /Type /Pages /Count 3 /Kids [3 0 R 5 0 R 7 0 R] /Resources << /Font << /F1 9 0 R /F2 10 0 R >> >> >>".to_vec(),
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
         stream("", page_one),
@@ -94,6 +95,11 @@ end
         b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Helvetica /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 13 0 R /DW 600 /CIDToGIDMap /Identity >>".to_vec(),
         stream("", cmap),
         b"<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [-166 -225 1000 931] /ItalicAngle 0 /Ascent 718 /Descent -207 /CapHeight 718 /StemV 80 >>".to_vec(),
+        b"<< /Type /Outlines /First 15 0 R /Last 18 0 R /Count 4 >>".to_vec(),
+        b"<< /Title (Getting Started) /Parent 14 0 R /Next 17 0 R /First 16 0 R /Last 16 0 R /Count 1 /Dest [3 0 R /FitH 760] >>".to_vec(),
+        b"<< /Title (Selecting text) /Parent 15 0 R /Dest [3 0 R /XYZ 54 530 null] >>".to_vec(),
+        b"<< /Title (Page 2 - Rotate 90) /Parent 14 0 R /Prev 15 0 R /Next 18 0 R /A << /S /GoTo /D [5 0 R /Fit] >> >>".to_vec(),
+        b"<< /Title (Wide documents) /Parent 14 0 R /Prev 17 0 R /Dest [7 0 R /FitH 396] >>".to_vec(),
     ];
 
     let mut pdf = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();

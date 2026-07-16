@@ -55,6 +55,10 @@ are macOS-specific today.
   virtualized result list, and previous/next navigation.
 - PDFium rendering for intrinsic page rotation, CropBox pages, annotations,
   and AcroForm appearances.
+- Outline-aware navigation for PDFs with a table of contents: a subtle
+  hierarchy rail follows reading position, reveals section detail on hover,
+  and smoothly moves to explicit destinations or matched page headings when
+  clicked.
 - Latest-wins rendering and bounded caches to keep rapid scrolling and zooming
   responsive.
 

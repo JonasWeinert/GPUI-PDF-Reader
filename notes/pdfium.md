@@ -13,6 +13,8 @@
 - Forced colors do not cover widget appearances drawn later by `FPDF_FFLDraw`; forms remain an explicit limitation to inspect on form-heavy documents.
 - Carry the concrete render appearance with every tile demand and completion. Comparing only page/raster keys can publish a stale light tile after a dark-theme replacement.
 - When users disable forced PDF colors inside a dark UI, return to the normal PDFium path and a light GPUI paper backing together. Changing either appearance must discard image tiles and re-request the viewport.
+- PDFium exposes the document outline as a bookmark graph. Traverse it iteratively with a visited set, cap nodes/depth/title bytes, accept only same-document destinations, and validate every destination page against the opened page count. A bookmark action may contain the local destination when `FPDFBookmark_GetDest` does not.
+- Preserve explicit destination y coordinates through PDFium's view settings and page-to-device conversion. For page-only destinations, lazily extract just that page, search for the normalized outline title, prefer the largest exact occurrence as the likely heading, and fall back to page top only when no match has usable bounds.
 - Pdfium's process-global bindings can be reused through a fresh `Pdfium::default()` facade after initialization, but native render tests must not drive the same Pdfium instance concurrently.
 - Validate page sizes, raster dimensions, tile containment, integer overflow, returned dimensions, and byte length before trusting native results.
 - The vendored `pdfium-render` changes are deliberately narrow: viewport tile rendering and constant-memory character access.

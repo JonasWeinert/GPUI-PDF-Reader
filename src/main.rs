@@ -230,12 +230,28 @@ fn main() {
                 std::env::var_os("GPUI_PDF_READER_QA_FEATURE_SCENARIO").is_some();
             let fluid_scenario =
                 std::env::var_os("GPUI_PDF_READER_QA_FLUID_SCENARIO").is_some();
+            let toc_hover = std::env::var("GPUI_PDF_READER_QA_TOC_HOVER")
+                .ok()
+                .map(|value| {
+                    value.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("invalid GPUI_PDF_READER_QA_TOC_HOVER: {value}")
+                    })
+                });
+            let toc_navigate = std::env::var("GPUI_PDF_READER_QA_TOC_NAVIGATE")
+                .ok()
+                .map(|value| {
+                    value.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("invalid GPUI_PDF_READER_QA_TOC_NAVIGATE: {value}")
+                    })
+                });
             if !keystrokes.is_empty()
                 || !wheel_deltas.is_empty()
                 || report
                 || exit_after_report
                 || feature_scenario
                 || fluid_scenario
+                || toc_hover.is_some()
+                || toc_navigate.is_some()
             {
                 window
                     .update(cx, |_, window, cx| {
@@ -267,6 +283,33 @@ fn main() {
                                     cx.background_executor()
                                         .timer(Duration::from_millis(25))
                                         .await;
+                                }
+                                if toc_hover.is_some() || toc_navigate.is_some() {
+                                    let outcome = cx
+                                        .update(|window, cx| {
+                                            let Some(Some(reader)) =
+                                                window.root::<reader::PdfReader>()
+                                            else {
+                                                return Err("TOC QA reader is unavailable".to_owned());
+                                            };
+                                            reader.update(cx, |reader, cx| {
+                                                if let Some(index) = toc_hover {
+                                                    reader.qa_set_toc_hovered(index, window, cx)?;
+                                                }
+                                                if let Some(index) = toc_navigate {
+                                                    reader.qa_navigate_toc(index, window, cx)?;
+                                                }
+                                                Ok(())
+                                            })
+                                        })
+                                        .unwrap_or_else(|error| {
+                                            Err(format!("TOC QA window update failed: {error}"))
+                                        });
+                                    if let Err(message) = outcome {
+                                        eprintln!("GPUI_PDF_READER_QA_ERROR {message}");
+                                        let _ = cx.update(|_, cx| cx.quit());
+                                        return;
+                                    }
                                 }
                                 if feature_scenario || fluid_scenario {
                                     let feature_deadline =

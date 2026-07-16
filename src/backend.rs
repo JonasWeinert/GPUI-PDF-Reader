@@ -1,4 +1,4 @@
-use crate::model::{PageSize, PixelRect, TextBounds, TextChar, TextLayer, TileKey};
+use crate::model::{PageSize, PixelRect, TextBounds, TextChar, TextLayer, TileKey, TocEntry};
 #[cfg(test)]
 use crate::model::{RasterSize, TextPosition, TextSelection, selected_text};
 use crate::search::{
@@ -19,6 +19,9 @@ const MAX_CACHED_TEXT_PAGES: usize = 16;
 const TEXT_CANCEL_INTERVAL: usize = 64;
 const AUTOMATIC_TEXT_IDLE_DELAY: Duration = Duration::from_millis(200);
 const MAX_SEARCH_HIGHLIGHT_RUNS: usize = 100_000;
+const MAX_TOC_ENTRIES: usize = 512;
+const MAX_TOC_DEPTH: u16 = 32;
+const MAX_TOC_TITLE_UTF16_BYTES: usize = 2_048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderColor {
@@ -60,6 +63,7 @@ pub enum WorkerEvent {
         generation: u64,
         path: PathBuf,
         pages: Vec<PageSize>,
+        toc: Vec<TocEntry>,
     },
     TileRendered {
         generation: u64,
@@ -1116,6 +1120,7 @@ fn accept_command(
 
             match open_document(pdfium, &path) {
                 Ok((document, pages)) => {
+                    let toc = extract_table_of_contents(&document, &pages);
                     state.page_count = pages.len();
                     state.document = Some(document);
                     if events
@@ -1123,6 +1128,7 @@ fn accept_command(
                             generation,
                             path,
                             pages,
+                            toc,
                         })
                         .is_err()
                     {
@@ -1327,6 +1333,100 @@ fn open_document(
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok((document, pages))
+}
+
+fn toc_destination_data(
+    document: &PdfDocument<'_>,
+    destination: &PdfDestination<'_>,
+    page_count: usize,
+) -> Option<(usize, Option<f32>)> {
+    let page = destination
+        .page_index()
+        .ok()
+        .and_then(|page| usize::try_from(page).ok())
+        .filter(|page| *page < page_count)?;
+    let page_index = i32::try_from(page).ok()?;
+    let pdf_page = document.pages().get(page_index).ok()?;
+    let left = pdf_page
+        .boundaries()
+        .crop()
+        .or_else(|_| pdf_page.boundaries().media())
+        .map(|boundary| boundary.bounds.left())
+        .unwrap_or(PdfPoints::ZERO);
+    let point = match destination.view_settings().ok() {
+        Some(PdfDestinationViewSettings::SpecificCoordinatesAndZoom(x, Some(y), _)) => {
+            Some((x.unwrap_or(left), y))
+        }
+        Some(PdfDestinationViewSettings::FitPageHorizontallyToWindow(Some(y)))
+        | Some(PdfDestinationViewSettings::FitBoundsHorizontallyToWindow(Some(y))) => {
+            Some((left, y))
+        }
+        Some(PdfDestinationViewSettings::FitPageToRectangle(rect)) => {
+            Some((rect.left(), rect.top()))
+        }
+        _ => None,
+    };
+    let destination_y = point.and_then(|(x, y)| {
+        let (width, height) =
+            precision_text_raster(pdf_page.width().value, pdf_page.height().value);
+        let config = PdfRenderConfig::new().set_fixed_size(width, height);
+        let (_, device_y) = pdf_page.points_to_pixels(x, y, &config).ok()?;
+        let normalized = device_y as f32 / height as f32;
+        normalized.is_finite().then_some(normalized.clamp(0.0, 1.0))
+    });
+    Some((page, destination_y))
+}
+
+fn extract_table_of_contents(document: &PdfDocument<'_>, pages: &[PageSize]) -> Vec<TocEntry> {
+    let Some(root) = document.bookmarks().root() else {
+        return Vec::new();
+    };
+    let mut pending = vec![(root, 0_u16)];
+    let mut visited = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+
+    while let Some((bookmark, depth)) = pending.pop() {
+        if visited.len() >= MAX_TOC_ENTRIES {
+            break;
+        }
+        if !visited.insert(bookmark.clone()) {
+            continue;
+        }
+        if let Some(sibling) = bookmark.next_sibling() {
+            pending.push((sibling, depth));
+        }
+        if depth < MAX_TOC_DEPTH
+            && let Some(child) = bookmark.first_child()
+        {
+            pending.push((child, depth + 1));
+        }
+
+        let Some(title) = bookmark.title_with_limit(MAX_TOC_TITLE_UTF16_BYTES) else {
+            continue;
+        };
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if title.is_empty() {
+            continue;
+        }
+        let destination = bookmark
+            .destination()
+            .and_then(|destination| toc_destination_data(document, &destination, pages.len()))
+            .or_else(|| {
+                let action = bookmark.action()?;
+                let destination = action.as_local_destination_action()?.destination().ok()?;
+                toc_destination_data(document, &destination, pages.len())
+            });
+        if let Some((page, destination_y)) = destination {
+            entries.push(TocEntry {
+                title,
+                page,
+                depth,
+                destination_y,
+            });
+        }
+    }
+
+    entries
 }
 
 type RenderOutput = (u32, u32, Vec<u8>);
@@ -1655,6 +1755,37 @@ mod tests {
                 },
             ]
         );
+        let root_bookmark = document.bookmarks().root().expect("fixture has an outline");
+        assert_eq!(root_bookmark.title_with_limit(2), None);
+        assert_eq!(
+            root_bookmark.title_with_limit(MAX_TOC_TITLE_UTF16_BYTES),
+            Some("Getting Started".to_owned())
+        );
+        let toc = extract_table_of_contents(&document, &pages);
+        assert_eq!(toc.len(), 4);
+        assert_eq!(
+            toc.iter()
+                .map(|entry| (entry.title.as_str(), entry.page, entry.depth))
+                .collect::<Vec<_>>(),
+            [
+                ("Getting Started", 0, 0),
+                ("Selecting text", 0, 1),
+                ("Page 2 - Rotate 90", 1, 0),
+                ("Wide documents", 2, 0),
+            ]
+        );
+        assert!(
+            toc[0]
+                .destination_y
+                .is_some_and(|y| (0.0..0.1).contains(&y))
+        );
+        assert!(
+            toc[1]
+                .destination_y
+                .is_some_and(|y| (0.2..0.5).contains(&y))
+        );
+        assert_eq!(toc[2].destination_y, None);
+        assert!(toc[3].destination_y.is_some());
 
         let mut state = WorkerState {
             document: Some(document),
