@@ -1,4 +1,5 @@
 use crate::model::{PdfLink, PdfLinkTarget, TextBounds, TextLayer};
+use crate::search::text_runs_for_range;
 use crate::search::{SearchPageOutcome, SearchQuery, search_page};
 use std::collections::BTreeMap;
 
@@ -20,17 +21,21 @@ pub struct ScientificSignals {
 pub struct ScientificAnalysis {
     pub is_scientific: bool,
     pub synthetic_links: Vec<PdfLink>,
+    pub references: Vec<ScientificReference>,
     pub signals: ScientificSignals,
 }
 
-#[derive(Clone, Debug)]
-struct ReferenceEntry {
-    number: u32,
-    page: usize,
-    x_fraction: Option<f32>,
-    y_fraction: Option<f32>,
-    text: String,
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScientificReference {
+    pub number: u32,
+    pub page: usize,
+    pub x_fraction: Option<f32>,
+    pub y_fraction: Option<f32>,
+    pub text: String,
+    pub text_runs: Vec<TextBounds>,
 }
+
+type ReferenceEntry = ScientificReference;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CitationKind {
@@ -172,9 +177,15 @@ impl ScientificAnalyzer {
         } else {
             Vec::new()
         };
+        let references = if is_scientific {
+            self.references.into_values().collect()
+        } else {
+            Vec::new()
+        };
         ScientificAnalysis {
             is_scientific,
             synthetic_links,
+            references,
             signals,
         }
     }
@@ -376,6 +387,7 @@ fn parse_reference_entries(page: usize, text: &TextLayer, start: usize) -> Vec<R
             x_fraction: bounds.map(|bounds| (bounds.left + bounds.right) * 0.5),
             y_fraction: bounds.map(|bounds| bounds.top),
             text: entry_text,
+            text_runs: text_runs_for_range(text.as_slice(), entry_start, entry_end),
         });
     }
     entries
@@ -684,6 +696,10 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(detect_doi(&entries[0].text).as_deref(), Some("10.1000/one"));
+        assert!(!entries[0].text_runs.is_empty());
+        assert!(entries[0].text_runs.iter().all(|run| {
+            run.left >= 0.0 && run.top >= 0.0 && run.right <= 1.0 && run.bottom <= 1.0
+        }));
     }
 
     #[test]
@@ -749,6 +765,7 @@ mod tests {
         assert_eq!(analysis.signals.reference_entries, 8);
         assert!(analysis.signals.superscript_citations >= 4);
         assert!(analysis.synthetic_links.len() >= 4);
+        assert_eq!(analysis.references.len(), 8);
         assert!(
             analysis
                 .synthetic_links

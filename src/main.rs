@@ -2,6 +2,7 @@ mod annotations;
 mod backend;
 mod comment_editor;
 mod document_jump;
+mod floating_panel;
 mod link_preview;
 mod link_resolution;
 mod model;
@@ -272,6 +273,16 @@ fn main() {
                             panic!("invalid GPUI_PDF_READER_QA_INTERNAL_LINK_HOVER: {value}")
                         })
                     });
+            let scientific_reference_hover =
+                std::env::var("GPUI_PDF_READER_QA_SCIENTIFIC_REFERENCE_HOVER")
+                    .ok()
+                    .map(|value| {
+                        value.parse::<usize>().unwrap_or_else(|_| {
+                            panic!(
+                                "invalid GPUI_PDF_READER_QA_SCIENTIFIC_REFERENCE_HOVER: {value}"
+                            )
+                        })
+                    });
             let toc_callout_hold =
                 std::env::var_os("GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD").is_some();
             if !keystrokes.is_empty()
@@ -285,6 +296,7 @@ fn main() {
                 || link_navigate.is_some()
                 || link_hover.is_some()
                 || internal_link_hover.is_some()
+                || scientific_reference_hover.is_some()
                 || toc_callout_hold
             {
                 window
@@ -323,6 +335,7 @@ fn main() {
                                     || link_navigate.is_some()
                                     || link_hover.is_some()
                                     || internal_link_hover.is_some()
+                                    || scientific_reference_hover.is_some()
                                     || toc_callout_hold
                                 {
                                     let outcome = cx
@@ -350,6 +363,11 @@ fn main() {
                                                 }
                                                 if let Some(ordinal) = internal_link_hover {
                                                     reader.qa_hover_internal_link(
+                                                        ordinal, window, cx,
+                                                    )?;
+                                                }
+                                                if let Some(ordinal) = scientific_reference_hover {
+                                                    reader.qa_hover_scientific_reference(
                                                         ordinal, window, cx,
                                                     )?;
                                                 }

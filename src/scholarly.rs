@@ -181,6 +181,10 @@ impl ScholarlySession {
             return false;
         }
         if !fetcher.fetch(generation, key.clone(), reference) {
+            self.entries.insert(
+                key,
+                ScholarlyMetadataState::Failed("lookup unavailable".to_owned()),
+            );
             return false;
         }
         self.entries.insert(key, ScholarlyMetadataState::Loading);
@@ -588,5 +592,16 @@ mod tests {
             reference_key("doi:10.1000/ABC."),
             reference_key("https://doi.org/10.1000/abc")
         );
+    }
+
+    #[test]
+    fn unavailable_fetcher_becomes_terminal_instead_of_loading_forever() {
+        let (fetcher, _events) = ScholarlyFetcher::new();
+        let mut session = ScholarlySession::default();
+        assert!(!session.request(&fetcher, 99, "A reference that cannot be queued"));
+        assert!(matches!(
+            session.state("A reference that cannot be queued"),
+            Some(ScholarlyMetadataState::Failed(_))
+        ));
     }
 }

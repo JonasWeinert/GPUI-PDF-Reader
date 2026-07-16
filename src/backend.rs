@@ -1,9 +1,9 @@
 use crate::model::{
-    PageSize, PdfLink as DocumentLink, PdfLinkTarget, PixelRect, TextBounds, TextChar, TextLayer,
-    TileKey, TocEntry,
+    PageSize, PdfLink as DocumentLink, PdfLinkTarget, PixelRect, RasterSize, TextBounds, TextChar,
+    TextLayer, TileKey, TocEntry,
 };
 #[cfg(test)]
-use crate::model::{RasterSize, TextPosition, TextSelection, selected_text};
+use crate::model::{TextPosition, TextSelection, selected_text};
 use crate::scientific::{ScientificAnalysis, ScientificAnalyzer};
 use crate::search::{
     MAX_SEARCH_RESULTS, SearchPageOutcome, SearchPageResults, SearchQuery, search_page,
@@ -63,6 +63,14 @@ pub struct TileRequest {
     pub render_rect: PixelRect,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PreviewSpec {
+    pub page: usize,
+    pub raster: RasterSize,
+    pub center_x: f32,
+    pub center_y: f32,
+}
+
 #[derive(Debug)]
 pub enum WorkerEvent {
     Ready,
@@ -87,6 +95,19 @@ pub enum WorkerEvent {
         generation: u64,
         appearance: RenderAppearance,
         key: TileKey,
+        message: String,
+    },
+    PreviewRendered {
+        generation: u64,
+        revision: u64,
+        appearance: RenderAppearance,
+        width: u32,
+        height: u32,
+        bgra: Vec<u8>,
+    },
+    PreviewFailed {
+        generation: u64,
+        revision: u64,
         message: String,
     },
     TextExtracted {
@@ -252,6 +273,28 @@ impl PdfWorker {
             })
             .is_ok()
     }
+
+    pub fn render_preview(
+        &self,
+        generation: u64,
+        revision: u64,
+        appearance: RenderAppearance,
+        spec: PreviewSpec,
+    ) -> bool {
+        self.commands
+            .send(WorkerCommand::RenderPreview {
+                request: preview_render_request(
+                    generation,
+                    revision,
+                    appearance,
+                    spec.page,
+                    spec.raster,
+                    spec.center_x,
+                    spec.center_y,
+                ),
+            })
+            .is_ok()
+    }
 }
 
 #[derive(Debug)]
@@ -285,6 +328,9 @@ enum WorkerCommand {
         generation: u64,
         next_revision: u64,
     },
+    RenderPreview {
+        request: PreviewRequest,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -294,6 +340,12 @@ struct RenderRequest {
     tile: TileRequest,
     priority: usize,
     prefetch: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewRequest {
+    revision: u64,
+    render: RenderRequest,
 }
 
 struct WorkerState {
@@ -307,6 +359,7 @@ struct WorkerState {
     latest_search_revision: Option<u64>,
     search_partial: Option<(usize, Vec<TextChar>)>,
     scientific: Option<ScientificJob>,
+    preview: Option<PreviewRequest>,
 }
 
 enum TextExtraction {
@@ -319,6 +372,7 @@ enum WorkerWork {
     Text { page: usize, explicit: bool },
     Search,
     Scientific,
+    Preview,
 }
 
 fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<WorkerEvent>) {
@@ -347,6 +401,7 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
         latest_search_revision: None,
         search_partial: None,
         scientific: None,
+        preview: None,
     };
     let mut pending = HashMap::<TileKey, RenderRequest>::new();
     let mut explicit_text = BTreeSet::<usize>::new();
@@ -358,6 +413,7 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
             && automatic_text.is_empty()
             && state.search.is_none()
             && state.scientific.is_none()
+            && state.preview.is_none()
         {
             match commands.recv() {
                 Ok(command) => {
@@ -396,6 +452,8 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
             .map(|(key, _)| *key);
         let work = if let Some(key) = next_visible_tile {
             WorkerWork::Tile(key)
+        } else if state.preview.is_some() {
+            WorkerWork::Preview
         } else if let Some(page) = explicit_text.pop_first() {
             WorkerWork::Text {
                 page,
@@ -458,6 +516,50 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
         } else {
             continue;
         };
+
+        if matches!(work, WorkerWork::Preview) {
+            let request = state.preview.take().expect("preview work checked above");
+            if state.generation != Some(request.render.generation) {
+                continue;
+            }
+            let result = render_tile(&mut state, &request.render);
+            if state.preview.as_ref().is_some_and(|latest| {
+                latest.revision > request.revision
+                    || latest.render.generation != request.render.generation
+            }) {
+                continue;
+            }
+            match result {
+                Ok((width, height, bgra)) => {
+                    if events
+                        .send(WorkerEvent::PreviewRendered {
+                            generation: request.render.generation,
+                            revision: request.revision,
+                            appearance: request.render.appearance,
+                            width,
+                            height,
+                            bgra,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(message) => {
+                    if events
+                        .send(WorkerEvent::PreviewFailed {
+                            generation: request.render.generation,
+                            revision: request.revision,
+                            message,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            continue;
+        }
 
         if let WorkerWork::Tile(next_tile) = work {
             // Leave the in-flight request in `pending`. A viewport replacement
@@ -1261,6 +1363,7 @@ fn accept_command(
             state.automatic_text_needs_quiet = false;
             reset_search_for_open(state);
             state.document = None;
+            state.preview = None;
             state.generation = Some(generation);
 
             match open_document(pdfium, &path) {
@@ -1347,6 +1450,12 @@ fn accept_command(
             cancel_searches_before(state, generation, next_revision);
             true
         }
+        WorkerCommand::RenderPreview { request } => {
+            if state.generation == Some(request.render.generation) {
+                state.preview = Some(request);
+            }
+            true
+        }
     }
 }
 
@@ -1363,6 +1472,51 @@ fn command_supersedes_text(
         | WorkerCommand::RenderViewport { .. }
         | WorkerCommand::Search { .. }
         | WorkerCommand::CancelSearch { .. } => false,
+        WorkerCommand::RenderPreview { .. } => false,
+    }
+}
+
+fn preview_render_request(
+    generation: u64,
+    revision: u64,
+    appearance: RenderAppearance,
+    page: usize,
+    raster: RasterSize,
+    center_x: f32,
+    center_y: f32,
+) -> PreviewRequest {
+    const PREVIEW_WIDTH: u32 = 360;
+    const PREVIEW_HEIGHT: u32 = 204;
+    let width = PREVIEW_WIDTH.min(raster.width.max(1));
+    let height = PREVIEW_HEIGHT.min(raster.height.max(1));
+    let center_x = (center_x.clamp(0.0, 1.0) * raster.width as f32).round() as u32;
+    let center_y = (center_y.clamp(0.0, 1.0) * raster.height as f32).round() as u32;
+    let rect = PixelRect {
+        x: center_x.saturating_sub(width / 2).min(raster.width - width),
+        y: center_y
+            .saturating_sub(height / 2)
+            .min(raster.height - height),
+        width,
+        height,
+    };
+    PreviewRequest {
+        revision,
+        render: RenderRequest {
+            generation,
+            appearance,
+            tile: TileRequest {
+                key: TileKey {
+                    page,
+                    raster,
+                    column: rect.x,
+                    row: rect.y,
+                },
+                core_rect: rect,
+                render_rect: rect,
+            },
+            priority: 0,
+            prefetch: false,
+        },
     }
 }
 
@@ -2021,6 +2175,29 @@ mod tests {
     static PDFIUM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn preview_crop_is_bounded_and_clamped_at_page_edges() {
+        let request = preview_render_request(
+            4,
+            9,
+            RenderAppearance::Normal,
+            3,
+            RasterSize {
+                width: 800,
+                height: 1_200,
+            },
+            1.0,
+            0.0,
+        );
+        assert_eq!(request.revision, 9);
+        assert_eq!(request.render.tile.key.page, 3);
+        assert_eq!(request.render.tile.render_rect.width, 360);
+        assert_eq!(request.render.tile.render_rect.height, 204);
+        assert_eq!(request.render.tile.render_rect.x, 440);
+        assert_eq!(request.render.tile.render_rect.y, 0);
+        validate_tile_request(request.render.tile).unwrap();
+    }
+
+    #[test]
     fn pdfium_opens_renders_and_extracts_the_integration_fixture() {
         let _pdfium_guard = PDFIUM_TEST_LOCK
             .lock()
@@ -2111,6 +2288,7 @@ mod tests {
             latest_search_revision: None,
             search_partial: None,
             scientific: None,
+            preview: None,
         };
         let source_text = match extract_page_text(&state, 0, Vec::new(), || false)
             .expect("fixture source text should extract")
@@ -2376,6 +2554,7 @@ mod tests {
             latest_search_revision: None,
             search_partial: None,
             scientific: None,
+            preview: None,
         };
         let mut analyzer = ScientificAnalyzer::new(pages.len(), &links);
         for page in analyzer.page_order().to_vec() {
@@ -2612,6 +2791,7 @@ mod tests {
             latest_search_revision: None,
             search_partial: None,
             scientific: None,
+            preview: None,
         };
         let key = TileKey {
             page: 0,
@@ -2811,6 +2991,7 @@ mod tests {
             latest_search_revision: None,
             search_partial: None,
             scientific: None,
+            preview: None,
         }
     }
 

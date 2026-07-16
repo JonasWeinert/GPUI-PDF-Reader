@@ -2,9 +2,12 @@ use crate::annotations::{
     AnnotationId, AnnotationSet, DocumentIdentity, HighlightColor, MAX_TEXT_CHARACTER_INDEX,
     TextRange, load_sidecar, save_sidecar,
 };
-use crate::backend::{PdfWorker, RenderAppearance, RenderColor, TileRequest, WorkerEvent};
+use crate::backend::{
+    PdfWorker, PreviewSpec, RenderAppearance, RenderColor, TileRequest, WorkerEvent,
+};
 use crate::comment_editor::{CommentEditor, CommentEditorEvent, RichTextBuffer};
 use crate::document_jump::DocumentJump;
+use crate::floating_panel::FloatingPanel;
 use crate::link_preview::{
     LinkPreviewEvent, LinkPreviewFetcher, LinkPreviewSession, WebsitePreviewState,
 };
@@ -20,8 +23,9 @@ use crate::navigation_focus::{
     NavigationFocusEffect, NavigationFocusFrame, NavigationFocusMotion, NavigationFocusTone,
 };
 use crate::scholarly::{
-    ScholarlyEvent, ScholarlyFetcher, ScholarlyMetadataState, ScholarlySession,
+    ScholarlyEvent, ScholarlyFetcher, ScholarlyMetadata, ScholarlyMetadataState, ScholarlySession,
 };
+use crate::scientific::ScientificReference;
 #[cfg(debug_assertions)]
 use crate::scientific::ScientificSignals;
 use crate::search::{
@@ -36,11 +40,12 @@ use crate::{
     SelectAll, SelectTheme, ToggleComments, ZoomIn, ZoomOut,
 };
 use gpui::{
-    App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners, CursorStyle, Entity,
-    FocusHandle, Focusable, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathPromptOptions, Pixels, Point, PromptButton, PromptLevel, Render, RenderImage,
-    ScrollStrategy, ScrollWheelEvent, SharedString, Task, UniformListScrollHandle, Window,
-    WindowControlArea, canvas, div, img, point, prelude::*, px, quad, size, uniform_list,
+    Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners,
+    CursorStyle, Entity, FocusHandle, Focusable, FontWeight, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, PromptButton,
+    PromptLevel, Render, RenderImage, ScrollStrategy, ScrollWheelEvent, SharedString, Task,
+    Transformation, UniformListScrollHandle, Window, WindowControlArea, canvas, div, ease_in_out,
+    img, percentage, point, prelude::*, px, quad, size, uniform_list,
 };
 #[cfg(debug_assertions)]
 use gpui::{Keystroke, Modifiers, ScrollDelta, TouchPhase};
@@ -428,6 +433,7 @@ struct DocumentState {
     pages: Vec<PageSize>,
     toc: Vec<TocEntry>,
     links: Vec<PdfLink>,
+    scientific_references: Vec<ScientificReference>,
 }
 
 #[derive(Clone)]
@@ -436,6 +442,47 @@ struct CachedTile {
     render_rect: PixelRect,
     byte_len: usize,
     image: Arc<RenderImage>,
+}
+
+#[derive(Clone)]
+struct DestinationPreview {
+    revision: u64,
+    image: Arc<RenderImage>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewTarget {
+    Link(usize),
+    Reference(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RevealState {
+    progress: f32,
+    target: f32,
+}
+
+impl Default for RevealState {
+    fn default() -> Self {
+        Self {
+            progress: 0.0,
+            target: 0.0,
+        }
+    }
+}
+
+impl RevealState {
+    fn is_animating(self) -> bool {
+        (self.progress - self.target).abs() > 0.001
+    }
+
+    fn advance(&mut self, dt: f32) {
+        let blend = 1.0 - (-22.0 * dt.clamp(1.0 / 240.0, 0.05)).exp();
+        self.progress += (self.target - self.progress) * blend;
+        if (self.target - self.progress).abs() < 0.001 {
+            self.progress = self.target;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -964,7 +1011,9 @@ pub struct PdfReader {
     link_preview_session: Option<LinkPreviewSession>,
     scholarly_fetcher: ScholarlyFetcher,
     scholarly_session: ScholarlySession,
-    scholarly_expanded: Option<String>,
+    reference_details: Option<String>,
+    reference_panel: RevealState,
+    link_card_expansion: RevealState,
     #[cfg(debug_assertions)]
     scientific_analysis_complete: bool,
     scientific_document: bool,
@@ -1022,9 +1071,13 @@ pub struct PdfReader {
     selecting: bool,
     pending_annotation_click: Option<AnnotationId>,
     hovered_link: Option<usize>,
+    hovered_reference: Option<usize>,
     link_source_hovered: bool,
     link_card_hovered: bool,
     previewed_link: Option<usize>,
+    previewed_reference: Option<usize>,
+    destination_preview: Option<DestinationPreview>,
+    destination_preview_revision: u64,
     link_hover_revision: u64,
     pending_link_click: Option<usize>,
     pending_link_navigation: Option<usize>,
@@ -1094,7 +1147,9 @@ impl PdfReader {
                 link_preview_session: None,
                 scholarly_fetcher,
                 scholarly_session: ScholarlySession::default(),
-                scholarly_expanded: None,
+                reference_details: None,
+                reference_panel: RevealState::default(),
+                link_card_expansion: RevealState::default(),
                 #[cfg(debug_assertions)]
                 scientific_analysis_complete: false,
                 scientific_document: false,
@@ -1152,9 +1207,13 @@ impl PdfReader {
                 selecting: false,
                 pending_annotation_click: None,
                 hovered_link: None,
+                hovered_reference: None,
                 link_source_hovered: false,
                 link_card_hovered: false,
                 previewed_link: None,
+                previewed_reference: None,
+                destination_preview: None,
+                destination_preview_revision: 0,
                 link_hover_revision: 0,
                 pending_link_click: None,
                 pending_link_navigation: None,
@@ -1308,16 +1367,15 @@ impl PdfReader {
             })
             .unwrap_or((0, "none"));
         let scholarly_state = self
-            .previewed_link
-            .and_then(|id| self.resolved_internal_link(id))
-            .and_then(|resolved| self.scholarly_session.state(&resolved.preview))
+            .current_reference_text()
+            .and_then(|reference| self.scholarly_session.state(&reference))
             .map_or("none", |state| match state {
                 ScholarlyMetadataState::Loading => "loading",
                 ScholarlyMetadataState::Ready(_) => "ready",
                 ScholarlyMetadataState::Failed(_) => "failed",
             });
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} reference_preview={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
             self.view_mode,
             theme_name,
             if matches!(
@@ -1337,6 +1395,7 @@ impl PdfReader {
                 .map_or(0, |document| document.links.len()),
             self.qa_link_navigations,
             link_preview,
+            self.previewed_reference.map_or(0, |index| index + 1),
             link_preview_state,
             scholarly_state,
             u8::from(self.scientific_document),
@@ -1514,6 +1573,31 @@ impl PdfReader {
     }
 
     #[cfg(debug_assertions)]
+    pub fn qa_hover_scientific_reference(
+        &mut self,
+        ordinal: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self
+            .document
+            .as_ref()
+            .is_none_or(|document| ordinal >= document.scientific_references.len())
+        {
+            return Err(format!(
+                "scientific reference ordinal {ordinal} is unavailable"
+            ));
+        }
+        self.hovered_reference = Some(ordinal);
+        self.show_reference_preview(ordinal, window, cx);
+        self.hovered_reference = None;
+        self.link_source_hovered = false;
+        self.schedule_link_preview_clear(window, cx);
+        self.set_link_card_hovered(true, window, cx);
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
     pub fn qa_hold_toc_callout(
         &mut self,
         window: &mut Window,
@@ -1570,6 +1654,8 @@ impl PdfReader {
                 && (!self.search.complete || self.search_debounce_task.is_some()))
             || self.sidebar.is_animating()
             || self.comment_pane.is_animating()
+            || self.reference_panel.is_animating()
+            || self.link_card_expansion.is_animating()
             || self.toc_hover_is_animating()
             || self.pending_toc_navigation.is_some()
             || self.pending_link_navigation.is_some()
@@ -1588,9 +1674,8 @@ impl PdfReader {
                     })
             })
             || self
-                .previewed_link
-                .and_then(|id| self.resolved_internal_link(id))
-                .and_then(|resolved| self.scholarly_session.state(&resolved.preview))
+                .current_reference_text()
+                .and_then(|reference| self.scholarly_session.state(&reference))
                 .is_some_and(|state| matches!(state, ScholarlyMetadataState::Loading))
             || self.navigation_focus.is_busy(Instant::now())
             || self.comment_autosave_task.is_some()
@@ -2458,11 +2543,20 @@ impl PdfReader {
                     let Ok(event) = receive.await else {
                         break;
                     };
-                    let _ = async_cx.update(|_, cx| {
+                    let _ = async_cx.update(|window, cx| {
                         weak.update(cx, |reader, cx| {
                             if event.generation() == reader.generation
                                 && reader.scholarly_session.apply(event) == Some(reader.generation)
                             {
+                                if reader.current_reference_text().is_some_and(|reference| {
+                                    matches!(
+                                        reader.scholarly_session.state(&reference),
+                                        Some(ScholarlyMetadataState::Ready(_))
+                                    )
+                                }) {
+                                    reader.link_card_expansion.target = 1.0;
+                                    reader.start_animation(window, cx);
+                                }
                                 cx.notify();
                             }
                         })
@@ -2542,6 +2636,7 @@ impl PdfReader {
                     pages,
                     toc,
                     links,
+                    scientific_references: Vec::new(),
                 });
                 self.page_text.clear();
                 self.pending.clear();
@@ -2553,9 +2648,17 @@ impl PdfReader {
                 self.copy_pending = None;
                 self.selection = None;
                 self.hovered_link = None;
+                self.hovered_reference = None;
                 self.link_source_hovered = false;
                 self.link_card_hovered = false;
                 self.previewed_link = None;
+                self.previewed_reference = None;
+                self.destination_preview = None;
+                self.destination_preview_revision =
+                    self.destination_preview_revision.wrapping_add(1);
+                self.reference_details = None;
+                self.reference_panel = RevealState::default();
+                self.link_card_expansion = RevealState::default();
                 self.pending_link_click = None;
                 self.pending_link_navigation = None;
                 self.scroll = Offset::default();
@@ -2627,6 +2730,43 @@ impl PdfReader {
                 self.pending.remove(&key);
                 self.warning = Some(message.into());
             }
+            WorkerEvent::PreviewRendered {
+                generation,
+                revision,
+                appearance,
+                width,
+                height,
+                bgra,
+            } if generation == self.generation
+                && appearance == self.render_appearance
+                && revision == self.destination_preview_revision =>
+            {
+                let expected = width
+                    .checked_mul(height)
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .and_then(|bytes| usize::try_from(bytes).ok());
+                if expected == Some(bgra.len())
+                    && let Some(buffer) = RgbaImage::from_raw(width, height, bgra)
+                {
+                    let previous = self.destination_preview.replace(DestinationPreview {
+                        revision,
+                        image: Arc::new(RenderImage::new(vec![Frame::new(buffer)])),
+                    });
+                    if let Some(previous) = previous {
+                        Self::retire_images(vec![previous.image], window, cx);
+                    }
+                }
+            }
+            WorkerEvent::PreviewFailed {
+                generation,
+                revision,
+                message,
+            } if generation == self.generation && revision == self.destination_preview_revision => {
+                if let Some(previous) = self.destination_preview.take() {
+                    Self::retire_images(vec![previous.image], window, cx);
+                }
+                self.warning = Some(format!("Could not render link preview: {message}").into());
+            }
             WorkerEvent::TextExtracted {
                 generation,
                 page,
@@ -2639,6 +2779,9 @@ impl PdfReader {
                 self.complete_pending_link_navigation(window, cx);
                 if let Some(id) = self.previewed_link {
                     self.request_scholarly_for_link(id);
+                }
+                if let Some(index) = self.previewed_reference {
+                    self.request_scholarly_for_reference(index);
                 }
                 self.evict_distant_text();
             }
@@ -2660,6 +2803,9 @@ impl PdfReader {
                 self.complete_pending_link_navigation(window, cx);
                 if let Some(id) = self.previewed_link {
                     self.request_scholarly_for_link(id);
+                }
+                if let Some(index) = self.previewed_reference {
+                    self.request_scholarly_for_reference(index);
                 }
                 self.evict_distant_text();
             }
@@ -2739,6 +2885,7 @@ impl PdfReader {
                 }
                 self.scientific_document = analysis.is_scientific;
                 if let Some(document) = self.document.as_mut() {
+                    document.scientific_references = analysis.references;
                     let mut next_id = document.links.len();
                     for mut link in analysis.synthetic_links {
                         link.id = next_id;
@@ -2748,6 +2895,9 @@ impl PdfReader {
                 }
                 if let Some(id) = self.previewed_link {
                     self.request_scholarly_for_link(id);
+                }
+                if let Some(index) = self.previewed_reference {
+                    self.request_scholarly_for_reference(index);
                 }
             }
             WorkerEvent::Error {
@@ -2939,7 +3089,11 @@ impl PdfReader {
         self.scholarly_fetcher.begin_document(self.generation);
         self.link_preview_session = None;
         self.scholarly_session = ScholarlySession::default();
-        self.scholarly_expanded = None;
+        self.reference_details = None;
+        self.reference_panel = RevealState::default();
+        self.link_card_expansion = RevealState::default();
+        self.destination_preview = None;
+        self.destination_preview_revision = self.destination_preview_revision.wrapping_add(1);
         #[cfg(debug_assertions)]
         {
             self.scientific_analysis_complete = false;
@@ -4148,8 +4302,21 @@ impl PdfReader {
     }
 
     fn drop_all_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let images = self.rendered.drain().map(|(_, tile)| tile.image).collect();
+        let mut images = self
+            .rendered
+            .drain()
+            .map(|(_, tile)| tile.image)
+            .collect::<Vec<_>>();
+        if let Some(preview) = self.destination_preview.take() {
+            images.push(preview.image);
+        }
         Self::retire_images(images, window, cx);
+    }
+
+    fn clear_destination_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(preview) = self.destination_preview.take() {
+            Self::retire_images(vec![preview.image], window, cx);
+        }
     }
 
     fn evict_distant_tiles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4395,6 +4562,15 @@ impl PdfReader {
                 self.finish_comment_editor_close();
             }
         }
+        if self.reference_panel.is_animating() {
+            self.reference_panel.advance(dt);
+            if !self.reference_panel.is_animating() && self.reference_panel.target == 0.0 {
+                self.reference_details = None;
+            }
+        }
+        if self.link_card_expansion.is_animating() {
+            self.link_card_expansion.advance(dt);
+        }
         advance_toc_hover_state(
             &mut self.toc_hover_position,
             &mut self.toc_hover_strength,
@@ -4410,6 +4586,8 @@ impl PdfReader {
         let navigation_settled = distance < 0.35
             && !self.sidebar.is_animating()
             && !self.comment_pane.is_animating()
+            && !self.reference_panel.is_animating()
+            && !self.link_card_expansion.is_animating()
             && !self.toc_hover_is_animating();
         if navigation_settled {
             self.scroll = self.scroll_target;
@@ -4718,14 +4896,25 @@ impl PdfReader {
             return;
         }
 
-        let hovered_link = self.hit_test_link(event.position);
-        if self.hovered_link != hovered_link {
+        // Bibliography entries own their full detected text range, including
+        // DOI annotations embedded inside it. This keeps the paper card
+        // stable instead of switching to a generic website card mid-line.
+        let hovered_reference = self.hit_test_scientific_reference(event.position);
+        let hovered_link = hovered_reference
+            .is_none()
+            .then(|| self.hit_test_link(event.position))
+            .flatten();
+        if self.hovered_link != hovered_link || self.hovered_reference != hovered_reference {
             let previous = self.hovered_link;
+            let previous_reference = self.hovered_reference;
             self.hovered_link = hovered_link;
-            self.link_source_hovered = hovered_link.is_some();
+            self.hovered_reference = hovered_reference;
+            self.link_source_hovered = hovered_link.is_some() || hovered_reference.is_some();
             if let Some(id) = hovered_link {
                 self.show_link_preview(id, window, cx);
-            } else if previous.is_some() {
+            } else if let Some(index) = hovered_reference {
+                self.show_reference_preview(index, window, cx);
+            } else if previous.is_some() || previous_reference.is_some() {
                 self.schedule_link_preview_clear(window, cx);
             }
             cx.notify();
@@ -4769,6 +4958,30 @@ impl PdfReader {
             .find_map(|link| {
                 let bounds = normalized_bounds_in_page(page_rect, link.bounds);
                 bounds.contains(x, y).then_some(link.id)
+            })
+    }
+
+    fn hit_test_scientific_reference(&self, position: Point<Pixels>) -> Option<usize> {
+        if !self.scientific_document {
+            return None;
+        }
+        let layout = self.layout()?;
+        let document = self.document.as_ref()?;
+        let x = self.scroll.x + f32::from(position.x);
+        let y = self.scroll.y + f32::from(position.y) - self.content_top();
+        let page = layout.page_at_content_point(x, y)?;
+        let page_rect = layout.page_rect(page)?;
+        document
+            .scientific_references
+            .iter()
+            .enumerate()
+            .filter(|(_, reference)| reference.page == page)
+            .find_map(|(index, reference)| {
+                reference
+                    .text_runs
+                    .iter()
+                    .any(|run| normalized_bounds_in_page(page_rect, *run).contains(x, y))
+                    .then_some(index)
             })
     }
 
@@ -4834,15 +5047,160 @@ impl PdfReader {
         if !self.scientific_document {
             return false;
         }
+        let Some(reference) = self.scientific_reference_for_link(id).cloned() else {
+            self.request_destination_preview(id);
+            return false;
+        };
+        self.scholarly_session
+            .request(&self.scholarly_fetcher, self.generation, &reference.text)
+    }
+
+    fn request_scholarly_for_reference(&mut self, index: usize) -> bool {
         let Some(reference) = self
-            .resolved_internal_link(id)
-            .map(|resolved| resolved.preview)
-            .filter(|reference| !reference.is_empty())
+            .document
+            .as_ref()
+            .and_then(|document| document.scientific_references.get(index))
+            .cloned()
         else {
             return false;
         };
         self.scholarly_session
-            .request(&self.scholarly_fetcher, self.generation, &reference)
+            .request(&self.scholarly_fetcher, self.generation, &reference.text)
+    }
+
+    fn current_reference_text(&self) -> Option<String> {
+        let document = self.document.as_ref()?;
+        if let Some(index) = self.previewed_reference {
+            return document
+                .scientific_references
+                .get(index)
+                .map(|reference| reference.text.clone());
+        }
+        self.previewed_link
+            .and_then(|id| self.scientific_reference_for_link(id))
+            .map(|reference| reference.text.clone())
+    }
+
+    fn jump_to_scientific_reference(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(reference) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.scientific_references.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        self.perform_document_jump(
+            DocumentJump::new(reference.page)
+                .position(reference.x_fraction, reference.y_fraction)
+                .center_horizontal(reference.x_fraction.is_some())
+                .focus(
+                    reference.text_runs,
+                    NavigationFocusTone::Accent,
+                    NavigationFocusMotion::Sweep,
+                ),
+            window,
+            cx,
+        );
+    }
+
+    fn open_reference_details(
+        &mut self,
+        reference: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reference_details = Some(reference);
+        self.reference_panel.target = 1.0;
+        self.previewed_link = None;
+        self.previewed_reference = None;
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
+    fn close_reference_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reference_panel.target = 0.0;
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
+    fn scientific_reference_for_link(&self, id: usize) -> Option<&ScientificReference> {
+        let document = self.document.as_ref()?;
+        let link = document.links.iter().find(|link| link.id == id)?;
+        let PdfLinkTarget::Internal {
+            page,
+            x_fraction: _,
+            y_fraction,
+        } = link.target
+        else {
+            return None;
+        };
+        let resolved = self.resolved_internal_link(id);
+        document.scientific_references.iter().find(|reference| {
+            scientific_reference_matches(reference, page, resolved.as_ref(), y_fraction)
+        })
+    }
+
+    fn request_destination_preview(&mut self, id: usize) -> bool {
+        if !self.scientific_document {
+            return false;
+        }
+        let Some((page, page_size, center_x, center_y)) =
+            self.document.as_ref().and_then(|document| {
+                let link = document.links.iter().find(|link| link.id == id)?;
+                let PdfLinkTarget::Internal {
+                    page,
+                    x_fraction,
+                    y_fraction,
+                } = link.target
+                else {
+                    return None;
+                };
+                let resolved = self.resolved_internal_link(id);
+                Some((
+                    page,
+                    *document.pages.get(page)?,
+                    resolved
+                        .as_ref()
+                        .and_then(|value| value.x_fraction)
+                        .or(x_fraction)
+                        .unwrap_or(0.5),
+                    resolved
+                        .as_ref()
+                        .and_then(|value| value.y_fraction)
+                        .or(y_fraction)
+                        .unwrap_or(0.5),
+                ))
+            })
+        else {
+            return false;
+        };
+        let longest = page_size.width.max(page_size.height).max(f32::MIN_POSITIVE);
+        let raster = RasterSize {
+            width: ((page_size.width / longest) * 1_200.0)
+                .round()
+                .clamp(1.0, 1_200.0) as u32,
+            height: ((page_size.height / longest) * 1_200.0)
+                .round()
+                .clamp(1.0, 1_200.0) as u32,
+        };
+        self.destination_preview_revision = self.destination_preview_revision.wrapping_add(1);
+        self.worker.render_preview(
+            self.generation,
+            self.destination_preview_revision,
+            self.render_appearance,
+            PreviewSpec {
+                page,
+                raster,
+                center_x,
+                center_y,
+            },
+        )
     }
 
     fn perform_internal_link_jump(
@@ -5377,7 +5735,7 @@ impl PdfReader {
             )
     }
 
-    fn show_link_preview(&mut self, id: usize, _window: &mut Window, cx: &mut Context<Self>) {
+    fn show_link_preview(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target) = self
             .document
             .as_ref()
@@ -5388,20 +5746,66 @@ impl PdfReader {
         };
         self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
         self.link_source_hovered = true;
-        if self.previewed_link != Some(id) {
-            self.scholarly_expanded = None;
+        if self.previewed_link != Some(id) || self.previewed_reference.is_some() {
+            self.link_card_expansion = RevealState::default();
+            self.clear_destination_preview(window, cx);
         }
         self.previewed_link = Some(id);
+        self.previewed_reference = None;
         match target {
             PdfLinkTarget::Internal { .. } => {
                 self.request_internal_link_text(id);
                 self.request_scholarly_for_link(id);
+                if self.current_reference_text().is_some_and(|reference| {
+                    matches!(
+                        self.scholarly_session.state(&reference),
+                        Some(ScholarlyMetadataState::Ready(_))
+                    )
+                }) {
+                    self.link_card_expansion.target = 1.0;
+                    self.start_animation(window, cx);
+                }
             }
             PdfLinkTarget::External { url } => {
                 if let Some(session) = self.link_preview_session.as_mut() {
                     session.request_website(&self.link_preview_fetcher, self.generation, &url);
                 }
             }
+        }
+        cx.notify();
+    }
+
+    fn show_reference_preview(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .document
+            .as_ref()
+            .and_then(|document| document.scientific_references.get(index))
+            .is_none()
+        {
+            return;
+        }
+        self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
+        self.link_source_hovered = true;
+        if self.previewed_reference != Some(index) || self.previewed_link.is_some() {
+            self.link_card_expansion = RevealState::default();
+            self.clear_destination_preview(window, cx);
+        }
+        self.previewed_link = None;
+        self.previewed_reference = Some(index);
+        self.request_scholarly_for_reference(index);
+        if self.current_reference_text().is_some_and(|reference| {
+            matches!(
+                self.scholarly_session.state(&reference),
+                Some(ScholarlyMetadataState::Ready(_))
+            )
+        }) {
+            self.link_card_expansion.target = 1.0;
+            self.start_animation(window, cx);
         }
         cx.notify();
     }
@@ -5428,7 +5832,7 @@ impl PdfReader {
         window
             .spawn(cx, async move |cx| {
                 cx.background_executor().timer(LINK_HOVER_LEAVE_DELAY).await;
-                let _ = cx.update(|_, cx| {
+                let _ = cx.update(|window, cx| {
                     weak.update(cx, |reader, cx| {
                         if reader.link_hover_revision == revision
                             && link_preview_should_close(
@@ -5437,6 +5841,8 @@ impl PdfReader {
                             )
                         {
                             reader.previewed_link = None;
+                            reader.previewed_reference = None;
+                            reader.clear_destination_preview(window, cx);
                             cx.notify();
                         }
                     })
@@ -5449,6 +5855,7 @@ impl PdfReader {
     fn on_document_hover(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
         if !hovered {
             self.hovered_link = None;
+            self.hovered_reference = None;
             self.link_source_hovered = false;
             self.schedule_link_preview_clear(window, cx);
         }
@@ -5825,419 +6232,277 @@ impl PdfReader {
         palette: ReaderPalette,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        let id = self.previewed_link?;
+        let target = self
+            .previewed_link
+            .map(PreviewTarget::Link)
+            .or_else(|| self.previewed_reference.map(PreviewTarget::Reference))?;
         let document = self.document.as_ref()?;
         let layout = self.layout()?;
-        let link = document.links.iter().find(|link| link.id == id)?.clone();
-        let page_rect = layout.page_rect(link.page)?;
-        let mut anchor = normalized_bounds_in_page(page_rect, link.bounds);
+        let (mut anchor, content, estimated_height) = match target {
+            PreviewTarget::Reference(index) => {
+                let reference = document.scientific_references.get(index)?.clone();
+                let page_rect = layout.page_rect(reference.page)?;
+                let bounds = reference
+                    .text_runs
+                    .iter()
+                    .copied()
+                    .reduce(union_text_bounds)?;
+                let anchor = normalized_bounds_in_page(page_rect, bounds);
+                let state = self.scholarly_session.state(&reference.text).cloned();
+                let content =
+                    self.render_reference_source_card(target, reference.text, state, palette, cx);
+                (
+                    anchor,
+                    content,
+                    122.0 + self.link_card_expansion.progress * 104.0,
+                )
+            }
+            PreviewTarget::Link(id) => {
+                let link = document.links.iter().find(|link| link.id == id)?.clone();
+                let page_rect = layout.page_rect(link.page)?;
+                let anchor = normalized_bounds_in_page(page_rect, link.bounds);
+                match &link.target {
+                    PdfLinkTarget::External { url } => {
+                        let parsed = url::Url::parse(url).ok();
+                        let host = parsed
+                            .as_ref()
+                            .and_then(url::Url::host_str)
+                            .unwrap_or("External link")
+                            .to_owned();
+                        let state = self
+                            .link_preview_session
+                            .as_ref()
+                            .and_then(|session| session.website(url))
+                            .cloned();
+                        let (title, site_name, image_path, status) = match state {
+                            Some(WebsitePreviewState::Ready(preview)) => (
+                                preview.title.unwrap_or_else(|| host.clone()),
+                                preview.site_name,
+                                preview.image_path,
+                                None,
+                            ),
+                            Some(WebsitePreviewState::Failed(_)) => (
+                                host.clone(),
+                                None,
+                                None,
+                                Some("Preview unavailable".to_owned()),
+                            ),
+                            Some(WebsitePreviewState::Loading) => (
+                                host.clone(),
+                                None,
+                                None,
+                                Some("Loading website preview…".to_owned()),
+                            ),
+                            None => (
+                                host.clone(),
+                                None,
+                                None,
+                                Some("Website preview is unavailable".to_owned()),
+                            ),
+                        };
+                        let open_id = id;
+                        let content = div()
+                            .min_w_0()
+                            .when_some(image_path, |content, image_path| {
+                                content.child(
+                                    div()
+                                        .mb_3()
+                                        .h(px(116.0))
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .rounded_lg()
+                                        .bg(palette.canvas)
+                                        .child(
+                                            img(image_path)
+                                                .size_full()
+                                                .object_fit(gpui::ObjectFit::Cover),
+                                        ),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(IconName::Globe)
+                                            .size(px(15.0))
+                                            .text_color(palette.text_tertiary),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(palette.text)
+                                            .child(title),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .min_w_0()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .text_color(palette.text_tertiary)
+                                    .child(site_name.unwrap_or(host)),
+                            )
+                            .when_some(status, |content, status| {
+                                content.child(
+                                    div()
+                                        .mt_2()
+                                        .text_xs()
+                                        .text_color(palette.text_secondary)
+                                        .child(status),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id(("link-preview-open", id))
+                                    .mt_3()
+                                    .h(px(32.0))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_1()
+                                    .rounded_md()
+                                    .bg(palette.accent)
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(palette.accent_foreground)
+                                    .cursor_pointer()
+                                    .hover(|button| button.bg(palette.accent_hover))
+                                    .active(|button| button.bg(palette.accent_active))
+                                    .on_click(cx.listener(move |reader, _, window, cx| {
+                                        reader.activate_document_link(open_id, window, cx);
+                                        reader.previewed_link = None;
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(Icon::new(IconName::ExternalLink).size(px(14.0)))
+                                    .child("Open in browser"),
+                            )
+                            .into_any_element();
+                        (
+                            anchor,
+                            content,
+                            if self
+                                .link_preview_session
+                                .as_ref()
+                                .and_then(|session| session.website(url))
+                                .is_some_and(|state| {
+                                    matches!(state, WebsitePreviewState::Ready(preview) if preview.image_path.is_some())
+                                })
+                            {
+                                274.0
+                            } else {
+                                156.0
+                            },
+                        )
+                    }
+                    PdfLinkTarget::Internal { page, .. } => {
+                        if let Some(reference) = self.scientific_reference_for_link(id).cloned() {
+                            let state = self.scholarly_session.state(&reference.text).cloned();
+                            (
+                                anchor,
+                                self.render_reference_source_card(
+                                    target,
+                                    reference.text,
+                                    state,
+                                    palette,
+                                    cx,
+                                ),
+                                122.0 + self.link_card_expansion.progress * 104.0,
+                            )
+                        } else {
+                            let title = link_section_title(
+                                &document.toc,
+                                *page,
+                                match link.target {
+                                    PdfLinkTarget::Internal { y_fraction, .. } => y_fraction,
+                                    PdfLinkTarget::External { .. } => None,
+                                },
+                            )
+                            .unwrap_or_else(|| "Document section".to_owned());
+                            let preview = self
+                                .resolved_internal_link(id)
+                                .map(|resolved| resolved.preview)
+                                .filter(|preview| !preview.is_empty());
+                            let image = self
+                                .destination_preview
+                                .as_ref()
+                                .filter(|preview| {
+                                    preview.revision == self.destination_preview_revision
+                                })
+                                .map(|preview| preview.image.clone());
+                            let image_pending = image.is_none();
+                            let content = div()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(palette.text)
+                                        .child(compact_words(&title, 12)),
+                                )
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(palette.text_tertiary)
+                                        .child(format!("Page {}", page + 1)),
+                                )
+                                .child(
+                                    div()
+                                        .mt_3()
+                                        .h(px(112.0))
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(palette.separator)
+                                        .bg(palette.canvas)
+                                        .when_some(image, |thumbnail, image| {
+                                            thumbnail.child(
+                                                img(image)
+                                                    .size_full()
+                                                    .object_fit(gpui::ObjectFit::Cover),
+                                            )
+                                        })
+                                        .when(image_pending, |thumbnail| {
+                                            thumbnail
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_xs()
+                                                .text_color(palette.text_tertiary)
+                                                .child("Rendering preview…")
+                                        }),
+                                )
+                                .when_some(preview, |content, preview| {
+                                    content.child(
+                                        div()
+                                            .mt_2()
+                                            .text_xs()
+                                            .text_color(palette.text_secondary)
+                                            .child(compact_words(&preview, 22)),
+                                    )
+                                })
+                                .child(self.render_preview_jump(target, palette, cx))
+                                .into_any_element();
+                            (anchor, content, 256.0)
+                        }
+                    }
+                }
+            }
+        };
         anchor.x -= self.scroll.x;
         anchor.y -= self.scroll.y;
         let card_width =
             LINK_CARD_WIDTH.min((self.viewport_width - LINK_CARD_MARGIN * 2.0).max(220.0));
-
-        let (estimated_height, content) = match &link.target {
-            PdfLinkTarget::Internal {
-                page, y_fraction, ..
-            } => {
-                let title = link_section_title(&document.toc, *page, *y_fraction)
-                    .unwrap_or_else(|| "Linked destination".to_owned());
-                let resolved = self.resolved_internal_link(id);
-                let preview = resolved
-                    .as_ref()
-                    .map(|resolved| resolved.preview.clone())
-                    .filter(|preview| !preview.is_empty())
-                    .unwrap_or_else(|| "Loading section preview…".to_owned());
-                let scholarly = resolved
-                    .as_ref()
-                    .and_then(|resolved| self.scholarly_session.state(&resolved.preview).cloned());
-                let abstract_expanded =
-                    self.scholarly_expanded.as_deref() == Some(preview.as_str());
-                let jump_id = id;
-                let mut content = div()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.text)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(palette.text_tertiary)
-                            .child(format!("Page {}", page + 1)),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .max_h(px(84.0))
-                            .overflow_hidden()
-                            .text_sm()
-                            .text_color(palette.text_secondary)
-                            .child(preview.clone()),
-                    )
-                    .child(
-                        div()
-                            .id(("link-preview-jump", id))
-                            .mt_3()
-                            .h(px(30.0))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_1()
-                            .rounded_md()
-                            .bg(palette.accent)
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.accent_foreground)
-                            .cursor_pointer()
-                            .hover(|button| button.opacity(0.9))
-                            .active(|button| button.opacity(0.78))
-                            .on_click(cx.listener(move |reader, _, window, cx| {
-                                reader.activate_document_link(jump_id, window, cx);
-                                reader.previewed_link = None;
-                                cx.stop_propagation();
-                            }))
-                            .child(Icon::new(IconName::ArrowRight).size(px(14.0)))
-                            .child("Jump to section"),
-                    );
-                let mut estimated_height = 190.0;
-                match scholarly {
-                    Some(ScholarlyMetadataState::Loading) => {
-                        estimated_height += 42.0;
-                        content = content.child(
-                            div()
-                                .mt_3()
-                                .pt_3()
-                                .border_t_1()
-                                .border_color(palette.text.opacity(0.10))
-                                .text_xs()
-                                .text_color(palette.text_tertiary)
-                                .child("Looking up paper metadata…"),
-                        );
-                    }
-                    Some(ScholarlyMetadataState::Failed(error)) => {
-                        estimated_height += 52.0;
-                        content = content.child(
-                            div()
-                                .mt_3()
-                                .pt_3()
-                                .border_t_1()
-                                .border_color(palette.text.opacity(0.10))
-                                .text_xs()
-                                .text_color(palette.text_tertiary)
-                                .child(format!("Paper metadata unavailable: {error}")),
-                        );
-                    }
-                    Some(ScholarlyMetadataState::Ready(metadata)) => {
-                        estimated_height += if abstract_expanded { 300.0 } else { 210.0 };
-                        let source = metadata.source.label();
-                        let match_label = metadata
-                            .certainty
-                            .map(|certainty| certainty.label())
-                            .unwrap_or("DOI match");
-                        let authors =
-                            (!metadata.authors.is_empty()).then(|| metadata.authors.join(", "));
-                        let publication = match (metadata.journal.as_deref(), metadata.year) {
-                            (Some(journal), Some(year)) => Some(format!("{journal} · {year}")),
-                            (Some(journal), None) => Some(journal.to_owned()),
-                            (None, Some(year)) => Some(year.to_string()),
-                            (None, None) => None,
-                        };
-                        let abstract_text = metadata.abstract_text.clone();
-                        let can_expand = abstract_text
-                            .as_ref()
-                            .is_some_and(|abstract_text| abstract_text.chars().count() > 260);
-                        let full_text_url = metadata
-                            .full_text_url
-                            .clone()
-                            .or_else(|| metadata.landing_url.clone());
-                        let reference_key = preview.clone();
-                        content = content.child(
-                            div()
-                                .mt_3()
-                                .pt_3()
-                                .border_t_1()
-                                .border_color(palette.text.opacity(0.10))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_2()
-                                        .text_xs()
-                                        .text_color(palette.text_tertiary)
-                                        .child(format!("{source} · {match_label}"))
-                                        .when_some(metadata.open_access, |row, open_access| {
-                                            row.child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .rounded_full()
-                                                    .bg(if open_access {
-                                                        palette.green.opacity(0.12)
-                                                    } else {
-                                                        palette.control
-                                                    })
-                                                    .text_color(if open_access {
-                                                        palette.green
-                                                    } else {
-                                                        palette.text_tertiary
-                                                    })
-                                                    .child(if open_access {
-                                                        "Open access"
-                                                    } else {
-                                                        "Access varies"
-                                                    }),
-                                            )
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .mt_2()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(palette.text)
-                                        .child(metadata.title),
-                                )
-                                .when_some(authors, |section, authors| {
-                                    section.child(
-                                        div()
-                                            .mt_1()
-                                            .max_h(px(38.0))
-                                            .overflow_hidden()
-                                            .text_xs()
-                                            .text_color(palette.text_secondary)
-                                            .child(authors),
-                                    )
-                                })
-                                .when_some(publication, |section, publication| {
-                                    section.child(
-                                        div()
-                                            .mt_1()
-                                            .text_xs()
-                                            .text_color(palette.text_tertiary)
-                                            .child(publication),
-                                    )
-                                })
-                                .when_some(abstract_text, |section, abstract_text| {
-                                    section
-                                        .child(
-                                            div()
-                                                .mt_2()
-                                                .max_h(px(if abstract_expanded {
-                                                    220.0
-                                                } else {
-                                                    70.0
-                                                }))
-                                                .overflow_hidden()
-                                                .text_xs()
-                                                .text_color(palette.text_secondary)
-                                                .child(abstract_text),
-                                        )
-                                        .when(can_expand, |section| {
-                                            section.child(
-                                                div()
-                                                    .id(("scholarly-abstract-toggle", id))
-                                                    .mt_1()
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(palette.accent)
-                                                    .cursor_pointer()
-                                                    .on_click(cx.listener(
-                                                        move |reader, _, _, cx| {
-                                                            if reader.scholarly_expanded.as_deref()
-                                                                == Some(reference_key.as_str())
-                                                            {
-                                                                reader.scholarly_expanded = None;
-                                                            } else {
-                                                                reader.scholarly_expanded =
-                                                                    Some(reference_key.clone());
-                                                            }
-                                                            cx.stop_propagation();
-                                                            cx.notify();
-                                                        },
-                                                    ))
-                                                    .child(if abstract_expanded {
-                                                        "Show less"
-                                                    } else {
-                                                        "Show full abstract"
-                                                    }),
-                                            )
-                                        })
-                                })
-                                .when_some(full_text_url, |section, full_text_url| {
-                                    section.child(
-                                        div()
-                                            .id(("scholarly-open", id))
-                                            .mt_3()
-                                            .h(px(30.0))
-                                            .px_3()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .gap_1()
-                                            .rounded_md()
-                                            .bg(palette.accent_soft)
-                                            .text_xs()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(palette.accent)
-                                            .cursor_pointer()
-                                            .hover(|button| button.opacity(0.86))
-                                            .active(|button| button.opacity(0.72))
-                                            .on_click(cx.listener(move |reader, _, _, cx| {
-                                                if let Err(error) =
-                                                    open::that_detached(&full_text_url)
-                                                {
-                                                    reader.warning = Some(
-                                                        format!("Could not open paper: {error}")
-                                                            .into(),
-                                                    );
-                                                }
-                                                cx.stop_propagation();
-                                                cx.notify();
-                                            }))
-                                            .child(Icon::new(IconName::ExternalLink).size(px(14.0)))
-                                            .child("Open paper"),
-                                    )
-                                }),
-                        );
-                    }
-                    None => {}
-                }
-                (estimated_height, content.into_any_element())
-            }
-            PdfLinkTarget::External { url } => {
-                let parsed = url::Url::parse(url).ok();
-                let host = parsed
-                    .as_ref()
-                    .and_then(url::Url::host_str)
-                    .unwrap_or("External link")
-                    .to_owned();
-                let state = self
-                    .link_preview_session
-                    .as_ref()
-                    .and_then(|session| session.website(url))
-                    .cloned();
-                let (title, site_name, image_path, status) = match state {
-                    Some(WebsitePreviewState::Ready(preview)) => (
-                        preview.title.unwrap_or_else(|| host.clone()),
-                        preview.site_name,
-                        preview.image_path,
-                        None,
-                    ),
-                    Some(WebsitePreviewState::Failed(error)) => (
-                        host.clone(),
-                        None,
-                        None,
-                        Some(format!("Preview unavailable: {error}")),
-                    ),
-                    Some(WebsitePreviewState::Loading) => (
-                        host.clone(),
-                        None,
-                        None,
-                        Some("Loading website preview…".to_owned()),
-                    ),
-                    None => (
-                        host.clone(),
-                        None,
-                        None,
-                        Some("Website preview is unavailable".to_owned()),
-                    ),
-                };
-                let estimated_height = if image_path.is_some() { 274.0 } else { 156.0 };
-                let open_id = id;
-                let content = div()
-                    .when_some(image_path, |content, image_path| {
-                        content.child(
-                            div()
-                                .mb_3()
-                                .h(px(116.0))
-                                .w_full()
-                                .overflow_hidden()
-                                .rounded_lg()
-                                .bg(palette.canvas)
-                                .child(
-                                    img(image_path)
-                                        .size_full()
-                                        .object_fit(gpui::ObjectFit::Cover),
-                                ),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Icon::new(IconName::Globe)
-                                    .size(px(15.0))
-                                    .text_color(palette.text_tertiary),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(palette.text)
-                                    .child(title),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_xs()
-                            .text_color(palette.text_tertiary)
-                            .child(site_name.unwrap_or(host)),
-                    )
-                    .when_some(status, |content, status| {
-                        content.child(
-                            div()
-                                .mt_2()
-                                .max_h(px(40.0))
-                                .overflow_hidden()
-                                .text_xs()
-                                .text_color(palette.text_secondary)
-                                .child(status),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(("link-preview-open", id))
-                            .mt_3()
-                            .h(px(30.0))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_1()
-                            .rounded_md()
-                            .bg(palette.accent)
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.accent_foreground)
-                            .cursor_pointer()
-                            .hover(|button| button.opacity(0.9))
-                            .active(|button| button.opacity(0.78))
-                            .on_click(cx.listener(move |reader, _, window, cx| {
-                                reader.activate_document_link(open_id, window, cx);
-                                reader.previewed_link = None;
-                                cx.stop_propagation();
-                            }))
-                            .child(Icon::new(IconName::ExternalLink).size(px(14.0)))
-                            .child("Open in browser"),
-                    )
-                    .into_any_element();
-                (estimated_height, content)
-            }
-        };
         let position = link_card_position(
             anchor,
             self.viewport_width,
@@ -6260,13 +6525,359 @@ impl PdfReader {
                     (self.viewport_height - LINK_CARD_MARGIN * 2.0).max(120.0)
                 ))
                 .overflow_y_scroll()
-                .p_3()
                 .rounded_xl()
                 .border_1()
                 .border_color(palette.text.opacity(0.13))
                 .bg(palette.surface)
                 .shadow_sm()
-                .child(content)
+                .child(div().min_w_0().p_4().child(content))
+                .into_any_element(),
+        )
+    }
+
+    fn render_reference_source_card(
+        &self,
+        target: PreviewTarget,
+        reference: String,
+        state: Option<ScholarlyMetadataState>,
+        palette: ReaderPalette,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let status = match state.clone() {
+            Some(ScholarlyMetadataState::Ready(metadata)) => {
+                let details_reference = reference.clone();
+                let citation = compact_citation_line(&metadata);
+                let progress = self.link_card_expansion.progress;
+                let details = div()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.text)
+                            .child(compact_words(&metadata.title, 11)),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(palette.text_secondary)
+                            .child(citation),
+                    )
+                    .child(
+                        div()
+                            .id("view-reference-details")
+                            .mt_3()
+                            .h(px(32.0))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .rounded_md()
+                            .bg(palette.accent_soft)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.accent)
+                            .cursor_pointer()
+                            .hover(|button| button.bg(palette.accent_soft_hover))
+                            .active(|button| button.opacity(0.76))
+                            .on_click(cx.listener(move |reader, _, window, cx| {
+                                reader.open_reference_details(
+                                    details_reference.clone(),
+                                    window,
+                                    cx,
+                                );
+                                cx.stop_propagation();
+                            }))
+                            .child("View Reference details")
+                            .child(Icon::new(IconName::ArrowRight).size(px(14.0))),
+                    );
+                div()
+                    .h(px(20.0 + progress * 104.0))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .when(progress < 0.65, |status| {
+                        status
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(palette.text_secondary)
+                            .child(loading_source_icon(palette))
+                            .child("Checking source")
+                    })
+                    .when(progress >= 0.65, |status| {
+                        status.child(details.opacity(((progress - 0.65) / 0.35).clamp(0.0, 1.0)))
+                    })
+                    .into_any_element()
+            }
+            Some(ScholarlyMetadataState::Failed(_)) => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_sm()
+                .text_color(palette.text_secondary)
+                .child(Icon::new(IconName::CircleX).size(px(15.0)))
+                .child("No source found")
+                .into_any_element(),
+            Some(ScholarlyMetadataState::Loading) | None => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_sm()
+                .text_color(palette.text_secondary)
+                .child(loading_source_icon(palette))
+                .child("Checking source")
+                .into_any_element(),
+        };
+        div()
+            .min_w_0()
+            .child(status)
+            .child(
+                div()
+                    .mt_3()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(palette.text.opacity(0.10))
+                    .child(self.render_preview_jump(target, palette, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_preview_jump(
+        &self,
+        target: PreviewTarget,
+        palette: ReaderPalette,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id("link-preview-jump")
+            .h(px(30.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .rounded_md()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(palette.accent)
+            .cursor_pointer()
+            .hover(|button| button.bg(palette.accent_soft))
+            .active(|button| button.bg(palette.accent_soft_hover))
+            .on_click(cx.listener(move |reader, _, window, cx| {
+                match target {
+                    PreviewTarget::Link(id) => reader.activate_document_link(id, window, cx),
+                    PreviewTarget::Reference(index) => {
+                        reader.jump_to_scientific_reference(index, window, cx)
+                    }
+                }
+                reader.previewed_link = None;
+                reader.previewed_reference = None;
+                cx.stop_propagation();
+            }))
+            .child("Jump to Document section")
+            .child(Icon::new(IconName::ArrowRight).size(px(14.0)))
+            .into_any_element()
+    }
+
+    fn render_reference_details_panel(
+        &mut self,
+        palette: ReaderPalette,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let reference = self.reference_details.clone()?;
+        let Some(ScholarlyMetadataState::Ready(metadata)) =
+            self.scholarly_session.state(&reference).cloned()
+        else {
+            return None;
+        };
+        let panel_width = 390.0_f32.min((self.viewport_width - 24.0).max(280.0));
+        let progress = self.reference_panel.progress;
+        let right = 12.0 - (panel_width + 24.0) * (1.0 - progress);
+        let full_text_url = metadata
+            .full_text_url
+            .clone()
+            .or_else(|| metadata.landing_url.clone());
+        let authors = if metadata.authors.is_empty() {
+            "Authors unavailable".to_owned()
+        } else {
+            metadata.authors.join(", ")
+        };
+        let publication = match (metadata.journal.as_deref(), metadata.year) {
+            (Some(journal), Some(year)) => format!("{journal} · {year}"),
+            (Some(journal), None) => journal.to_owned(),
+            (None, Some(year)) => year.to_string(),
+            (None, None) => "Publication details unavailable".to_owned(),
+        };
+        let source_line = format!(
+            "{} · {}",
+            metadata.source.label(),
+            metadata
+                .certainty
+                .map(|certainty| certainty.label())
+                .unwrap_or("DOI match")
+        );
+        let content = div()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(54.0))
+                    .flex_none()
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(palette.separator)
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.text)
+                            .child("Reference details"),
+                    )
+                    .child(
+                        div()
+                            .id("close-reference-details")
+                            .size(px(30.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_color(palette.text_secondary)
+                            .hover(|button| button.bg(palette.control_hover))
+                            .active(|button| button.bg(palette.control_pressed))
+                            .on_click(cx.listener(|reader, _, window, cx| {
+                                reader.close_reference_details(window, cx);
+                                cx.stop_propagation();
+                            }))
+                            .child(Icon::new(IconName::Close).size(px(16.0))),
+                    ),
+            )
+            .child(
+                div()
+                    .id("reference-details-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_y_scroll()
+                    .p_5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(palette.text_tertiary)
+                            .child(source_line),
+                    )
+                    .child(
+                        div()
+                            .mt_3()
+                            .text_lg()
+                            .line_height(px(25.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.text)
+                            .child(metadata.title),
+                    )
+                    .child(
+                        div()
+                            .mt_3()
+                            .text_sm()
+                            .line_height(px(20.0))
+                            .text_color(palette.text_secondary)
+                            .child(authors),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .text_color(palette.text_tertiary)
+                            .child(publication),
+                    )
+                    .when_some(metadata.doi, |body, doi| {
+                        body.child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(palette.text_tertiary)
+                                .child(format!("DOI {doi}")),
+                        )
+                    })
+                    .when_some(metadata.abstract_text, |body, abstract_text| {
+                        body.child(
+                            div()
+                                .mt_5()
+                                .child(
+                                    div()
+                                        .mb_2()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(palette.text)
+                                        .child("Abstract"),
+                                )
+                                .child(
+                                    div()
+                                        .id("reference-abstract-scroll")
+                                        .max_h(px(240.0))
+                                        .overflow_y_scroll()
+                                        .pr_2()
+                                        .text_sm()
+                                        .line_height(px(21.0))
+                                        .text_color(palette.text_secondary)
+                                        .child(abstract_text),
+                                ),
+                        )
+                    })
+                    .when_some(full_text_url, |body, full_text_url| {
+                        body.child(
+                            div()
+                                .id("open-reference-paper")
+                                .mt_5()
+                                .h(px(34.0))
+                                .px_4()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .rounded_md()
+                                .bg(palette.accent)
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(palette.accent_foreground)
+                                .cursor_pointer()
+                                .hover(|button| button.bg(palette.accent_hover))
+                                .active(|button| button.bg(palette.accent_active))
+                                .on_click(cx.listener(move |reader, _, _, cx| {
+                                    if let Err(error) = open::that_detached(&full_text_url) {
+                                        reader.warning =
+                                            Some(format!("Could not open paper: {error}").into());
+                                    }
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }))
+                                .child(Icon::new(IconName::ExternalLink).size(px(15.0)))
+                                .child("Open paper"),
+                        )
+                    }),
+            );
+        Some(
+            div()
+                .id("reference-details-panel")
+                .block_mouse_except_scroll()
+                .absolute()
+                .top(px(TOOLBAR_HEIGHT + FLUID_PANEL_VERTICAL_MARGIN))
+                .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
+                .right(px(right))
+                .w(px(panel_width))
+                .opacity(progress.max(0.01))
+                .child(FloatingPanel::new(palette, content))
                 .into_any_element(),
         )
     }
@@ -8215,7 +8826,7 @@ impl Render for PdfReader {
                 .bg(palette.canvas)
                 .cursor(if self.pan.is_some() {
                     CursorStyle::ClosedHand
-                } else if self.hovered_link.is_some() {
+                } else if self.hovered_link.is_some() || self.hovered_reference.is_some() {
                     CursorStyle::PointingHand
                 } else {
                     CursorStyle::IBeam
@@ -8385,19 +8996,12 @@ impl Render for PdfReader {
                     .child(
                         div()
                             .id("reader-sidebar")
-                            .occlude()
                             .absolute()
                             .top(px(FLUID_PANEL_VERTICAL_MARGIN))
                             .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
                             .right(px(FLUID_PANEL_HORIZONTAL_MARGIN))
                             .w(px(panel_width))
-                            .overflow_hidden()
-                            .rounded_xl()
-                            .border_1()
-                            .border_color(palette.text.opacity(0.13))
-                            .bg(palette.surface)
-                            .shadow_sm()
-                            .child(sidebar_content),
+                            .child(FloatingPanel::new(palette, sidebar_content)),
                     );
                 div()
                     .relative()
@@ -8440,10 +9044,12 @@ impl Render for PdfReader {
             None
         };
 
+        let reference_details_panel = self.render_reference_details_panel(palette, cx);
         div()
             .key_context("PdfReader")
             .track_focus(&self.focus_handle)
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(palette.canvas)
@@ -8478,6 +9084,7 @@ impl Render for PdfReader {
             .child(toolbar)
             .children(error_bar)
             .child(workspace)
+            .children(reference_details_panel)
     }
 }
 
@@ -8944,10 +9551,214 @@ fn content_rect_to_bounds(canvas: Bounds<Pixels>, rect: Rect, scroll: Offset) ->
     )
 }
 
+fn text_bounds_overlap(left: TextBounds, right: TextBounds) -> bool {
+    left.left < right.right
+        && left.right > right.left
+        && left.top < right.bottom
+        && left.bottom > right.top
+}
+
+fn scientific_reference_matches(
+    reference: &ScientificReference,
+    target_page: usize,
+    resolved: Option<&ResolvedInternalLink>,
+    rough_y: Option<f32>,
+) -> bool {
+    if reference.page != target_page {
+        return false;
+    }
+    if resolved.is_some_and(|resolved| {
+        resolved.text_runs.iter().any(|resolved_run| {
+            reference
+                .text_runs
+                .iter()
+                .any(|reference_run| text_bounds_overlap(*resolved_run, *reference_run))
+        })
+    }) {
+        return true;
+    }
+    let target_y = resolved
+        .and_then(|resolved| resolved.y_fraction)
+        .or(rough_y);
+    let top = reference
+        .text_runs
+        .iter()
+        .map(|run| run.top)
+        .min_by(f32::total_cmp);
+    let bottom = reference
+        .text_runs
+        .iter()
+        .map(|run| run.bottom)
+        .max_by(f32::total_cmp);
+    matches!((target_y, top, bottom), (Some(y), Some(top), Some(bottom)) if y >= top - 0.012 && y <= bottom + 0.012)
+}
+
+fn union_text_bounds(left: TextBounds, right: TextBounds) -> TextBounds {
+    TextBounds {
+        left: left.left.min(right.left),
+        top: left.top.min(right.top),
+        right: left.right.max(right.right),
+        bottom: left.bottom.max(right.bottom),
+    }
+}
+
+fn compact_words(text: &str, maximum_words: usize) -> String {
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    if words.len() <= maximum_words {
+        return words.join(" ");
+    }
+    format!("{}…", words[..maximum_words].join(" "))
+}
+
+fn author_last_name(author: &str) -> &str {
+    author
+        .split_whitespace()
+        .last()
+        .unwrap_or(author)
+        .trim_matches(|character: char| matches!(character, ',' | ';'))
+}
+
+fn compact_authors(authors: &[String]) -> String {
+    if authors.is_empty() {
+        return "Unknown author".to_owned();
+    }
+    if authors.len() > 3 {
+        return format!("{} et al.", author_last_name(&authors[0]));
+    }
+    let joined = authors
+        .iter()
+        .map(|author| author_last_name(author))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if joined.chars().count() > 38 {
+        format!("{} et al.", author_last_name(&authors[0]))
+    } else {
+        joined
+    }
+}
+
+fn compact_journal(journal: &str) -> String {
+    let mut result = journal.chars().take(28).collect::<String>();
+    if journal.chars().count() > 28 {
+        result.push('…');
+    }
+    result
+}
+
+fn compact_citation_line(metadata: &ScholarlyMetadata) -> String {
+    let mut parts = vec![compact_authors(&metadata.authors)];
+    if let Some(journal) = metadata.journal.as_deref() {
+        parts.push(compact_journal(journal));
+    }
+    if let Some(year) = metadata.year {
+        parts.push(year.to_string());
+    }
+    parts.join(" · ")
+}
+
+fn loading_source_icon(palette: ReaderPalette) -> gpui::AnyElement {
+    Icon::new(IconName::LoaderCircle)
+        .size(px(15.0))
+        .text_color(palette.accent)
+        .with_animation(
+            "reference-source-spinner",
+            Animation::new(Duration::from_millis(800))
+                .repeat()
+                .with_easing(ease_in_out),
+            |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+        )
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui_component::{ThemeColor, ThemeMode};
+
+    #[test]
+    fn scientific_lookup_is_limited_to_exact_reference_ranges() {
+        let reference = ScientificReference {
+            number: 7,
+            page: 9,
+            x_fraction: Some(0.2),
+            y_fraction: Some(0.72),
+            text: "7. A real paper reference".to_owned(),
+            text_runs: vec![TextBounds {
+                left: 0.1,
+                top: 0.70,
+                right: 0.9,
+                bottom: 0.78,
+            }],
+        };
+        let figure = ResolvedInternalLink {
+            x_fraction: Some(0.5),
+            y_fraction: Some(0.22),
+            text_runs: vec![TextBounds {
+                left: 0.1,
+                top: 0.20,
+                right: 0.8,
+                bottom: 0.25,
+            }],
+            preview: "Figure 2".to_owned(),
+            matched_source: true,
+        };
+        let citation = ResolvedInternalLink {
+            x_fraction: Some(0.5),
+            y_fraction: Some(0.72),
+            text_runs: reference.text_runs.clone(),
+            preview: reference.text.clone(),
+            matched_source: true,
+        };
+        assert!(!scientific_reference_matches(
+            &reference,
+            9,
+            Some(&figure),
+            Some(0.72)
+        ));
+        assert!(scientific_reference_matches(
+            &reference,
+            9,
+            Some(&citation),
+            None
+        ));
+        assert!(!scientific_reference_matches(
+            &reference,
+            8,
+            Some(&citation),
+            Some(0.72)
+        ));
+    }
+
+    #[test]
+    fn compact_reference_labels_are_bounded_and_use_last_names() {
+        let authors = vec![
+            "Ada Lovelace".to_owned(),
+            "Grace Hopper".to_owned(),
+            "Alan Turing".to_owned(),
+        ];
+        assert_eq!(compact_authors(&authors), "Lovelace, Hopper, Turing");
+        let many = [authors, vec!["Katherine Johnson".to_owned()]].concat();
+        assert_eq!(compact_authors(&many), "Lovelace et al.");
+        assert_eq!(compact_words("one two three four", 3), "one two three…");
+        assert!(compact_journal("A very long journal title that needs shortening").ends_with('…'));
+    }
+
+    #[test]
+    fn reusable_reveal_state_reverses_and_settles() {
+        let mut reveal = RevealState {
+            target: 1.0,
+            ..RevealState::default()
+        };
+        for _ in 0..60 {
+            reveal.advance(1.0 / 60.0);
+        }
+        assert_eq!(reveal.progress, 1.0);
+        reveal.target = 0.0;
+        for _ in 0..60 {
+            reveal.advance(1.0 / 60.0);
+        }
+        assert_eq!(reveal.progress, 0.0);
+    }
 
     #[test]
     fn toc_helpers_center_the_stack_cascade_hover_and_preserve_navigation() {
