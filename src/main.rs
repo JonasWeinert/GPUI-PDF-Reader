@@ -3,6 +3,7 @@ mod backend;
 mod comment_editor;
 mod model;
 mod native_gestures;
+mod navigation_focus;
 mod reader;
 mod search;
 mod text_field;
