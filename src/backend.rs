@@ -1,6 +1,10 @@
-use crate::model::{PageSize, PixelRect, TextBounds, TextChar, TextLayer, TileKey, TocEntry};
+use crate::model::{
+    PageSize, PdfLink as DocumentLink, PdfLinkTarget, PixelRect, RasterSize, TextBounds, TextChar,
+    TextLayer, TileKey, TocEntry,
+};
 #[cfg(test)]
-use crate::model::{RasterSize, TextPosition, TextSelection, selected_text};
+use crate::model::{TextPosition, TextSelection, selected_text};
+use crate::scientific::{ScientificAnalysis, ScientificAnalyzer};
 use crate::search::{
     MAX_SEARCH_RESULTS, SearchPageOutcome, SearchPageResults, SearchQuery, search_page,
 };
@@ -10,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
+use url::Url;
 
 const MAX_RASTER_DIMENSION: u32 = 65_536;
 const MAX_TILE_DIMENSION: u32 = 1_088;
@@ -22,6 +27,8 @@ const MAX_SEARCH_HIGHLIGHT_RUNS: usize = 100_000;
 const MAX_TOC_ENTRIES: usize = 512;
 const MAX_TOC_DEPTH: u16 = 32;
 const MAX_TOC_TITLE_UTF16_BYTES: usize = 2_048;
+const MAX_DOCUMENT_LINKS: usize = 20_000;
+const MAX_LINK_URI_BYTES: usize = 8_192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderColor {
@@ -56,6 +63,14 @@ pub struct TileRequest {
     pub render_rect: PixelRect,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PreviewSpec {
+    pub page: usize,
+    pub raster: RasterSize,
+    pub center_x: f32,
+    pub center_y: f32,
+}
+
 #[derive(Debug)]
 pub enum WorkerEvent {
     Ready,
@@ -64,6 +79,7 @@ pub enum WorkerEvent {
         path: PathBuf,
         pages: Vec<PageSize>,
         toc: Vec<TocEntry>,
+        links: Vec<DocumentLink>,
     },
     TileRendered {
         generation: u64,
@@ -79,6 +95,19 @@ pub enum WorkerEvent {
         generation: u64,
         appearance: RenderAppearance,
         key: TileKey,
+        message: String,
+    },
+    PreviewRendered {
+        generation: u64,
+        revision: u64,
+        appearance: RenderAppearance,
+        width: u32,
+        height: u32,
+        bgra: Vec<u8>,
+    },
+    PreviewFailed {
+        generation: u64,
+        revision: u64,
         message: String,
     },
     TextExtracted {
@@ -116,6 +145,10 @@ pub enum WorkerEvent {
         revision: u64,
         message: String,
     },
+    ScientificAnalysisComplete {
+        generation: u64,
+        analysis: ScientificAnalysis,
+    },
     Error {
         generation: Option<u64>,
         message: String,
@@ -138,6 +171,13 @@ struct SearchJob {
     total_highlight_runs: usize,
     skipped_pages: usize,
     truncated: bool,
+}
+
+struct ScientificJob {
+    generation: u64,
+    analyzer: ScientificAnalyzer,
+    next_page: usize,
+    partial: Option<(usize, Vec<TextChar>)>,
 }
 
 impl PdfWorker {
@@ -201,6 +241,12 @@ impl PdfWorker {
             .is_ok()
     }
 
+    pub fn ensure_text_pages(&self, generation: u64, pages: Vec<usize>) -> bool {
+        self.commands
+            .send(WorkerCommand::EnsureTextPages { generation, pages })
+            .is_ok()
+    }
+
     pub fn cancel_explicit_text(&self, generation: u64) -> bool {
         self.commands
             .send(WorkerCommand::CancelExplicitText { generation })
@@ -227,6 +273,28 @@ impl PdfWorker {
             })
             .is_ok()
     }
+
+    pub fn render_preview(
+        &self,
+        generation: u64,
+        revision: u64,
+        appearance: RenderAppearance,
+        spec: PreviewSpec,
+    ) -> bool {
+        self.commands
+            .send(WorkerCommand::RenderPreview {
+                request: preview_render_request(
+                    generation,
+                    revision,
+                    appearance,
+                    spec.page,
+                    spec.raster,
+                    spec.center_x,
+                    spec.center_y,
+                ),
+            })
+            .is_ok()
+    }
 }
 
 #[derive(Debug)]
@@ -244,6 +312,10 @@ enum WorkerCommand {
         generation: u64,
         page: usize,
     },
+    EnsureTextPages {
+        generation: u64,
+        pages: Vec<usize>,
+    },
     CancelExplicitText {
         generation: u64,
     },
@@ -256,6 +328,9 @@ enum WorkerCommand {
         generation: u64,
         next_revision: u64,
     },
+    RenderPreview {
+        request: PreviewRequest,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -265,6 +340,12 @@ struct RenderRequest {
     tile: TileRequest,
     priority: usize,
     prefetch: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewRequest {
+    revision: u64,
+    render: RenderRequest,
 }
 
 struct WorkerState {
@@ -277,6 +358,8 @@ struct WorkerState {
     search: Option<SearchJob>,
     latest_search_revision: Option<u64>,
     search_partial: Option<(usize, Vec<TextChar>)>,
+    scientific: Option<ScientificJob>,
+    preview: Option<PreviewRequest>,
 }
 
 enum TextExtraction {
@@ -288,6 +371,8 @@ enum WorkerWork {
     Tile(TileKey),
     Text { page: usize, explicit: bool },
     Search,
+    Scientific,
+    Preview,
 }
 
 fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<WorkerEvent>) {
@@ -315,6 +400,8 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
         search: None,
         latest_search_revision: None,
         search_partial: None,
+        scientific: None,
+        preview: None,
     };
     let mut pending = HashMap::<TileKey, RenderRequest>::new();
     let mut explicit_text = BTreeSet::<usize>::new();
@@ -325,6 +412,8 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
             && explicit_text.is_empty()
             && automatic_text.is_empty()
             && state.search.is_none()
+            && state.scientific.is_none()
+            && state.preview.is_none()
         {
             match commands.recv() {
                 Ok(command) => {
@@ -363,6 +452,8 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
             .map(|(key, _)| *key);
         let work = if let Some(key) = next_visible_tile {
             WorkerWork::Tile(key)
+        } else if state.preview.is_some() {
+            WorkerWork::Preview
         } else if let Some(page) = explicit_text.pop_first() {
             WorkerWork::Text {
                 page,
@@ -420,9 +511,55 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
             .map(|(key, _)| *key)
         {
             WorkerWork::Tile(key)
+        } else if state.scientific.is_some() {
+            WorkerWork::Scientific
         } else {
             continue;
         };
+
+        if matches!(work, WorkerWork::Preview) {
+            let request = state.preview.take().expect("preview work checked above");
+            if state.generation != Some(request.render.generation) {
+                continue;
+            }
+            let result = render_tile(&mut state, &request.render);
+            if state.preview.as_ref().is_some_and(|latest| {
+                latest.revision > request.revision
+                    || latest.render.generation != request.render.generation
+            }) {
+                continue;
+            }
+            match result {
+                Ok((width, height, bgra)) => {
+                    if events
+                        .send(WorkerEvent::PreviewRendered {
+                            generation: request.render.generation,
+                            revision: request.revision,
+                            appearance: request.render.appearance,
+                            width,
+                            height,
+                            bgra,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(message) => {
+                    if events
+                        .send(WorkerEvent::PreviewFailed {
+                            generation: request.render.generation,
+                            revision: request.revision,
+                            message,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            continue;
+        }
 
         if let WorkerWork::Tile(next_tile) = work {
             // Leave the in-flight request in `pending`. A viewport replacement
@@ -497,6 +634,21 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
 
         if matches!(work, WorkerWork::Search) {
             if !process_search_work(
+                &commands,
+                pdfium,
+                &events,
+                &mut state,
+                &mut pending,
+                &mut explicit_text,
+                &mut automatic_text,
+            ) {
+                return;
+            }
+            continue;
+        }
+
+        if matches!(work, WorkerWork::Scientific) {
+            if !process_scientific_work(
                 &commands,
                 pdfium,
                 &events,
@@ -903,6 +1055,100 @@ fn process_search_work(
     true
 }
 
+fn process_scientific_work(
+    commands: &mpsc::Receiver<WorkerCommand>,
+    pdfium: &'static Pdfium,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    state: &mut WorkerState,
+    pending: &mut HashMap<TileKey, RenderRequest>,
+    explicit_text: &mut BTreeSet<usize>,
+    automatic_text: &mut VecDeque<usize>,
+) -> bool {
+    let Some(job) = state.scientific.as_ref() else {
+        return true;
+    };
+    let generation = job.generation;
+    if state.generation != Some(generation) {
+        state.scientific = None;
+        return true;
+    }
+    let page = job.analyzer.page_order().get(job.next_page).copied();
+    let Some(page) = page else {
+        let analysis = state
+            .scientific
+            .take()
+            .expect("scientific job checked above")
+            .analyzer
+            .finish();
+        return events
+            .send(WorkerEvent::ScientificAnalysisComplete {
+                generation,
+                analysis,
+            })
+            .is_ok();
+    };
+
+    let text = if let Some(text) = state.text_cache.get(&page).cloned() {
+        text
+    } else {
+        let partial = state
+            .scientific
+            .as_mut()
+            .and_then(|job| job.partial.take())
+            .filter(|(partial_page, _)| *partial_page == page)
+            .map(|(_, partial)| partial)
+            .unwrap_or_default();
+        let mut deferred = Vec::new();
+        let mut connected = true;
+        let extracted = extract_page_text(state, page, partial, || {
+            connected &= collect_available_commands(commands, &mut deferred);
+            !connected || !deferred.is_empty()
+        });
+        if !connected {
+            return false;
+        }
+        if !accept_deferred_commands(
+            deferred,
+            pdfium,
+            events,
+            state,
+            pending,
+            explicit_text,
+            automatic_text,
+        ) {
+            return false;
+        }
+        if state.generation != Some(generation) || state.scientific.is_none() {
+            return true;
+        }
+        match extracted {
+            Ok(TextExtraction::Cancelled(partial)) => {
+                if let Some(job) = state.scientific.as_mut() {
+                    job.partial = Some((page, partial));
+                }
+                return true;
+            }
+            Ok(TextExtraction::Complete(characters)) => {
+                cache_completed_text(state, page, characters)
+            }
+            Err(_) => Arc::new(TextLayer::empty()),
+        }
+    };
+
+    let Some(job) = state.scientific.as_mut() else {
+        return true;
+    };
+    if job.generation != generation
+        || job.analyzer.page_order().get(job.next_page).copied() != Some(page)
+    {
+        return true;
+    }
+    job.analyzer.ingest_page(page, &text);
+    job.next_page += 1;
+    job.partial = None;
+    true
+}
+
 fn cap_search_highlight_runs(results: &mut SearchPageResults, remaining_runs: usize) -> usize {
     let mut added_runs = 0_usize;
     let mut retained = 0;
@@ -1095,6 +1341,7 @@ fn reset_search_for_open(state: &mut WorkerState) {
     state.search = None;
     state.latest_search_revision = None;
     state.search_partial = None;
+    state.scientific = None;
 }
 
 fn accept_command(
@@ -1116,12 +1363,20 @@ fn accept_command(
             state.automatic_text_needs_quiet = false;
             reset_search_for_open(state);
             state.document = None;
+            state.preview = None;
             state.generation = Some(generation);
 
             match open_document(pdfium, &path) {
                 Ok((document, pages)) => {
                     let toc = extract_table_of_contents(&document, &pages);
+                    let links = extract_document_links(&document, &pages);
                     state.page_count = pages.len();
+                    state.scientific = Some(ScientificJob {
+                        generation,
+                        analyzer: ScientificAnalyzer::new(pages.len(), &links),
+                        next_page: 0,
+                        partial: None,
+                    });
                     state.document = Some(document);
                     if events
                         .send(WorkerEvent::Opened {
@@ -1129,6 +1384,7 @@ fn accept_command(
                             path,
                             pages,
                             toc,
+                            links,
                         })
                         .is_err()
                     {
@@ -1169,6 +1425,12 @@ fn accept_command(
             }
             true
         }
+        WorkerCommand::EnsureTextPages { generation, pages } => {
+            if state.generation == Some(generation) {
+                explicit_text.extend(pages.into_iter().filter(|page| *page < state.page_count));
+            }
+            true
+        }
         WorkerCommand::CancelExplicitText { generation } => {
             if state.generation == Some(generation) {
                 explicit_text.clear();
@@ -1188,6 +1450,12 @@ fn accept_command(
             cancel_searches_before(state, generation, next_revision);
             true
         }
+        WorkerCommand::RenderPreview { request } => {
+            if state.generation == Some(request.render.generation) {
+                state.preview = Some(request);
+            }
+            true
+        }
     }
 }
 
@@ -1198,11 +1466,57 @@ fn command_supersedes_text(
 ) -> bool {
     match command {
         WorkerCommand::ExtractText { page, .. } => *page != current_page,
+        WorkerCommand::EnsureTextPages { .. } => false,
         WorkerCommand::CancelExplicitText { .. } => current_is_explicit,
         WorkerCommand::Open { .. }
         | WorkerCommand::RenderViewport { .. }
         | WorkerCommand::Search { .. }
         | WorkerCommand::CancelSearch { .. } => false,
+        WorkerCommand::RenderPreview { .. } => false,
+    }
+}
+
+fn preview_render_request(
+    generation: u64,
+    revision: u64,
+    appearance: RenderAppearance,
+    page: usize,
+    raster: RasterSize,
+    center_x: f32,
+    center_y: f32,
+) -> PreviewRequest {
+    const PREVIEW_WIDTH: u32 = 360;
+    const PREVIEW_HEIGHT: u32 = 204;
+    let width = PREVIEW_WIDTH.min(raster.width.max(1));
+    let height = PREVIEW_HEIGHT.min(raster.height.max(1));
+    let center_x = (center_x.clamp(0.0, 1.0) * raster.width as f32).round() as u32;
+    let center_y = (center_y.clamp(0.0, 1.0) * raster.height as f32).round() as u32;
+    let rect = PixelRect {
+        x: center_x.saturating_sub(width / 2).min(raster.width - width),
+        y: center_y
+            .saturating_sub(height / 2)
+            .min(raster.height - height),
+        width,
+        height,
+    };
+    PreviewRequest {
+        revision,
+        render: RenderRequest {
+            generation,
+            appearance,
+            tile: TileRequest {
+                key: TileKey {
+                    page,
+                    raster,
+                    column: rect.x,
+                    row: rect.y,
+                },
+                core_rect: rect,
+                render_rect: rect,
+            },
+            priority: 0,
+            prefetch: false,
+        },
     }
 }
 
@@ -1339,7 +1653,7 @@ fn toc_destination_data(
     document: &PdfDocument<'_>,
     destination: &PdfDestination<'_>,
     page_count: usize,
-) -> Option<(usize, Option<f32>)> {
+) -> Option<DestinationData> {
     let page = destination
         .page_index()
         .ok()
@@ -1347,12 +1661,14 @@ fn toc_destination_data(
         .filter(|page| *page < page_count)?;
     let page_index = i32::try_from(page).ok()?;
     let pdf_page = document.pages().get(page_index).ok()?;
-    let left = pdf_page
+    let boundary = pdf_page
         .boundaries()
         .crop()
         .or_else(|_| pdf_page.boundaries().media())
-        .map(|boundary| boundary.bounds.left())
-        .unwrap_or(PdfPoints::ZERO);
+        .map(|boundary| boundary.bounds)
+        .unwrap_or_else(|_| pdf_page.page_size());
+    let left = boundary.left();
+    let bottom = boundary.bottom();
     let point = match destination.view_settings().ok() {
         Some(PdfDestinationViewSettings::SpecificCoordinatesAndZoom(x, Some(y), _)) => {
             Some((x.unwrap_or(left), y))
@@ -1364,17 +1680,44 @@ fn toc_destination_data(
         Some(PdfDestinationViewSettings::FitPageToRectangle(rect)) => {
             Some((rect.left(), rect.top()))
         }
+        Some(PdfDestinationViewSettings::FitPageVerticallyToWindow(Some(x)))
+        | Some(PdfDestinationViewSettings::FitBoundsVerticallyToWindow(Some(x))) => {
+            Some((x, bottom))
+        }
         _ => None,
     };
-    let destination_y = point.and_then(|(x, y)| {
+    let (x_fraction, y_fraction) = point.map_or((None, None), |(x, y)| {
         let (width, height) =
             precision_text_raster(pdf_page.width().value, pdf_page.height().value);
         let config = PdfRenderConfig::new().set_fixed_size(width, height);
-        let (_, device_y) = pdf_page.points_to_pixels(x, y, &config).ok()?;
-        let normalized = device_y as f32 / height as f32;
-        normalized.is_finite().then_some(normalized.clamp(0.0, 1.0))
+        let Ok((device_x, device_y)) = pdf_page.points_to_pixels(x, y, &config) else {
+            return (None, None);
+        };
+        (
+            normalized_device_coordinate(device_x, width),
+            normalized_device_coordinate(device_y, height),
+        )
     });
-    Some((page, destination_y))
+    Some(DestinationData {
+        page,
+        x_fraction,
+        y_fraction,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DestinationData {
+    page: usize,
+    x_fraction: Option<f32>,
+    y_fraction: Option<f32>,
+}
+
+fn normalized_device_coordinate(value: i32, extent: i32) -> Option<f32> {
+    if extent <= 0 {
+        return None;
+    }
+    let normalized = value as f32 / extent as f32;
+    normalized.is_finite().then_some(normalized.clamp(0.0, 1.0))
 }
 
 fn extract_table_of_contents(document: &PdfDocument<'_>, pages: &[PageSize]) -> Vec<TocEntry> {
@@ -1416,17 +1759,118 @@ fn extract_table_of_contents(document: &PdfDocument<'_>, pages: &[PageSize]) -> 
                 let destination = action.as_local_destination_action()?.destination().ok()?;
                 toc_destination_data(document, &destination, pages.len())
             });
-        if let Some((page, destination_y)) = destination {
+        if let Some(destination) = destination {
             entries.push(TocEntry {
                 title,
-                page,
+                page: destination.page,
                 depth,
-                destination_y,
+                destination_y: destination.y_fraction,
             });
         }
     }
 
     entries
+}
+
+fn extract_document_links(document: &PdfDocument<'_>, pages: &[PageSize]) -> Vec<DocumentLink> {
+    let mut result = Vec::new();
+    for page_index in 0..pages.len() {
+        if result.len() >= MAX_DOCUMENT_LINKS {
+            break;
+        }
+        let Ok(pdf_page_index) = i32::try_from(page_index) else {
+            break;
+        };
+        let Ok(page) = document.pages().get(pdf_page_index) else {
+            continue;
+        };
+        let (width, height) = precision_text_raster(page.width().value, page.height().value);
+        let config = PdfRenderConfig::new().set_fixed_size(width, height);
+        for link in page
+            .links()
+            .iter()
+            .take(MAX_DOCUMENT_LINKS.saturating_sub(result.len()))
+        {
+            let Some(bounds) = link
+                .rect()
+                .ok()
+                .and_then(|rect| normalized_link_bounds(&page, rect, &config, width, height))
+            else {
+                continue;
+            };
+            let destination = link
+                .destination()
+                .and_then(|destination| toc_destination_data(document, &destination, pages.len()));
+            let target = destination
+                .or_else(|| {
+                    let action = link.action()?;
+                    let destination = action.as_local_destination_action()?.destination().ok()?;
+                    toc_destination_data(document, &destination, pages.len())
+                })
+                .map(|destination| PdfLinkTarget::Internal {
+                    page: destination.page,
+                    x_fraction: destination.x_fraction,
+                    y_fraction: destination.y_fraction,
+                })
+                .or_else(|| {
+                    let action = link.action()?;
+                    let uri = action.as_uri_action()?.uri().ok()?;
+                    validated_link_url(&uri).map(|url| PdfLinkTarget::External { url })
+                });
+            let Some(target) = target else {
+                continue;
+            };
+            result.push(DocumentLink {
+                id: result.len(),
+                page: page_index,
+                bounds,
+                target,
+            });
+        }
+    }
+    result
+}
+
+fn normalized_link_bounds(
+    page: &PdfPage<'_>,
+    rect: PdfRect,
+    config: &PdfRenderConfig,
+    width: i32,
+    height: i32,
+) -> Option<TextBounds> {
+    let points = [
+        (rect.left(), rect.top()),
+        (rect.right(), rect.top()),
+        (rect.right(), rect.bottom()),
+        (rect.left(), rect.bottom()),
+    ];
+    let mut left = f32::INFINITY;
+    let mut top = f32::INFINITY;
+    let mut right = f32::NEG_INFINITY;
+    let mut bottom = f32::NEG_INFINITY;
+    for (x, y) in points {
+        let (device_x, device_y) = page.points_to_pixels(x, y, config).ok()?;
+        let normalized_x = normalized_device_coordinate(device_x, width)?;
+        let normalized_y = normalized_device_coordinate(device_y, height)?;
+        left = left.min(normalized_x);
+        top = top.min(normalized_y);
+        right = right.max(normalized_x);
+        bottom = bottom.max(normalized_y);
+    }
+    (right > left && bottom > top).then_some(TextBounds {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
+fn validated_link_url(uri: &str) -> Option<String> {
+    if uri.len() > MAX_LINK_URI_BYTES {
+        return None;
+    }
+    let parsed = Url::parse(uri).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
 }
 
 type RenderOutput = (u32, u32, Vec<u8>);
@@ -1731,6 +2175,29 @@ mod tests {
     static PDFIUM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn preview_crop_is_bounded_and_clamped_at_page_edges() {
+        let request = preview_render_request(
+            4,
+            9,
+            RenderAppearance::Normal,
+            3,
+            RasterSize {
+                width: 800,
+                height: 1_200,
+            },
+            1.0,
+            0.0,
+        );
+        assert_eq!(request.revision, 9);
+        assert_eq!(request.render.tile.key.page, 3);
+        assert_eq!(request.render.tile.render_rect.width, 360);
+        assert_eq!(request.render.tile.render_rect.height, 204);
+        assert_eq!(request.render.tile.render_rect.x, 440);
+        assert_eq!(request.render.tile.render_rect.y, 0);
+        validate_tile_request(request.render.tile).unwrap();
+    }
+
+    #[test]
     fn pdfium_opens_renders_and_extracts_the_integration_fixture() {
         let _pdfium_guard = PDFIUM_TEST_LOCK
             .lock()
@@ -1786,6 +2253,29 @@ mod tests {
         );
         assert_eq!(toc[2].destination_y, None);
         assert!(toc[3].destination_y.is_some());
+        let links = extract_document_links(&document, &pages);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].page, 0);
+        assert!(links[0].bounds.left < links[0].bounds.right);
+        assert_eq!(
+            links[0].target,
+            PdfLinkTarget::External {
+                url: "https://example.com/research?source=pdf".to_owned(),
+            }
+        );
+        assert_eq!(links[1].page, 0);
+        match links[1].target {
+            PdfLinkTarget::Internal {
+                page,
+                x_fraction,
+                y_fraction,
+            } => {
+                assert_eq!(page, 2);
+                assert!(x_fraction.is_some_and(|value| (0.0..=1.0).contains(&value)));
+                assert!(y_fraction.is_some_and(|value| (0.0..=1.0).contains(&value)));
+            }
+            _ => panic!("second fixture link should be internal"),
+        }
 
         let mut state = WorkerState {
             document: Some(document),
@@ -1797,7 +2287,44 @@ mod tests {
             search: None,
             latest_search_revision: None,
             search_partial: None,
+            scientific: None,
+            preview: None,
         };
+        let source_text = match extract_page_text(&state, 0, Vec::new(), || false)
+            .expect("fixture source text should extract")
+        {
+            TextExtraction::Complete(characters) => TextLayer::new(characters),
+            TextExtraction::Cancelled(_) => panic!("fixture source text unexpectedly cancelled"),
+        };
+        let target_text = match extract_page_text(&state, 2, Vec::new(), || false)
+            .expect("fixture target text should extract")
+        {
+            TextExtraction::Complete(characters) => TextLayer::new(characters),
+            TextExtraction::Cancelled(_) => panic!("fixture target text unexpectedly cancelled"),
+        };
+        let source = crate::link_resolution::link_source_text(&source_text, links[1].bounds);
+        let resolved = match links[1].target {
+            PdfLinkTarget::Internal {
+                page,
+                x_fraction,
+                y_fraction,
+            } => crate::link_resolution::resolve_internal_link(
+                &source_text,
+                links[1].bounds,
+                &target_text,
+                page,
+                x_fraction,
+                y_fraction,
+            ),
+            _ => panic!("fixture link should remain internal"),
+        };
+        assert!(
+            resolved.matched_source,
+            "PDFium link source {source:?} should resolve to its reference entry"
+        );
+        assert!(resolved.preview.starts_with("[12] Synthetic reference"));
+        assert!(resolved.preview.contains("Continued journal and DOI"));
+        assert!(!resolved.preview.contains("[13]"));
         assert!(matches!(
             extract_page_text(&state, 0, Vec::new(), || true),
             Ok(TextExtraction::Cancelled(_))
@@ -2003,6 +2530,82 @@ mod tests {
     }
 
     #[test]
+    fn pdfium_scientific_analysis_recovers_unannotated_superscript_references() {
+        let _pdfium_guard = PDFIUM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let pdfium = initialize_pdfium().expect("the pinned PDFium binary should load");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scientific-unlinked.pdf");
+        let (document, pages) = open_document(pdfium, &fixture).expect("fixture should open");
+        let links = extract_document_links(&document, &pages);
+        assert!(
+            links.is_empty(),
+            "the fixture must prove inferred references rather than authored links"
+        );
+        let state = WorkerState {
+            document: Some(document),
+            generation: Some(1),
+            text_cache: HashMap::new(),
+            partial_text: HashMap::new(),
+            automatic_text_needs_quiet: false,
+            page_count: pages.len(),
+            search: None,
+            latest_search_revision: None,
+            search_partial: None,
+            scientific: None,
+            preview: None,
+        };
+        let mut analyzer = ScientificAnalyzer::new(pages.len(), &links);
+        for page in analyzer.page_order().to_vec() {
+            let text = match extract_page_text(&state, page, Vec::new(), || false)
+                .expect("fixture text should extract")
+            {
+                TextExtraction::Complete(characters) => TextLayer::new(characters),
+                TextExtraction::Cancelled(_) => {
+                    panic!("fixture text extraction unexpectedly cancelled")
+                }
+            };
+            analyzer.ingest_page(page, &text);
+        }
+        let analysis = analyzer.finish();
+        assert!(analysis.is_scientific);
+        assert_eq!(analysis.signals.reference_entries, 8);
+        assert!(analysis.signals.doi_entries >= 2);
+        assert_eq!(analysis.signals.bracket_citations, 1);
+        assert!(
+            analysis.signals.superscript_citations >= 4,
+            "signals were {:?}",
+            analysis.signals
+        );
+        assert_eq!(analysis.synthetic_links.len(), 5);
+        assert!(
+            analysis
+                .synthetic_links
+                .iter()
+                .all(|link| { matches!(link.target, PdfLinkTarget::Internal { page: 2, .. }) })
+        );
+    }
+
+    #[test]
+    fn link_urls_accept_only_bounded_http_and_https_targets() {
+        assert_eq!(
+            validated_link_url("https://example.com/a b"),
+            Some("https://example.com/a%20b".to_owned())
+        );
+        assert_eq!(
+            validated_link_url("http://example.com"),
+            Some("http://example.com/".to_owned())
+        );
+        assert_eq!(validated_link_url("javascript:alert(1)"), None);
+        assert_eq!(validated_link_url("file:///etc/passwd"), None);
+        assert_eq!(
+            validated_link_url(&"https://example.com/".repeat(600)),
+            None
+        );
+    }
+
+    #[test]
     fn tile_validation_rejects_unbounded_or_non_containing_requests() {
         let key = TileKey {
             page: 0,
@@ -2188,6 +2791,8 @@ mod tests {
             search: None,
             latest_search_revision: None,
             search_partial: None,
+            scientific: None,
+            preview: None,
         };
         let key = TileKey {
             page: 0,
@@ -2326,6 +2931,13 @@ mod tests {
         assert!(command_supersedes_text(&replacement, 2, false));
         assert!(!command_supersedes_text(&replacement, 4, true));
 
+        let ensure = WorkerCommand::EnsureTextPages {
+            generation: 7,
+            pages: vec![2, 4],
+        };
+        assert!(!command_supersedes_text(&ensure, 2, true));
+        assert!(!command_supersedes_text(&ensure, 3, true));
+
         let cancel = WorkerCommand::CancelExplicitText { generation: 7 };
         assert!(command_supersedes_text(&cancel, 2, true));
         assert!(!command_supersedes_text(&cancel, 2, false));
@@ -2379,6 +2991,8 @@ mod tests {
             search: None,
             latest_search_revision: None,
             search_partial: None,
+            scientific: None,
+            preview: None,
         }
     }
 

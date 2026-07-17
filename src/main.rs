@@ -1,10 +1,16 @@
 mod annotations;
 mod backend;
 mod comment_editor;
+mod document_jump;
+mod floating_panel;
+mod link_preview;
+mod link_resolution;
 mod model;
 mod native_gestures;
 mod navigation_focus;
 mod reader;
+mod scholarly;
+mod scientific;
 mod search;
 mod text_field;
 mod theme;
@@ -245,8 +251,42 @@ fn main() {
                         panic!("invalid GPUI_PDF_READER_QA_TOC_NAVIGATE: {value}")
                     })
                 });
+            let link_navigate = std::env::var("GPUI_PDF_READER_QA_LINK_NAVIGATE")
+                .ok()
+                .map(|value| {
+                    value.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("invalid GPUI_PDF_READER_QA_LINK_NAVIGATE: {value}")
+                    })
+                });
+            let link_hover = std::env::var("GPUI_PDF_READER_QA_LINK_HOVER")
+                .ok()
+                .map(|value| {
+                    value.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("invalid GPUI_PDF_READER_QA_LINK_HOVER: {value}")
+                    })
+                });
+            let internal_link_hover =
+                std::env::var("GPUI_PDF_READER_QA_INTERNAL_LINK_HOVER")
+                    .ok()
+                    .map(|value| {
+                        value.parse::<usize>().unwrap_or_else(|_| {
+                            panic!("invalid GPUI_PDF_READER_QA_INTERNAL_LINK_HOVER: {value}")
+                        })
+                    });
+            let scientific_reference_hover =
+                std::env::var("GPUI_PDF_READER_QA_SCIENTIFIC_REFERENCE_HOVER")
+                    .ok()
+                    .map(|value| {
+                        value.parse::<usize>().unwrap_or_else(|_| {
+                            panic!(
+                                "invalid GPUI_PDF_READER_QA_SCIENTIFIC_REFERENCE_HOVER: {value}"
+                            )
+                        })
+                    });
             let toc_callout_hold =
                 std::env::var_os("GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD").is_some();
+            let reference_details =
+                std::env::var_os("GPUI_PDF_READER_QA_REFERENCE_DETAILS").is_some();
             if !keystrokes.is_empty()
                 || !wheel_deltas.is_empty()
                 || report
@@ -255,7 +295,12 @@ fn main() {
                 || fluid_scenario
                 || toc_hover.is_some()
                 || toc_navigate.is_some()
+                || link_navigate.is_some()
+                || link_hover.is_some()
+                || internal_link_hover.is_some()
+                || scientific_reference_hover.is_some()
                 || toc_callout_hold
+                || reference_details
             {
                 window
                     .update(cx, |_, window, cx| {
@@ -288,7 +333,14 @@ fn main() {
                                         .timer(Duration::from_millis(25))
                                         .await;
                                 }
-                                if toc_hover.is_some() || toc_navigate.is_some() || toc_callout_hold {
+                                if toc_hover.is_some()
+                                    || toc_navigate.is_some()
+                                    || link_navigate.is_some()
+                                    || link_hover.is_some()
+                                    || internal_link_hover.is_some()
+                                    || scientific_reference_hover.is_some()
+                                    || toc_callout_hold
+                                {
                                     let outcome = cx
                                         .update(|window, cx| {
                                             let Some(Some(reader)) =
@@ -306,6 +358,22 @@ fn main() {
                                                 if let Some(index) = toc_navigate {
                                                     reader.qa_navigate_toc(index, window, cx)?;
                                                 }
+                                                if let Some(index) = link_navigate {
+                                                    reader.qa_navigate_link(index, window, cx)?;
+                                                }
+                                                if let Some(index) = link_hover {
+                                                    reader.qa_hover_link(index, window, cx)?;
+                                                }
+                                                if let Some(ordinal) = internal_link_hover {
+                                                    reader.qa_hover_internal_link(
+                                                        ordinal, window, cx,
+                                                    )?;
+                                                }
+                                                if let Some(ordinal) = scientific_reference_hover {
+                                                    reader.qa_hover_scientific_reference(
+                                                        ordinal, window, cx,
+                                                    )?;
+                                                }
                                                 Ok(())
                                             })
                                         })
@@ -316,6 +384,61 @@ fn main() {
                                         eprintln!("GPUI_PDF_READER_QA_ERROR {message}");
                                         let _ = cx.update(|_, cx| cx.quit());
                                         return;
+                                    }
+                                }
+                                if reference_details {
+                                    let Some(details_ordinal) = scientific_reference_hover else {
+                                        eprintln!(
+                                            "GPUI_PDF_READER_QA_ERROR reference details require GPUI_PDF_READER_QA_SCIENTIFIC_REFERENCE_HOVER"
+                                        );
+                                        let _ = cx.update(|_, cx| cx.quit());
+                                        return;
+                                    };
+                                    let details_deadline = std::time::Instant::now()
+                                        + Duration::from_millis(timeout);
+                                    loop {
+                                        let outcome = cx
+                                            .update(|window, cx| {
+                                                let Some(Some(reader)) =
+                                                    window.root::<reader::PdfReader>()
+                                                else {
+                                                    return Err(
+                                                        "reference details reader is unavailable"
+                                                            .to_owned(),
+                                                    );
+                                                };
+                                                reader.update(cx, |reader, cx| {
+                                                    reader.qa_open_reference_details(
+                                                        details_ordinal,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })
+                                            })
+                                            .unwrap_or_else(|error| {
+                                                Err(format!(
+                                                    "reference details window update failed: {error}"
+                                                ))
+                                            });
+                                        match outcome {
+                                            Ok(true) => break,
+                                            Ok(false) => {}
+                                            Err(message) => {
+                                                eprintln!("GPUI_PDF_READER_QA_ERROR {message}");
+                                                let _ = cx.update(|_, cx| cx.quit());
+                                                return;
+                                            }
+                                        }
+                                        if std::time::Instant::now() >= details_deadline {
+                                            eprintln!(
+                                                "GPUI_PDF_READER_QA_ERROR reference details did not load"
+                                            );
+                                            let _ = cx.update(|_, cx| cx.quit());
+                                            return;
+                                        }
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(25))
+                                            .await;
                                     }
                                 }
                                 if feature_scenario || fluid_scenario {
@@ -545,7 +668,23 @@ mod tests {
             IconName::ArrowRight,
             IconName::ArrowUp,
             IconName::BookOpen,
+            IconName::Calendar,
+            IconName::Check,
             IconName::ChevronLeft,
+            IconName::ChevronDown,
+            IconName::ChevronRight,
+            IconName::ChevronUp,
+            IconName::CircleCheck,
+            IconName::CircleUser,
+            IconName::CircleX,
+            IconName::Close,
+            IconName::Copy,
+            IconName::ExternalLink,
+            IconName::EyeOff,
+            IconName::File,
+            IconName::Globe,
+            IconName::Info,
+            IconName::LoaderCircle,
             IconName::Menu,
             IconName::Minus,
             IconName::Moon,
