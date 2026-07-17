@@ -81,6 +81,8 @@ const ZOOM_RENDER_DEBOUNCE: Duration = Duration::from_millis(150);
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 const COMMENT_AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 const SIDEBAR_WIDTH: f32 = 344.0;
+const REFERENCE_PANEL_MIN_WIDTH: f32 = 372.0;
+const REFERENCE_PANEL_MAX_WIDTH: f32 = 468.0;
 const MIN_DOCUMENT_VIEWPORT_WIDTH: f32 = 300.0;
 const FLUID_PANEL_HORIZONTAL_MARGIN: f32 = 12.0;
 const FLUID_PANEL_VERTICAL_MARGIN: f32 = 18.0;
@@ -1375,7 +1377,7 @@ impl PdfReader {
                 ScholarlyMetadataState::Failed(_) => "failed",
             });
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} reference_preview={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} reference_preview={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} reference_panel={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
             self.view_mode,
             theme_name,
             if matches!(
@@ -1424,6 +1426,8 @@ impl PdfReader {
             self.scroll.y,
             self.sidebar.progress,
             self.sidebar.target,
+            self.reference_panel.progress,
+            self.reference_panel.target,
             self.comment_pane.progress,
             self.comment_pane.target,
             u8::from(self.comment_editor.is_some()),
@@ -1595,6 +1599,31 @@ impl PdfReader {
         self.schedule_link_preview_clear(window, cx);
         self.set_link_card_hovered(true, window, cx);
         Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn qa_open_reference_details(
+        &mut self,
+        ordinal: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        let reference = self
+            .document
+            .as_ref()
+            .and_then(|document| document.scientific_references.get(ordinal))
+            .map(|reference| reference.text.clone())
+            .ok_or_else(|| format!("scientific reference ordinal {ordinal} is unavailable"))?;
+        match self.scholarly_session.state(&reference) {
+            Some(ScholarlyMetadataState::Ready(_)) => {
+                self.open_reference_details(reference, window, cx);
+                Ok(true)
+            }
+            Some(ScholarlyMetadataState::Loading) | None => Ok(false),
+            Some(ScholarlyMetadataState::Failed(message)) => {
+                Err(format!("reference lookup failed: {message}"))
+            }
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -3225,18 +3254,17 @@ impl PdfReader {
         let size = window.viewport_size();
         let full_width = f32::from(size.width).max(1.0);
         let next_width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
-        if (next_width - self.viewport_width).abs() <= 0.01 {
-            return;
+        if (next_width - self.viewport_width).abs() > 0.01 {
+            self.viewport_width = next_width;
+            self.rebuild_layout();
         }
-        self.viewport_width = next_width;
-        self.rebuild_layout();
         if let Some(anchor) = self.sidebar_anchor
             && let Some((x, y)) = self
                 .layout()
                 .and_then(|layout| layout.content_point_for_anchor(anchor))
         {
             self.scroll = Offset {
-                x: x - self.viewport_width * 0.5,
+                x: x - self.panel_safe_viewport_width() * 0.5,
                 y: y - self.viewport_height * 0.5,
             };
             self.scroll_target = self.scroll;
@@ -3246,21 +3274,29 @@ impl PdfReader {
 
     fn sidebar_reserved_width(&self, full_width: f32) -> f32 {
         match self.view_mode {
-            ReaderView::Classic => self.sidebar.available_width(full_width),
+            ReaderView::Classic => {
+                self.sidebar.available_width(full_width)
+                    + reference_panel_extent(full_width, self.reference_panel.progress)
+            }
             ReaderView::Fluid => 0.0,
         }
     }
 
     fn fluid_panel_occlusion(&self) -> f32 {
         if self.view_mode == ReaderView::Fluid {
-            (self.fluid_panel_width() + FLUID_PANEL_HORIZONTAL_MARGIN * 2.0) * self.sidebar.progress
+            fluid_sidebar_extent(self.viewport_width, self.sidebar.progress)
+                + reference_panel_extent(self.viewport_width, self.reference_panel.progress)
         } else {
             0.0
         }
     }
 
     fn fluid_panel_width(&self) -> f32 {
-        SIDEBAR_WIDTH.min((self.viewport_width - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(0.0))
+        fluid_sidebar_width(self.viewport_width)
+    }
+
+    fn panel_safe_viewport_width(&self) -> f32 {
+        (self.viewport_width - self.fluid_panel_occlusion()).max(1.0)
     }
 
     fn max_scroll_x(&self, layout: &DocumentLayout) -> f32 {
@@ -3273,7 +3309,7 @@ impl PdfReader {
         }
         self.sidebar_anchor = self.layout().and_then(|layout| {
             layout.anchor_at_content_point(
-                self.scroll.x + self.viewport_width * 0.5,
+                self.scroll.x + self.panel_safe_viewport_width() * 0.5,
                 self.scroll.y + self.viewport_height * 0.5,
             )
         });
@@ -3335,7 +3371,7 @@ impl PdfReader {
     fn toggle_sidebar(&mut self, panel: SidePanel, window: &mut Window, cx: &mut Context<Self>) {
         let center_anchor = self.layout().and_then(|layout| {
             layout.anchor_at_content_point(
-                self.scroll.x + self.viewport_width * 0.5,
+                self.scroll.x + self.panel_safe_viewport_width() * 0.5,
                 self.scroll.y + self.viewport_height * 0.5,
             )
         });
@@ -3348,6 +3384,7 @@ impl PdfReader {
         // render-scale churn on every animation frame when Fit was last used.
         self.fit_width = false;
         self.scroll_target = self.scroll;
+        self.reference_panel.target = 0.0;
         self.sidebar.toggle(panel);
         if self.sidebar.target < 0.5 {
             window.focus(&self.focus_handle);
@@ -3370,7 +3407,7 @@ impl PdfReader {
         };
         let actual = self.layout().and_then(|layout| {
             layout.anchor_at_content_point(
-                self.scroll.x + self.viewport_width * 0.5,
+                self.scroll.x + self.panel_safe_viewport_width() * 0.5,
                 self.scroll.y + self.viewport_height * 0.5,
             )
         });
@@ -4544,14 +4581,9 @@ impl PdfReader {
         self.last_animation_tick = now;
         let blend = 1.0 - (-18.0 * dt).exp();
         let sidebar_was_animating = self.sidebar.is_animating();
+        let reference_was_animating = self.reference_panel.is_animating();
         if sidebar_was_animating {
             self.sidebar.advance(dt);
-            self.update_sidebar_viewport_preserving_anchor(window);
-            if !self.sidebar.is_animating() {
-                #[cfg(debug_assertions)]
-                self.record_qa_sidebar_transition();
-                self.sidebar_anchor = None;
-            }
         }
         if self.comment_pane.is_animating() {
             self.comment_pane.advance(dt);
@@ -4562,10 +4594,18 @@ impl PdfReader {
                 self.finish_comment_editor_close();
             }
         }
-        if self.reference_panel.is_animating() {
+        if reference_was_animating {
             self.reference_panel.advance(dt);
             if !self.reference_panel.is_animating() && self.reference_panel.target == 0.0 {
                 self.reference_details = None;
+            }
+        }
+        if sidebar_was_animating || reference_was_animating {
+            self.update_sidebar_viewport_preserving_anchor(window);
+            if !self.sidebar.is_animating() && !self.reference_panel.is_animating() {
+                #[cfg(debug_assertions)]
+                self.record_qa_sidebar_transition();
+                self.sidebar_anchor = None;
             }
         }
         if self.link_card_expansion.is_animating() {
@@ -5115,7 +5155,21 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let center_anchor = self.layout().and_then(|layout| {
+            layout.anchor_at_content_point(
+                self.scroll.x + self.panel_safe_viewport_width() * 0.5,
+                self.scroll.y + self.viewport_height * 0.5,
+            )
+        });
+        self.sidebar_anchor = center_anchor;
+        #[cfg(debug_assertions)]
+        {
+            self.qa_sidebar_anchor_reference = center_anchor;
+        }
+        self.fit_width = false;
+        self.scroll_target = self.scroll;
         self.reference_details = Some(reference);
+        self.sidebar.target = 0.0;
         self.reference_panel.target = 1.0;
         self.previewed_link = None;
         self.previewed_reference = None;
@@ -5124,6 +5178,19 @@ impl PdfReader {
     }
 
     fn close_reference_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let center_anchor = self.layout().and_then(|layout| {
+            layout.anchor_at_content_point(
+                self.scroll.x + self.panel_safe_viewport_width() * 0.5,
+                self.scroll.y + self.viewport_height * 0.5,
+            )
+        });
+        self.sidebar_anchor = center_anchor;
+        #[cfg(debug_assertions)]
+        {
+            self.qa_sidebar_anchor_reference = center_anchor;
+        }
+        self.fit_width = false;
+        self.scroll_target = self.scroll;
         self.reference_panel.target = 0.0;
         self.start_animation(window, cx);
         cx.notify();
@@ -6238,9 +6305,10 @@ impl PdfReader {
             .or_else(|| self.previewed_reference.map(PreviewTarget::Reference))?;
         let document = self.document.as_ref()?;
         let layout = self.layout()?;
-        let (mut anchor, content, estimated_height) = match target {
+        let (mut anchor, content, estimated_height, desired_width, card_accent) = match target {
             PreviewTarget::Reference(index) => {
                 let reference = document.scientific_references.get(index)?.clone();
+                let card_accent = reference_identity_color(&reference.text, palette);
                 let page_rect = layout.page_rect(reference.page)?;
                 let bounds = reference
                     .text_runs
@@ -6249,12 +6317,22 @@ impl PdfReader {
                     .reduce(union_text_bounds)?;
                 let anchor = normalized_bounds_in_page(page_rect, bounds);
                 let state = self.scholarly_session.state(&reference.text).cloned();
-                let content =
-                    self.render_reference_source_card(target, reference.text, state, palette, cx);
+                let desired_width =
+                    reference_preview_width(state.as_ref(), self.link_card_expansion.progress);
+                let content = self.render_reference_source_card(
+                    target,
+                    reference.text,
+                    state,
+                    card_accent,
+                    palette,
+                    cx,
+                );
                 (
                     anchor,
                     content,
                     122.0 + self.link_card_expansion.progress * 104.0,
+                    desired_width,
+                    card_accent,
                 )
             }
             PreviewTarget::Link(id) => {
@@ -6301,6 +6379,15 @@ impl PdfReader {
                             ),
                         };
                         let open_id = id;
+                        let desired_width = if image_path.is_some() {
+                            328.0
+                        } else {
+                            measured_preview_width(
+                                &[title.as_str(), site_name.as_deref().unwrap_or(&host)],
+                                228.0,
+                                360.0,
+                            )
+                        };
                         let content = div()
                             .min_w_0()
                             .when_some(image_path, |content, image_path| {
@@ -6370,13 +6457,13 @@ impl PdfReader {
                                     .justify_center()
                                     .gap_1()
                                     .rounded_md()
-                                    .bg(palette.accent)
+                                    .bg(palette.blue)
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(palette.accent_foreground)
                                     .cursor_pointer()
-                                    .hover(|button| button.bg(palette.accent_hover))
-                                    .active(|button| button.bg(palette.accent_active))
+                                    .hover(|button| button.bg(palette.blue.opacity(0.86)))
+                                    .active(|button| button.bg(palette.blue.opacity(0.72)))
                                     .on_click(cx.listener(move |reader, _, window, cx| {
                                         reader.activate_document_link(open_id, window, cx);
                                         reader.previewed_link = None;
@@ -6401,21 +6488,31 @@ impl PdfReader {
                             } else {
                                 156.0
                             },
+                            desired_width,
+                            palette.blue,
                         )
                     }
                     PdfLinkTarget::Internal { page, .. } => {
                         if let Some(reference) = self.scientific_reference_for_link(id).cloned() {
+                            let card_accent = reference_identity_color(&reference.text, palette);
                             let state = self.scholarly_session.state(&reference.text).cloned();
+                            let desired_width = reference_preview_width(
+                                state.as_ref(),
+                                self.link_card_expansion.progress,
+                            );
                             (
                                 anchor,
                                 self.render_reference_source_card(
                                     target,
                                     reference.text,
                                     state,
+                                    card_accent,
                                     palette,
                                     cx,
                                 ),
                                 122.0 + self.link_card_expansion.progress * 104.0,
+                                desired_width,
+                                card_accent,
                             )
                         } else {
                             let title = link_section_title(
@@ -6439,6 +6536,18 @@ impl PdfReader {
                                 })
                                 .map(|preview| preview.image.clone());
                             let image_pending = image.is_none();
+                            let desired_width = if image.is_some() {
+                                328.0
+                            } else {
+                                measured_preview_width(
+                                    &[
+                                        title.as_str(),
+                                        preview.as_deref().unwrap_or("Document section"),
+                                    ],
+                                    240.0,
+                                    344.0,
+                                )
+                            };
                             let content = div()
                                 .min_w_0()
                                 .child(
@@ -6491,9 +6600,9 @@ impl PdfReader {
                                             .child(compact_words(&preview, 22)),
                                     )
                                 })
-                                .child(self.render_preview_jump(target, palette, cx))
+                                .child(self.render_preview_jump(target, palette.purple, cx))
                                 .into_any_element();
-                            (anchor, content, 256.0)
+                            (anchor, content, 256.0, desired_width, palette.purple)
                         }
                     }
                 }
@@ -6501,8 +6610,10 @@ impl PdfReader {
         };
         anchor.x -= self.scroll.x;
         anchor.y -= self.scroll.y;
-        let card_width =
-            LINK_CARD_WIDTH.min((self.viewport_width - LINK_CARD_MARGIN * 2.0).max(220.0));
+        let card_width = desired_width.clamp(
+            220.0,
+            LINK_CARD_WIDTH.min((self.viewport_width - LINK_CARD_MARGIN * 2.0).max(220.0)),
+        );
         let position = link_card_position(
             anchor,
             self.viewport_width,
@@ -6527,10 +6638,11 @@ impl PdfReader {
                 .overflow_y_scroll()
                 .rounded_xl()
                 .border_1()
-                .border_color(palette.text.opacity(0.13))
+                .border_color(card_accent.opacity(0.30))
                 .bg(palette.surface)
                 .shadow_sm()
-                .child(div().min_w_0().p_4().child(content))
+                .child(div().h(px(3.0)).w_full().bg(card_accent))
+                .child(div().min_w_0().px_4().pt_3().pb_4().child(content))
                 .into_any_element(),
         )
     }
@@ -6540,6 +6652,7 @@ impl PdfReader {
         target: PreviewTarget,
         reference: String,
         state: Option<ScholarlyMetadataState>,
+        identity_color: gpui::Hsla,
         palette: ReaderPalette,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -6578,12 +6691,12 @@ impl PdfReader {
                             .justify_center()
                             .gap_1()
                             .rounded_md()
-                            .bg(palette.accent_soft)
+                            .bg(identity_color.opacity(0.12))
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.accent)
+                            .text_color(identity_color)
                             .cursor_pointer()
-                            .hover(|button| button.bg(palette.accent_soft_hover))
+                            .hover(move |button| button.bg(identity_color.opacity(0.19)))
                             .active(|button| button.opacity(0.76))
                             .on_click(cx.listener(move |reader, _, window, cx| {
                                 reader.open_reference_details(
@@ -6607,7 +6720,7 @@ impl PdfReader {
                             .gap_2()
                             .text_sm()
                             .text_color(palette.text_secondary)
-                            .child(loading_source_icon(palette))
+                            .child(loading_source_icon(identity_color))
                             .child("Checking source")
                     })
                     .when(progress >= 0.65, |status| {
@@ -6630,7 +6743,7 @@ impl PdfReader {
                 .gap_2()
                 .text_sm()
                 .text_color(palette.text_secondary)
-                .child(loading_source_icon(palette))
+                .child(loading_source_icon(identity_color))
                 .child("Checking source")
                 .into_any_element(),
         };
@@ -6643,7 +6756,7 @@ impl PdfReader {
                     .pt_3()
                     .border_t_1()
                     .border_color(palette.text.opacity(0.10))
-                    .child(self.render_preview_jump(target, palette, cx)),
+                    .child(self.render_preview_jump(target, identity_color, cx)),
             )
             .into_any_element()
     }
@@ -6651,7 +6764,7 @@ impl PdfReader {
     fn render_preview_jump(
         &self,
         target: PreviewTarget,
-        palette: ReaderPalette,
+        accent: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         div()
@@ -6665,10 +6778,10 @@ impl PdfReader {
             .rounded_md()
             .text_xs()
             .font_weight(FontWeight::MEDIUM)
-            .text_color(palette.accent)
+            .text_color(accent)
             .cursor_pointer()
-            .hover(|button| button.bg(palette.accent_soft))
-            .active(|button| button.bg(palette.accent_soft_hover))
+            .hover(move |button| button.bg(accent.opacity(0.10)))
+            .active(move |button| button.bg(accent.opacity(0.17)))
             .on_click(cx.listener(move |reader, _, window, cx| {
                 match target {
                     PreviewTarget::Link(id) => reader.activate_document_link(id, window, cx),
@@ -6688,6 +6801,7 @@ impl PdfReader {
     fn render_reference_details_panel(
         &mut self,
         palette: ReaderPalette,
+        full_width: f32,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let reference = self.reference_details.clone()?;
@@ -6696,13 +6810,12 @@ impl PdfReader {
         else {
             return None;
         };
-        let panel_width = 390.0_f32.min((self.viewport_width - 24.0).max(280.0));
+        let panel_width = reference_panel_width(full_width);
+        if panel_width <= 0.0 {
+            return None;
+        }
         let progress = self.reference_panel.progress;
         let right = 12.0 - (panel_width + 24.0) * (1.0 - progress);
-        let full_text_url = metadata
-            .full_text_url
-            .clone()
-            .or_else(|| metadata.landing_url.clone());
         let authors = if metadata.authors.is_empty() {
             "Authors unavailable".to_owned()
         } else {
@@ -6722,6 +6835,95 @@ impl PdfReader {
                 .map(|certainty| certainty.label())
                 .unwrap_or("DOI match")
         );
+        let abstract_height = (self.viewport_height * 0.34).clamp(160.0, 360.0);
+        let title_size = if metadata.title.chars().count() > 120 {
+            17.0
+        } else {
+            19.0
+        };
+        let doi_url = metadata
+            .doi
+            .as_ref()
+            .map(|doi| format!("https://doi.org/{doi}"));
+        let open_access = metadata.open_access;
+        let identity_color = reference_identity_color(&metadata.title, palette);
+        let access_icon = match open_access {
+            Some(true) => IconName::CircleCheck,
+            Some(false) => IconName::EyeOff,
+            None => IconName::Info,
+        };
+        let access_label = match open_access {
+            Some(true) => "Open access",
+            Some(false) => "Access may be restricted",
+            None => "Access unknown",
+        };
+        let access_color = if open_access == Some(true) {
+            palette.green
+        } else {
+            palette.text_secondary
+        };
+        let hero_publication = metadata
+            .journal
+            .clone()
+            .unwrap_or_else(|| "Scholarly reference".to_owned());
+        let hero_year = metadata
+            .year
+            .map(|year| year.to_string())
+            .unwrap_or_else(|| "Year unavailable".to_owned());
+        let hero_height = reference_hero_height(&hero_publication);
+        let mut access_actions = Vec::new();
+        if let Some(url) = metadata.journal_url.clone() {
+            access_actions.push(self.render_reference_action(
+                "open-reference-journal",
+                IconName::BookOpen,
+                "Journal page",
+                url_host_label(&url),
+                url,
+                false,
+                identity_color,
+                palette,
+                cx,
+            ));
+        }
+        if let Some(url) = metadata.full_text_url.clone() {
+            access_actions.push(self.render_reference_action(
+                "open-reference-pdf",
+                IconName::File,
+                "Open PDF",
+                "Full text document".to_owned(),
+                url,
+                true,
+                identity_color,
+                palette,
+                cx,
+            ));
+        }
+        if let Some(url) = doi_url {
+            access_actions.push(self.render_reference_action(
+                "open-reference-doi",
+                IconName::ExternalLink,
+                "Publisher page",
+                metadata.doi.clone().unwrap_or_default(),
+                url,
+                false,
+                identity_color,
+                palette,
+                cx,
+            ));
+        }
+        if let Some(url) = metadata.landing_url.clone() {
+            access_actions.push(self.render_reference_action(
+                "open-reference-metadata",
+                IconName::Globe,
+                "Metadata record",
+                url_host_label(&url),
+                url,
+                false,
+                identity_color,
+                palette,
+                cx,
+            ));
+        }
         let content = div()
             .size_full()
             .min_w_0()
@@ -6730,9 +6932,9 @@ impl PdfReader {
             .flex_col()
             .child(
                 div()
-                    .h(px(54.0))
+                    .h(px(58.0))
                     .flex_none()
-                    .px_4()
+                    .px_5()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -6740,6 +6942,7 @@ impl PdfReader {
                     .border_color(palette.separator)
                     .child(
                         div()
+                            .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(palette.text)
                             .child("Reference details"),
@@ -6765,23 +6968,94 @@ impl PdfReader {
             )
             .child(
                 div()
+                    .h(px(hero_height))
+                    .flex_none()
+                    .relative()
+                    .overflow_hidden()
+                    .bg(identity_color.opacity(0.14))
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(5.0))
+                            .bg(identity_color),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(-54.0))
+                            .top(px(-64.0))
+                            .size(px(180.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(identity_color.opacity(0.28)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(22.0))
+                            .bottom(px(-70.0))
+                            .size(px(128.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(identity_color.opacity(0.20)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(28.0))
+                            .top(px(28.0))
+                            .text_color(identity_color.opacity(0.52))
+                            .child(Icon::new(IconName::BookOpen).size(px(38.0))),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(22.0))
+                            .right(px(92.0))
+                            .bottom(px(20.0))
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(identity_color)
+                                    .child(source_line),
+                            )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .text_base()
+                                    .line_height(px(22.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(palette.text)
+                                    .child(hero_publication),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(palette.text_secondary)
+                                    .child(hero_year),
+                            ),
+                    ),
+            )
+            .child(
+                div()
                     .id("reference-details-scroll")
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
                     .overflow_y_scroll()
-                    .p_5()
+                    .px_5()
+                    .pt_5()
+                    .pb_6()
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(palette.text_tertiary)
-                            .child(source_line),
-                    )
-                    .child(
-                        div()
-                            .mt_3()
-                            .text_lg()
-                            .line_height(px(25.0))
+                            .text_size(px(title_size))
+                            .line_height(px(title_size + 7.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(palette.text)
                             .child(metadata.title),
@@ -6789,81 +7063,149 @@ impl PdfReader {
                     .child(
                         div()
                             .mt_3()
-                            .text_sm()
-                            .line_height(px(20.0))
-                            .text_color(palette.text_secondary)
-                            .child(authors),
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_4()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(access_color)
+                                    .child(Icon::new(access_icon).size(px(14.0)))
+                                    .child(access_label),
+                            )
+                            .when_some(metadata.doi.clone(), |status, doi| {
+                                status.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_color(palette.text_tertiary)
+                                        .child(Icon::new(IconName::ExternalLink).size(px(13.0)))
+                                        .child(doi),
+                                )
+                            }),
                     )
                     .child(
                         div()
-                            .mt_2()
-                            .text_xs()
-                            .text_color(palette.text_tertiary)
-                            .child(publication),
+                            .mt_6()
+                            .pt_4()
+                            .border_t_1()
+                            .border_color(palette.separator)
+                            .child(
+                                div()
+                                    .mb_1()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(identity_color)
+                                    .child("CITATION"),
+                            )
+                            .child(
+                                div()
+                                    .py_3()
+                                    .flex()
+                                    .items_start()
+                                    .gap_4()
+                                    .child(
+                                        div()
+                                            .w(px(92.0))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .text_xs()
+                                            .text_color(palette.text_tertiary)
+                                            .child(Icon::new(IconName::CircleUser).size(px(14.0)))
+                                            .child("Authors"),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .text_sm()
+                                            .line_height(px(20.0))
+                                            .text_color(palette.text)
+                                            .child(authors),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .py_3()
+                                    .border_t_1()
+                                    .border_color(palette.separator)
+                                    .flex()
+                                    .items_start()
+                                    .gap_4()
+                                    .child(
+                                        div()
+                                            .w(px(92.0))
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .text_xs()
+                                            .text_color(palette.text_tertiary)
+                                            .child(Icon::new(IconName::BookOpen).size(px(14.0)))
+                                            .child("Published"),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .text_sm()
+                                            .line_height(px(20.0))
+                                            .text_color(palette.text)
+                                            .child(publication),
+                                    ),
+                            ),
                     )
-                    .when_some(metadata.doi, |body, doi| {
+                    .when(!access_actions.is_empty(), |body| {
                         body.child(
                             div()
-                                .mt_2()
+                                .mt_6()
+                                .mb_1()
                                 .text_xs()
-                                .text_color(palette.text_tertiary)
-                                .child(format!("DOI {doi}")),
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(identity_color)
+                                .child("ACCESS & LINKS"),
+                        )
+                        .child(
+                            div()
+                                .border_b_1()
+                                .border_color(palette.separator)
+                                .children(access_actions),
                         )
                     })
                     .when_some(metadata.abstract_text, |body, abstract_text| {
                         body.child(
                             div()
-                                .mt_5()
+                                .mt_6()
                                 .child(
                                     div()
                                         .mb_2()
-                                        .text_sm()
+                                        .text_xs()
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(palette.text)
-                                        .child("Abstract"),
+                                        .text_color(identity_color)
+                                        .child("ABSTRACT"),
                                 )
                                 .child(
                                     div()
                                         .id("reference-abstract-scroll")
-                                        .max_h(px(240.0))
+                                        .max_h(px(abstract_height))
                                         .overflow_y_scroll()
+                                        .pl_4()
                                         .pr_2()
+                                        .border_l_2()
+                                        .border_color(identity_color.opacity(0.52))
                                         .text_sm()
                                         .line_height(px(21.0))
                                         .text_color(palette.text_secondary)
                                         .child(abstract_text),
                                 ),
-                        )
-                    })
-                    .when_some(full_text_url, |body, full_text_url| {
-                        body.child(
-                            div()
-                                .id("open-reference-paper")
-                                .mt_5()
-                                .h(px(34.0))
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .rounded_md()
-                                .bg(palette.accent)
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(palette.accent_foreground)
-                                .cursor_pointer()
-                                .hover(|button| button.bg(palette.accent_hover))
-                                .active(|button| button.bg(palette.accent_active))
-                                .on_click(cx.listener(move |reader, _, _, cx| {
-                                    if let Err(error) = open::that_detached(&full_text_url) {
-                                        reader.warning =
-                                            Some(format!("Could not open paper: {error}").into());
-                                    }
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }))
-                                .child(Icon::new(IconName::ExternalLink).size(px(15.0)))
-                                .child("Open paper"),
                         )
                     }),
             );
@@ -6880,6 +7222,96 @@ impl PdfReader {
                 .child(FloatingPanel::new(palette, content))
                 .into_any_element(),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_reference_action(
+        &self,
+        id: &'static str,
+        icon: IconName,
+        label: &'static str,
+        detail: String,
+        url: String,
+        primary: bool,
+        identity_color: gpui::Hsla,
+        palette: ReaderPalette,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(id)
+            .min_h(px(54.0))
+            .px_1()
+            .py_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_t_1()
+            .border_color(palette.separator)
+            .cursor_pointer()
+            .hover(move |row| row.bg(identity_color.opacity(0.10)))
+            .active(move |row| row.bg(palette.control_pressed))
+            .on_click(cx.listener(move |reader, _, _, cx| {
+                if let Err(error) = open::that_detached(&url) {
+                    reader.warning = Some(format!("Could not open reference: {error}").into());
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .size(px(30.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .bg(if primary {
+                        identity_color
+                    } else {
+                        identity_color.opacity(0.12)
+                    })
+                    .text_color(if primary {
+                        palette.accent_foreground
+                    } else {
+                        identity_color
+                    })
+                    .child(Icon::new(icon).size(px(15.0))),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if primary {
+                                identity_color
+                            } else {
+                                palette.text
+                            })
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .mt(px(1.0))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(palette.text_tertiary)
+                            .child(detail),
+                    ),
+            )
+            .child(
+                Icon::new(IconName::ExternalLink)
+                    .size(px(14.0))
+                    .text_color(if primary {
+                        identity_color
+                    } else {
+                        palette.text_tertiary
+                    }),
+            )
+            .into_any_element()
     }
 
     fn render_fluid_main_pill(
@@ -8949,6 +9381,8 @@ impl Render for PdfReader {
             }
             ReaderView::Fluid => {
                 let panel_width = self.fluid_panel_width();
+                let sidebar_reveal =
+                    fluid_sidebar_extent(self.viewport_width, self.sidebar.progress);
                 let panel_reveal = self.fluid_panel_occlusion();
                 let available_width = (self.viewport_width - panel_reveal).max(1.0);
                 let main_pill = self.render_fluid_main_pill(
@@ -8991,7 +9425,7 @@ impl Render for PdfReader {
                     .top_0()
                     .bottom_0()
                     .right_0()
-                    .w(px(panel_reveal))
+                    .w(px(sidebar_reveal))
                     .overflow_hidden()
                     .child(
                         div()
@@ -9044,7 +9478,7 @@ impl Render for PdfReader {
             None
         };
 
-        let reference_details_panel = self.render_reference_details_panel(palette, cx);
+        let reference_details_panel = self.render_reference_details_panel(palette, full_width, cx);
         div()
             .key_context("PdfReader")
             .track_focus(&self.focus_handle)
@@ -9558,6 +9992,40 @@ fn text_bounds_overlap(left: TextBounds, right: TextBounds) -> bool {
         && left.bottom > right.top
 }
 
+fn reference_panel_width(full_width: f32) -> f32 {
+    let maximum =
+        (full_width - MIN_DOCUMENT_VIEWPORT_WIDTH - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(0.0);
+    (full_width * 0.36)
+        .clamp(REFERENCE_PANEL_MIN_WIDTH, REFERENCE_PANEL_MAX_WIDTH)
+        .min(maximum)
+}
+
+fn reference_panel_extent(full_width: f32, progress: f32) -> f32 {
+    let width = reference_panel_width(full_width);
+    if width <= 0.0 {
+        0.0
+    } else {
+        (width + FLUID_PANEL_HORIZONTAL_MARGIN * 2.0) * progress.clamp(0.0, 1.0)
+    }
+}
+
+fn fluid_sidebar_width(full_width: f32) -> f32 {
+    SIDEBAR_WIDTH.min((full_width - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(0.0))
+}
+
+fn fluid_sidebar_extent(full_width: f32, progress: f32) -> f32 {
+    (fluid_sidebar_width(full_width) + FLUID_PANEL_HORIZONTAL_MARGIN * 2.0)
+        * progress.clamp(0.0, 1.0)
+}
+
+fn url_host_label(value: &str) -> String {
+    url::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .map(|host| host.strip_prefix("www.").unwrap_or(&host).to_owned())
+        .unwrap_or_else(|| "Web link".to_owned())
+}
+
 fn scientific_reference_matches(
     reference: &ScientificReference,
     target_page: usize,
@@ -9600,6 +10068,44 @@ fn union_text_bounds(left: TextBounds, right: TextBounds) -> TextBounds {
         right: left.right.max(right.right),
         bottom: left.bottom.max(right.bottom),
     }
+}
+
+fn measured_preview_width(lines: &[&str], minimum: f32, maximum: f32) -> f32 {
+    let longest = lines
+        .iter()
+        .map(|line| line.chars().count().min(64))
+        .max()
+        .unwrap_or(0);
+    (longest as f32 * 6.6 + 54.0).clamp(minimum, maximum)
+}
+
+fn reference_identity_color(title: &str, palette: ReaderPalette) -> gpui::Hsla {
+    let signature = title.bytes().fold(0_u32, |hash, byte| {
+        hash.wrapping_mul(16777619).wrapping_add(u32::from(byte))
+    });
+    match signature % 4 {
+        0 => palette.blue,
+        1 => palette.pink,
+        2 => palette.purple,
+        _ => palette.green,
+    }
+}
+
+fn reference_hero_height(publication: &str) -> f32 {
+    let wrapped_lines = publication.chars().count().div_ceil(34).clamp(1, 3);
+    126.0 + (wrapped_lines.saturating_sub(1) as f32 * 20.0)
+}
+
+fn reference_preview_width(state: Option<&ScholarlyMetadataState>, expansion_progress: f32) -> f32 {
+    let compact_width = 232.0;
+    let Some(ScholarlyMetadataState::Ready(metadata)) = state else {
+        return compact_width;
+    };
+    let title = compact_words(&metadata.title, 11);
+    let citation = compact_citation_line(metadata);
+    let expanded_width =
+        measured_preview_width(&[title.as_str(), citation.as_str()], 280.0, LINK_CARD_WIDTH);
+    compact_width + (expanded_width - compact_width) * expansion_progress.clamp(0.0, 1.0)
 }
 
 fn compact_words(text: &str, maximum_words: usize) -> String {
@@ -9656,10 +10162,10 @@ fn compact_citation_line(metadata: &ScholarlyMetadata) -> String {
     parts.join(" · ")
 }
 
-fn loading_source_icon(palette: ReaderPalette) -> gpui::AnyElement {
+fn loading_source_icon(color: gpui::Hsla) -> gpui::AnyElement {
     Icon::new(IconName::LoaderCircle)
         .size(px(15.0))
-        .text_color(palette.accent)
+        .text_color(color)
         .with_animation(
             "reference-source-spinner",
             Animation::new(Duration::from_millis(800))
@@ -9744,6 +10250,48 @@ mod tests {
     }
 
     #[test]
+    fn reference_previews_measure_content_and_expand_their_shell_smoothly() {
+        let short = measured_preview_width(&["Short"], 220.0, 340.0);
+        let long = measured_preview_width(
+            &["A substantially longer title that should earn a wider preview shell"],
+            220.0,
+            340.0,
+        );
+        assert_eq!(short, 220.0);
+        assert!(long > short);
+        assert_eq!(long, 340.0);
+
+        let ready = ScholarlyMetadataState::Ready(ScholarlyMetadata {
+            source: crate::scholarly::ScholarlySource::OpenAlex,
+            title: "A substantially longer scientific title for adaptive sizing".to_owned(),
+            abstract_text: None,
+            authors: vec!["Ada Author".to_owned(), "Ben Writer".to_owned()],
+            year: Some(2025),
+            journal: Some("Journal of Responsive Interfaces".to_owned()),
+            journal_url: None,
+            doi: Some("10.1000/adaptive".to_owned()),
+            open_access: Some(true),
+            full_text_url: None,
+            landing_url: None,
+            certainty: None,
+        });
+        let collapsed = reference_preview_width(Some(&ready), 0.0);
+        let halfway = reference_preview_width(Some(&ready), 0.5);
+        let expanded = reference_preview_width(Some(&ready), 1.0);
+        assert_eq!(collapsed, 232.0);
+        assert!(halfway > collapsed && halfway < expanded);
+        assert!(expanded <= LINK_CARD_WIDTH);
+        assert_eq!(reference_preview_width(None, 1.0), 232.0);
+        assert_eq!(reference_hero_height("Short journal"), 126.0);
+        assert_eq!(
+            reference_hero_height(
+                "A journal with a deliberately long descriptive name that wraps cleanly"
+            ),
+            166.0
+        );
+    }
+
+    #[test]
     fn reusable_reveal_state_reverses_and_settles() {
         let mut reveal = RevealState {
             target: 1.0,
@@ -9758,6 +10306,37 @@ mod tests {
             reveal.advance(1.0 / 60.0);
         }
         assert_eq!(reveal.progress, 0.0);
+    }
+
+    #[test]
+    fn reference_panel_geometry_is_responsive_and_preserves_document_space() {
+        assert_eq!(reference_panel_width(250.0), 0.0);
+        assert_eq!(reference_panel_extent(250.0, 1.0), 0.0);
+        assert_eq!(reference_panel_width(500.0), 176.0);
+        assert!((reference_panel_width(1_100.0) - 396.0).abs() < 0.001);
+        assert_eq!(reference_panel_width(2_000.0), REFERENCE_PANEL_MAX_WIDTH);
+
+        let full_extent = reference_panel_extent(1_100.0, 1.0);
+        assert!((full_extent - 420.0).abs() < 0.001);
+        assert_eq!(reference_panel_extent(1_100.0, -2.0), 0.0);
+        assert_eq!(reference_panel_extent(1_100.0, 2.0), full_extent);
+        assert!(1_100.0 - full_extent >= MIN_DOCUMENT_VIEWPORT_WIDTH);
+
+        assert_eq!(fluid_sidebar_extent(1_100.0, 0.0), 0.0);
+        assert_eq!(fluid_sidebar_extent(1_100.0, 1.0), 368.0);
+        assert_eq!(fluid_sidebar_extent(1_100.0, -1.0), 0.0);
+        assert_eq!(fluid_sidebar_extent(1_100.0, 2.0), 368.0);
+        assert!(reference_panel_extent(1_100.0, 1.0) > 0.0);
+    }
+
+    #[test]
+    fn reference_link_labels_use_safe_compact_hosts() {
+        assert_eq!(
+            url_host_label("https://www.nature.com/articles/example"),
+            "nature.com"
+        );
+        assert_eq!(url_host_label("https://doi.org/10.1/test"), "doi.org");
+        assert_eq!(url_host_label("not a URL"), "Web link");
     }
 
     #[test]

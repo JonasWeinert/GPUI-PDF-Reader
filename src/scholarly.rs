@@ -53,6 +53,7 @@ pub struct ScholarlyMetadata {
     pub authors: Vec<String>,
     pub year: Option<u32>,
     pub journal: Option<String>,
+    pub journal_url: Option<String>,
     pub doi: Option<String>,
     pub open_access: Option<bool>,
     pub full_text_url: Option<String>,
@@ -283,24 +284,16 @@ fn parse_openalex(value: &Value) -> Option<ScholarlyMetadata> {
         .map(normalize_space)
         .filter(|journal| !journal.is_empty());
     let open_access = value.pointer("/open_access/is_oa").and_then(Value::as_bool);
-    let full_text_url = [
-        "/best_oa_location/pdf_url",
-        "/best_oa_location/landing_page_url",
-    ]
-    .into_iter()
-    .find_map(|pointer| http_string(value.pointer(pointer)))
-    .or_else(|| {
+    let full_text_url = http_string(value.pointer("/best_oa_location/pdf_url")).or_else(|| {
         value
             .get("locations")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .find_map(|location| {
-                http_string(location.get("pdf_url"))
-                    .or_else(|| http_string(location.get("landing_page_url")))
-            })
+            .find_map(|location| http_string(location.get("pdf_url")))
     });
-    let landing_url = http_string(value.get("doi")).or_else(|| http_string(value.get("id")));
+    let journal_url = http_string(value.pointer("/primary_location/landing_page_url"));
+    let landing_url = http_string(value.get("id"));
     Some(ScholarlyMetadata {
         source: ScholarlySource::OpenAlex,
         title,
@@ -313,6 +306,7 @@ fn parse_openalex(value: &Value) -> Option<ScholarlyMetadata> {
             .and_then(Value::as_u64)
             .and_then(|year| u32::try_from(year).ok()),
         journal,
+        journal_url,
         doi: value
             .get("doi")
             .and_then(Value::as_str)
@@ -381,6 +375,7 @@ fn parse_semantic_scholar(value: &Value, query: &str) -> Option<ScholarlyMetadat
             .and_then(Value::as_str)
             .map(normalize_space)
             .filter(|venue| !venue.is_empty()),
+        journal_url: None,
         doi: work
             .pointer("/externalIds/DOI")
             .and_then(Value::as_str)
@@ -530,7 +525,10 @@ mod tests {
                 {"author": {"display_name": "Ada Author"}},
                 {"author": {"display_name": "Ben Writer"}}
             ],
-            "primary_location": {"source": {"display_name": "Good Journal"}},
+            "primary_location": {
+                "landing_page_url": "https://journal.example/article",
+                "source": {"display_name": "Good Journal"}
+            },
             "best_oa_location": {
                 "pdf_url": "https://example.org/paper.pdf",
                 "landing_page_url": "https://example.org/paper"
@@ -551,6 +549,44 @@ mod tests {
         assert_eq!(metadata.authors, vec!["Ada Author", "Ben Writer"]);
         assert_eq!(metadata.doi.as_deref(), Some("10.1000/example"));
         assert_eq!(metadata.open_access, Some(true));
+        assert_eq!(
+            metadata.full_text_url.as_deref(),
+            Some("https://example.org/paper.pdf")
+        );
+        assert_eq!(
+            metadata.journal_url.as_deref(),
+            Some("https://journal.example/article")
+        );
+        assert_eq!(
+            metadata.landing_url.as_deref(),
+            Some("https://openalex.org/W1")
+        );
+    }
+
+    #[test]
+    fn openalex_never_labels_a_landing_page_as_a_pdf() {
+        let value = json!({
+            "id": "https://openalex.org/W2",
+            "title": "Landing pages are not documents",
+            "primary_location": {
+                "landing_page_url": "https://publisher.example/article",
+                "source": {"display_name": "Example Journal"}
+            },
+            "best_oa_location": {
+                "landing_page_url": "https://repository.example/item"
+            },
+            "locations": [{
+                "landing_page_url": "https://another.example/work",
+                "pdf_url": null
+            }]
+        });
+
+        let metadata = parse_openalex(&value).unwrap();
+        assert_eq!(metadata.full_text_url, None);
+        assert_eq!(
+            metadata.journal_url.as_deref(),
+            Some("https://publisher.example/article")
+        );
     }
 
     #[test]

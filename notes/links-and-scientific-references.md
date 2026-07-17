@@ -12,3 +12,9 @@
 - Retain each bibliography entry's exact multi-line text bounds. Use them for target hover, jump focus, and as the hard boundary for scholarly lookup; internal targets outside those bounds are figures/tables/sections and get a local thumbnail instead.
 - Render destination thumbnails as bounded, latest-wins crop requests on the existing PDFium worker. A second PDFium thread would reintroduce unsafe concurrent engine access.
 - Keep hover cards compact and move long abstracts into a reusable floating detail panel with independent scrolling. Deliberate ellipses are safer than clipping live text against rounded corners.
+- Treat a floating details panel as viewport geometry, not decoration: preserve the visible-center anchor during reveal and add the occluded width to horizontal scroll range so no PDF content becomes unreachable.
+- Keep the actual sidebar reveal width separate from total panel occlusion. Otherwise a closed Search/Comments panel can remain visible or intercept input behind another floating panel.
+- Do not infer a PDF URL from a scholarly landing page. Model publisher/journal, full-text PDF, DOI, and metadata-record destinations separately and label each action honestly.
+- Size hover previews from bounded text measurements and interpolate width during metadata reveal; a single fixed tooltip width makes short failures feel empty and long citations cramped.
+- A stable title-derived theme color gives each reference visual identity without storing artwork. Use it consistently for the preview rail, detail hero, section labels, and link affordances.
+- Prefer editorial dividers and key/value rows over nested gray cards for dense reference metadata. Let long journal names increase the hero height rather than clipping them.

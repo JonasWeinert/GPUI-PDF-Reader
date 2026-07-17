@@ -285,6 +285,8 @@ fn main() {
                     });
             let toc_callout_hold =
                 std::env::var_os("GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD").is_some();
+            let reference_details =
+                std::env::var_os("GPUI_PDF_READER_QA_REFERENCE_DETAILS").is_some();
             if !keystrokes.is_empty()
                 || !wheel_deltas.is_empty()
                 || report
@@ -298,6 +300,7 @@ fn main() {
                 || internal_link_hover.is_some()
                 || scientific_reference_hover.is_some()
                 || toc_callout_hold
+                || reference_details
             {
                 window
                     .update(cx, |_, window, cx| {
@@ -381,6 +384,61 @@ fn main() {
                                         eprintln!("GPUI_PDF_READER_QA_ERROR {message}");
                                         let _ = cx.update(|_, cx| cx.quit());
                                         return;
+                                    }
+                                }
+                                if reference_details {
+                                    let Some(details_ordinal) = scientific_reference_hover else {
+                                        eprintln!(
+                                            "GPUI_PDF_READER_QA_ERROR reference details require GPUI_PDF_READER_QA_SCIENTIFIC_REFERENCE_HOVER"
+                                        );
+                                        let _ = cx.update(|_, cx| cx.quit());
+                                        return;
+                                    };
+                                    let details_deadline = std::time::Instant::now()
+                                        + Duration::from_millis(timeout);
+                                    loop {
+                                        let outcome = cx
+                                            .update(|window, cx| {
+                                                let Some(Some(reader)) =
+                                                    window.root::<reader::PdfReader>()
+                                                else {
+                                                    return Err(
+                                                        "reference details reader is unavailable"
+                                                            .to_owned(),
+                                                    );
+                                                };
+                                                reader.update(cx, |reader, cx| {
+                                                    reader.qa_open_reference_details(
+                                                        details_ordinal,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })
+                                            })
+                                            .unwrap_or_else(|error| {
+                                                Err(format!(
+                                                    "reference details window update failed: {error}"
+                                                ))
+                                            });
+                                        match outcome {
+                                            Ok(true) => break,
+                                            Ok(false) => {}
+                                            Err(message) => {
+                                                eprintln!("GPUI_PDF_READER_QA_ERROR {message}");
+                                                let _ = cx.update(|_, cx| cx.quit());
+                                                return;
+                                            }
+                                        }
+                                        if std::time::Instant::now() >= details_deadline {
+                                            eprintln!(
+                                                "GPUI_PDF_READER_QA_ERROR reference details did not load"
+                                            );
+                                            let _ = cx.update(|_, cx| cx.quit());
+                                            return;
+                                        }
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(25))
+                                            .await;
                                     }
                                 }
                                 if feature_scenario || fluid_scenario {
@@ -611,8 +669,16 @@ mod tests {
             IconName::ArrowUp,
             IconName::BookOpen,
             IconName::ChevronLeft,
+            IconName::CircleCheck,
+            IconName::CircleUser,
+            IconName::CircleX,
+            IconName::Close,
             IconName::ExternalLink,
+            IconName::EyeOff,
+            IconName::File,
             IconName::Globe,
+            IconName::Info,
+            IconName::LoaderCircle,
             IconName::Menu,
             IconName::Minus,
             IconName::Moon,
