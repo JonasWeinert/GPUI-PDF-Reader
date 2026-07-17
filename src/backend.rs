@@ -2572,12 +2572,13 @@ mod tests {
         assert!(analysis.is_scientific);
         assert_eq!(analysis.signals.reference_entries, 8);
         assert!(analysis.signals.doi_entries >= 2);
+        assert_eq!(analysis.signals.bracket_citations, 1);
         assert!(
             analysis.signals.superscript_citations >= 4,
             "signals were {:?}",
             analysis.signals
         );
-        assert_eq!(analysis.synthetic_links.len(), 4);
+        assert_eq!(analysis.synthetic_links.len(), 5);
         assert!(
             analysis
                 .synthetic_links

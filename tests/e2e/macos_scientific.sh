@@ -23,7 +23,7 @@ fi
 
 cd "$root"
 cargo build --locked
-GPUI_PDF_READER_QA_SCIENTIFIC_REFERENCE_HOVER=0 \
+GPUI_PDF_READER_QA_LINK_HOVER=0 \
 GPUI_PDF_READER_QA_TIMEOUT_MS=30000 \
 GPUI_PDF_READER_QA_REPORT=1 \
 GPUI_PDF_READER_QA_EXIT=1 \
@@ -53,7 +53,7 @@ if [ "$(printf '%s\n' "$report" | wc -l | tr -d ' ')" -ne 1 ]; then
   exit 1
 fi
 case "$report" in
-  *"links=4 "*"reference_preview=1 "*"scholarly=failed "*"scientific=1/1 "*"references=8 "*"dois=2 "*"superscript_citations=4 "*"pending=0 "*"debouncing=0 "*"status=Ready") ;;
+  *"links=5 "*"link_preview=1 "*"reference_preview=0 "*"reference_group=3 "*"scholarly=failed "*"scientific=1/1 "*"references=8 "*"dois=2 "*"bracket_citations=1 "*"superscript_citations=4 "*"pending=0 "*"debouncing=0 "*"status=Ready") ;;
   *)
     printf 'Scientific-document E2E did not infer its references: %s\n' "$report" >&2
     exit 1

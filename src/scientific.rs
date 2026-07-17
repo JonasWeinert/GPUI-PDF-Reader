@@ -7,6 +7,7 @@ const MAX_REFERENCE_ENTRIES: usize = 1_000;
 const MAX_SYNTHETIC_LINKS: usize = 10_000;
 const MAX_REFERENCE_TEXT_CHARACTERS: usize = 2_000;
 const MAX_CITATION_SOURCE_CHARACTERS: usize = 24;
+const MAX_GROUPED_CITATION_REFERENCES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ScientificSignals {
@@ -33,6 +34,72 @@ pub struct ScientificReference {
     pub y_fraction: Option<f32>,
     pub text: String,
     pub text_runs: Vec<TextBounds>,
+}
+
+/// Parses the compact numeric citation grammar commonly rendered as
+/// `[20-22]`, `[20, 22-24]`, or an unwrapped superscript equivalent.
+/// A group is returned only when it contains at least two distinct, bounded
+/// reference numbers; callers can therefore fall back to their single-link
+/// destination without treating ordinary numbers as citation groups.
+pub fn grouped_citation_numbers(source: &str) -> Option<Vec<u32>> {
+    let source = source.trim().trim_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '.' | ':' | ',' | ';' | '†' | '*')
+    });
+    let inner = match (source.chars().next(), source.chars().last()) {
+        (Some('['), Some(']')) | (Some('('), Some(')')) => {
+            source.get(1..source.len().saturating_sub(1))?
+        }
+        (Some('[' | '('), _) | (_, Some(']' | ')')) => return None,
+        _ => source,
+    };
+    if inner.is_empty()
+        || inner.chars().any(|character| {
+            !(character.is_ascii_digit()
+                || character.is_whitespace()
+                || matches!(character, ',' | ';' | '-' | '–' | '—'))
+        })
+    {
+        return None;
+    }
+
+    let mut numbers = Vec::new();
+    for part in inner.split([',', ';']) {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        let bounds = part
+            .split(['-', '–', '—'])
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        let (start, end) = match bounds.as_slice() {
+            [single] => {
+                let number = parse_reference_number(single)?;
+                (number, number)
+            }
+            [start, end] if !start.is_empty() && !end.is_empty() => {
+                (parse_reference_number(start)?, parse_reference_number(end)?)
+            }
+            _ => return None,
+        };
+        if end < start || usize::try_from(end - start + 1).ok()? > MAX_GROUPED_CITATION_REFERENCES {
+            return None;
+        }
+        for number in start..=end {
+            if !numbers.contains(&number) {
+                numbers.push(number);
+                if numbers.len() > MAX_GROUPED_CITATION_REFERENCES {
+                    return None;
+                }
+            }
+        }
+    }
+    (numbers.len() >= 2).then_some(numbers)
+}
+
+fn parse_reference_number(value: &str) -> Option<u32> {
+    let number = value.parse::<u32>().ok()?;
+    (number > 0 && number <= MAX_REFERENCE_ENTRIES as u32).then_some(number)
 }
 
 type ReferenceEntry = ScientificReference;
@@ -680,6 +747,22 @@ mod tests {
             Some("10.1001/jama.2016.17216")
         );
         assert_eq!(detect_doi("not a doi 10.12/no"), None);
+    }
+
+    #[test]
+    fn grouped_citations_expand_ranges_and_reject_unsafe_or_partial_grammar() {
+        assert_eq!(grouped_citation_numbers("[20-22]"), Some(vec![20, 21, 22]));
+        assert_eq!(grouped_citation_numbers("[20-22]."), Some(vec![20, 21, 22]));
+        assert_eq!(
+            grouped_citation_numbers("(20, 22–24; 24)"),
+            Some(vec![20, 22, 23, 24])
+        );
+        assert_eq!(grouped_citation_numbers("20—22"), Some(vec![20, 21, 22]));
+        assert_eq!(grouped_citation_numbers("[20]"), None);
+        assert_eq!(grouped_citation_numbers("[22-20]"), None);
+        assert_eq!(grouped_citation_numbers("[20-]"), None);
+        assert_eq!(grouped_citation_numbers("[20-80]"), None);
+        assert_eq!(grouped_citation_numbers("[20-22] text"), None);
     }
 
     #[test]

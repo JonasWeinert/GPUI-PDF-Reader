@@ -25,6 +25,7 @@ BT /F1 13 Tf 54 610 Td (Further evidence supports the second claim) Tj ET
 BT /F1 7 Tf 15 Ts 309 610 Td (2) Tj ET
 BT /F1 13 Tf 54 560 Td (Another experiment confirmed the finding) Tj ET
 BT /F1 7 Tf 15 Ts 299 560 Td (3) Tj ET
+BT /F1 13 Tf 54 510 Td (A combined analysis reconciled reports [1-3].) Tj ET
 "#;
     let body_two = br#"BT /F1 20 Tf 54 720 Td (Results) Tj ET
 BT /F1 13 Tf 54 660 Td (The final analysis agrees with earlier reports) Tj ET

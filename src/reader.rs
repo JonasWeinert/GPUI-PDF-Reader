@@ -11,7 +11,7 @@ use crate::floating_panel::FloatingPanel;
 use crate::link_preview::{
     LinkPreviewEvent, LinkPreviewFetcher, LinkPreviewSession, WebsitePreviewState,
 };
-use crate::link_resolution::{ResolvedInternalLink, resolve_internal_link};
+use crate::link_resolution::{ResolvedInternalLink, link_source_text, resolve_internal_link};
 #[cfg(test)]
 use crate::model::TextChar;
 use crate::model::{
@@ -24,10 +24,11 @@ use crate::navigation_focus::{
 };
 use crate::scholarly::{
     ScholarlyEvent, ScholarlyFetcher, ScholarlyMetadata, ScholarlyMetadataState, ScholarlySession,
+    ScholarlySource,
 };
-use crate::scientific::ScientificReference;
 #[cfg(debug_assertions)]
 use crate::scientific::ScientificSignals;
+use crate::scientific::{ScientificReference, grouped_citation_numbers};
 use crate::search::{
     MAX_SEARCH_QUERY_BYTES, SearchMatch, SearchMatchId, SearchPageOutcome, SearchQuery, search_page,
 };
@@ -45,11 +46,14 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, PromptButton,
     PromptLevel, Render, RenderImage, ScrollStrategy, ScrollWheelEvent, SharedString, Task,
     Transformation, UniformListScrollHandle, Window, WindowControlArea, canvas, div, ease_in_out,
-    img, percentage, point, prelude::*, px, quad, size, uniform_list,
+    img, percentage, point, prelude::*, px, quad, rems, size, uniform_list,
 };
 #[cfg(debug_assertions)]
 use gpui::{Keystroke, Modifiers, ScrollDelta, TouchPhase};
-use gpui_component::{Icon, IconName, Theme};
+use gpui_component::{
+    Icon, IconName, Theme,
+    text::{TextView, TextViewStyle},
+};
 use image::{Frame, RgbaImage};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -99,7 +103,11 @@ const MAX_TOC_HEADING_MATCHES: usize = 16;
 const LINK_CARD_WIDTH: f32 = 340.0;
 const LINK_CARD_MARGIN: f32 = 12.0;
 const LINK_CARD_GAP: f32 = 8.0;
-const LINK_HOVER_LEAVE_DELAY: Duration = Duration::from_millis(140);
+const LINK_HOVER_HANDOFF_DELAY: Duration = Duration::from_millis(180);
+const LINK_HOVER_CLOSE_DELAY: Duration = Duration::from_millis(320);
+const LINK_HOVER_STABILITY_RADIUS: f32 = 3.0;
+const LINK_CARD_MOVE_DEBOUNCE: Duration = Duration::from_millis(45);
+const DOI_COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(1_100);
 
 fn render_appearance_from_theme(theme: &Theme, pdf_dark_mode_enabled: bool) -> RenderAppearance {
     if !theme.is_dark() || !pdf_dark_mode_enabled {
@@ -425,6 +433,28 @@ fn link_card_position(
     Offset { x, y }
 }
 
+fn pointer_link_card_position(
+    pointer: Offset,
+    viewport_width: f32,
+    viewport_height: f32,
+    card_width: f32,
+    estimated_height: f32,
+) -> Offset {
+    let maximum_x = (viewport_width - card_width - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN);
+    let x = (pointer.x - card_width * 0.5).clamp(LINK_CARD_MARGIN, maximum_x);
+    let below = pointer.y + LINK_CARD_GAP;
+    let y = if below + estimated_height <= viewport_height - LINK_CARD_MARGIN {
+        below
+    } else {
+        pointer.y - estimated_height - LINK_CARD_GAP
+    }
+    .clamp(
+        LINK_CARD_MARGIN,
+        (viewport_height - estimated_height - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN),
+    );
+    Offset { x, y }
+}
+
 fn link_preview_should_close(source_hovered: bool, card_hovered: bool) -> bool {
     !source_hovered && !card_hovered
 }
@@ -456,6 +486,19 @@ struct DestinationPreview {
 enum PreviewTarget {
     Link(usize),
     Reference(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingLinkHover {
+    target: Option<PreviewTarget>,
+    position: Point<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ReferenceSummaryTab {
+    #[default]
+    Tldr,
+    Abstract,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1014,7 +1057,15 @@ pub struct PdfReader {
     scholarly_fetcher: ScholarlyFetcher,
     scholarly_session: ScholarlySession,
     reference_details: Option<String>,
+    reference_details_group: Vec<String>,
+    reference_details_transition: RevealState,
+    reference_details_direction: f32,
     reference_panel: RevealState,
+    reference_citation_expansion: RevealState,
+    reference_summary_transition: RevealState,
+    reference_summary_tab: ReferenceSummaryTab,
+    reference_summary_previous_tab: ReferenceSummaryTab,
+    doi_copy_started: Option<Instant>,
     link_card_expansion: RevealState,
     #[cfg(debug_assertions)]
     scientific_analysis_complete: bool,
@@ -1081,6 +1132,10 @@ pub struct PdfReader {
     destination_preview: Option<DestinationPreview>,
     destination_preview_revision: u64,
     link_hover_revision: u64,
+    pending_link_hover: Option<PendingLinkHover>,
+    link_card_pointer: Option<Offset>,
+    link_card_pointer_target: Option<Offset>,
+    link_card_reposition_revision: u64,
     pending_link_click: Option<usize>,
     pending_link_navigation: Option<usize>,
     toc_hovered: Option<usize>,
@@ -1150,7 +1205,21 @@ impl PdfReader {
                 scholarly_fetcher,
                 scholarly_session: ScholarlySession::default(),
                 reference_details: None,
+                reference_details_group: Vec::new(),
+                reference_details_transition: RevealState {
+                    progress: 1.0,
+                    target: 1.0,
+                },
+                reference_details_direction: 1.0,
                 reference_panel: RevealState::default(),
+                reference_citation_expansion: RevealState::default(),
+                reference_summary_transition: RevealState {
+                    progress: 1.0,
+                    target: 1.0,
+                },
+                reference_summary_tab: ReferenceSummaryTab::Tldr,
+                reference_summary_previous_tab: ReferenceSummaryTab::Tldr,
+                doi_copy_started: None,
                 link_card_expansion: RevealState::default(),
                 #[cfg(debug_assertions)]
                 scientific_analysis_complete: false,
@@ -1217,6 +1286,10 @@ impl PdfReader {
                 destination_preview: None,
                 destination_preview_revision: 0,
                 link_hover_revision: 0,
+                pending_link_hover: None,
+                link_card_pointer: None,
+                link_card_pointer_target: None,
+                link_card_reposition_revision: 0,
                 pending_link_click: None,
                 pending_link_navigation: None,
                 toc_hovered: None,
@@ -1376,8 +1449,19 @@ impl PdfReader {
                 ScholarlyMetadataState::Ready(_) => "ready",
                 ScholarlyMetadataState::Failed(_) => "failed",
             });
+        let citation_source = self
+            .previewed_link
+            .and_then(|id| {
+                let document = self.document.as_ref()?;
+                let link = document.links.iter().find(|link| link.id == id)?;
+                let text = self.page_text.get(&link.page)?;
+                Some(link_source_text(text, link.bounds))
+            })
+            .filter(|source| !source.is_empty())
+            .map(|source| source.split_whitespace().collect::<Vec<_>>().join("_"))
+            .unwrap_or_else(|| "none".to_owned());
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} reference_preview={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} reference_panel={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} reference_preview={} reference_group={} citation_source={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} reference_panel={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
             self.view_mode,
             theme_name,
             if matches!(
@@ -1398,6 +1482,8 @@ impl PdfReader {
             self.qa_link_navigations,
             link_preview,
             self.previewed_reference.map_or(0, |index| index + 1),
+            self.current_reference_texts().len(),
+            citation_source,
             link_preview_state,
             scholarly_state,
             u8::from(self.scientific_document),
@@ -1539,14 +1625,21 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        let Some(id) = self
+        let Some((id, page, bounds)) = self
             .document
             .as_ref()
             .and_then(|document| document.links.get(index))
-            .map(|link| link.id)
+            .map(|link| (link.id, link.page, link.bounds))
         else {
             return Err(format!("link index {index} is unavailable"));
         };
+        if let Some(page_rect) = self.layout().and_then(|layout| layout.page_rect(page)) {
+            let bounds = normalized_bounds_in_page(page_rect, bounds);
+            self.set_link_card_pointer_immediate(point(
+                px(bounds.x + bounds.width * 0.5 - self.scroll.x),
+                px(bounds.y + bounds.height * 0.5 - self.scroll.y + self.content_top()),
+            ));
+        }
         self.hovered_link = Some(id);
         self.show_link_preview(id, window, cx);
         self.hovered_link = None;
@@ -1592,6 +1685,24 @@ impl PdfReader {
                 "scientific reference ordinal {ordinal} is unavailable"
             ));
         }
+        if let Some((page, bounds)) = self.document.as_ref().and_then(|document| {
+            let reference = document.scientific_references.get(ordinal)?;
+            Some((
+                reference.page,
+                reference
+                    .text_runs
+                    .iter()
+                    .copied()
+                    .reduce(union_text_bounds)?,
+            ))
+        }) && let Some(page_rect) = self.layout().and_then(|layout| layout.page_rect(page))
+        {
+            let bounds = normalized_bounds_in_page(page_rect, bounds);
+            self.set_link_card_pointer_immediate(point(
+                px(bounds.x + bounds.width * 0.5 - self.scroll.x),
+                px(bounds.y + bounds.height * 0.5 - self.scroll.y + self.content_top()),
+            ));
+        }
         self.hovered_reference = Some(ordinal);
         self.show_reference_preview(ordinal, window, cx);
         self.hovered_reference = None;
@@ -1617,6 +1728,10 @@ impl PdfReader {
         match self.scholarly_session.state(&reference) {
             Some(ScholarlyMetadataState::Ready(_)) => {
                 self.open_reference_details(reference, window, cx);
+                if std::env::var_os("GPUI_PDF_READER_QA_REFERENCE_DETAILS_EXPANDED").is_some() {
+                    self.reference_citation_expansion.target = 1.0;
+                    self.start_animation(window, cx);
+                }
                 Ok(true)
             }
             Some(ScholarlyMetadataState::Loading) | None => Ok(false),
@@ -1684,7 +1799,12 @@ impl PdfReader {
             || self.sidebar.is_animating()
             || self.comment_pane.is_animating()
             || self.reference_panel.is_animating()
+            || self.reference_details_transition.is_animating()
+            || self.reference_citation_expansion.is_animating()
+            || self.reference_summary_transition.is_animating()
+            || self.doi_copy_started.is_some()
             || self.link_card_expansion.is_animating()
+            || self.link_card_pointer_is_animating()
             || self.toc_hover_is_animating()
             || self.pending_toc_navigation.is_some()
             || self.pending_link_navigation.is_some()
@@ -2577,9 +2697,9 @@ impl PdfReader {
                             if event.generation() == reader.generation
                                 && reader.scholarly_session.apply(event) == Some(reader.generation)
                             {
-                                if reader.current_reference_text().is_some_and(|reference| {
+                                if reader.current_reference_texts().iter().any(|reference| {
                                     matches!(
-                                        reader.scholarly_session.state(&reference),
+                                        reader.scholarly_session.state(reference),
                                         Some(ScholarlyMetadataState::Ready(_))
                                     )
                                 }) {
@@ -2686,8 +2806,27 @@ impl PdfReader {
                 self.destination_preview_revision =
                     self.destination_preview_revision.wrapping_add(1);
                 self.reference_details = None;
+                self.reference_details_group.clear();
+                self.reference_details_transition = RevealState {
+                    progress: 1.0,
+                    target: 1.0,
+                };
+                self.reference_details_direction = 1.0;
                 self.reference_panel = RevealState::default();
+                self.reference_citation_expansion = RevealState::default();
+                self.reference_summary_transition = RevealState {
+                    progress: 1.0,
+                    target: 1.0,
+                };
+                self.reference_summary_tab = ReferenceSummaryTab::Tldr;
+                self.reference_summary_previous_tab = ReferenceSummaryTab::Tldr;
+                self.doi_copy_started = None;
                 self.link_card_expansion = RevealState::default();
+                self.pending_link_hover = None;
+                self.link_card_pointer = None;
+                self.link_card_pointer_target = None;
+                self.link_card_reposition_revision =
+                    self.link_card_reposition_revision.wrapping_add(1);
                 self.pending_link_click = None;
                 self.pending_link_navigation = None;
                 self.scroll = Offset::default();
@@ -3119,8 +3258,25 @@ impl PdfReader {
         self.link_preview_session = None;
         self.scholarly_session = ScholarlySession::default();
         self.reference_details = None;
+        self.reference_details_group.clear();
+        self.reference_details_transition = RevealState {
+            progress: 1.0,
+            target: 1.0,
+        };
+        self.reference_details_direction = 1.0;
         self.reference_panel = RevealState::default();
+        self.reference_citation_expansion = RevealState::default();
+        self.reference_summary_transition = RevealState {
+            progress: 1.0,
+            target: 1.0,
+        };
+        self.reference_summary_tab = ReferenceSummaryTab::Tldr;
+        self.reference_summary_previous_tab = ReferenceSummaryTab::Tldr;
+        self.doi_copy_started = None;
         self.link_card_expansion = RevealState::default();
+        self.link_card_pointer = None;
+        self.link_card_pointer_target = None;
+        self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);
         self.destination_preview = None;
         self.destination_preview_revision = self.destination_preview_revision.wrapping_add(1);
         #[cfg(debug_assertions)]
@@ -3172,10 +3328,12 @@ impl PdfReader {
         self.selection = None;
         self.pending_annotation_click = None;
         self.hovered_link = None;
+        self.hovered_reference = None;
         self.link_source_hovered = false;
         self.link_card_hovered = false;
         self.previewed_link = None;
         self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
+        self.pending_link_hover = None;
         self.pending_link_click = None;
         self.pending_link_navigation = None;
         self.toc_hovered = None;
@@ -4552,6 +4710,14 @@ impl PdfReader {
         )
     }
 
+    fn link_card_pointer_is_animating(&self) -> bool {
+        matches!(
+            (self.link_card_pointer, self.link_card_pointer_target),
+            (Some(current), Some(target))
+                if (current.x - target.x).abs() + (current.y - target.y).abs() > 0.35
+        )
+    }
+
     fn queue_animation_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.animation_frame_queued {
             return;
@@ -4598,6 +4764,7 @@ impl PdfReader {
             self.reference_panel.advance(dt);
             if !self.reference_panel.is_animating() && self.reference_panel.target == 0.0 {
                 self.reference_details = None;
+                self.reference_details_group.clear();
             }
         }
         if sidebar_was_animating || reference_was_animating {
@@ -4610,6 +4777,31 @@ impl PdfReader {
         }
         if self.link_card_expansion.is_animating() {
             self.link_card_expansion.advance(dt);
+        }
+        if let (Some(current), Some(target)) = (
+            self.link_card_pointer.as_mut(),
+            self.link_card_pointer_target,
+        ) {
+            current.x += (target.x - current.x) * blend;
+            current.y += (target.y - current.y) * blend;
+            if (current.x - target.x).abs() + (current.y - target.y).abs() < 0.35 {
+                *current = target;
+            }
+        }
+        if self.reference_citation_expansion.is_animating() {
+            self.reference_citation_expansion.advance(dt);
+        }
+        if self.reference_details_transition.is_animating() {
+            self.reference_details_transition.advance(dt);
+        }
+        if self.reference_summary_transition.is_animating() {
+            self.reference_summary_transition.advance(dt);
+        }
+        if self
+            .doi_copy_started
+            .is_some_and(|started| now.duration_since(started) >= DOI_COPY_FEEDBACK_DURATION)
+        {
+            self.doi_copy_started = None;
         }
         advance_toc_hover_state(
             &mut self.toc_hover_position,
@@ -4627,7 +4819,12 @@ impl PdfReader {
             && !self.sidebar.is_animating()
             && !self.comment_pane.is_animating()
             && !self.reference_panel.is_animating()
+            && !self.reference_details_transition.is_animating()
+            && !self.reference_citation_expansion.is_animating()
+            && !self.reference_summary_transition.is_animating()
+            && self.doi_copy_started.is_none()
             && !self.link_card_expansion.is_animating()
+            && !self.link_card_pointer_is_animating()
             && !self.toc_hover_is_animating();
         if navigation_settled {
             self.scroll = self.scroll_target;
@@ -4944,19 +5141,29 @@ impl PdfReader {
             .is_none()
             .then(|| self.hit_test_link(event.position))
             .flatten();
-        if self.hovered_link != hovered_link || self.hovered_reference != hovered_reference {
-            let previous = self.hovered_link;
-            let previous_reference = self.hovered_reference;
-            self.hovered_link = hovered_link;
-            self.hovered_reference = hovered_reference;
-            self.link_source_hovered = hovered_link.is_some() || hovered_reference.is_some();
-            if let Some(id) = hovered_link {
-                self.show_link_preview(id, window, cx);
-            } else if let Some(index) = hovered_reference {
-                self.show_reference_preview(index, window, cx);
-            } else if previous.is_some() || previous_reference.is_some() {
-                self.schedule_link_preview_clear(window, cx);
+        let detected = hovered_reference
+            .map(PreviewTarget::Reference)
+            .or_else(|| hovered_link.map(PreviewTarget::Link));
+        self.hovered_link = hovered_link;
+        self.hovered_reference = hovered_reference;
+        let current = self.current_preview_target();
+        if current.is_none() {
+            if let Some(target) = detected {
+                self.set_link_card_pointer_immediate(event.position);
+                self.show_preview_target(target, window, cx);
             }
+        } else if detected == current {
+            self.link_source_hovered = true;
+            self.cancel_pending_link_hover();
+            self.schedule_link_card_reposition(event.position, window, cx);
+        } else {
+            // Do not hand the card to a neighboring link merely because the
+            // pointer crossed its tight PDF bounds. The new target must remain
+            // stable for the full settle interval first.
+            self.link_source_hovered = false;
+            self.schedule_stable_link_hover(detected, event.position, window, cx);
+        }
+        if current != detected {
             cx.notify();
         }
     }
@@ -5087,12 +5294,27 @@ impl PdfReader {
         if !self.scientific_document {
             return false;
         }
-        let Some(reference) = self.scientific_reference_for_link(id).cloned() else {
+        let references = self.scientific_reference_indices_for_link(id);
+        if references.is_empty() {
             self.request_destination_preview(id);
             return false;
-        };
-        self.scholarly_session
-            .request(&self.scholarly_fetcher, self.generation, &reference.text)
+        }
+        let texts = self
+            .document
+            .as_ref()
+            .map(|document| {
+                references
+                    .into_iter()
+                    .filter_map(|index| document.scientific_references.get(index))
+                    .map(|reference| reference.text.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        texts.into_iter().fold(false, |requested, reference| {
+            self.scholarly_session
+                .request(&self.scholarly_fetcher, self.generation, &reference)
+                || requested
+        })
     }
 
     fn request_scholarly_for_reference(&mut self, index: usize) -> bool {
@@ -5108,17 +5330,31 @@ impl PdfReader {
             .request(&self.scholarly_fetcher, self.generation, &reference.text)
     }
 
+    #[cfg(debug_assertions)]
     fn current_reference_text(&self) -> Option<String> {
-        let document = self.document.as_ref()?;
+        self.current_reference_texts().into_iter().next()
+    }
+
+    fn current_reference_texts(&self) -> Vec<String> {
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
         if let Some(index) = self.previewed_reference {
             return document
                 .scientific_references
                 .get(index)
-                .map(|reference| reference.text.clone());
+                .map(|reference| vec![reference.text.clone()])
+                .unwrap_or_default();
         }
         self.previewed_link
-            .and_then(|id| self.scientific_reference_for_link(id))
-            .map(|reference| reference.text.clone())
+            .map(|id| {
+                self.scientific_reference_indices_for_link(id)
+                    .into_iter()
+                    .filter_map(|index| document.scientific_references.get(index))
+                    .map(|reference| reference.text.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn jump_to_scientific_reference(
@@ -5155,6 +5391,16 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_reference_details_group(reference.clone(), vec![reference], window, cx);
+    }
+
+    fn open_reference_details_group(
+        &mut self,
+        reference: String,
+        mut group: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let center_anchor = self.layout().and_then(|layout| {
             layout.anchor_at_content_point(
                 self.scroll.x + self.panel_safe_viewport_width() * 0.5,
@@ -5168,13 +5414,90 @@ impl PdfReader {
         }
         self.fit_width = false;
         self.scroll_target = self.scroll;
+        if !group.contains(&reference) {
+            group.insert(0, reference.clone());
+        }
+        group.dedup();
+        self.reference_details_group = group;
         self.reference_details = Some(reference);
+        self.reset_reference_detail_content_state();
+        self.reference_details_transition = RevealState {
+            progress: 1.0,
+            target: 1.0,
+        };
+        self.reference_details_direction = 1.0;
         self.sidebar.target = 0.0;
         self.reference_panel.target = 1.0;
-        self.previewed_link = None;
-        self.previewed_reference = None;
+        self.dismiss_link_preview(window, cx);
         self.start_animation(window, cx);
         cx.notify();
+    }
+
+    fn reset_reference_detail_content_state(&mut self) {
+        let preferred_summary = self
+            .reference_details
+            .as_deref()
+            .and_then(|reference| self.scholarly_session.state(reference))
+            .and_then(|state| match state {
+                ScholarlyMetadataState::Ready(metadata) if metadata.tldr_text.is_some() => {
+                    Some(ReferenceSummaryTab::Tldr)
+                }
+                ScholarlyMetadataState::Ready(metadata) if metadata.abstract_text.is_some() => {
+                    Some(ReferenceSummaryTab::Abstract)
+                }
+                _ => None,
+            })
+            .unwrap_or(ReferenceSummaryTab::Tldr);
+        self.reference_citation_expansion = RevealState::default();
+        self.reference_summary_tab = preferred_summary;
+        self.reference_summary_previous_tab = preferred_summary;
+        self.reference_summary_transition = RevealState {
+            progress: 1.0,
+            target: 1.0,
+        };
+        self.doi_copy_started = None;
+    }
+
+    fn navigate_reference_details(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let navigable = self.navigable_reference_details_group();
+        if navigable.len() < 2 {
+            return;
+        }
+        let Some(current) = self.reference_details.as_ref() else {
+            return;
+        };
+        let current_index = navigable
+            .iter()
+            .position(|reference| reference == current)
+            .unwrap_or(0);
+        let next_index = adjacent_group_index(current_index, navigable.len(), forward);
+        self.reference_details = navigable.get(next_index).cloned();
+        self.reference_details_direction = if forward { 1.0 } else { -1.0 };
+        self.reference_details_transition = RevealState {
+            progress: 0.0,
+            target: 1.0,
+        };
+        self.reset_reference_detail_content_state();
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
+    fn navigable_reference_details_group(&self) -> Vec<String> {
+        self.reference_details_group
+            .iter()
+            .filter(|reference| {
+                matches!(
+                    self.scholarly_session.state(reference),
+                    Some(ScholarlyMetadataState::Ready(_))
+                )
+            })
+            .cloned()
+            .collect()
     }
 
     fn close_reference_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5211,6 +5534,34 @@ impl PdfReader {
         document.scientific_references.iter().find(|reference| {
             scientific_reference_matches(reference, page, resolved.as_ref(), y_fraction)
         })
+    }
+
+    fn scientific_reference_indices_for_link(&self, id: usize) -> Vec<usize> {
+        let Some(primary_number) = self
+            .scientific_reference_for_link(id)
+            .map(|reference| reference.number)
+        else {
+            return Vec::new();
+        };
+        let Some(document) = self.document.as_ref() else {
+            return Vec::new();
+        };
+        let Some(primary_index) = document
+            .scientific_references
+            .iter()
+            .position(|reference| reference.number == primary_number)
+        else {
+            return Vec::new();
+        };
+        let Some(link) = document.links.iter().find(|link| link.id == id) else {
+            return vec![primary_index];
+        };
+        let Some(source_text) = self.page_text.get(&link.page) else {
+            return vec![primary_index];
+        };
+        let source = link_source_text(source_text, link.bounds);
+        complete_grouped_reference_indices(&document.scientific_references, &source, primary_number)
+            .unwrap_or_else(|| vec![primary_index])
     }
 
     fn request_destination_preview(&mut self, id: usize) -> bool {
@@ -5812,6 +6163,7 @@ impl PdfReader {
             return;
         };
         self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
+        self.pending_link_hover = None;
         self.link_source_hovered = true;
         if self.previewed_link != Some(id) || self.previewed_reference.is_some() {
             self.link_card_expansion = RevealState::default();
@@ -5823,9 +6175,9 @@ impl PdfReader {
             PdfLinkTarget::Internal { .. } => {
                 self.request_internal_link_text(id);
                 self.request_scholarly_for_link(id);
-                if self.current_reference_text().is_some_and(|reference| {
+                if self.current_reference_texts().iter().any(|reference| {
                     matches!(
-                        self.scholarly_session.state(&reference),
+                        self.scholarly_session.state(reference),
                         Some(ScholarlyMetadataState::Ready(_))
                     )
                 }) {
@@ -5839,6 +6191,43 @@ impl PdfReader {
                 }
             }
         }
+        cx.notify();
+    }
+
+    fn toggle_reference_citation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reference_citation_expansion.target = if self.reference_citation_expansion.target > 0.5
+        {
+            0.0
+        } else {
+            1.0
+        };
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
+    fn select_reference_summary(
+        &mut self,
+        tab: ReferenceSummaryTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if tab == self.reference_summary_tab {
+            return;
+        }
+        self.reference_summary_previous_tab = self.reference_summary_tab;
+        self.reference_summary_tab = tab;
+        self.reference_summary_transition = RevealState {
+            progress: 0.0,
+            target: 1.0,
+        };
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
+    fn copy_reference_doi(&mut self, doi: String, window: &mut Window, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(format!("https://doi.org/{doi}")));
+        self.doi_copy_started = Some(Instant::now());
+        self.start_animation(window, cx);
         cx.notify();
     }
 
@@ -5857,6 +6246,7 @@ impl PdfReader {
             return;
         }
         self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
+        self.pending_link_hover = None;
         self.link_source_hovered = true;
         if self.previewed_reference != Some(index) || self.previewed_link.is_some() {
             self.link_card_expansion = RevealState::default();
@@ -5865,9 +6255,9 @@ impl PdfReader {
         self.previewed_link = None;
         self.previewed_reference = Some(index);
         self.request_scholarly_for_reference(index);
-        if self.current_reference_text().is_some_and(|reference| {
+        if self.current_reference_texts().iter().any(|reference| {
             matches!(
-                self.scholarly_session.state(&reference),
+                self.scholarly_session.state(reference),
                 Some(ScholarlyMetadataState::Ready(_))
             )
         }) {
@@ -5885,7 +6275,8 @@ impl PdfReader {
     ) {
         self.link_card_hovered = hovered;
         if hovered {
-            self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
+            self.cancel_pending_link_hover();
+            self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);
             cx.notify();
         } else {
             self.schedule_link_preview_clear(window, cx);
@@ -5893,23 +6284,143 @@ impl PdfReader {
     }
 
     fn schedule_link_preview_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.schedule_stable_link_hover(None, point(px(-1.0), px(-1.0)), window, cx);
+    }
+
+    fn current_preview_target(&self) -> Option<PreviewTarget> {
+        self.previewed_link
+            .map(PreviewTarget::Link)
+            .or_else(|| self.previewed_reference.map(PreviewTarget::Reference))
+    }
+
+    fn show_preview_target(
+        &mut self,
+        target: PreviewTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            PreviewTarget::Link(id) => self.show_link_preview(id, window, cx),
+            PreviewTarget::Reference(index) => self.show_reference_preview(index, window, cx),
+        }
+    }
+
+    fn cancel_pending_link_hover(&mut self) {
         self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
-        let revision = self.link_hover_revision;
+        self.pending_link_hover = None;
+    }
+
+    fn dismiss_link_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_pending_link_hover();
+        self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);
+        self.hovered_link = None;
+        self.hovered_reference = None;
+        self.link_source_hovered = false;
+        self.link_card_hovered = false;
+        self.previewed_link = None;
+        self.previewed_reference = None;
+        self.link_card_pointer = None;
+        self.link_card_pointer_target = None;
+        self.clear_destination_preview(window, cx);
+    }
+
+    fn link_pointer_in_viewport(&self, position: Point<Pixels>) -> Offset {
+        Offset {
+            x: f32::from(position.x),
+            y: f32::from(position.y) - self.content_top(),
+        }
+    }
+
+    fn set_link_card_pointer_immediate(&mut self, position: Point<Pixels>) {
+        self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);
+        let pointer = self.link_pointer_in_viewport(position);
+        self.link_card_pointer = Some(pointer);
+        self.link_card_pointer_target = Some(pointer);
+    }
+
+    fn schedule_link_card_reposition(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self.link_pointer_in_viewport(position);
+        let already_at_target = self.link_card_pointer_target.is_some_and(|current| {
+            (current.x - target.x).abs() < 0.5 && (current.y - target.y).abs() < 0.5
+        });
+        // Every movement invalidates an older pending retarget, including a
+        // movement back to the position where the card already sits.
+        self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);
+        if already_at_target {
+            return;
+        }
+        let revision = self.link_card_reposition_revision;
         let weak = cx.weak_entity();
         window
             .spawn(cx, async move |cx| {
-                cx.background_executor().timer(LINK_HOVER_LEAVE_DELAY).await;
+                cx.background_executor()
+                    .timer(LINK_CARD_MOVE_DEBOUNCE)
+                    .await;
                 let _ = cx.update(|window, cx| {
                     weak.update(cx, |reader, cx| {
-                        if reader.link_hover_revision == revision
-                            && link_preview_should_close(
+                        if reader.link_card_reposition_revision == revision
+                            && reader.link_source_hovered
+                            && reader.current_preview_target().is_some()
+                        {
+                            reader.link_card_pointer_target = Some(target);
+                            reader.link_card_pointer.get_or_insert(target);
+                            reader.start_animation(window, cx);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                });
+            })
+            .detach();
+    }
+
+    fn schedule_stable_link_hover(
+        &mut self,
+        target: Option<PreviewTarget>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .pending_link_hover
+            .is_some_and(|pending| !link_hover_candidate_needs_restart(pending, target, position))
+        {
+            return;
+        }
+        self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
+        let revision = self.link_hover_revision;
+        self.pending_link_hover = Some(PendingLinkHover { target, position });
+        let settle_delay = if target.is_some() {
+            LINK_HOVER_HANDOFF_DELAY
+        } else {
+            LINK_HOVER_CLOSE_DELAY
+        };
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                cx.background_executor().timer(settle_delay).await;
+                let _ = cx.update(|window, cx| {
+                    weak.update(cx, |reader, cx| {
+                        if reader.link_hover_revision == revision && !reader.link_card_hovered {
+                            let settled = reader.pending_link_hover.take();
+                            if let Some(PendingLinkHover {
+                                target: Some(target),
+                                position,
+                            }) = settled
+                            {
+                                reader.set_link_card_pointer_immediate(position);
+                                reader.show_preview_target(target, window, cx);
+                            } else if link_preview_should_close(
                                 reader.link_source_hovered,
                                 reader.link_card_hovered,
-                            )
-                        {
-                            reader.previewed_link = None;
-                            reader.previewed_reference = None;
-                            reader.clear_destination_preview(window, cx);
+                            ) {
+                                reader.dismiss_link_preview(window, cx);
+                            }
                             cx.notify();
                         }
                     })
@@ -6466,7 +6977,7 @@ impl PdfReader {
                                     .active(|button| button.bg(palette.blue.opacity(0.72)))
                                     .on_click(cx.listener(move |reader, _, window, cx| {
                                         reader.activate_document_link(open_id, window, cx);
-                                        reader.previewed_link = None;
+                                        reader.dismiss_link_preview(window, cx);
                                         cx.stop_propagation();
                                     }))
                                     .child(Icon::new(IconName::ExternalLink).size(px(14.0)))
@@ -6493,7 +7004,41 @@ impl PdfReader {
                         )
                     }
                     PdfLinkTarget::Internal { page, .. } => {
-                        if let Some(reference) = self.scientific_reference_for_link(id).cloned() {
+                        let reference_indices = self.scientific_reference_indices_for_link(id);
+                        if reference_indices.len() > 1 {
+                            let references = reference_indices
+                                .into_iter()
+                                .filter_map(|index| {
+                                    let reference =
+                                        document.scientific_references.get(index)?.clone();
+                                    let state =
+                                        self.scholarly_session.state(&reference.text).cloned();
+                                    Some((index, reference, state))
+                                })
+                                .collect::<Vec<_>>();
+                            let card_accent = references
+                                .first()
+                                .map(|(_, reference, _)| {
+                                    reference_identity_color(&reference.text, palette)
+                                })
+                                .unwrap_or(palette.purple);
+                            let estimated_height = (58.0 + references.len() as f32 * 122.0)
+                                .min((self.viewport_height - LINK_CARD_MARGIN * 2.0).max(160.0));
+                            (
+                                anchor,
+                                self.render_grouped_reference_source_card(
+                                    references,
+                                    card_accent,
+                                    palette,
+                                    cx,
+                                ),
+                                estimated_height,
+                                LINK_CARD_WIDTH,
+                                card_accent,
+                            )
+                        } else if let Some(reference) =
+                            self.scientific_reference_for_link(id).cloned()
+                        {
                             let card_accent = reference_identity_color(&reference.text, palette);
                             let state = self.scholarly_session.state(&reference.text).cloned();
                             let desired_width = reference_preview_width(
@@ -6614,12 +7159,25 @@ impl PdfReader {
             220.0,
             LINK_CARD_WIDTH.min((self.viewport_width - LINK_CARD_MARGIN * 2.0).max(220.0)),
         );
-        let position = link_card_position(
-            anchor,
-            self.viewport_width,
-            self.viewport_height,
-            card_width,
-            estimated_height,
+        let position = self.link_card_pointer.map_or_else(
+            || {
+                link_card_position(
+                    anchor,
+                    self.viewport_width,
+                    self.viewport_height,
+                    card_width,
+                    estimated_height,
+                )
+            },
+            |pointer| {
+                pointer_link_card_position(
+                    pointer,
+                    self.viewport_width,
+                    self.viewport_height,
+                    card_width,
+                    estimated_height,
+                )
+            },
         );
         Some(
             div()
@@ -6635,16 +7193,226 @@ impl PdfReader {
                 .max_h(px(
                     (self.viewport_height - LINK_CARD_MARGIN * 2.0).max(120.0)
                 ))
-                .overflow_y_scroll()
+                .overflow_hidden()
                 .rounded_xl()
                 .border_1()
                 .border_color(card_accent.opacity(0.30))
                 .bg(palette.surface)
                 .shadow_sm()
-                .child(div().h(px(3.0)).w_full().bg(card_accent))
-                .child(div().min_w_0().px_4().pt_3().pb_4().child(content))
+                .child(
+                    div()
+                        .id("link-preview-card-scroll")
+                        .max_h(px(
+                            (self.viewport_height - LINK_CARD_MARGIN * 2.0).max(120.0)
+                        ))
+                        .overflow_y_scroll()
+                        .child(div().h(px(3.0)).w_full().flex_none().bg(card_accent))
+                        .child(div().min_w_0().px_4().pt_3().pb_4().child(content)),
+                )
                 .into_any_element(),
         )
+    }
+
+    fn render_grouped_reference_source_card(
+        &self,
+        references: Vec<(usize, ScientificReference, Option<ScholarlyMetadataState>)>,
+        identity_color: gpui::Hsla,
+        palette: ReaderPalette,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let group = references
+            .iter()
+            .map(|(_, reference, _)| reference.text.clone())
+            .collect::<Vec<_>>();
+        let count = references.len();
+        let rows = references.into_iter().enumerate().map(
+            |(position, (reference_index, reference, state))| {
+                let details_group = group.clone();
+                let details_reference = reference.text.clone();
+                let body = match state {
+                    Some(ScholarlyMetadataState::Ready(metadata)) => div()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(palette.text)
+                                .child(compact_words(&metadata.title, 14)),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .min_w_0()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .text_color(palette.text_secondary)
+                                .child(compact_citation_line(&metadata)),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .flex()
+                                .items_center()
+                                .gap_4()
+                                .child(self.render_grouped_reference_jump(
+                                    reference_index,
+                                    palette,
+                                    cx,
+                                ))
+                                .child(
+                                    div()
+                                        .id(("grouped-reference-details", reference_index))
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(identity_color)
+                                        .cursor_pointer()
+                                        .hover(|button| button.opacity(0.68))
+                                        .active(|button| button.opacity(0.48))
+                                        .on_click(cx.listener(move |reader, _, window, cx| {
+                                            reader.open_reference_details_group(
+                                                details_reference.clone(),
+                                                details_group.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        }))
+                                        .child("View details")
+                                        .child(Icon::new(IconName::ArrowRight).size(px(12.0))),
+                                ),
+                        )
+                        .into_any_element(),
+                    Some(ScholarlyMetadataState::Failed(_)) => div()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_xs()
+                                .line_height(px(18.0))
+                                .text_color(palette.text_secondary)
+                                .child(compact_words(&reference.text, 18)),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(palette.text_tertiary)
+                                .child(Icon::new(IconName::CircleX).size(px(13.0)))
+                                .child("No source found"),
+                        )
+                        .child(div().mt_2().child(self.render_grouped_reference_jump(
+                            reference_index,
+                            palette,
+                            cx,
+                        )))
+                        .into_any_element(),
+                    Some(ScholarlyMetadataState::Loading) | None => div()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_xs()
+                                .line_height(px(18.0))
+                                .text_color(palette.text_secondary)
+                                .child(compact_words(&reference.text, 18)),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(palette.text_tertiary)
+                                .child(loading_source_icon(identity_color))
+                                .child("Checking source"),
+                        )
+                        .child(div().mt_2().child(self.render_grouped_reference_jump(
+                            reference_index,
+                            palette,
+                            cx,
+                        )))
+                        .into_any_element(),
+                };
+                div()
+                    .when(position != 0, |row| {
+                        row.mt_3()
+                            .pt_3()
+                            .border_t_1()
+                            .border_color(palette.separator)
+                    })
+                    .child(
+                        div()
+                            .mb_1()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(identity_color)
+                            .child(format!("REFERENCE {}", reference.number)),
+                    )
+                    .child(body)
+            },
+        );
+        div()
+            .min_w_0()
+            .child(
+                div()
+                    .mb_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.text)
+                            .child("Grouped citation"),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_full()
+                            .bg(identity_color.opacity(0.12))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(identity_color)
+                            .child(format!("{count} sources")),
+                    ),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn render_grouped_reference_jump(
+        &self,
+        reference_index: usize,
+        palette: ReaderPalette,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(("grouped-reference-jump", reference_index))
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(palette.text_secondary)
+            .cursor_pointer()
+            .hover(|button| button.opacity(0.68))
+            .active(|button| button.opacity(0.48))
+            .on_click(cx.listener(move |reader, _, window, cx| {
+                reader.jump_to_scientific_reference(reference_index, window, cx);
+                reader.dismiss_link_preview(window, cx);
+                cx.stop_propagation();
+            }))
+            .child("Jump")
+            .child(Icon::new(IconName::ArrowRight).size(px(12.0)))
+            .into_any_element()
     }
 
     fn render_reference_source_card(
@@ -6789,8 +7557,7 @@ impl PdfReader {
                         reader.jump_to_scientific_reference(index, window, cx)
                     }
                 }
-                reader.previewed_link = None;
-                reader.previewed_reference = None;
+                reader.dismiss_link_preview(window, cx);
                 cx.stop_propagation();
             }))
             .child("Jump to Document section")
@@ -6802,6 +7569,7 @@ impl PdfReader {
         &mut self,
         palette: ReaderPalette,
         full_width: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let reference = self.reference_details.clone()?;
@@ -6816,17 +7584,25 @@ impl PdfReader {
         }
         let progress = self.reference_panel.progress;
         let right = 12.0 - (panel_width + 24.0) * (1.0 - progress);
+        let navigable_details = self.navigable_reference_details_group();
+        let detail_position = navigable_details
+            .iter()
+            .position(|candidate| candidate == &reference)
+            .unwrap_or(0);
+        let detail_count = navigable_details.len().max(1);
+        let page_transition = self.reference_details_transition.progress;
+        let detail_offset =
+            self.reference_details_direction * (1.0 - page_transition) * (panel_width - 2.0);
+        let detail_opacity = (0.72 + page_transition * 0.28).clamp(0.0, 1.0);
         let authors = if metadata.authors.is_empty() {
             "Authors unavailable".to_owned()
         } else {
             metadata.authors.join(", ")
         };
-        let publication = match (metadata.journal.as_deref(), metadata.year) {
-            (Some(journal), Some(year)) => format!("{journal} · {year}"),
-            (Some(journal), None) => journal.to_owned(),
-            (None, Some(year)) => year.to_string(),
-            (None, None) => "Publication details unavailable".to_owned(),
-        };
+        let journal = metadata
+            .journal
+            .clone()
+            .unwrap_or_else(|| "Journal unavailable".to_owned());
         let source_line = format!(
             "{} · {}",
             metadata.source.label(),
@@ -6835,7 +7611,7 @@ impl PdfReader {
                 .map(|certainty| certainty.label())
                 .unwrap_or("DOI match")
         );
-        let abstract_height = (self.viewport_height * 0.34).clamp(160.0, 360.0);
+        let summary_height = (self.viewport_height * 0.30).clamp(150.0, 300.0);
         let title_size = if metadata.title.chars().count() > 120 {
             17.0
         } else {
@@ -6862,22 +7638,13 @@ impl PdfReader {
         } else {
             palette.text_secondary
         };
-        let hero_publication = metadata
-            .journal
-            .clone()
-            .unwrap_or_else(|| "Scholarly reference".to_owned());
-        let hero_year = metadata
-            .year
-            .map(|year| year.to_string())
-            .unwrap_or_else(|| "Year unavailable".to_owned());
-        let hero_height = reference_hero_height(&hero_publication);
+        let hero_height = reference_hero_height(&metadata.title);
         let mut access_actions = Vec::new();
         if let Some(url) = metadata.journal_url.clone() {
             access_actions.push(self.render_reference_action(
                 "open-reference-journal",
                 IconName::BookOpen,
-                "Journal page",
-                url_host_label(&url),
+                "Journal",
                 url,
                 false,
                 identity_color,
@@ -6889,8 +7656,7 @@ impl PdfReader {
             access_actions.push(self.render_reference_action(
                 "open-reference-pdf",
                 IconName::File,
-                "Open PDF",
-                "Full text document".to_owned(),
+                "PDF",
                 url,
                 true,
                 identity_color,
@@ -6902,8 +7668,7 @@ impl PdfReader {
             access_actions.push(self.render_reference_action(
                 "open-reference-doi",
                 IconName::ExternalLink,
-                "Publisher page",
-                metadata.doi.clone().unwrap_or_default(),
+                "Publisher",
                 url,
                 false,
                 identity_color,
@@ -6915,8 +7680,7 @@ impl PdfReader {
             access_actions.push(self.render_reference_action(
                 "open-reference-metadata",
                 IconName::Globe,
-                "Metadata record",
-                url_host_label(&url),
+                "Metadata",
                 url,
                 false,
                 identity_color,
@@ -6924,6 +7688,95 @@ impl PdfReader {
                 cx,
             ));
         }
+        let hero_title = self.selectable_reference_text(
+            "reference-hero-title-text",
+            &metadata.title,
+            window,
+            cx,
+        );
+        let source_text =
+            self.selectable_reference_text("reference-source-text", &source_line, window, cx);
+        let citation = self.render_reference_citation(
+            &metadata,
+            &authors,
+            &journal,
+            identity_color,
+            palette,
+            window,
+            cx,
+        );
+        let summary = self.render_reference_summary(
+            &metadata,
+            panel_width,
+            summary_height,
+            identity_color,
+            palette,
+            window,
+            cx,
+        );
+        let header_doi = metadata.doi.as_deref().map(|doi| {
+            self.render_copyable_doi(
+                "reference-hero-doi",
+                "reference-hero-doi-text",
+                doi,
+                &middle_truncate(doi, 25),
+                identity_color,
+                palette,
+                window,
+                cx,
+            )
+        });
+        let navigation = (detail_count > 1).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .id("previous-reference-detail")
+                        .size(px(28.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_color(palette.text_secondary)
+                        .hover(|button| button.opacity(0.68))
+                        .active(|button| button.opacity(0.48))
+                        .on_click(cx.listener(|reader, _, window, cx| {
+                            reader.navigate_reference_details(false, window, cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(Icon::new(IconName::ChevronLeft).size(px(15.0))),
+                )
+                .child(
+                    div()
+                        .min_w(px(42.0))
+                        .text_center()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(palette.text_tertiary)
+                        .child(format!("{} of {}", detail_position + 1, detail_count)),
+                )
+                .child(
+                    div()
+                        .id("next-reference-detail")
+                        .size(px(28.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_color(palette.text_secondary)
+                        .hover(|button| button.opacity(0.68))
+                        .active(|button| button.opacity(0.48))
+                        .on_click(cx.listener(|reader, _, window, cx| {
+                            reader.navigate_reference_details(true, window, cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(Icon::new(IconName::ChevronRight).size(px(15.0))),
+                )
+        });
         let content = div()
             .size_full()
             .min_w_0()
@@ -6949,21 +7802,28 @@ impl PdfReader {
                     )
                     .child(
                         div()
-                            .id("close-reference-details")
-                            .size(px(30.0))
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .text_color(palette.text_secondary)
-                            .hover(|button| button.bg(palette.control_hover))
-                            .active(|button| button.bg(palette.control_pressed))
-                            .on_click(cx.listener(|reader, _, window, cx| {
-                                reader.close_reference_details(window, cx);
-                                cx.stop_propagation();
-                            }))
-                            .child(Icon::new(IconName::Close).size(px(16.0))),
+                            .gap_2()
+                            .children(navigation)
+                            .child(
+                                div()
+                                    .id("close-reference-details")
+                                    .size(px(30.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(palette.text_secondary)
+                                    .hover(|button| button.bg(palette.control_hover))
+                                    .active(|button| button.bg(palette.control_pressed))
+                                    .on_click(cx.listener(|reader, _, window, cx| {
+                                        reader.close_reference_details(window, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child(Icon::new(IconName::Close).size(px(16.0))),
+                            ),
                     ),
             )
             .child(
@@ -6971,6 +7831,8 @@ impl PdfReader {
                     .h(px(hero_height))
                     .flex_none()
                     .relative()
+                    .left(px(detail_offset))
+                    .opacity(detail_opacity)
                     .overflow_hidden()
                     .bg(identity_color.opacity(0.14))
                     .child(
@@ -7014,155 +7876,74 @@ impl PdfReader {
                         div()
                             .absolute()
                             .left(px(22.0))
-                            .right(px(92.0))
-                            .bottom(px(20.0))
+                            .right(px(22.0))
+                            .top(px(20.0))
+                            .bottom(px(16.0))
                             .min_w_0()
                             .child(
                                 div()
+                                    .pr(px(70.0))
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(identity_color)
-                                    .child(source_line),
+                                    .child(source_text),
                             )
                             .child(
                                 div()
                                     .mt_2()
-                                    .text_base()
-                                    .line_height(px(22.0))
+                                    .pr(px(70.0))
+                                    .text_size(px(title_size))
+                                    .line_height(px(title_size + 6.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(palette.text)
-                                    .child(hero_publication),
+                                    .child(hero_title),
                             )
                             .child(
                                 div()
-                                    .mt_1()
+                                    .mt_2()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
                                     .text_xs()
-                                    .text_color(palette.text_secondary)
-                                    .child(hero_year),
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(access_color)
+                                            .child(Icon::new(access_icon).size(px(14.0)))
+                                            .child(access_label),
+                                    )
+                                    .when(metadata.doi.is_some(), |status| {
+                                        status.child(
+                                            div()
+                                                .size(px(3.0))
+                                                .flex_none()
+                                                .rounded_full()
+                                                .bg(palette.text_tertiary.opacity(0.56)),
+                                        )
+                                    })
+                                    .children(header_doi),
                             ),
                     ),
             )
             .child(
                 div()
-                    .id("reference-details-scroll")
+                    .id(("reference-details-scroll", detail_position))
+                    .relative()
+                    .left(px(detail_offset))
+                    .opacity(detail_opacity)
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
                     .overflow_y_scroll()
                     .px_5()
-                    .pt_5()
+                    .pt_3()
                     .pb_6()
-                    .child(
-                        div()
-                            .text_size(px(title_size))
-                            .line_height(px(title_size + 7.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.text)
-                            .child(metadata.title),
-                    )
-                    .child(
-                        div()
-                            .mt_3()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_4()
-                            .text_xs()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(access_color)
-                                    .child(Icon::new(access_icon).size(px(14.0)))
-                                    .child(access_label),
-                            )
-                            .when_some(metadata.doi.clone(), |status, doi| {
-                                status.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_color(palette.text_tertiary)
-                                        .child(Icon::new(IconName::ExternalLink).size(px(13.0)))
-                                        .child(doi),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .mt_6()
-                            .pt_4()
-                            .border_t_1()
-                            .border_color(palette.separator)
-                            .child(
-                                div()
-                                    .mb_1()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(identity_color)
-                                    .child("CITATION"),
-                            )
-                            .child(
-                                div()
-                                    .py_3()
-                                    .flex()
-                                    .items_start()
-                                    .gap_4()
-                                    .child(
-                                        div()
-                                            .w(px(92.0))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .text_xs()
-                                            .text_color(palette.text_tertiary)
-                                            .child(Icon::new(IconName::CircleUser).size(px(14.0)))
-                                            .child("Authors"),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .text_sm()
-                                            .line_height(px(20.0))
-                                            .text_color(palette.text)
-                                            .child(authors),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .py_3()
-                                    .border_t_1()
-                                    .border_color(palette.separator)
-                                    .flex()
-                                    .items_start()
-                                    .gap_4()
-                                    .child(
-                                        div()
-                                            .w(px(92.0))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .text_xs()
-                                            .text_color(palette.text_tertiary)
-                                            .child(Icon::new(IconName::BookOpen).size(px(14.0)))
-                                            .child("Published"),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .text_sm()
-                                            .line_height(px(20.0))
-                                            .text_color(palette.text)
-                                            .child(publication),
-                                    ),
-                            ),
-                    )
+                    .child(citation)
                     .when(!access_actions.is_empty(), |body| {
                         body.child(
                             div()
@@ -7175,39 +7956,15 @@ impl PdfReader {
                         )
                         .child(
                             div()
-                                .border_b_1()
-                                .border_color(palette.separator)
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .gap_1()
+                                .overflow_hidden()
                                 .children(access_actions),
                         )
                     })
-                    .when_some(metadata.abstract_text, |body, abstract_text| {
-                        body.child(
-                            div()
-                                .mt_6()
-                                .child(
-                                    div()
-                                        .mb_2()
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(identity_color)
-                                        .child("ABSTRACT"),
-                                )
-                                .child(
-                                    div()
-                                        .id("reference-abstract-scroll")
-                                        .max_h(px(abstract_height))
-                                        .overflow_y_scroll()
-                                        .pl_4()
-                                        .pr_2()
-                                        .border_l_2()
-                                        .border_color(identity_color.opacity(0.52))
-                                        .text_sm()
-                                        .line_height(px(21.0))
-                                        .text_color(palette.text_secondary)
-                                        .child(abstract_text),
-                                ),
-                        )
-                    }),
+                    .children(summary),
             );
         Some(
             div()
@@ -7224,13 +7981,481 @@ impl PdfReader {
         )
     }
 
+    fn selectable_reference_text(
+        &self,
+        id: &'static str,
+        text: impl AsRef<str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        TextView::markdown(id, escape_markdown_text(text.as_ref()), window, cx)
+            .style(TextViewStyle::default().paragraph_gap(rems(0.0)))
+            .selectable(true)
+            .cursor(CursorStyle::IBeam)
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_copyable_doi(
+        &self,
+        container_id: &'static str,
+        text_id: &'static str,
+        doi: &str,
+        display: &str,
+        identity_color: gpui::Hsla,
+        palette: ReaderPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let doi_text = self.selectable_reference_text(text_id, display, window, cx);
+        let copy_doi = doi.to_owned();
+        let copy_progress = self.doi_copy_started.map_or(0.0, |started| {
+            (Instant::now().duration_since(started).as_secs_f32()
+                / DOI_COPY_FEEDBACK_DURATION.as_secs_f32())
+            .clamp(0.0, 1.0)
+        });
+        let copy_scale = 1.0 + (copy_progress * std::f32::consts::PI).sin() * 0.12;
+        let copy_id = if container_id == "reference-hero-doi" {
+            "copy-reference-hero-doi"
+        } else {
+            "copy-reference-citation-doi"
+        };
+        div()
+            .id(container_id)
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_color(palette.text_secondary)
+            .child(Icon::new(IconName::ExternalLink).size(px(13.0)))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(doi_text),
+            )
+            .child(
+                div()
+                    .id(copy_id)
+                    .size(px(26.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(identity_color)
+                    .hover(|button| button.opacity(0.72))
+                    .active(|button| button.opacity(0.52))
+                    .on_click(cx.listener(move |reader, _, window, cx| {
+                        reader.copy_reference_doi(copy_doi.clone(), window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        Icon::new(if copy_progress > 0.0 {
+                            IconName::Check
+                        } else {
+                            IconName::Copy
+                        })
+                        .size(px(14.0))
+                        .transform(Transformation::scale(size(copy_scale, copy_scale))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_reference_summary_content(
+        &self,
+        text_id: &'static str,
+        text: &str,
+        tab: ReferenceSummaryTab,
+        metadata: &ScholarlyMetadata,
+        identity_color: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let text = self.selectable_reference_text(text_id, text, window, cx);
+        let semantic_scholar_url = (tab == ReferenceSummaryTab::Tldr
+            && metadata.source == ScholarlySource::SemanticScholar)
+            .then(|| metadata.landing_url.clone())
+            .flatten();
+        let source_id = if text_id == "reference-summary-current-text" {
+            "reference-summary-current-source"
+        } else {
+            "reference-summary-previous-source"
+        };
+        div()
+            .min_w_0()
+            .child(text)
+            .when_some(semantic_scholar_url, |content, url| {
+                content.child(
+                    div()
+                        .id(source_id)
+                        .mt_3()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(identity_color)
+                        .cursor_pointer()
+                        .hover(|link| link.opacity(0.72))
+                        .active(|link| link.opacity(0.52))
+                        .on_click(cx.listener(move |reader, _, _, cx| {
+                            if let Err(error) = open::that_detached(&url) {
+                                reader.warning = Some(
+                                    format!("Could not open Semantic Scholar: {error}").into(),
+                                );
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .child("Provided by Semantic Scholar")
+                        .child(Icon::new(IconName::ExternalLink).size(px(12.0))),
+                )
+            })
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_reference_citation(
+        &self,
+        metadata: &ScholarlyMetadata,
+        authors: &str,
+        journal: &str,
+        identity_color: gpui::Hsla,
+        palette: ReaderPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let progress = self.reference_citation_expansion.progress;
+        let expanded_height = citation_expanded_height(authors, journal, metadata.doi.is_some());
+        let compact = compact_reference_panel_citation(metadata);
+        let compact_text =
+            self.selectable_reference_text("reference-citation-compact-text", &compact, window, cx);
+        let authors_text =
+            self.selectable_reference_text("reference-citation-authors-text", authors, window, cx);
+        let journal_text =
+            self.selectable_reference_text("reference-citation-journal-text", journal, window, cx);
+        let year = metadata
+            .year
+            .map(|year| year.to_string())
+            .unwrap_or_else(|| "Year unavailable".to_owned());
+        let year_text =
+            self.selectable_reference_text("reference-citation-year-text", &year, window, cx);
+        let expanded_doi = metadata.doi.as_deref().map(|doi| {
+            self.render_copyable_doi(
+                "reference-citation-doi",
+                "reference-citation-doi-text",
+                doi,
+                doi,
+                identity_color,
+                palette,
+                window,
+                cx,
+            )
+        });
+        div()
+            .child(
+                div()
+                    .id("reference-citation-toggle")
+                    .min_h(px(46.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(palette.control_hover))
+                    .active(|row| row.bg(palette.control_pressed))
+                    .on_click(cx.listener(|reader, _, window, cx| {
+                        reader.toggle_reference_citation(window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        Icon::new(IconName::CircleUser)
+                            .size(px(14.0))
+                            .text_color(identity_color),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(palette.text_secondary)
+                            .child(compact_text),
+                    )
+                    .child(
+                        div()
+                            .size(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(identity_color.opacity(0.10))
+                            .child(
+                                Icon::new(if progress > 0.5 {
+                                    IconName::ChevronUp
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size(px(14.0))
+                                .text_color(identity_color),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(expanded_height * progress))
+                    .opacity(progress)
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .px_2()
+                            .pt_2()
+                            .pb_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_start()
+                                    .gap_3()
+                                    .child(
+                                        Icon::new(IconName::CircleUser)
+                                            .size(px(14.0))
+                                            .text_color(palette.text_tertiary),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .text_sm()
+                                            .line_height(px(20.0))
+                                            .text_color(palette.text)
+                                            .child(authors_text),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt_3()
+                                    .flex()
+                                    .items_start()
+                                    .gap_3()
+                                    .child(
+                                        Icon::new(IconName::BookOpen)
+                                            .size(px(14.0))
+                                            .text_color(palette.text_tertiary),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .text_sm()
+                                            .line_height(px(20.0))
+                                            .text_color(palette.text)
+                                            .child(journal_text),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt_3()
+                                    .flex()
+                                    .items_start()
+                                    .gap_3()
+                                    .child(
+                                        Icon::new(IconName::Calendar)
+                                            .size(px(14.0))
+                                            .text_color(palette.text_tertiary),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .text_sm()
+                                            .line_height(px(20.0))
+                                            .text_color(palette.text)
+                                            .child(year_text),
+                                    ),
+                            )
+                            .when_some(expanded_doi, |details, doi| {
+                                details.child(
+                                    div()
+                                        .mt_3()
+                                        .min_w_0()
+                                        .pl(px(26.0))
+                                        .text_sm()
+                                        .line_height(px(20.0))
+                                        .child(doi),
+                                )
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_reference_summary(
+        &self,
+        metadata: &ScholarlyMetadata,
+        panel_width: f32,
+        summary_height: f32,
+        identity_color: gpui::Hsla,
+        palette: ReaderPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let has_tldr = metadata.tldr_text.is_some();
+        let has_abstract = metadata.abstract_text.is_some();
+        if !has_tldr && !has_abstract {
+            return None;
+        }
+        let current = if summary_text(metadata, self.reference_summary_tab).is_some() {
+            self.reference_summary_tab
+        } else if has_tldr {
+            ReferenceSummaryTab::Tldr
+        } else {
+            ReferenceSummaryTab::Abstract
+        };
+        let current_text = summary_text(metadata, current).unwrap_or_default();
+        let current_view = self.render_reference_summary_content(
+            "reference-summary-current-text",
+            current_text,
+            current,
+            metadata,
+            identity_color,
+            window,
+            cx,
+        );
+        let transition = self.reference_summary_transition.progress;
+        let switching = self.reference_summary_transition.is_animating()
+            && self.reference_summary_previous_tab != current
+            && summary_text(metadata, self.reference_summary_previous_tab).is_some();
+        let previous_view = switching.then(|| {
+            self.render_reference_summary_content(
+                "reference-summary-previous-text",
+                summary_text(metadata, self.reference_summary_previous_tab).unwrap_or_default(),
+                self.reference_summary_previous_tab,
+                metadata,
+                identity_color,
+                window,
+                cx,
+            )
+        });
+        let direction = if self.reference_summary_previous_tab == ReferenceSummaryTab::Tldr
+            && current == ReferenceSummaryTab::Abstract
+        {
+            1.0
+        } else {
+            -1.0
+        };
+        let slide_width = (panel_width - 40.0).max(200.0);
+        let summary_pane = |id: &'static str, text: gpui::AnyElement, offset: f32, opacity: f32| {
+            div()
+                .id(id)
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(offset))
+                .w_full()
+                .opacity(opacity)
+                .overflow_y_scroll()
+                .pl_4()
+                .pr_2()
+                .py_2()
+                .border_l_2()
+                .border_color(identity_color.opacity(0.52))
+                .text_sm()
+                .line_height(px(21.0))
+                .text_color(palette.text_secondary)
+                .child(text)
+        };
+        let current_offset = if switching {
+            direction * (1.0 - transition) * slide_width
+        } else {
+            0.0
+        };
+        let previous_offset = -direction * transition * slide_width;
+        Some(
+            div()
+                .mt_5()
+                .child(
+                    div()
+                        .h(px(34.0))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .when(has_tldr && has_abstract, |tabs| {
+                            tabs.child(reference_summary_tab_button(
+                                "reference-summary-tldr-tab",
+                                "TL;DR",
+                                ReferenceSummaryTab::Tldr,
+                                current,
+                                identity_color,
+                                palette,
+                                cx,
+                            ))
+                            .child(reference_summary_tab_button(
+                                "reference-summary-abstract-tab",
+                                "Abstract",
+                                ReferenceSummaryTab::Abstract,
+                                current,
+                                identity_color,
+                                palette,
+                                cx,
+                            ))
+                        })
+                        .when(!(has_tldr && has_abstract), |label| {
+                            label.child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(identity_color)
+                                    .child(if has_tldr { "TL;DR" } else { "ABSTRACT" }),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .h(px(summary_height))
+                        .min_w_0()
+                        .overflow_hidden()
+                        .when_some(previous_view, |panes, previous_view| {
+                            panes.child(summary_pane(
+                                "reference-summary-previous-pane",
+                                previous_view,
+                                previous_offset,
+                                (1.0 - transition * 0.28).clamp(0.0, 1.0),
+                            ))
+                        })
+                        .child(summary_pane(
+                            "reference-summary-current-pane",
+                            current_view,
+                            current_offset,
+                            if switching {
+                                (0.72 + transition * 0.28).clamp(0.0, 1.0)
+                            } else {
+                                1.0
+                            },
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_reference_action(
         &self,
         id: &'static str,
         icon: IconName,
         label: &'static str,
-        detail: String,
         url: String,
         primary: bool,
         identity_color: gpui::Hsla,
@@ -7239,17 +8464,17 @@ impl PdfReader {
     ) -> gpui::AnyElement {
         div()
             .id(id)
-            .min_h(px(54.0))
-            .px_1()
-            .py_3()
+            .h(px(48.0))
+            .min_w_0()
+            .flex_1()
+            .px_2()
             .flex()
             .items_center()
-            .gap_3()
-            .border_t_1()
-            .border_color(palette.separator)
+            .justify_center()
+            .gap_1()
             .cursor_pointer()
-            .hover(move |row| row.bg(identity_color.opacity(0.10)))
-            .active(move |row| row.bg(palette.control_pressed))
+            .hover(|row| row.opacity(0.72))
+            .active(|row| row.opacity(0.52))
             .on_click(cx.listener(move |reader, _, _, cx| {
                 if let Err(error) = open::that_detached(&url) {
                     reader.warning = Some(format!("Could not open reference: {error}").into());
@@ -7259,7 +8484,7 @@ impl PdfReader {
             }))
             .child(
                 div()
-                    .size(px(30.0))
+                    .size(px(26.0))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -7275,41 +8500,21 @@ impl PdfReader {
                     } else {
                         identity_color
                     })
-                    .child(Icon::new(icon).size(px(15.0))),
+                    .child(Icon::new(icon).size(px(13.0))),
             )
             .child(
                 div()
                     .min_w_0()
-                    .flex_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if primary {
-                                identity_color
-                            } else {
-                                palette.text
-                            })
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .mt(px(1.0))
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_xs()
-                            .text_color(palette.text_tertiary)
-                            .child(detail),
-                    ),
-            )
-            .child(
-                Icon::new(IconName::ExternalLink)
-                    .size(px(14.0))
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(if primary {
                         identity_color
                     } else {
-                        palette.text_tertiary
-                    }),
+                        palette.text
+                    })
+                    .child(label),
             )
             .into_any_element()
     }
@@ -9280,7 +10485,6 @@ impl Render for PdfReader {
                     .size_full(),
                 )
                 .children(toc_navigation)
-                .children(link_preview)
                 .into_any_element()
         } else {
             div()
@@ -9371,12 +10575,15 @@ impl Render for PdfReader {
                             .child(sidebar_content),
                     );
                 div()
+                    .relative()
                     .flex_1()
                     .min_h(px(0.0))
                     .w_full()
                     .flex()
+                    .overflow_hidden()
                     .child(content)
                     .child(sidebar)
+                    .children(link_preview)
                     .into_any_element()
             }
             ReaderView::Fluid => {
@@ -9456,6 +10663,7 @@ impl Render for PdfReader {
                     )
                     .children(context_pill)
                     .child(sidebar)
+                    .children(link_preview)
                     .into_any_element()
             }
         };
@@ -9478,7 +10686,8 @@ impl Render for PdfReader {
             None
         };
 
-        let reference_details_panel = self.render_reference_details_panel(palette, full_width, cx);
+        let reference_details_panel =
+            self.render_reference_details_panel(palette, full_width, window, cx);
         div()
             .key_context("PdfReader")
             .track_focus(&self.focus_handle)
@@ -10018,14 +11227,6 @@ fn fluid_sidebar_extent(full_width: f32, progress: f32) -> f32 {
         * progress.clamp(0.0, 1.0)
 }
 
-fn url_host_label(value: &str) -> String {
-    url::Url::parse(value)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .map(|host| host.strip_prefix("www.").unwrap_or(&host).to_owned())
-        .unwrap_or_else(|| "Web link".to_owned())
-}
-
 fn scientific_reference_matches(
     reference: &ScientificReference,
     target_page: usize,
@@ -10070,6 +11271,38 @@ fn union_text_bounds(left: TextBounds, right: TextBounds) -> TextBounds {
     }
 }
 
+fn complete_grouped_reference_indices(
+    references: &[ScientificReference],
+    source: &str,
+    primary_number: u32,
+) -> Option<Vec<usize>> {
+    let numbers = grouped_citation_numbers(source)?;
+    let indices = numbers
+        .iter()
+        .map(|number| {
+            references
+                .iter()
+                .position(|reference| reference.number == *number)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    indices
+        .iter()
+        .any(|index| references[*index].number == primary_number)
+        .then_some(indices)
+}
+
+fn adjacent_group_index(current: usize, count: usize, forward: bool) -> usize {
+    if count <= 1 {
+        return 0;
+    }
+    let current = current.min(count - 1);
+    if forward {
+        (current + 1) % count
+    } else {
+        (current + count - 1) % count
+    }
+}
+
 fn measured_preview_width(lines: &[&str], minimum: f32, maximum: f32) -> f32 {
     let longest = lines
         .iter()
@@ -10077,6 +11310,90 @@ fn measured_preview_width(lines: &[&str], minimum: f32, maximum: f32) -> f32 {
         .max()
         .unwrap_or(0);
     (longest as f32 * 6.6 + 54.0).clamp(minimum, maximum)
+}
+
+fn escape_markdown_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(
+            character,
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '<' | '>' | '#' | '+' | '-' | '!'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+fn summary_text(metadata: &ScholarlyMetadata, tab: ReferenceSummaryTab) -> Option<&str> {
+    match tab {
+        ReferenceSummaryTab::Tldr => metadata.tldr_text.as_deref(),
+        ReferenceSummaryTab::Abstract => metadata.abstract_text.as_deref(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reference_summary_tab_button(
+    id: &'static str,
+    label: &'static str,
+    tab: ReferenceSummaryTab,
+    selected: ReferenceSummaryTab,
+    identity_color: gpui::Hsla,
+    palette: ReaderPalette,
+    cx: &mut Context<PdfReader>,
+) -> gpui::AnyElement {
+    let active = tab == selected;
+    div()
+        .id(id)
+        .h(px(28.0))
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded_full()
+        .cursor_pointer()
+        .bg(if active {
+            identity_color.opacity(0.14)
+        } else {
+            palette.surface
+        })
+        .text_xs()
+        .font_weight(if active {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        })
+        .text_color(if active {
+            identity_color
+        } else {
+            palette.text_secondary
+        })
+        .hover(move |button| button.bg(identity_color.opacity(0.11)))
+        .on_click(cx.listener(move |reader, _, window, cx| {
+            reader.select_reference_summary(tab, window, cx);
+            cx.stop_propagation();
+        }))
+        .child(label)
+        .into_any_element()
+}
+
+fn citation_expanded_height(authors: &str, journal: &str, has_doi: bool) -> f32 {
+    let author_lines = authors.chars().count().div_ceil(44).clamp(1, 5);
+    let journal_lines = journal.chars().count().div_ceil(44).clamp(1, 3);
+    72.0 + (author_lines + journal_lines) as f32 * 20.0 + if has_doi { 40.0 } else { 0.0 }
+}
+
+fn link_hover_candidate_needs_restart(
+    pending: PendingLinkHover,
+    target: Option<PreviewTarget>,
+    position: Point<Pixels>,
+) -> bool {
+    if pending.target != target {
+        return true;
+    }
+    let dx = f32::from(position.x - pending.position.x);
+    let dy = f32::from(position.y - pending.position.y);
+    dx.mul_add(dx, dy * dy) > LINK_HOVER_STABILITY_RADIUS * LINK_HOVER_STABILITY_RADIUS
 }
 
 fn reference_identity_color(title: &str, palette: ReaderPalette) -> gpui::Hsla {
@@ -10091,9 +11408,9 @@ fn reference_identity_color(title: &str, palette: ReaderPalette) -> gpui::Hsla {
     }
 }
 
-fn reference_hero_height(publication: &str) -> f32 {
-    let wrapped_lines = publication.chars().count().div_ceil(34).clamp(1, 3);
-    126.0 + (wrapped_lines.saturating_sub(1) as f32 * 20.0)
+fn reference_hero_height(title: &str) -> f32 {
+    let wrapped_lines = title.chars().count().div_ceil(28).clamp(1, 5);
+    116.0 + (wrapped_lines.saturating_sub(1) as f32 * 24.0)
 }
 
 fn reference_preview_width(state: Option<&ScholarlyMetadataState>, expansion_progress: f32) -> f32 {
@@ -10149,6 +11466,37 @@ fn compact_journal(journal: &str) -> String {
         result.push('…');
     }
     result
+}
+
+fn middle_truncate(text: &str, maximum_characters: usize) -> String {
+    let characters = text.chars().collect::<Vec<_>>();
+    if characters.len() <= maximum_characters || maximum_characters < 3 {
+        return text.to_owned();
+    }
+    let left = (maximum_characters - 1).div_ceil(2);
+    let right = maximum_characters - 1 - left;
+    format!(
+        "{}…{}",
+        characters[..left].iter().collect::<String>(),
+        characters[characters.len() - right..]
+            .iter()
+            .collect::<String>()
+    )
+}
+
+fn compact_reference_panel_citation(metadata: &ScholarlyMetadata) -> String {
+    let mut parts = vec![compact_authors(&metadata.authors)];
+    if let Some(journal) = metadata
+        .journal_short
+        .as_deref()
+        .or(metadata.journal.as_deref())
+    {
+        parts.push(middle_truncate(journal, 22));
+    }
+    if let Some(year) = metadata.year {
+        parts.push(year.to_string());
+    }
+    parts.join(" · ")
 }
 
 fn compact_citation_line(metadata: &ScholarlyMetadata) -> String {
@@ -10236,6 +11584,36 @@ mod tests {
     }
 
     #[test]
+    fn grouped_reference_resolution_requires_every_bibliography_entry() {
+        let reference = |number| ScientificReference {
+            number,
+            page: 9,
+            x_fraction: Some(0.2),
+            y_fraction: Some(0.1 + number as f32 * 0.01),
+            text: format!("{number}. Reference {number}"),
+            text_runs: Vec::new(),
+        };
+        let complete = vec![reference(20), reference(21), reference(22)];
+        assert_eq!(
+            complete_grouped_reference_indices(&complete, "[20-22]", 20),
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(
+            complete_grouped_reference_indices(&complete, "[20-22]", 19),
+            None
+        );
+        let incomplete = vec![reference(20), reference(22)];
+        assert_eq!(
+            complete_grouped_reference_indices(&incomplete, "[20-22]", 20),
+            None
+        );
+        assert_eq!(adjacent_group_index(0, 3, true), 1);
+        assert_eq!(adjacent_group_index(2, 3, true), 0);
+        assert_eq!(adjacent_group_index(0, 3, false), 2);
+        assert_eq!(adjacent_group_index(7, 1, false), 0);
+    }
+
+    #[test]
     fn compact_reference_labels_are_bounded_and_use_last_names() {
         let authors = vec![
             "Ada Lovelace".to_owned(),
@@ -10261,20 +11639,22 @@ mod tests {
         assert!(long > short);
         assert_eq!(long, 340.0);
 
-        let ready = ScholarlyMetadataState::Ready(ScholarlyMetadata {
+        let ready = ScholarlyMetadataState::Ready(Box::new(ScholarlyMetadata {
             source: crate::scholarly::ScholarlySource::OpenAlex,
             title: "A substantially longer scientific title for adaptive sizing".to_owned(),
             abstract_text: None,
+            tldr_text: None,
             authors: vec!["Ada Author".to_owned(), "Ben Writer".to_owned()],
             year: Some(2025),
             journal: Some("Journal of Responsive Interfaces".to_owned()),
+            journal_short: Some("J Resp Interfaces".to_owned()),
             journal_url: None,
             doi: Some("10.1000/adaptive".to_owned()),
             open_access: Some(true),
             full_text_url: None,
             landing_url: None,
             certainty: None,
-        });
+        }));
         let collapsed = reference_preview_width(Some(&ready), 0.0);
         let halfway = reference_preview_width(Some(&ready), 0.5);
         let expanded = reference_preview_width(Some(&ready), 1.0);
@@ -10282,12 +11662,59 @@ mod tests {
         assert!(halfway > collapsed && halfway < expanded);
         assert!(expanded <= LINK_CARD_WIDTH);
         assert_eq!(reference_preview_width(None, 1.0), 232.0);
-        assert_eq!(reference_hero_height("Short journal"), 126.0);
+        assert_eq!(reference_hero_height("Short title"), 116.0);
         assert_eq!(
             reference_hero_height(
                 "A journal with a deliberately long descriptive name that wraps cleanly"
             ),
-            166.0
+            164.0
+        );
+        let ScholarlyMetadataState::Ready(metadata) = &ready else {
+            unreachable!();
+        };
+        assert_eq!(
+            compact_reference_panel_citation(metadata),
+            "Author, Writer · J Resp Interfaces · 2025"
+        );
+    }
+
+    #[test]
+    fn dense_link_hover_requires_a_stable_neighbor_before_handoff() {
+        assert!(LINK_CARD_MOVE_DEBOUNCE < LINK_HOVER_HANDOFF_DELAY);
+        assert!(LINK_HOVER_HANDOFF_DELAY < LINK_HOVER_CLOSE_DELAY);
+        assert!(LINK_HOVER_CLOSE_DELAY >= Duration::from_millis(300));
+        let origin = point(px(100.0), px(200.0));
+        let pending = PendingLinkHover {
+            target: Some(PreviewTarget::Link(1)),
+            position: origin,
+        };
+        assert!(!link_hover_candidate_needs_restart(
+            pending,
+            Some(PreviewTarget::Link(1)),
+            point(px(102.0), px(201.0)),
+        ));
+        assert!(link_hover_candidate_needs_restart(
+            pending,
+            Some(PreviewTarget::Link(2)),
+            origin,
+        ));
+        assert!(link_hover_candidate_needs_restart(
+            pending,
+            Some(PreviewTarget::Link(1)),
+            point(px(104.0), px(200.0)),
+        ));
+    }
+
+    #[test]
+    fn reference_detail_helpers_bound_expansion_and_preserve_literal_text() {
+        assert_eq!(escape_markdown_text("DOI_10*[x]"), "DOI\\_10\\*\\[x\\]");
+        assert_eq!(
+            middle_truncate("10.1234/a-very-long-doi", 15),
+            "10.1234…ong-doi"
+        );
+        assert!(citation_expanded_height("One Author", "A Journal", false) >= 112.0);
+        assert!(
+            citation_expanded_height(&"Author ".repeat(80), &"Journal ".repeat(20), true) <= 272.0
         );
     }
 
@@ -10327,16 +11754,6 @@ mod tests {
         assert_eq!(fluid_sidebar_extent(1_100.0, -1.0), 0.0);
         assert_eq!(fluid_sidebar_extent(1_100.0, 2.0), 368.0);
         assert!(reference_panel_extent(1_100.0, 1.0) > 0.0);
-    }
-
-    #[test]
-    fn reference_link_labels_use_safe_compact_hosts() {
-        assert_eq!(
-            url_host_label("https://www.nature.com/articles/example"),
-            "nature.com"
-        );
-        assert_eq!(url_host_label("https://doi.org/10.1/test"), "doi.org");
-        assert_eq!(url_host_label("not a URL"), "Web link");
     }
 
     #[test]
@@ -10497,6 +11914,14 @@ mod tests {
         assert!(position.x + 340.0 <= 800.0 - LINK_CARD_MARGIN + 0.001);
         assert!(position.y >= LINK_CARD_MARGIN);
         assert!(position.y + 190.0 <= 600.0 - LINK_CARD_MARGIN + 0.001);
+        let pointer_position =
+            pointer_link_card_position(Offset { x: 400.0, y: 240.0 }, 800.0, 600.0, 340.0, 190.0);
+        assert!((pointer_position.x + 170.0 - 400.0).abs() < 0.001);
+        assert_eq!(pointer_position.y, 240.0 + LINK_CARD_GAP);
+        let edge_position =
+            pointer_link_card_position(Offset { x: 790.0, y: 590.0 }, 800.0, 600.0, 340.0, 190.0);
+        assert!(edge_position.x + 340.0 <= 800.0 - LINK_CARD_MARGIN + 0.001);
+        assert!(edge_position.y < 590.0);
         assert!(!link_preview_should_close(true, false));
         assert!(!link_preview_should_close(false, true));
         assert!(!link_preview_should_close(true, true));

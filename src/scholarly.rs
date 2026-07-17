@@ -50,9 +50,11 @@ pub struct ScholarlyMetadata {
     pub source: ScholarlySource,
     pub title: String,
     pub abstract_text: Option<String>,
+    pub tldr_text: Option<String>,
     pub authors: Vec<String>,
     pub year: Option<u32>,
     pub journal: Option<String>,
+    pub journal_short: Option<String>,
     pub journal_url: Option<String>,
     pub doi: Option<String>,
     pub open_access: Option<bool>,
@@ -64,7 +66,7 @@ pub struct ScholarlyMetadata {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScholarlyMetadataState {
     Loading,
-    Ready(ScholarlyMetadata),
+    Ready(Box<ScholarlyMetadata>),
     Failed(String),
 }
 
@@ -202,7 +204,7 @@ impl ScholarlySession {
                 self.entries.insert(
                     key,
                     match result {
-                        Ok(metadata) => ScholarlyMetadataState::Ready(metadata),
+                        Ok(metadata) => ScholarlyMetadataState::Ready(Box::new(metadata)),
                         Err(error) => ScholarlyMetadataState::Failed(error),
                     },
                 );
@@ -247,14 +249,21 @@ fn fetch_semantic_scholar(reference: &str) -> Result<ScholarlyMetadata, String> 
         .append_pair("query", &query)
         .append_pair(
             "fields",
-            "title,abstract,authors,year,venue,openAccessPdf,url,externalIds",
+            "title,abstract,tldr,authors,year,venue,openAccessPdf,url,externalIds",
         );
     let body = fetch_public_json(url.as_str(), MAX_METADATA_BYTES)
         .map_err(|error| format!("Semantic Scholar: {error}"))?;
     let value: Value = serde_json::from_slice(&body)
         .map_err(|error| format!("Semantic Scholar returned invalid metadata: {error}"))?;
-    parse_semantic_scholar(&value, &query)
-        .ok_or_else(|| "Semantic Scholar found no reliable title match".to_owned())
+    let metadata = parse_semantic_scholar(&value, &query)
+        .ok_or_else(|| "Semantic Scholar found no reliable title match".to_owned())?;
+    if let Some(doi) = metadata.doi.clone()
+        && semantic_metadata_needs_openalex(&metadata)
+        && let Ok(openalex) = fetch_openalex(&doi)
+    {
+        return Ok(merge_semantic_with_openalex(metadata, openalex));
+    }
+    Ok(metadata)
 }
 
 fn parse_openalex(value: &Value) -> Option<ScholarlyMetadata> {
@@ -283,6 +292,11 @@ fn parse_openalex(value: &Value) -> Option<ScholarlyMetadata> {
         .and_then(Value::as_str)
         .map(normalize_space)
         .filter(|journal| !journal.is_empty());
+    let journal_short = value
+        .pointer("/primary_location/source/display_name")
+        .and_then(Value::as_str)
+        .map(normalize_space)
+        .filter(|journal| !journal.is_empty());
     let open_access = value.pointer("/open_access/is_oa").and_then(Value::as_bool);
     let full_text_url = http_string(value.pointer("/best_oa_location/pdf_url")).or_else(|| {
         value
@@ -300,12 +314,14 @@ fn parse_openalex(value: &Value) -> Option<ScholarlyMetadata> {
         abstract_text: value
             .get("abstract_inverted_index")
             .and_then(reconstruct_abstract),
+        tldr_text: None,
         authors,
         year: value
             .get("publication_year")
             .and_then(Value::as_u64)
             .and_then(|year| u32::try_from(year).ok()),
         journal,
+        journal_short,
         journal_url,
         doi: value
             .get("doi")
@@ -365,6 +381,11 @@ fn parse_semantic_scholar(value: &Value, query: &str) -> Option<ScholarlyMetadat
             .and_then(Value::as_str)
             .map(|text| truncate_text(&normalize_space(text), MAX_ABSTRACT_CHARS))
             .filter(|text| !text.is_empty()),
+        tldr_text: work
+            .pointer("/tldr/text")
+            .and_then(Value::as_str)
+            .map(|text| truncate_text(&normalize_space(text), MAX_ABSTRACT_CHARS))
+            .filter(|text| !text.is_empty()),
         authors,
         year: work
             .get("year")
@@ -375,6 +396,7 @@ fn parse_semantic_scholar(value: &Value, query: &str) -> Option<ScholarlyMetadat
             .and_then(Value::as_str)
             .map(normalize_space)
             .filter(|venue| !venue.is_empty()),
+        journal_short: None,
         journal_url: None,
         doi: work
             .pointer("/externalIds/DOI")
@@ -385,6 +407,40 @@ fn parse_semantic_scholar(value: &Value, query: &str) -> Option<ScholarlyMetadat
         landing_url,
         certainty: Some(certainty),
     })
+}
+
+fn semantic_metadata_needs_openalex(metadata: &ScholarlyMetadata) -> bool {
+    metadata.abstract_text.is_none()
+        || metadata.authors.is_empty()
+        || metadata.year.is_none()
+        || metadata.journal.is_none()
+        || metadata.journal_short.is_none()
+        || metadata.journal_url.is_none()
+        || metadata.full_text_url.is_none()
+        || metadata.open_access != Some(true)
+}
+
+fn merge_semantic_with_openalex(
+    mut semantic: ScholarlyMetadata,
+    openalex: ScholarlyMetadata,
+) -> ScholarlyMetadata {
+    if semantic.abstract_text.is_none() {
+        semantic.abstract_text = openalex.abstract_text;
+    }
+    if semantic.authors.is_empty() {
+        semantic.authors = openalex.authors;
+    }
+    semantic.year = semantic.year.or(openalex.year);
+    semantic.journal = semantic.journal.or(openalex.journal);
+    semantic.journal_short = semantic.journal_short.or(openalex.journal_short);
+    semantic.journal_url = semantic.journal_url.or(openalex.journal_url);
+    semantic.doi = semantic.doi.or(openalex.doi);
+    semantic.full_text_url = semantic.full_text_url.or(openalex.full_text_url);
+    if semantic.open_access != Some(true) {
+        semantic.open_access = openalex.open_access.or(semantic.open_access);
+    }
+    semantic.landing_url = semantic.landing_url.or(openalex.landing_url);
+    semantic
 }
 
 fn reconstruct_abstract(value: &Value) -> Option<String> {
@@ -547,6 +603,7 @@ mod tests {
             Some("First second sentence")
         );
         assert_eq!(metadata.authors, vec!["Ada Author", "Ben Writer"]);
+        assert_eq!(metadata.journal_short.as_deref(), Some("Good Journal"));
         assert_eq!(metadata.doi.as_deref(), Some("10.1000/example"));
         assert_eq!(metadata.open_access, Some(true));
         assert_eq!(
@@ -598,6 +655,7 @@ mod tests {
                 "venue": "EClinicalMedicine",
                 "authors": [{"name": "H Lin"}],
                 "abstract": "An abstract.",
+                "tldr": {"text": "A short machine-generated summary."},
                 "openAccessPdf": {"url": "https://example.org/full.pdf"},
                 "url": "https://semanticscholar.org/paper/1",
                 "externalIds": {"DOI": "10.1000/test"}
@@ -610,7 +668,57 @@ mod tests {
         .unwrap();
         assert_eq!(metadata.certainty, Some(MatchCertainty::High));
         assert_eq!(metadata.open_access, Some(true));
+        assert_eq!(
+            metadata.tldr_text.as_deref(),
+            Some("A short machine-generated summary.")
+        );
         assert!(parse_semantic_scholar(&value, "Completely unrelated book title").is_none());
+    }
+
+    #[test]
+    fn openalex_enrichment_fills_semantic_gaps_without_replacing_match_identity() {
+        let semantic_value = json!({
+            "data": [{
+                "title": "A carefully matched paper title",
+                "authors": [],
+                "venue": "Journal of Enrichment",
+                "tldr": {"text": "Semantic summary"},
+                "externalIds": {"DOI": "10.1000/enrich"},
+                "url": "https://semanticscholar.org/paper/matched"
+            }]
+        });
+        let openalex_value = json!({
+            "id": "https://openalex.org/W99",
+            "doi": "https://doi.org/10.1000/enrich",
+            "title": "A differently normalized title",
+            "publication_year": 2025,
+            "authorships": [{"author": {"display_name": "Ada Author"}}],
+            "primary_location": {
+                "landing_page_url": "https://journal.example/work",
+                "source": {"display_name": "J Enrichment"}
+            },
+            "best_oa_location": {"pdf_url": "https://repository.example/work.pdf"},
+            "open_access": {"is_oa": true},
+            "abstract_inverted_index": {"OpenAlex": [0], "abstract": [1]}
+        });
+        let semantic =
+            parse_semantic_scholar(&semantic_value, "A carefully matched paper title").unwrap();
+        assert!(semantic_metadata_needs_openalex(&semantic));
+        let enriched =
+            merge_semantic_with_openalex(semantic, parse_openalex(&openalex_value).unwrap());
+        assert_eq!(enriched.source, ScholarlySource::SemanticScholar);
+        assert_eq!(enriched.title, "A carefully matched paper title");
+        assert_eq!(enriched.tldr_text.as_deref(), Some("Semantic summary"));
+        assert_eq!(enriched.abstract_text.as_deref(), Some("OpenAlex abstract"));
+        assert_eq!(enriched.authors, vec!["Ada Author"]);
+        assert_eq!(enriched.year, Some(2025));
+        assert_eq!(enriched.journal.as_deref(), Some("Journal of Enrichment"));
+        assert_eq!(enriched.journal_short.as_deref(), Some("J Enrichment"));
+        assert_eq!(enriched.open_access, Some(true));
+        assert_eq!(
+            enriched.landing_url.as_deref(),
+            Some("https://semanticscholar.org/paper/matched")
+        );
     }
 
     #[test]
