@@ -34,6 +34,8 @@ impl SearchMatchId {
 pub struct SearchMatch {
     pub id: SearchMatchId,
     pub preview: String,
+    /// UTF-8 byte range of the matched text within `preview`.
+    pub preview_match: std::ops::Range<usize>,
     pub highlight_runs: Vec<TextBounds>,
 }
 
@@ -171,9 +173,11 @@ pub fn search_page(
             return SearchPageOutcome::Cancelled;
         };
         let id = SearchMatchId { page, start, end };
+        let (preview, preview_match) = preview(characters, start, end);
         matches.push(SearchMatch {
             id,
-            preview: preview(characters, start, end),
+            preview,
+            preview_match,
             highlight_runs,
         });
 
@@ -283,7 +287,7 @@ impl NormalizedAtom for SourceAtom {
     }
 }
 
-fn preview(characters: &[TextChar], start: usize, end: usize) -> String {
+fn preview(characters: &[TextChar], start: usize, end: usize) -> (String, std::ops::Range<usize>) {
     let window_start = start.saturating_sub(PREVIEW_CONTEXT_CHARS);
     let window_end = end
         .saturating_add(PREVIEW_CONTEXT_CHARS)
@@ -291,11 +295,17 @@ fn preview(characters: &[TextChar], start: usize, end: usize) -> String {
         .min(characters.len());
     let mut result = String::new();
     let mut previous_whitespace = true;
+    let mut match_start = None;
+    let mut match_end = None;
 
     if window_start > 0 {
         result.push('\u{2026}');
     }
-    for character in &characters[window_start..window_end] {
+    for (source_index, character) in characters[window_start..window_end].iter().enumerate() {
+        let source_index = window_start + source_index;
+        if source_index == start {
+            match_start = Some(result.len());
+        }
         let value = character.value;
         if value == '\0' || value == '\u{00ad}' {
             continue;
@@ -309,6 +319,9 @@ fn preview(characters: &[TextChar], start: usize, end: usize) -> String {
             result.push(value);
             previous_whitespace = false;
         }
+        if source_index == end {
+            match_end = Some(result.len());
+        }
     }
     while result.ends_with(' ') {
         result.pop();
@@ -316,7 +329,11 @@ fn preview(characters: &[TextChar], start: usize, end: usize) -> String {
     if window_end < characters.len() {
         result.push('\u{2026}');
     }
-    result
+    let match_start = match_start.unwrap_or(0).min(result.len());
+    let match_end = match_end
+        .unwrap_or(match_start)
+        .clamp(match_start, result.len());
+    (result, match_start..match_end)
 }
 
 fn highlight_runs(
@@ -490,6 +507,11 @@ mod tests {
         let one_character = find(2, &chars("İ"), "i\u{307}");
         assert_eq!(one_character.matches[0].id.start, 0);
         assert_eq!(one_character.matches[0].id.end, 0);
+        let preview = &one_character.matches[0].preview;
+        assert_eq!(
+            &preview[one_character.matches[0].preview_match.clone()],
+            "İ"
+        );
     }
 
     #[test]
@@ -501,6 +523,10 @@ mod tests {
         let whitespace = find(0, &text, " \n\t");
         assert_eq!(whitespace.matches[0].id.range(), 1..=4);
         assert_eq!(phrase.matches[0].preview, "A B");
+        assert_eq!(
+            &phrase.matches[0].preview[phrase.matches[0].preview_match.clone()],
+            "A B"
+        );
     }
 
     #[test]
@@ -671,5 +697,7 @@ mod tests {
         assert!(preview.ends_with('\u{2026}'));
         assert!(preview.contains(" Match "));
         assert!(preview.chars().count() <= PREVIEW_CONTEXT_CHARS * 2 + 7);
+        let range = results.matches[0].preview_match.clone();
+        assert_eq!(&preview[range], "Match");
     }
 }

@@ -2958,6 +2958,7 @@ mod tests {
                 end: start,
             },
             preview: String::new(),
+            preview_match: 0..0,
             highlight_runs: vec![bounds; run_count],
         };
         let mut results = SearchPageResults {
