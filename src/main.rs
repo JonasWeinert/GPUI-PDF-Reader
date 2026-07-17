@@ -1,10 +1,10 @@
 mod annotations;
 mod backend;
-mod comment_editor;
 mod document_jump;
 mod floating_panel;
 mod link_preview;
 mod link_resolution;
+mod markdown_editor;
 mod model;
 mod native_gestures;
 mod navigation_focus;
@@ -15,12 +15,6 @@ mod search;
 mod text_field;
 mod theme;
 
-use comment_editor::{
-    CommentBackspace, CommentCancel, CommentDelete, CommentDown, CommentEnd, CommentHome,
-    CommentLeft, CommentRight, CommentSave, CommentSelectDown, CommentSelectLeft,
-    CommentSelectRight, CommentSelectUp, CommentToggleBold, CommentToggleBulletedList,
-    CommentToggleCode, CommentToggleItalic, CommentToggleNumberedList, CommentUp,
-};
 #[cfg(debug_assertions)]
 use gpui::Keystroke;
 #[cfg(target_os = "macos")]
@@ -28,6 +22,12 @@ use gpui::TitlebarOptions;
 use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, Point, SharedString, WindowBounds,
     WindowOptions, actions, px, size,
+};
+use markdown_editor::{
+    CommentBackspace, CommentCancel, CommentDelete, CommentDown, CommentEnd, CommentHome,
+    CommentLeft, CommentNewline, CommentRight, CommentSave, CommentSelectDown, CommentSelectLeft,
+    CommentSelectRight, CommentSelectUp, CommentToggleBold, CommentToggleBulletedList,
+    CommentToggleCode, CommentToggleItalic, CommentToggleNumberedList, CommentUp,
 };
 use std::path::PathBuf;
 #[cfg(debug_assertions)]
@@ -37,7 +37,7 @@ use text_field::{
     FieldSelectLeft, FieldSelectRight, FieldSubmit,
 };
 
-const READER_NAVIGATION_CONTEXT: &str = "PdfReader && !TextField && !CommentEditor";
+const READER_NAVIGATION_CONTEXT: &str = "PdfReader && !TextField && !MarkdownEditor";
 
 actions!(
     gpui_pdf_reader,
@@ -612,33 +612,34 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", FieldEnd, Some("TextField")),
         KeyBinding::new("enter", FieldSubmit, Some("TextField")),
         KeyBinding::new("escape", FieldCancel, Some("TextField")),
-        KeyBinding::new("backspace", CommentBackspace, Some("CommentEditor")),
-        KeyBinding::new("delete", CommentDelete, Some("CommentEditor")),
-        KeyBinding::new("left", CommentLeft, Some("CommentEditor")),
-        KeyBinding::new("right", CommentRight, Some("CommentEditor")),
-        KeyBinding::new("up", CommentUp, Some("CommentEditor")),
-        KeyBinding::new("down", CommentDown, Some("CommentEditor")),
-        KeyBinding::new("shift-left", CommentSelectLeft, Some("CommentEditor")),
-        KeyBinding::new("shift-right", CommentSelectRight, Some("CommentEditor")),
-        KeyBinding::new("shift-up", CommentSelectUp, Some("CommentEditor")),
-        KeyBinding::new("shift-down", CommentSelectDown, Some("CommentEditor")),
-        KeyBinding::new("home", CommentHome, Some("CommentEditor")),
-        KeyBinding::new("end", CommentEnd, Some("CommentEditor")),
-        KeyBinding::new("cmd-b", CommentToggleBold, Some("CommentEditor")),
-        KeyBinding::new("cmd-i", CommentToggleItalic, Some("CommentEditor")),
-        KeyBinding::new("cmd-e", CommentToggleCode, Some("CommentEditor")),
+        KeyBinding::new("backspace", CommentBackspace, Some("MarkdownEditor")),
+        KeyBinding::new("delete", CommentDelete, Some("MarkdownEditor")),
+        KeyBinding::new("left", CommentLeft, Some("MarkdownEditor")),
+        KeyBinding::new("right", CommentRight, Some("MarkdownEditor")),
+        KeyBinding::new("up", CommentUp, Some("MarkdownEditor")),
+        KeyBinding::new("down", CommentDown, Some("MarkdownEditor")),
+        KeyBinding::new("shift-left", CommentSelectLeft, Some("MarkdownEditor")),
+        KeyBinding::new("shift-right", CommentSelectRight, Some("MarkdownEditor")),
+        KeyBinding::new("shift-up", CommentSelectUp, Some("MarkdownEditor")),
+        KeyBinding::new("shift-down", CommentSelectDown, Some("MarkdownEditor")),
+        KeyBinding::new("home", CommentHome, Some("MarkdownEditor")),
+        KeyBinding::new("end", CommentEnd, Some("MarkdownEditor")),
+        KeyBinding::new("enter", CommentNewline, Some("MarkdownEditor")),
+        KeyBinding::new("cmd-b", CommentToggleBold, Some("MarkdownEditor")),
+        KeyBinding::new("cmd-i", CommentToggleItalic, Some("MarkdownEditor")),
+        KeyBinding::new("cmd-e", CommentToggleCode, Some("MarkdownEditor")),
         KeyBinding::new(
             "cmd-shift-8",
             CommentToggleBulletedList,
-            Some("CommentEditor"),
+            Some("MarkdownEditor"),
         ),
         KeyBinding::new(
             "cmd-shift-7",
             CommentToggleNumberedList,
-            Some("CommentEditor"),
+            Some("MarkdownEditor"),
         ),
-        KeyBinding::new("cmd-enter", CommentSave, Some("CommentEditor")),
-        KeyBinding::new("escape", CommentCancel, Some("CommentEditor")),
+        KeyBinding::new("cmd-enter", CommentSave, Some("MarkdownEditor")),
+        KeyBinding::new("escape", CommentCancel, Some("MarkdownEditor")),
     ]);
 }
 
@@ -653,7 +654,7 @@ mod tests {
         let predicate = KeyBindingContextPredicate::parse(READER_NAVIGATION_CONTEXT).unwrap();
         let reader = KeyContext::parse("PdfReader").unwrap();
         let search = KeyContext::parse("TextField").unwrap();
-        let comment = KeyContext::parse("CommentEditor").unwrap();
+        let comment = KeyContext::parse("MarkdownEditor").unwrap();
 
         assert_eq!(predicate.depth_of(std::slice::from_ref(&reader)), Some(1));
         assert_eq!(predicate.depth_of(&[reader.clone(), search]), None);
@@ -664,11 +665,14 @@ mod tests {
     fn every_reader_icon_is_present_in_the_component_asset_bundle() {
         let assets = gpui_component_assets::Assets;
         for icon in [
+            IconName::ALargeSmall,
             IconName::ArrowDown,
             IconName::ArrowRight,
             IconName::ArrowUp,
+            IconName::Asterisk,
             IconName::BookOpen,
             IconName::Calendar,
+            IconName::CaseSensitive,
             IconName::Check,
             IconName::ChevronLeft,
             IconName::ChevronDown,

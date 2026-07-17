@@ -5,13 +5,13 @@ use crate::annotations::{
 use crate::backend::{
     PdfWorker, PreviewSpec, RenderAppearance, RenderColor, TileRequest, WorkerEvent,
 };
-use crate::comment_editor::{CommentEditor, CommentEditorEvent, RichTextBuffer};
 use crate::document_jump::DocumentJump;
 use crate::floating_panel::FloatingPanel;
 use crate::link_preview::{
     LinkPreviewEvent, LinkPreviewFetcher, LinkPreviewSession, WebsitePreviewState,
 };
 use crate::link_resolution::{ResolvedInternalLink, link_source_text, resolve_internal_link};
+use crate::markdown_editor::{MarkdownEditor, MarkdownEditorEvent, RichTextBuffer};
 #[cfg(test)]
 use crate::model::TextChar;
 use crate::model::{
@@ -42,11 +42,12 @@ use crate::{
 };
 use gpui::{
     Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners,
-    CursorStyle, Entity, FocusHandle, Focusable, FontWeight, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, PromptButton,
-    PromptLevel, Render, RenderImage, ScrollStrategy, ScrollWheelEvent, SharedString, Task,
-    Transformation, UniformListScrollHandle, Window, WindowControlArea, canvas, div, ease_in_out,
-    img, percentage, point, prelude::*, px, quad, rems, size, uniform_list,
+    CursorStyle, Entity, FocusHandle, Focusable, FontWeight, IntoElement, ListAlignment, ListState,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point,
+    PromptButton, PromptLevel, Render, RenderImage, ScrollWheelEvent, SharedString, StyledText,
+    Task, TextRun, Transformation, UniformListScrollHandle, Window, WindowControlArea, canvas, div,
+    ease_in_out, font, img, list, percentage, point, prelude::*, px, quad, rems, size,
+    uniform_list,
 };
 #[cfg(debug_assertions)]
 use gpui::{Keystroke, Modifiers, ScrollDelta, TouchPhase};
@@ -98,6 +99,9 @@ const TOC_STACK_MARGIN: f32 = 22.0;
 const TOC_STACK_SPACING: f32 = 12.0;
 const TOC_CASCADE_RADIUS: f32 = 5.0;
 const TOC_CARD_MIN_HEIGHT: f32 = 82.0;
+const TOC_BREADCRUMB_CHARACTER_BUDGET: usize = 46;
+const TOC_BREADCRUMB_MIN_LABEL_CHARACTERS: usize = 8;
+const TOC_BREADCRUMB_MAX_LABEL_CHARACTERS: usize = 20;
 const TOC_HOVER_LEAVE_DELAY: Duration = Duration::from_millis(120);
 const MAX_TOC_HEADING_MATCHES: usize = 16;
 const LINK_CARD_WIDTH: f32 = 340.0;
@@ -370,6 +374,38 @@ fn toc_breadcrumb_entries(entries: &[TocEntry], index: usize) -> Option<Vec<(usi
     Some(path)
 }
 
+fn end_truncate(text: &str, maximum_characters: usize) -> String {
+    let character_count = text.chars().count();
+    if character_count <= maximum_characters || maximum_characters < 2 {
+        return text.to_owned();
+    }
+    let mut result = text
+        .chars()
+        .take(maximum_characters - 1)
+        .collect::<String>();
+    result.push('…');
+    result
+}
+
+fn toc_display_breadcrumbs(breadcrumbs: &[(usize, String)]) -> Vec<(usize, String)> {
+    if breadcrumbs.is_empty() {
+        return Vec::new();
+    }
+    let separators = breadcrumbs.len().saturating_sub(1) * 3;
+    let label_budget = TOC_BREADCRUMB_CHARACTER_BUDGET
+        .saturating_sub(separators)
+        .checked_div(breadcrumbs.len())
+        .unwrap_or(TOC_BREADCRUMB_MIN_LABEL_CHARACTERS)
+        .clamp(
+            TOC_BREADCRUMB_MIN_LABEL_CHARACTERS,
+            TOC_BREADCRUMB_MAX_LABEL_CHARACTERS,
+        );
+    breadcrumbs
+        .iter()
+        .map(|(index, title)| (*index, end_truncate(title, label_budget)))
+        .collect()
+}
+
 fn toc_callout_height(breadcrumbs: &[(usize, String)], width: f32) -> f32 {
     let available_width = (width - 32.0).max(64.0);
     let characters_per_line = (available_width / 6.5).floor().max(8.0);
@@ -574,7 +610,6 @@ struct FluidPillState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChromeButtonStyle {
-    Neutral,
     Ghost,
     Floating,
     Selected,
@@ -605,6 +640,7 @@ enum QaFeaturePhase {
     WaitSearchReturn,
     WaitSearchClosed,
     WaitSearchReopened,
+    WaitSearchRepopulated,
     WaitFinalNavigation,
     Complete,
 }
@@ -727,6 +763,49 @@ struct SearchState {
     total_highlight_runs: usize,
     complete: bool,
     truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchListRow {
+    Page(usize),
+    Match { id: SearchMatchId, ordinal: usize },
+}
+
+fn search_list_rows(order: &[SearchMatchId]) -> Vec<SearchListRow> {
+    let mut rows = Vec::with_capacity(order.len().saturating_add(8));
+    let mut previous_page = None;
+    for (ordinal, id) in order.iter().copied().enumerate() {
+        if previous_page != Some(id.page) {
+            rows.push(SearchListRow::Page(id.page));
+            previous_page = Some(id.page);
+        }
+        rows.push(SearchListRow::Match { id, ordinal });
+    }
+    rows
+}
+
+fn search_preview_text(result: &SearchMatch, palette: ReaderPalette) -> StyledText {
+    let matched = result.preview_match.clone();
+    let mut runs = Vec::with_capacity(3);
+    for (range, weight) in [
+        (0..matched.start, FontWeight::NORMAL),
+        (matched.clone(), FontWeight::BOLD),
+        (matched.end..result.preview.len(), FontWeight::NORMAL),
+    ] {
+        if !range.is_empty() {
+            let mut selected_font = font(".SystemUIFont");
+            selected_font.weight = weight;
+            runs.push(TextRun {
+                len: range.len(),
+                font: selected_font,
+                color: palette.text,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+    }
+    StyledText::new(result.preview.clone()).with_runs(runs)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1095,7 +1174,7 @@ pub struct PdfReader {
     pending_open: Option<PathBuf>,
     active_annotation: Option<AnnotationId>,
     search_field: Entity<TextField>,
-    comment_editor: Option<Entity<CommentEditor>>,
+    comment_editor: Option<Entity<MarkdownEditor>>,
     comment_draft_dirty: bool,
     comment_discard_prompt_open: bool,
     comment_pane: CommentPaneState,
@@ -1104,7 +1183,7 @@ pub struct PdfReader {
     editing_annotation: Option<AnnotationId>,
     pending_comment_range: Option<TextRange>,
     comment_order: Vec<AnnotationId>,
-    search_list_scroll: UniformListScrollHandle,
+    search_list_state: ListState,
     comment_list_scroll: UniformListScrollHandle,
     status: ReaderStatus,
     view_mode: ReaderView,
@@ -1258,7 +1337,7 @@ impl PdfReader {
                 editing_annotation: None,
                 pending_comment_range: None,
                 comment_order: Vec::new(),
-                search_list_scroll: UniformListScrollHandle::new(),
+                search_list_state: ListState::new(0, ListAlignment::Top, px(160.0)),
                 comment_list_scroll: UniformListScrollHandle::new(),
                 status: ReaderStatus::Initializing,
                 view_mode: ReaderView::Classic,
@@ -1997,7 +2076,7 @@ impl PdfReader {
         if self.search.order.len() < 3
             || !self.search.complete
             || self.search.total_highlight_runs == 0
-            || self.qa_search_focuses != 4
+            || self.qa_search_focuses != 5
             || self
                 .search
                 .active
@@ -2066,14 +2145,20 @@ impl PdfReader {
                         return Err("repeated Add Comment replaced the open draft".to_owned());
                     }
                     self.warning = None;
+                    if std::env::var_os("GPUI_PDF_READER_QA_MARKDOWN_MENU_VISUAL").is_some() {
+                        Self::qa_defer_keystrokes(&["/", "h"], window, cx)?;
+                        self.qa_feature_phase = QaFeaturePhase::Complete;
+                        return Ok(true);
+                    }
                     // Exercise the same native key/input path a person uses:
-                    // multiword text (including Space), selection, and
-                    // formatting. The shared debounce must persist it without
-                    // an explicit save command.
+                    // a slash command, multiword text, and Return-driven list
+                    // continuation. The shared debounce must persist it
+                    // without an explicit save command.
                     Self::qa_defer_keystrokes(
                         &[
-                            "i", "m", "p", "o", "r", "t", "a", "n", "t", "space", "c", "o", "p",
-                            "y", "space", "c", "h", "e", "c", "k", "cmd-a", "cmd-b",
+                            "/", "b", "u", "l", "l", "e", "t", "enter", "i", "m", "p", "o", "r",
+                            "t", "a", "n", "t", "space", "c", "o", "p", "y", "enter", "c", "h",
+                            "e", "c", "k",
                         ],
                         window,
                         cx,
@@ -2088,7 +2173,7 @@ impl PdfReader {
                 if !self.comment_draft_dirty {
                     return Err("native comment edits did not mark the draft dirty".to_owned());
                 }
-                if editor.read(cx).markdown() != "**important copy check**" {
+                if editor.read(cx).markdown() != "- important copy\n- check" {
                     return Ok(false);
                 }
                 self.qa_feature_phase = QaFeaturePhase::WaitCommentSaved;
@@ -2111,7 +2196,7 @@ impl PdfReader {
                     .iter()
                     .find_map(|annotation| annotation.comment_markdown().map(ToOwned::to_owned))
                     .ok_or_else(|| "native comment save produced no Markdown".to_owned())?;
-                if comment != "**important copy check**" {
+                if comment != "- important copy\n- check" {
                     return Err(format!(
                         "native comment input/formatting produced unexpected Markdown: {comment:?}"
                     ));
@@ -2138,7 +2223,7 @@ impl PdfReader {
                 let comment = annotations
                     .iter()
                     .find_map(|annotation| annotation.comment_markdown());
-                if annotations.revision() != 6 || comment != Some("**important copy check**") {
+                if annotations.revision() != 6 || comment != Some("- important copy\n- check") {
                     return Err("Back changed the persisted comment".to_owned());
                 }
                 let annotation = annotations
@@ -2306,6 +2391,12 @@ impl PdfReader {
                     if !self.focus_handle.is_focused(window) {
                         return Err("closing Search left its hidden text field focused".to_owned());
                     }
+                    if !self.search.query.is_empty()
+                        || !self.search.order.is_empty()
+                        || !self.search_field.read(cx).text().is_empty()
+                    {
+                        return Err("closing Search did not reset its query and results".to_owned());
+                    }
                     self.show_sidebar(SidePanel::Search, window, cx);
                     self.qa_feature_phase = QaFeaturePhase::WaitSearchReopened;
                 }
@@ -2315,6 +2406,13 @@ impl PdfReader {
                     && self.sidebar.panel == SidePanel::Search
                     && self.sidebar.progress == 1.0
                 {
+                    window.focus(&self.search_field.focus_handle(cx));
+                    Self::qa_defer_keystrokes(&["p", "a", "g", "e"], window, cx)?;
+                    self.qa_feature_phase = QaFeaturePhase::WaitSearchRepopulated;
+                }
+            }
+            QaFeaturePhase::WaitSearchRepopulated => {
+                if self.qa_viewport_is_settled() && self.search.order.len() >= 2 {
                     self.navigate_search(true, window, cx);
                     self.qa_feature_phase = QaFeaturePhase::WaitFinalNavigation;
                 }
@@ -2996,6 +3094,8 @@ impl PdfReader {
                     .pages
                     .insert(results.page, Arc::from(results.matches));
                 self.search.truncated |= results.truncated;
+                self.search_list_state
+                    .reset(search_list_rows(&self.search.order).len());
             }
             WorkerEvent::SearchFinished {
                 generation,
@@ -3527,6 +3627,7 @@ impl PdfReader {
     }
 
     fn toggle_sidebar(&mut self, panel: SidePanel, window: &mut Window, cx: &mut Context<Self>) {
+        let search_was_open = self.sidebar.panel == SidePanel::Search && self.sidebar.target > 0.5;
         let center_anchor = self.layout().and_then(|layout| {
             layout.anchor_at_content_point(
                 self.scroll.x + self.panel_safe_viewport_width() * 0.5,
@@ -3544,6 +3645,10 @@ impl PdfReader {
         self.scroll_target = self.scroll;
         self.reference_panel.target = 0.0;
         self.sidebar.toggle(panel);
+        if search_was_open && (self.sidebar.panel != SidePanel::Search || self.sidebar.target < 0.5)
+        {
+            self.reset_search(cx);
+        }
         if self.sidebar.target < 0.5 {
             window.focus(&self.focus_handle);
         } else if panel == SidePanel::Comments {
@@ -3638,6 +3743,7 @@ impl PdfReader {
         self.search.total_highlight_runs = 0;
         self.search.complete = false;
         self.search.truncated = false;
+        self.search_list_state.reset(0);
         self.search_debounce_task = None;
         let _ = self
             .worker
@@ -3692,9 +3798,10 @@ impl PdfReader {
         };
         let jump = search_document_jump(result);
         self.search.active = Some(id);
-        if let Some(index) = self.search.order.iter().position(|result| *result == id) {
-            self.search_list_scroll
-                .scroll_to_item(index, ScrollStrategy::Center);
+        if let Some(index) = search_list_rows(&self.search.order).iter().position(
+            |row| matches!(row, SearchListRow::Match { id: candidate, .. } if *candidate == id),
+        ) {
+            self.search_list_state.scroll_to_reveal_item(index);
         }
         self.perform_document_jump(jump, window, cx);
         #[cfg(debug_assertions)]
@@ -4039,17 +4146,17 @@ impl PdfReader {
         if self.annotation_failed_revision.is_none() && !self.annotation_persistence_blocked {
             self.annotation_error = None;
         }
-        let editor = cx.new(|cx| CommentEditor::new(cx, buffer));
+        let editor = cx.new(|cx| MarkdownEditor::new(cx, buffer));
         cx.subscribe_in(
             &editor,
             window,
             |reader, _, event, window, cx| match event {
-                CommentEditorEvent::Changed => reader.comment_editor_changed(window, cx),
-                CommentEditorEvent::Save(markdown) => {
+                MarkdownEditorEvent::Changed => reader.comment_editor_changed(window, cx),
+                MarkdownEditorEvent::Save(markdown) => {
                     reader.cancel_comment_autosave();
                     let _ = reader.write_comment(markdown.clone(), cx);
                 }
-                CommentEditorEvent::Cancel => reader.cancel_comment_editor(window, cx),
+                MarkdownEditorEvent::Cancel => reader.cancel_comment_editor(window, cx),
             },
         )
         .detach();
@@ -4162,6 +4269,27 @@ impl PdfReader {
                 .ok();
             });
         }));
+    }
+
+    fn reset_search(&mut self, cx: &mut Context<Self>) {
+        let revision = self.search.revision.wrapping_add(1);
+        let _ = self.worker.cancel_search(self.generation, revision);
+        self.search = SearchState {
+            revision,
+            complete: true,
+            ..SearchState::default()
+        };
+        self.search_debounce_task = None;
+        self.navigation_focus.cancel();
+        self.search_list_state.reset(0);
+        if !self.search_field.read(cx).text().is_empty()
+            && let Err(rejection) = self
+                .search_field
+                .update(cx, |field, cx| field.set_text("", cx))
+        {
+            self.search.input_error = Some(rejection.to_string().into());
+        }
+        cx.notify();
     }
 
     fn cancel_comment_autosave(&mut self) {
@@ -6009,13 +6137,6 @@ impl PdfReader {
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
         let (background, border, text, hover, pressed) = match style {
-            ChromeButtonStyle::Neutral => (
-                palette.control,
-                palette.separator,
-                palette.text,
-                palette.control_hover,
-                palette.control_pressed,
-            ),
             ChromeButtonStyle::Ghost => (
                 palette.chrome,
                 palette.chrome,
@@ -6652,7 +6773,8 @@ impl PdfReader {
         let detail = hovered.and_then(|index| {
             let entry = document.toc.get(index)?;
             let marker_y = stack_top + self.toc_hover_position * marker_spacing;
-            let breadcrumbs = toc_breadcrumb_entries(&document.toc, index)?;
+            let breadcrumbs =
+                toc_display_breadcrumbs(&toc_breadcrumb_entries(&document.toc, index)?);
             let card_width = toc_callout_width(&breadcrumbs, maximum_card_width);
             let card_height = toc_callout_height(&breadcrumbs, card_width)
                 .min((self.viewport_height - 20.0).max(TOC_CARD_MIN_HEIGHT));
@@ -8841,25 +8963,42 @@ impl PdfReader {
                 )
                 .into_any_element()
         } else {
-            uniform_list(
-                "search-results",
-                result_count,
-                cx.processor(move |reader, range: std::ops::Range<usize>, _window, cx| {
-                    range
-                        .filter_map(|index| {
-                            let id = *reader.search.order.get(index)?;
-                            let result = reader
-                                .search
-                                .pages
-                                .get(&id.page)?
-                                .iter()
-                                .find(|result| result.id == id)?;
-                            let preview: SharedString = result.preview.clone().into();
+            let rows: Arc<[SearchListRow]> = search_list_rows(&self.search.order).into();
+            list(
+                self.search_list_state.clone(),
+                cx.processor(move |reader, index, _window, cx| {
+                    let Some(row) = rows.get(index).copied() else {
+                        return div().into_any_element();
+                    };
+                    match row {
+                        SearchListRow::Page(page) => div()
+                            .h(px(34.0))
+                            .w_full()
+                            .px_4()
+                            .pt_3()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(palette.text_secondary)
+                            .child(format!("PAGE {}", page + 1))
+                            .into_any_element(),
+                        SearchListRow::Match { id, ordinal } => {
+                            let Some(result) =
+                                reader.search.pages.get(&id.page).and_then(|matches| {
+                                    matches.iter().find(|result| result.id == id)
+                                })
+                            else {
+                                return div().into_any_element();
+                            };
+                            let preview = search_preview_text(result, palette);
                             let active = reader.search.active == Some(id);
-                            Some(
-                                div().h(px(88.0)).w_full().px_3().py_1().child(
+                            div()
+                                .h(px(68.0))
+                                .w_full()
+                                .px_3()
+                                .py_1()
+                                .child(
                                     div()
-                                        .id(("search-result", index))
+                                        .id(("search-result", ordinal))
                                         .size_full()
                                         .overflow_hidden()
                                         .flex()
@@ -8901,41 +9040,18 @@ impl PdfReader {
                                                 .min_w(px(0.0))
                                                 .px_3()
                                                 .py_2()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(if active {
-                                                            palette.accent
-                                                        } else {
-                                                            palette.text_secondary
-                                                        })
-                                                        .child(format!("PAGE {}", id.page + 1))
-                                                        .child(format!("{}", index + 1)),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .h(px(40.0))
-                                                        .overflow_hidden()
-                                                        .text_sm()
-                                                        .line_height(px(19.0))
-                                                        .text_color(palette.text)
-                                                        .child(preview),
-                                                ),
+                                                .h(px(58.0))
+                                                .overflow_hidden()
+                                                .text_sm()
+                                                .line_height(px(19.0))
+                                                .child(preview),
                                         ),
-                                ),
-                            )
-                        })
-                        .collect::<Vec<_>>()
+                                )
+                                .into_any_element()
+                        }
+                    }
                 }),
             )
-            .track_scroll(self.search_list_scroll.clone())
             .flex_1()
             .min_h(px(0.0))
             .w_full()
@@ -8970,7 +9086,7 @@ impl PdfReader {
                     .child(Self::chrome_button(
                         palette,
                         "close-search",
-                        "Close",
+                        Icon::new(IconName::Close).size(px(16.0)),
                         ChromeButtonStyle::Ghost,
                         true,
                         cx.listener(|reader, _, window, cx| {
@@ -9042,13 +9158,6 @@ impl PdfReader {
 
     fn render_fluid_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let palette = ReaderPalette::from_theme(Theme::global(cx));
-        let editor_open = self.comment_editor.is_some();
-        let can_add_comment = annotation_actions_enabled(
-            self.selection.is_some(),
-            self.annotations_loading,
-            self.annotation_persistence_blocked,
-            editor_open,
-        );
         let list_header = div()
             .h(px(54.0))
             .flex_none()
@@ -9071,18 +9180,8 @@ impl PdfReader {
                     .gap_1()
                     .child(Self::chrome_button(
                         palette,
-                        "fluid-add-comment",
-                        "+ New",
-                        ChromeButtonStyle::Neutral,
-                        can_add_comment,
-                        cx.listener(|reader, _, window, cx| {
-                            reader.add_comment(&AddComment, window, cx)
-                        }),
-                    ))
-                    .child(Self::chrome_button(
-                        palette,
                         "fluid-close-comments",
-                        "Close",
+                        Icon::new(IconName::Close).size(px(16.0)),
                         ChromeButtonStyle::Ghost,
                         true,
                         cx.listener(|reader, _, window, cx| {
@@ -9329,7 +9428,7 @@ impl PdfReader {
                         .child(Self::chrome_button(
                             palette,
                             "fluid-comment-back",
-                            Self::icon_label(IconName::ChevronLeft, "Back"),
+                            Self::icon_label(IconName::ChevronLeft, "Overview"),
                             ChromeButtonStyle::Ghost,
                             true,
                             cx.listener(|reader, _, window, cx| {
@@ -9368,7 +9467,7 @@ impl PdfReader {
                         .child(Self::chrome_button(
                             palette,
                             "fluid-close-comment-editor",
-                            "Close",
+                            Icon::new(IconName::Close).size(px(16.0)),
                             ChromeButtonStyle::Ghost,
                             true,
                             cx.listener(|reader, _, window, cx| {
@@ -9411,13 +9510,6 @@ impl PdfReader {
         let palette = ReaderPalette::from_theme(Theme::global(cx));
         let error = self.annotation_error.clone();
         let editor_open = self.comment_editor.is_some();
-        let can_add_comment = annotation_actions_enabled(
-            self.context_range().is_some(),
-            self.annotations_loading,
-            self.annotation_persistence_blocked,
-            editor_open,
-        );
-        let context_has_comment = self.context_has_comment();
         let annotations_pending = self
             .annotations
             .as_ref()
@@ -9459,7 +9551,7 @@ impl PdfReader {
                         heading.child(Self::chrome_button(
                             palette,
                             "classic-comment-back",
-                            Self::icon_label(IconName::ChevronLeft, "Back"),
+                            Self::icon_label(IconName::ChevronLeft, "Overview"),
                             ChromeButtonStyle::Ghost,
                             true,
                             cx.listener(|reader, _, window, cx| {
@@ -9500,22 +9592,10 @@ impl PdfReader {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .when(!editor_open, |actions| {
-                        actions.child(Self::chrome_button(
-                            palette,
-                            "add-comment",
-                            if context_has_comment { "Edit" } else { "+ New" },
-                            ChromeButtonStyle::Neutral,
-                            can_add_comment,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.comment_on_context(window, cx)
-                            }),
-                        ))
-                    })
                     .child(Self::chrome_button(
                         palette,
                         "close-comments",
-                        "Close",
+                        Icon::new(IconName::Close).size(px(16.0)),
                         ChromeButtonStyle::Ghost,
                         true,
                         cx.listener(|reader, _, window, cx| {
@@ -11827,8 +11907,26 @@ mod tests {
                 "An equally long child section title that must remain fully visible".to_owned(),
             ),
         ];
-        assert_eq!(toc_callout_width(&long_breadcrumbs, 360.0), 360.0);
-        assert!(toc_callout_height(&long_breadcrumbs, 220.0) > TOC_CARD_MIN_HEIGHT);
+        let compact_breadcrumbs = toc_display_breadcrumbs(&long_breadcrumbs);
+        assert_eq!(
+            compact_breadcrumbs
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(compact_breadcrumbs.iter().all(|(_, title)| {
+            title.chars().count() <= TOC_BREADCRUMB_MAX_LABEL_CHARACTERS && title.ends_with('…')
+        }));
+        assert!(toc_callout_width(&compact_breadcrumbs, 360.0) < 360.0);
+        assert_eq!(
+            toc_callout_height(
+                &compact_breadcrumbs,
+                toc_callout_width(&compact_breadcrumbs, 360.0)
+            ),
+            TOC_CARD_MIN_HEIGHT
+        );
+        assert_eq!(end_truncate("Résumé détaillé", 8), "Résumé …");
 
         assert_eq!(toc_stack_geometry(600.0, 3), Some((288.0, 12.0)));
         assert_eq!(toc_stack_geometry(600.0, 1), Some((300.0, 0.0)));
@@ -12423,6 +12521,33 @@ mod tests {
     }
 
     #[test]
+    fn search_list_groups_matches_under_one_heading_per_page() {
+        let rows = search_list_rows(&[
+            SearchMatchId {
+                page: 1,
+                start: 2,
+                end: 3,
+            },
+            SearchMatchId {
+                page: 1,
+                start: 8,
+                end: 9,
+            },
+            SearchMatchId {
+                page: 4,
+                start: 1,
+                end: 2,
+            },
+        ]);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], SearchListRow::Page(1));
+        assert!(matches!(rows[1], SearchListRow::Match { ordinal: 0, .. }));
+        assert!(matches!(rows[2], SearchListRow::Match { ordinal: 1, .. }));
+        assert_eq!(rows[3], SearchListRow::Page(4));
+        assert!(matches!(rows[4], SearchListRow::Match { ordinal: 2, .. }));
+    }
+
+    #[test]
     fn search_jump_uses_result_geometry_and_a_bounded_fallback() {
         let result = SearchMatch {
             id: SearchMatchId {
@@ -12431,6 +12556,7 @@ mod tests {
                 end: 12,
             },
             preview: "result".to_owned(),
+            preview_match: 0..6,
             highlight_runs: vec![
                 TextBounds {
                     left: 0.2,
@@ -12473,6 +12599,7 @@ mod tests {
                 end: 2,
             },
             preview: "unlocated".to_owned(),
+            preview_match: 0..9,
             highlight_runs: Vec::new(),
         })
         .resolve(&layout, 0.0, 500.0, 400.0, 500.0)
