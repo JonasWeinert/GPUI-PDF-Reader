@@ -301,6 +301,93 @@ fn statistics_package_and_runtime_enforce_independent_component_bounds() {
 }
 
 #[test]
+fn adversarial_component_is_reproducible_and_suspended_after_repeated_loops() {
+    let package = load("reference-adversarial-loop");
+    let manifest = package.manifest().clone();
+    let ExtensionEntrypoint::WasmComponent {
+        component, world, ..
+    } = &manifest.entrypoint
+    else {
+        panic!("adversarial fixture must be a Component Model package");
+    };
+    let component_bytes = package
+        .component()
+        .expect("validated package retains component bytes")
+        .bytes();
+    let source = std::fs::read_to_string(
+        package_root("reference-adversarial-loop").join("../source/component.wat"),
+    )
+    .expect("auditable adversarial source is readable");
+    assert_eq!(
+        wat::parse_str(source).expect("adversarial source compiles"),
+        component_bytes,
+        "checked-in hostile binary must be reproducible from its WAT source"
+    );
+
+    let runtime = WasmRuntime::new(WasmRuntimeLimits {
+        fuel_per_invocation: 10_000,
+        ..WasmRuntimeLimits::default()
+    })
+    .expect("bounded runtime starts");
+    let adapter = compile_host_adapter(
+        &runtime,
+        WasmHostAdapterConfig {
+            extension: manifest.id.clone(),
+            component: component.clone(),
+            world: world.clone(),
+            subscriptions: vec![EventSubscription::Commands],
+        },
+        component_bytes,
+    )
+    .expect("hostile fixture compiles inside the real runtime");
+
+    let mut host = ExtensionHost::new(Default::default());
+    host.register_host_capability(
+        manifest.capabilities.required[0].id.clone(),
+        ExtensionVersion::from_str("0.1.0").expect("static version"),
+    );
+    host.register_wasm_adapter(adapter);
+    host.install(manifest.clone(), PackageMetadata::bundled())
+        .expect("hostile fixture installs");
+    for request in &manifest.permissions {
+        host.set_permission_decision(
+            manifest.id.clone(),
+            request.permission.clone(),
+            PermissionDecision::Granted,
+        );
+    }
+    host.activate(&manifest.id)
+        .expect("activation itself stays within budget");
+    let probe = &manifest.contributions.commands[0].id;
+    for _ in 0..4 {
+        host.invoke_command(probe, DataValue::Null)
+            .expect("bounded probe event queues before suspension");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.state(&manifest.id) != Some(LifecycleState::Suspended) {
+        host.process_tick();
+        assert!(
+            Instant::now() < deadline,
+            "repeated hostile calls were not suspended"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(host.collect_contributions().commands.is_empty());
+}
+
+#[test]
+fn native_escape_fixture_is_explicitly_native_and_contains_no_payload() {
+    let package = load("reference-native-escape");
+    assert!(matches!(
+        package.manifest().entrypoint,
+        ExtensionEntrypoint::NativeBuiltin { .. }
+    ));
+    assert!(package.component().is_none());
+    assert!(package.ui().is_none());
+}
+
+#[test]
 fn package_api_compatibility_stays_on_the_pre_stable_contract() {
     for package in [
         load("reference-theme-pack"),

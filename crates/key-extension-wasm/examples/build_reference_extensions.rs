@@ -26,6 +26,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let workspace = workspace_root()?;
     build_theme_pack(&workspace)?;
     build_document_statistics(&workspace)?;
+    build_adversarial_loop(&workspace)?;
+    build_native_escape(&workspace)?;
     println!(
         "rebuilt reference extension packages in {}",
         workspace.display()
@@ -81,6 +83,24 @@ fn build_document_statistics(workspace: &Path) -> Result<(), Box<dyn Error>> {
     let source = fs::read_to_string(root.join("source/component.wat"))?;
     let component = wat::parse_str(&source)?;
     fs::write(package.join("component.wasm"), component)?;
+    Ok(())
+}
+
+fn build_adversarial_loop(workspace: &Path) -> Result<(), Box<dyn Error>> {
+    let root = workspace.join("extensions/reference-adversarial-loop");
+    let package = root.join("package");
+    fs::create_dir_all(&package)?;
+    write_manifest(&package, &adversarial_loop_manifest())?;
+    let source = fs::read_to_string(root.join("source/component.wat"))?;
+    let component = wat::parse_str(&source)?;
+    fs::write(package.join("component.wasm"), component)?;
+    Ok(())
+}
+
+fn build_native_escape(workspace: &Path) -> Result<(), Box<dyn Error>> {
+    let package = workspace.join("extensions/reference-native-escape/package");
+    fs::create_dir_all(&package)?;
+    write_manifest(&package, &native_escape_manifest())?;
     Ok(())
 }
 
@@ -376,6 +396,79 @@ fn statistics_manifest() -> ExtensionManifest {
             ephemeral_cache_bytes: 64 * 1024,
             ..StorageRequirements::default()
         },
+    }
+}
+
+fn adversarial_loop_manifest() -> ExtensionManifest {
+    let probe = command("org.key.reference.adversarial-loop/probe");
+    ExtensionManifest {
+        schema_version: CURRENT_MANIFEST_SCHEMA,
+        id: extension("org.key.reference.adversarial-loop"),
+        name: "Reference Adversarial Loop".into(),
+        version: version("1.0.0"),
+        publisher: reference_publisher(),
+        description: "Security fixture whose event handler intentionally exhausts its fuel budget."
+            .into(),
+        license: "MIT".into(),
+        compatibility: compatibility(),
+        entrypoint: ExtensionEntrypoint::WasmComponent {
+            component: package_path("component.wasm"),
+            world: "key:extension-runtime/extension@0.1.0".into(),
+            ui: None,
+        },
+        dependencies: Vec::new(),
+        capabilities: CapabilityRequirements {
+            required: vec![CapabilityRequest {
+                id: capability("key:pdf/document-metadata"),
+                version: compatible("^0.1"),
+                scope: CapabilityScope::ActiveDocument,
+            }],
+            optional: Vec::new(),
+            provided: Vec::new(),
+        },
+        permissions: vec![PermissionRequest {
+            permission: Permission::ReadDocumentMetadata,
+            reason: "Receive a bounded document event used by the containment test.".into(),
+            required: true,
+        }],
+        contributions: ContributionSet {
+            commands: vec![CommandDefinition {
+                id: probe,
+                title: "Run adversarial containment probe".into(),
+                description: "Deliver another bounded event to the hostile test guest.".into(),
+                category: "Security testing".into(),
+            }],
+            ..ContributionSet::default()
+        },
+        settings: SettingsSchema::default(),
+        storage: StorageRequirements::default(),
+    }
+}
+
+fn native_escape_manifest() -> ExtensionManifest {
+    ExtensionManifest {
+        schema_version: CURRENT_MANIFEST_SCHEMA,
+        id: extension("org.key.reference.native-escape"),
+        name: "Reference Native Escape".into(),
+        version: version("1.0.0"),
+        publisher: reference_publisher(),
+        description: "Security fixture proving that local packages cannot request native code."
+            .into(),
+        license: "MIT".into(),
+        compatibility: compatibility(),
+        entrypoint: ExtensionEntrypoint::NativeBuiltin {
+            adapter: key_extension_api::NativeAdapterId::parse(
+                "org.key.reference.native-escape/forbidden",
+            )
+            .expect("static adapter ID"),
+            ui: None,
+        },
+        dependencies: Vec::new(),
+        capabilities: CapabilityRequirements::default(),
+        permissions: Vec::new(),
+        contributions: ContributionSet::default(),
+        settings: SettingsSchema::default(),
+        storage: StorageRequirements::default(),
     }
 }
 

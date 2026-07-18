@@ -1,0 +1,41 @@
+schema_version = 1
+id = "org.key.reference.native-escape"
+name = "Reference Native Escape"
+version = "1.0.0"
+description = "Security fixture proving that local packages cannot request native code."
+license = "MIT"
+dependencies = []
+permissions = []
+
+[publisher]
+id = "key-reference"
+name = "Key Reference Extensions"
+
+[compatibility]
+extension_api = "^0.1"
+minimum_host = "0.1.0"
+platforms = []
+
+[entrypoint]
+kind = "native_builtin"
+adapter = "org.key.reference.native-escape/forbidden"
+
+[capabilities]
+required = []
+optional = []
+provided = []
+
+[contributions]
+commands = []
+command_behaviors = []
+menus = []
+views = []
+
+[settings]
+version = 0
+fields = []
+
+[storage]
+settings_bytes = 0
+document_bytes = 0
+ephemeral_cache_bytes = 0

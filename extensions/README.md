@@ -34,8 +34,12 @@ it outside this workspace.
 - `reference-document-statistics` is a no-WASI Component Model guest. It proves
   the same lifecycle and UI path under fuel, deadline, memory, stack, queue,
   input, and output limits while consuming bounded document summaries.
+- `reference-adversarial-loop` is a hostile no-WASI test guest. It proves that
+  repeated infinite event handlers exhaust fuel and suspend only the package.
+- `reference-native-escape` is rejected during preview because installable
+  packages cannot declare trusted native adapters.
 
-Rebuild both checked-in packages reproducibly with:
+Rebuild all checked-in packages reproducibly with:
 
 ```sh
 cargo run -p key-extension-wasm --example build_reference_extensions

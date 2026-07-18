@@ -1,0 +1,59 @@
+schema_version = 1
+id = "org.key.reference.adversarial-loop"
+name = "Reference Adversarial Loop"
+version = "1.0.0"
+description = "Security fixture whose event handler intentionally exhausts its fuel budget."
+license = "MIT"
+dependencies = []
+
+[publisher]
+id = "key-reference"
+name = "Key Reference Extensions"
+
+[compatibility]
+extension_api = "^0.1"
+minimum_host = "0.1.0"
+platforms = []
+
+[entrypoint]
+kind = "wasm_component"
+component = "component.wasm"
+world = "key:extension-runtime/extension@0.1.0"
+
+[capabilities]
+optional = []
+provided = []
+
+[[capabilities.required]]
+id = "key:pdf/document-metadata"
+version = "^0.1"
+
+[capabilities.required.scope]
+kind = "active_document"
+
+[[permissions]]
+reason = "Receive a bounded document event used by the containment test."
+required = true
+
+[permissions.permission]
+kind = "read_document_metadata"
+
+[contributions]
+command_behaviors = []
+menus = []
+views = []
+
+[[contributions.commands]]
+id = "org.key.reference.adversarial-loop/probe"
+title = "Run adversarial containment probe"
+description = "Deliver another bounded event to the hostile test guest."
+category = "Security testing"
+
+[settings]
+version = 0
+fields = []
+
+[storage]
+settings_bytes = 0
+document_bytes = 0
+ephemeral_cache_bytes = 0
