@@ -132,6 +132,7 @@ pub enum ExtensionRegistryError {
     DuplicatePermission,
     InvalidPermission(String),
     InvalidSettings(String),
+    #[cfg(test)]
     ExtensionNotFound(ExtensionId),
     AtomicRollbackFailed {
         path: PathBuf,
@@ -190,6 +191,7 @@ impl fmt::Display for ExtensionRegistryError {
             Self::InvalidSettings(reason) => {
                 write!(formatter, "invalid persisted extension settings: {reason}")
             }
+            #[cfg(test)]
             Self::ExtensionNotFound(extension) => {
                 write!(formatter, "extension {extension} is not in the registry")
             }
@@ -263,16 +265,13 @@ impl ExtensionRegistry {
         Self::load(root.join(EXTENSION_REGISTRY_FILE_NAME))
     }
 
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
+    #[cfg(test)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -314,6 +313,7 @@ impl ExtensionRegistry {
         Ok(Some(removed))
     }
 
+    #[cfg(test)]
     pub fn set_enabled(
         &mut self,
         extension: &ExtensionId,
@@ -330,6 +330,7 @@ impl ExtensionRegistry {
         self.commit(next)
     }
 
+    #[cfg(test)]
     pub fn set_permission_decision(
         &mut self,
         extension: &ExtensionId,
@@ -363,6 +364,7 @@ impl ExtensionRegistry {
         self.commit(next)
     }
 
+    #[cfg(test)]
     pub fn replace_permission_decisions(
         &mut self,
         extension: &ExtensionId,
@@ -377,6 +379,7 @@ impl ExtensionRegistry {
         self.commit(next)
     }
 
+    #[cfg(test)]
     pub fn replace_settings(
         &mut self,
         extension: &ExtensionId,
@@ -393,6 +396,7 @@ impl ExtensionRegistry {
 
     /// Removes a stored decision, returning the permission to the host's
     /// undecided state. This does not grant or deny anything implicitly.
+    #[cfg(test)]
     pub fn clear_permission_decision(
         &mut self,
         extension: &ExtensionId,

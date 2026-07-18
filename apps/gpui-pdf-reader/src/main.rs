@@ -202,10 +202,11 @@ pub(crate) fn rebuild_application_menus(
         tools_items.push(MenuItem::separator());
     }
     let extension_tools = {
-        let mut items = Vec::new();
-        #[cfg(feature = "installable-extensions")]
-        items.push(MenuItem::action("Install or Update…", InstallExtension));
-        items.push(MenuItem::action("Manage…", ManageExtensions));
+        let items = vec![
+            #[cfg(feature = "installable-extensions")]
+            MenuItem::action("Install or Update…", InstallExtension),
+            MenuItem::action("Manage…", ManageExtensions),
+        ];
         MenuItem::submenu(Menu {
             name: "Extensions".into(),
             items,

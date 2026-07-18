@@ -2504,11 +2504,14 @@ impl PdfReader {
                 return;
             }
         };
-        let activation_updates = self.extensions.settle_package_activations();
-        if let Some(update) = activation_updates.last() {
-            self.warning = Some(update.message.clone().into());
-            self.refresh_extension_manager_state();
-            crate::rebuild_application_menus(&mut self.extensions, cx);
+        #[cfg(feature = "installable-extensions")]
+        {
+            let activation_updates = self.extensions.settle_package_activations();
+            if let Some(update) = activation_updates.last() {
+                self.warning = Some(update.message.clone().into());
+                self.refresh_extension_manager_state();
+                crate::rebuild_application_menus(&mut self.extensions, cx);
+            }
         }
         self.refresh_active_extension_view(window, cx);
         if !report.effects.is_empty() {

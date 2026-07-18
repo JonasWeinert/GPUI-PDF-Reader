@@ -4,13 +4,10 @@
 //! reader shell remains responsible for executing approved effects against
 //! GPUI, PDF sessions, storage, and operating-system services.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{path::PathBuf, str::FromStr, sync::Arc};
 
+#[cfg(feature = "installable-extensions")]
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "installable-extensions")]
 use std::path::Path;
 
@@ -51,7 +48,7 @@ use crate::pdf_capability_bridge::PdfCapabilityBridge;
 #[cfg(feature = "installable-extensions")]
 use crate::extension_packages::{
     ExtensionPackageError, InstallableExtensionManager, InstalledPackageSummary,
-    PackageInstallPreview, PackageInstallReport,
+    PackageInstallPreview, PackageInstallReport, RegisteredPackageRestore,
 };
 
 const THEME_EXTENSION: &str = "com.jonasweinert.gpuipdf.theme";
@@ -85,6 +82,7 @@ pub struct ReaderExtensions {
 
 /// User-facing outcome produced when a provisional asynchronous package
 /// upgrade either commits or rolls back on a later host tick.
+#[cfg(feature = "installable-extensions")]
 pub struct PackageActivationUpdate {
     pub message: String,
 }
@@ -352,47 +350,41 @@ impl ReaderExtensions {
     /// Commits durable package state only after a Wasm upgrade has actually
     /// crossed its worker boundary. A failed candidate is rolled back by the
     /// package manager while the old registry entry and assets remain intact.
+    #[cfg(feature = "installable-extensions")]
     pub fn settle_package_activations(&mut self) -> Vec<PackageActivationUpdate> {
-        #[cfg(not(feature = "installable-extensions"))]
-        {
-            Vec::new()
-        }
-        #[cfg(feature = "installable-extensions")]
-        {
-            let Some(packages) = self.packages.as_mut() else {
-                return Vec::new();
-            };
-            let settlements = packages.settle_activating_upgrades(&mut self.host);
-            let mut updates = Vec::with_capacity(settlements.len());
-            for (extension, settlement) in settlements {
-                match settlement {
-                    Ok(report) => {
-                        let source = self.pending_sources.remove(&extension);
-                        let durable = self
-                            .persist_managed_package(&extension, source.as_deref(), true)
-                            .and_then(|()| self.sync_extension_assets(&extension, true));
-                        match durable {
-                            Ok(()) => updates.push(PackageActivationUpdate {
-                                message: format!("Updated {} {}", report.name, report.version),
-                            }),
-                            Err(error) => updates.push(PackageActivationUpdate {
-                                message: format!(
-                                    "Extension activated, but its durable state could not be updated: {error}"
-                                ),
-                            }),
-                        }
-                    }
-                    Err(error) => {
-                        self.pending_sources.remove(&extension);
-                        updates.push(PackageActivationUpdate {
-                            message: format!("Extension update was rolled back: {error}"),
-                        });
+        let Some(packages) = self.packages.as_mut() else {
+            return Vec::new();
+        };
+        let settlements = packages.settle_activating_upgrades(&mut self.host);
+        let mut updates = Vec::with_capacity(settlements.len());
+        for (extension, settlement) in settlements {
+            match settlement {
+                Ok(report) => {
+                    let source = self.pending_sources.remove(&extension);
+                    let durable = self
+                        .persist_managed_package(&extension, source.as_deref(), true)
+                        .and_then(|()| self.sync_extension_assets(&extension, true));
+                    match durable {
+                        Ok(()) => updates.push(PackageActivationUpdate {
+                            message: format!("Updated {} {}", report.name, report.version),
+                        }),
+                        Err(error) => updates.push(PackageActivationUpdate {
+                            message: format!(
+                                "Extension activated, but its durable state could not be updated: {error}"
+                            ),
+                        }),
                     }
                 }
-                self.last_snapshots.clear();
+                Err(error) => {
+                    self.pending_sources.remove(&extension);
+                    updates.push(PackageActivationUpdate {
+                        message: format!("Extension update was rolled back: {error}"),
+                    });
+                }
             }
-            updates
+            self.last_snapshots.clear();
         }
+        updates
     }
 
     pub fn contributions(&mut self) -> CollectedContributions {
@@ -900,12 +892,14 @@ fn restore_installable_extensions(
             .collect::<Vec<_>>();
         let restored = packages.restore_registered(
             host,
-            &entry.source_path,
-            &entry.extension,
-            &entry.expected_content_sha256,
-            &decisions,
-            entry.settings.clone(),
-            entry.enabled && !safe_mode,
+            RegisteredPackageRestore {
+                path: &entry.source_path,
+                expected_extension: &entry.extension,
+                expected_content_sha256: &entry.expected_content_sha256,
+                permission_decisions: &decisions,
+                settings: entry.settings.clone(),
+                enabled: entry.enabled && !safe_mode,
+            },
         );
         let result = restored.and_then(|report| {
             if report.activation == crate::extension_packages::PackageActivation::Active {

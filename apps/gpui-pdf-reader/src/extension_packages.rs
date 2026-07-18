@@ -71,6 +71,18 @@ pub struct PackageInstallPreview {
     referenced_assets: Vec<(PackagePath, Vec<u8>)>,
 }
 
+/// Durable state supplied by the app when restoring one previously reviewed
+/// package. Grouping the identity and authority snapshot keeps restoration a
+/// single explicit boundary instead of an error-prone positional call.
+pub(crate) struct RegisteredPackageRestore<'a> {
+    pub path: &'a Path,
+    pub expected_extension: &'a ExtensionId,
+    pub expected_content_sha256: &'a str,
+    pub permission_decisions: &'a [(Permission, PermissionDecision)],
+    pub settings: Option<DataValue>,
+    pub enabled: bool,
+}
+
 impl PackageInstallPreview {
     #[must_use]
     pub fn content_sha256_hex(&self) -> String {
@@ -377,16 +389,19 @@ impl InstallableExtensionManager {
     /// Restores one package that was previously reviewed and recorded by the
     /// application. Identity, content, permissions, and settings are checked
     /// before optional activation; a changed source never inherits authority.
-    pub fn restore_registered(
+    pub(crate) fn restore_registered(
         &mut self,
         host: &mut ExtensionHost,
-        path: &Path,
-        expected_extension: &ExtensionId,
-        expected_content_sha256: &str,
-        permission_decisions: &[(Permission, PermissionDecision)],
-        settings: Option<DataValue>,
-        enabled: bool,
+        restore: RegisteredPackageRestore<'_>,
     ) -> Result<PackageInstallReport, ExtensionPackageError> {
+        let RegisteredPackageRestore {
+            path,
+            expected_extension,
+            expected_content_sha256,
+            permission_decisions,
+            settings,
+            enabled,
+        } = restore;
         let managed = self.load_managed(path)?;
         let actual_extension = managed.manifest().id.clone();
         if &actual_extension != expected_extension {

@@ -112,6 +112,7 @@ impl PdfCapabilityBridge {
     ///
     /// Returns a structured internal error if the generation counter is
     /// exhausted or the bridge lock was poisoned.
+    #[cfg(test)]
     pub fn begin_document(&self, page_count: u32) -> PdfExtensionResult<DocumentHandle> {
         let mut state = self.write_state()?;
         let generation = allocate_document_generation(&mut state)?;
@@ -483,6 +484,7 @@ impl PdfCapabilityBridge {
     ///
     /// Returns the first contract, generation, handle, or monotonic-revision
     /// violation. Invalid publications leave the previous snapshot untouched.
+    #[cfg(test)]
     pub fn publish_snapshot(&self, snapshot: PdfBridgeSnapshot) -> PdfExtensionResult<()> {
         let mut state = self.write_state()?;
         let active = require_active_mut(&mut state)?;

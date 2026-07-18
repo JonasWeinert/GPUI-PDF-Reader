@@ -14,7 +14,7 @@ cargo test --locked --workspace --all-targets
 cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings
 cargo check --locked -p gpui-pdf-reader --no-default-features
 sh scripts/audit-boundaries.sh
-cargo test --locked \
+CARGO_TARGET_DIR="$root/target/vendor-pdfium-render" cargo test --locked \
   --manifest-path vendor/pdfium-render-tile/Cargo.toml \
   test_tiled_rendering_matches_full_rendering -- --test-threads=1
 sh scripts/audit-licenses.sh
