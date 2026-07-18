@@ -17,19 +17,17 @@ use std::ops::Range;
 use crate::theme::ReaderPalette;
 use crate::{EditCopy, EditCut, EditPaste, EditSelectAll};
 
-mod model;
-
-pub use model::{BlockKind, InlineStyle, RichTextBuffer};
+pub use key_editor_core::{BlockKind, InlineStyle, RichTextBuffer};
 // Compatibility name for existing PDF-comment callers. New reusable code
 // should use the storage-neutral `MarkdownLimitExceeded` name.
 #[cfg(test)]
-use model::{
+use key_editor_core::{
     DEFAULT_MAX_MARKDOWN_BYTES as MAX_COMMENT_BYTES, markdown_fits_with_run_operations,
     parse_inline_with_operations,
 };
 #[allow(unused_imports)]
-pub use model::{MarkdownLimitExceeded, MarkdownLimitExceeded as CommentMarkdownTooLong};
-use model::{
+pub use key_editor_core::{MarkdownLimitExceeded, MarkdownLimitExceeded as CommentMarkdownTooLong};
+use key_editor_core::{
     StyleRunCursor, line_at_offset, line_ranges, next_grapheme_boundary, previous_grapheme_boundary,
 };
 
@@ -231,7 +229,7 @@ impl MarkdownEditor {
     }
 
     fn slash_query(&self) -> Option<(Range<usize>, String)> {
-        if !self.buffer.selection.is_empty() {
+        if !self.buffer.selection().is_empty() {
             return None;
         }
         let cursor = self.buffer.cursor_offset();
@@ -274,9 +272,7 @@ impl MarkdownEditor {
             return;
         };
         let original = self.buffer.clone();
-        self.buffer.selection = menu.range;
-        self.buffer.selection_reversed = false;
-        self.buffer.pending_style = None;
+        self.buffer.set_selection(menu.range, false);
         let removed = self.buffer.replace_selection("");
         let formatted = removed
             && match command {
@@ -325,10 +321,11 @@ impl MarkdownEditor {
     }
 
     fn move_left(&mut self, _: &CommentLeft, _: &mut Window, cx: &mut Context<Self>) {
-        let destination = if self.buffer.selection.is_empty() {
+        let selection = self.buffer.selection();
+        let destination = if selection.is_empty() {
             previous_grapheme_boundary(self.buffer.text(), self.buffer.cursor_offset())
         } else {
-            self.buffer.selection.start
+            selection.start
         };
         self.buffer.move_to(destination);
         self.refresh_slash_menu();
@@ -337,10 +334,11 @@ impl MarkdownEditor {
     }
 
     fn move_right(&mut self, _: &CommentRight, _: &mut Window, cx: &mut Context<Self>) {
-        let destination = if self.buffer.selection.is_empty() {
+        let selection = self.buffer.selection();
+        let destination = if selection.is_empty() {
             next_grapheme_boundary(self.buffer.text(), self.buffer.cursor_offset())
         } else {
-            self.buffer.selection.end
+            selection.end
         };
         self.buffer.move_to(destination);
         self.refresh_slash_menu();
@@ -472,9 +470,10 @@ impl MarkdownEditor {
     }
 
     fn copy(&mut self, _: &CommentCopy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.buffer.selection.is_empty() {
+        let selection = self.buffer.selection();
+        if !selection.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.buffer.text()[self.buffer.selection.clone()].to_owned(),
+                self.buffer.text()[selection].to_owned(),
             ));
         }
         cx.stop_propagation();
@@ -485,9 +484,10 @@ impl MarkdownEditor {
     }
 
     fn cut(&mut self, _: &CommentCut, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.buffer.selection.is_empty() {
+        let selection = self.buffer.selection();
+        if !selection.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
-                self.buffer.text()[self.buffer.selection.clone()].to_owned(),
+                self.buffer.text()[selection].to_owned(),
             ));
             let accepted = self.buffer.replace_selection("");
             self.finish_mutation(accepted, cx);
@@ -799,20 +799,20 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.buffer.range_to_utf16(self.buffer.selection.clone()),
-            reversed: self.buffer.selection_reversed,
+            range: self.buffer.range_to_utf16(self.buffer.selection()),
+            reversed: self.buffer.selection_is_reversed(),
         })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
         self.buffer
-            .marked_range
+            .marked_range()
             .clone()
             .map(|range| self.buffer.range_to_utf16(range))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.buffer.marked_range = None;
+        self.buffer.clear_marked_range();
     }
 
     fn replace_text_in_range(
@@ -1100,12 +1100,14 @@ impl DisplayProjection {
     }
 
     fn new_with_run_operations(buffer: &RichTextBuffer) -> (Self, usize) {
-        let ranges = line_ranges(&buffer.text);
+        let text_value = buffer.text();
+        let block_kinds = buffer.block_kinds();
+        let ranges = line_ranges(text_value);
         let mut text = String::new();
         let mut lines = Vec::with_capacity(ranges.len());
         let mut spans = Vec::new();
         let mut numbered_index = 0usize;
-        let mut cursor = StyleRunCursor::new(&buffer.runs);
+        let mut cursor = StyleRunCursor::new(buffer.style_runs());
 
         for (line_index, (model_start, model_end)) in ranges.into_iter().enumerate() {
             if line_index > 0 {
@@ -1120,7 +1122,7 @@ impl DisplayProjection {
                 );
             }
             let display_start = text.len();
-            let prefix = match buffer.blocks[line_index] {
+            let prefix = match block_kinds[line_index] {
                 BlockKind::Paragraph => {
                     numbered_index = 0;
                     String::new()
@@ -1152,7 +1154,7 @@ impl DisplayProjection {
                 );
             }
             let display_content_start = text.len();
-            text.push_str(&buffer.text[model_start..model_end]);
+            text.push_str(&text_value[model_start..model_end]);
             cursor.for_each_overlap(model_start, model_end, |overlap, style| {
                 let display_range = display_content_start + (overlap.start - model_start)
                     ..display_content_start + (overlap.end - model_start);
@@ -1206,20 +1208,20 @@ fn display_text_runs(
     palette: ReaderPalette,
 ) -> Vec<TextRun> {
     let mut result = Vec::new();
+    let selection = buffer.selection();
+    let marked_range = buffer.marked_range();
+    let text = buffer.text();
+    let block_kinds = buffer.block_kinds();
     for span in &projection.spans {
         if let Some(model) = &span.model {
             let mut boundaries = vec![model.start, model.end];
             for boundary in [
-                buffer.selection.start,
-                buffer.selection.end,
-                buffer
-                    .marked_range
+                selection.start,
+                selection.end,
+                marked_range
                     .as_ref()
                     .map_or(usize::MAX, |range| range.start),
-                buffer
-                    .marked_range
-                    .as_ref()
-                    .map_or(usize::MAX, |range| range.end),
+                marked_range.as_ref().map_or(usize::MAX, |range| range.end),
             ] {
                 if boundary > model.start && boundary < model.end {
                     boundaries.push(boundary);
@@ -1230,17 +1232,15 @@ fn display_text_runs(
             for pair in boundaries.windows(2) {
                 let start = pair[0];
                 let end = pair[1];
-                let selected = !buffer.selection.is_empty()
-                    && start < buffer.selection.end
-                    && end > buffer.selection.start;
-                let marked = buffer
-                    .marked_range
+                let selected =
+                    !selection.is_empty() && start < selection.end && end > selection.start;
+                let marked = marked_range
                     .as_ref()
                     .is_some_and(|range| start < range.end && end > range.start);
                 result.push(make_text_run(
                     end - start,
                     span.style,
-                    buffer.blocks[line_at_offset(&buffer.text, start)],
+                    block_kinds[line_at_offset(text, start)],
                     selected,
                     marked,
                     palette,
@@ -1382,7 +1382,7 @@ mod tests {
             RichTextBuffer::from_markdown(&buffer.markdown()).text(),
             buffer.text()
         );
-        assert_eq!(buffer.blocks, vec![BlockKind::Paragraph; 3]);
+        assert_eq!(buffer.block_kinds(), vec![BlockKind::Paragraph; 3]);
     }
 
     #[test]
@@ -1420,13 +1420,13 @@ mod tests {
         // rather than causing repeated suffix retries inside the opener.
         let literal = RichTextBuffer::from_markdown("```code``");
         assert_eq!(literal.text(), "```code``");
-        assert_eq!(literal.runs.len(), 1);
+        assert_eq!(literal.style_runs().len(), 1);
 
         // Outside a code span the backslash branch consumes the escaped
         // opener, so it cannot later become a delimiter.
         let escaped = RichTextBuffer::from_markdown("\\`not code`");
         assert_eq!(escaped.text(), "`not code`");
-        assert_eq!(escaped.runs.len(), 1);
+        assert_eq!(escaped.style_runs().len(), 1);
     }
 
     #[test]
@@ -1435,10 +1435,10 @@ mod tests {
         buffer.set_selection(1..4, false);
         buffer.toggle_bold();
         assert_eq!(buffer.markdown(), "h**ell**o");
-        assert_eq!(buffer.runs.len(), 3);
+        assert_eq!(buffer.style_runs().len(), 3);
         buffer.toggle_bold();
         assert_eq!(buffer.markdown(), "hello");
-        assert_eq!(buffer.runs.len(), 1);
+        assert_eq!(buffer.style_runs().len(), 1);
     }
 
     #[test]
@@ -1470,8 +1470,8 @@ mod tests {
         buffer.set_selection(1..5, false);
         buffer.replace_selection("X");
         assert_eq!(buffer.text(), "aXf");
-        assert!(buffer.runs.first().unwrap().style.bold());
-        assert!(buffer.runs.last().unwrap().style.italic());
+        assert!(buffer.style_runs().first().unwrap().style().bold());
+        assert!(buffer.style_runs().last().unwrap().style().italic());
         assert_eq!(
             RichTextBuffer::from_markdown(&buffer.markdown()).text(),
             "aXf"
@@ -1498,7 +1498,7 @@ mod tests {
         buffer.set_selection(3..4, false);
         buffer.replace_selection("");
         assert_eq!(buffer.markdown(), "- onetwo");
-        assert_eq!(buffer.blocks, vec![BlockKind::Bulleted]);
+        assert_eq!(buffer.block_kinds(), vec![BlockKind::Bulleted]);
     }
 
     #[test]
@@ -1513,7 +1513,10 @@ mod tests {
         assert_eq!(list.markdown(), "- first\n- ");
         assert!(list.insert_newline());
         assert_eq!(list.markdown(), "- first\n");
-        assert_eq!(list.blocks, vec![BlockKind::Bulleted, BlockKind::Paragraph]);
+        assert_eq!(
+            list.block_kinds(),
+            vec![BlockKind::Bulleted, BlockKind::Paragraph]
+        );
     }
 
     #[test]
@@ -1527,7 +1530,7 @@ mod tests {
             buffer.markdown(),
             "# Title\n\n## Section\n### Detail\n> Quoted"
         );
-        assert_eq!(buffer.blocks[1], BlockKind::Paragraph);
+        assert_eq!(buffer.block_kinds()[1], BlockKind::Paragraph);
     }
 
     #[test]
@@ -1554,11 +1557,11 @@ mod tests {
         buffer.set_selection(1..5, false);
         assert!(buffer.replace_and_mark_utf16(None, "漢字", Some(1..2)));
         assert_eq!(buffer.text(), "A漢字B");
-        assert_eq!(buffer.marked_range, Some(1..7));
-        assert_eq!(buffer.selection, 4..7);
+        assert_eq!(buffer.marked_range(), Some(1..7));
+        assert_eq!(buffer.selection(), 4..7);
         assert!(buffer.replace_and_mark_utf16(None, "語", Some(1..1)));
         assert_eq!(buffer.text(), "A語B");
-        assert_eq!(buffer.marked_range, Some(1..4));
+        assert_eq!(buffer.marked_range(), Some(1..4));
     }
 
     #[test]
@@ -1602,7 +1605,7 @@ mod tests {
         buffer.select_all();
         assert!(buffer.replace_and_mark_utf16(None, &exact, Some(1..2)));
         assert_eq!(buffer.markdown().len(), MAX_COMMENT_BYTES);
-        assert_eq!(buffer.marked_range, Some(0..exact.len()));
+        assert_eq!(buffer.marked_range(), Some(0..exact.len()));
 
         let before = buffer.clone();
         let overflow = format!("{exact}a");
@@ -1643,12 +1646,12 @@ mod tests {
         let mut buffer = RichTextBuffer::from_markdown("abcd");
         buffer.move_to(3);
         buffer.select_to(1);
-        assert_eq!(buffer.selection, 1..3);
-        assert!(buffer.selection_reversed);
+        assert_eq!(buffer.selection(), 1..3);
+        assert!(buffer.selection_is_reversed());
         assert_eq!(buffer.cursor_offset(), 1);
         buffer.select_to(4);
-        assert_eq!(buffer.selection, 3..4);
-        assert!(!buffer.selection_reversed);
+        assert_eq!(buffer.selection(), 3..4);
+        assert!(!buffer.selection_is_reversed());
     }
 
     #[test]
@@ -1680,11 +1683,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let buffer = RichTextBuffer::from_markdown(&markdown);
-        let structural_size = buffer.blocks.len() + buffer.runs.len();
+        let structural_size = buffer.block_kinds().len() + buffer.style_runs().len();
 
         let (serialized, markdown_operations) = buffer.markdown_with_run_operations();
-        let (fits, fit_operations) =
-            markdown_fits_with_run_operations(&buffer.text, &buffer.runs, &buffer.blocks);
+        let (fits, fit_operations) = markdown_fits_with_run_operations(
+            buffer.text(),
+            buffer.style_runs(),
+            buffer.block_kinds(),
+        );
         let (projection, projection_operations) =
             DisplayProjection::new_with_run_operations(&buffer);
 
@@ -1701,7 +1707,7 @@ mod tests {
         let buffer = RichTextBuffer::from_markdown("a\r\n- b\rc");
         assert_eq!(buffer.text(), "a\nb\nc");
         assert_eq!(
-            buffer.blocks,
+            buffer.block_kinds(),
             vec![
                 BlockKind::Paragraph,
                 BlockKind::Bulleted,
@@ -1717,7 +1723,7 @@ mod tests {
             let buffer = RichTextBuffer::from_markdown(markdown);
             assert_eq!(buffer.markdown(), markdown);
             assert_eq!(
-                buffer.blocks.len(),
+                buffer.block_kinds().len(),
                 buffer.text().bytes().filter(|byte| *byte == b'\n').count() + 1
             );
         }

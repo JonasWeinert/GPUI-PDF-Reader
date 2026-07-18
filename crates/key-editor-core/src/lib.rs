@@ -1,7 +1,11 @@
-//! Pure Markdown-backed rich-text model.
+//! UI-agnostic Markdown-backed rich-text editing.
 //!
-//! This module deliberately has no GPUI or PDF-specific dependencies. The
-//! presentation layer in the parent module adapts it to native text input.
+//! The crate owns the editor's document state, canonical Markdown storage,
+//! selections, formatting, Unicode movement, and transactional size limits.
+//! It deliberately has no GPUI, filesystem, networking, or PDF dependency;
+//! presentation crates adapt it to native text input and rendering.
+
+#![forbid(unsafe_code)]
 
 use std::{collections::HashMap, fmt, ops::Range};
 
@@ -57,6 +61,11 @@ impl InlineStyle {
         self.0 & Self::CODE != 0
     }
 
+    /// Returns whether no inline formatting is active.
+    pub fn is_plain(self) -> bool {
+        self == Self::default()
+    }
+
     fn with_flag(mut self, flag: u8, enabled: bool) -> Self {
         if enabled {
             if flag == Self::CODE {
@@ -73,22 +82,33 @@ impl InlineStyle {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct StyleRun {
-    pub(super) range: Range<usize>,
-    pub(super) style: InlineStyle,
+pub struct StyleRun {
+    range: Range<usize>,
+    style: InlineStyle,
+}
+
+impl StyleRun {
+    /// UTF-8 byte range covered by this normalized run.
+    pub fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+
+    pub fn style(&self) -> InlineStyle {
+        self.style
+    }
 }
 
 /// Monotonic access to normalized style runs. A run that crosses a line
 /// boundary remains current and is visited once on each crossed line; every
 /// other run is advanced past exactly once.
-pub(super) struct StyleRunCursor<'a> {
+pub struct StyleRunCursor<'a> {
     runs: &'a [StyleRun],
     index: usize,
     operations: usize,
 }
 
 impl<'a> StyleRunCursor<'a> {
-    pub(super) fn new(runs: &'a [StyleRun]) -> Self {
+    pub fn new(runs: &'a [StyleRun]) -> Self {
         Self {
             runs,
             index: 0,
@@ -107,7 +127,7 @@ impl<'a> StyleRunCursor<'a> {
         }
     }
 
-    pub(super) fn style_at(&mut self, offset: usize) -> InlineStyle {
+    pub fn style_at(&mut self, offset: usize) -> InlineStyle {
         self.style_extent_at(offset).0
     }
 
@@ -124,7 +144,7 @@ impl<'a> StyleRunCursor<'a> {
         }
     }
 
-    pub(super) fn for_each_overlap(
+    pub fn for_each_overlap(
         &mut self,
         start: usize,
         end: usize,
@@ -153,7 +173,9 @@ impl<'a> StyleRunCursor<'a> {
         }
     }
 
-    pub(super) fn operations(&self) -> usize {
+    /// Number of run visits made so far. Intended for performance regression
+    /// tests and diagnostics rather than application behavior.
+    pub fn operations(&self) -> usize {
         self.operations
     }
 }
@@ -162,17 +184,28 @@ impl<'a> StyleRunCursor<'a> {
 /// boundaries; conversion to UTF-16 is contained here for native IME APIs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RichTextBuffer {
-    pub(super) text: String,
-    pub(super) runs: Vec<StyleRun>,
-    pub(super) blocks: Vec<BlockKind>,
-    pub(super) selection: Range<usize>,
-    pub(super) selection_reversed: bool,
-    pub(super) marked_range: Option<Range<usize>>,
-    pub(super) pending_style: Option<InlineStyle>,
+    text: String,
+    runs: Vec<StyleRun>,
+    blocks: Vec<BlockKind>,
+    selection: Range<usize>,
+    selection_reversed: bool,
+    marked_range: Option<Range<usize>>,
+    pending_style: Option<InlineStyle>,
     max_markdown_bytes: usize,
 }
 
 impl RichTextBuffer {
+    /// Creates an empty document using the default persistence limit.
+    pub fn new() -> Self {
+        Self::parse_markdown("", DEFAULT_MAX_MARKDOWN_BYTES)
+    }
+
+    /// Creates an empty document with a caller-defined canonical Markdown
+    /// byte limit.
+    pub fn with_max_markdown_bytes(max_markdown_bytes: usize) -> Self {
+        Self::parse_markdown("", max_markdown_bytes)
+    }
+
     /// Parses persisted Markdown while enforcing the canonical persistence
     /// limit. Production callers must use this path: raw input can fit the
     /// sidecar limit while canonical escaping makes it larger.
@@ -202,18 +235,18 @@ impl RichTextBuffer {
     /// Convenience parser for Markdown whose canonical size is already a
     /// trusted invariant. It panics rather than silently truncating invalid
     /// input; production data-loading paths use [`Self::try_from_markdown`].
-    #[cfg(test)]
     pub fn from_trusted_markdown(markdown: &str) -> Self {
         Self::try_from_markdown(markdown)
             .expect("trusted comment Markdown must fit the canonical 1 MiB limit")
     }
 
-    #[cfg(test)]
-    pub(super) fn from_markdown(markdown: &str) -> Self {
+    #[doc(hidden)]
+    pub fn from_markdown(markdown: &str) -> Self {
         Self::from_trusted_markdown(markdown)
     }
 
-    pub(super) fn parse_markdown(markdown: &str, max_markdown_bytes: usize) -> Self {
+    #[doc(hidden)]
+    pub fn parse_markdown(markdown: &str, max_markdown_bytes: usize) -> Self {
         let markdown = normalize_newlines(markdown);
         let mut text = String::new();
         let mut runs = Vec::new();
@@ -252,11 +285,45 @@ impl RichTextBuffer {
         &self.text
     }
 
+    /// Normalized style runs covering the complete visible text.
+    pub fn style_runs(&self) -> &[StyleRun] {
+        &self.runs
+    }
+
+    /// One block kind for every logical line in [`Self::text`].
+    pub fn block_kinds(&self) -> &[BlockKind] {
+        &self.blocks
+    }
+
+    /// Current ordered UTF-8 byte selection.
+    pub fn selection(&self) -> Range<usize> {
+        self.selection.clone()
+    }
+
+    /// Whether the selection cursor is at the start rather than the end.
+    pub fn selection_is_reversed(&self) -> bool {
+        self.selection_reversed
+    }
+
+    /// Current native IME composition range, expressed as UTF-8 bytes.
+    pub fn marked_range(&self) -> Option<Range<usize>> {
+        self.marked_range.clone()
+    }
+
+    /// Inline style that will be applied to text inserted at the caret.
+    pub fn pending_inline_style(&self) -> Option<InlineStyle> {
+        self.pending_style
+    }
+
+    pub fn max_markdown_bytes(&self) -> usize {
+        self.max_markdown_bytes
+    }
+
     pub fn markdown(&self) -> String {
         self.markdown_with_run_operations().0
     }
 
-    pub(super) fn fits_persistence_limit(&self) -> bool {
+    pub fn fits_persistence_limit(&self) -> bool {
         markdown_fits_with_limit(
             &self.text,
             &self.runs,
@@ -265,7 +332,8 @@ impl RichTextBuffer {
         )
     }
 
-    pub(super) fn markdown_with_run_operations(&self) -> (String, usize) {
+    #[doc(hidden)]
+    pub fn markdown_with_run_operations(&self) -> (String, usize) {
         let mut output = String::new();
         let mut cursor = StyleRunCursor::new(&self.runs);
         for (line_index, (start, end)) in line_ranges(&self.text).into_iter().enumerate() {
@@ -303,8 +371,9 @@ impl RichTextBuffer {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn set_selection(&mut self, range: Range<usize>, reversed: bool) {
+    /// Sets an ordered UTF-8 byte selection. Non-boundary offsets are rounded
+    /// down safely and out-of-range offsets are clamped.
+    pub fn set_selection(&mut self, range: Range<usize>, reversed: bool) {
         let start = floor_char_boundary(&self.text, range.start.min(self.text.len()));
         let end = floor_char_boundary(&self.text, range.end.min(self.text.len()));
         self.selection = start.min(end)..start.max(end);
@@ -335,6 +404,11 @@ impl RichTextBuffer {
         self.selection = 0..self.text.len();
         self.selection_reversed = false;
         self.pending_style = None;
+    }
+
+    /// Clears native IME composition without changing text or selection.
+    pub fn clear_marked_range(&mut self) {
+        self.marked_range = None;
     }
 
     /// Replaces the current selection if the resulting serialized Markdown
@@ -654,7 +728,8 @@ impl RichTextBuffer {
         true
     }
 
-    pub(super) fn set_block(&mut self, target: BlockKind) -> bool {
+    /// Applies one block kind to every line touched by the selection.
+    pub fn set_block(&mut self, target: BlockKind) -> bool {
         let lines = self.selected_lines();
         let mut updated = self.blocks.clone();
         for kind in &mut updated[lines] {
@@ -721,6 +796,20 @@ impl RichTextBuffer {
     }
 }
 
+impl Default for RichTextBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TryFrom<&str> for RichTextBuffer {
+    type Error = MarkdownLimitExceeded;
+
+    fn try_from(markdown: &str) -> Result<Self, Self::Error> {
+        Self::try_from_markdown(markdown)
+    }
+}
+
 fn parse_block_prefix(line: &str) -> (BlockKind, &str) {
     if let Some(rest) = line.strip_prefix("### ") {
         (BlockKind::Heading3, rest)
@@ -745,11 +834,11 @@ fn looks_numbered_prefix(line: &str) -> Option<usize> {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct InlineParseOperations {
-    pub(super) indexed_bytes: usize,
-    pub(super) parse_steps: usize,
-    pub(super) delimiter_queries: usize,
-    pub(super) delimiter_positions_advanced: usize,
+pub struct InlineParseOperations {
+    pub indexed_bytes: usize,
+    pub parse_steps: usize,
+    pub delimiter_queries: usize,
+    pub delimiter_positions_advanced: usize,
 }
 
 struct BacktickRunIndex {
@@ -800,7 +889,8 @@ fn parse_inline(source: &str, output: &mut String, runs: &mut Vec<StyleRun>) {
     let _ = parse_inline_with_operations(source, output, runs);
 }
 
-pub(super) fn parse_inline_with_operations(
+#[doc(hidden)]
+pub fn parse_inline_with_operations(
     source: &str,
     output: &mut String,
     runs: &mut Vec<StyleRun>,
@@ -964,8 +1054,8 @@ fn encoded_inline_len(source: &str, style: InlineStyle) -> Option<usize> {
 /// Mirrors `RichTextBuffer::markdown` without allocating the serialized
 /// comment. This makes the editor's transactional guard exactly match the
 /// persistence contract, including list prefixes, escapes, and style markers.
-#[cfg(test)]
-pub(super) fn markdown_fits_with_run_operations(
+#[doc(hidden)]
+pub fn markdown_fits_with_run_operations(
     text: &str,
     runs: &[StyleRun],
     blocks: &[BlockKind],
@@ -1125,7 +1215,9 @@ fn has_flag(style: InlineStyle, flag: u8) -> bool {
     style.0 & flag != 0
 }
 
-pub(super) fn line_ranges(text: &str) -> Vec<(usize, usize)> {
+/// Returns the UTF-8 byte range of every logical line, including a trailing
+/// empty line when the text ends in a newline.
+pub fn line_ranges(text: &str) -> Vec<(usize, usize)> {
     let mut result = Vec::new();
     let mut start = 0;
     for (index, byte) in text.bytes().enumerate() {
@@ -1138,7 +1230,8 @@ pub(super) fn line_ranges(text: &str) -> Vec<(usize, usize)> {
     result
 }
 
-pub(super) fn line_at_offset(text: &str, offset: usize) -> usize {
+/// Returns the zero-based logical line containing a UTF-8 byte offset.
+pub fn line_at_offset(text: &str, offset: usize) -> usize {
     text.as_bytes()[..offset.min(text.len())]
         .iter()
         .filter(|byte| **byte == b'\n')
@@ -1200,7 +1293,9 @@ fn previous_char_boundary(text: &str, offset: usize) -> usize {
         .map_or(0, |(index, _)| index)
 }
 
-pub(super) fn previous_grapheme_boundary(text: &str, offset: usize) -> usize {
+/// Finds the previous user-perceived character boundary using the compact
+/// grapheme rules required by the native editor.
+pub fn previous_grapheme_boundary(text: &str, offset: usize) -> usize {
     let offset = floor_char_boundary(text, offset);
     if offset == 0 {
         return 0;
@@ -1217,7 +1312,9 @@ pub(super) fn previous_grapheme_boundary(text: &str, offset: usize) -> usize {
     previous
 }
 
-pub(super) fn next_grapheme_boundary(text: &str, offset: usize) -> usize {
+/// Finds the next user-perceived character boundary using the compact
+/// grapheme rules required by the native editor.
+pub fn next_grapheme_boundary(text: &str, offset: usize) -> usize {
     let start = floor_char_boundary(text, offset);
     if start >= text.len() {
         return text.len();
@@ -1270,4 +1367,317 @@ fn is_grapheme_extend(character: char) -> bool {
 
 fn is_regional_indicator(character: char) -> bool {
     matches!(character as u32, 0x1f1e6..=0x1f1ff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_subset_parses_and_serializes_canonically() {
+        let input = "- **bold** *italic* ***both*** `code`\n7. second\nplain";
+        let buffer = RichTextBuffer::from_markdown(input);
+        assert_eq!(
+            buffer.markdown(),
+            "- **bold** *italic* ***both*** `code`\n1. second\nplain"
+        );
+        assert_eq!(
+            RichTextBuffer::from_markdown(&buffer.markdown()).markdown(),
+            buffer.markdown()
+        );
+    }
+
+    #[test]
+    fn canonical_expansion_is_included_in_the_input_limit() {
+        let raw = format!("*{}", "x".repeat(DEFAULT_MAX_MARKDOWN_BYTES - 1));
+        assert_eq!(raw.len(), DEFAULT_MAX_MARKDOWN_BYTES);
+
+        let parsed = RichTextBuffer::parse_markdown(&raw, DEFAULT_MAX_MARKDOWN_BYTES);
+        assert_eq!(parsed.markdown().len(), DEFAULT_MAX_MARKDOWN_BYTES + 1);
+        assert_eq!(
+            RichTextBuffer::try_from_markdown(&raw),
+            Err(MarkdownLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn caller_limit_is_preserved_transactionally() {
+        assert_eq!(
+            RichTextBuffer::try_from_markdown_with_limit("*", 1),
+            Err(MarkdownLimitExceeded)
+        );
+        let mut buffer = RichTextBuffer::try_from_markdown_with_limit("hello", 5).unwrap();
+        let before = buffer.clone();
+        assert!(!buffer.replace_selection("!"));
+        assert_eq!(buffer, before);
+        assert_eq!(buffer.max_markdown_bytes(), 5);
+    }
+
+    #[test]
+    fn markdown_escapes_literals_and_ambiguous_paragraph_prefixes() {
+        let buffer = RichTextBuffer::from_markdown(
+            "\\- paragraph, not a list\n\\12. still a paragraph\nslashes \\\\ and \\*stars\\* and \\`ticks\\`",
+        );
+        assert_eq!(
+            buffer.text(),
+            "- paragraph, not a list\n12. still a paragraph\nslashes \\ and *stars* and `ticks`"
+        );
+        assert_eq!(
+            RichTextBuffer::from_markdown(&buffer.markdown()).text(),
+            buffer.text()
+        );
+        assert_eq!(buffer.block_kinds(), &[BlockKind::Paragraph; 3]);
+    }
+
+    #[test]
+    fn code_fence_grows_to_preserve_embedded_backticks() {
+        let buffer = RichTextBuffer::from_markdown("``a`b``");
+        assert_eq!(buffer.text(), "a`b");
+        assert_eq!(buffer.markdown(), "``a`b``");
+        assert_eq!(RichTextBuffer::from_markdown(&buffer.markdown()), buffer);
+    }
+
+    #[test]
+    fn unmatched_backtick_parser_work_is_linear() {
+        let run_count = 512usize;
+        let mut source = String::new();
+        for length in (1..=run_count).rev() {
+            source.push_str(&"`".repeat(length));
+            source.push('x');
+        }
+        let mut text = String::new();
+        let mut runs = Vec::new();
+        let operations = parse_inline_with_operations(&source, &mut text, &mut runs);
+
+        assert_eq!(text, source);
+        assert_eq!(operations.indexed_bytes, source.len());
+        assert_eq!(operations.delimiter_queries, run_count);
+        assert!(operations.delimiter_positions_advanced <= run_count);
+        assert!(
+            operations
+                .parse_steps
+                .saturating_add(operations.delimiter_positions_advanced)
+                <= source.len() + run_count
+        );
+    }
+
+    #[test]
+    fn selection_formatting_splits_and_rejoins_runs() {
+        let mut buffer = RichTextBuffer::from_markdown("hello");
+        buffer.set_selection(1..4, false);
+        assert!(buffer.toggle_bold());
+        assert_eq!(buffer.markdown(), "h**ell**o");
+        assert_eq!(buffer.style_runs().len(), 3);
+        assert!(buffer.toggle_bold());
+        assert_eq!(buffer.markdown(), "hello");
+        assert_eq!(buffer.style_runs().len(), 1);
+    }
+
+    #[test]
+    fn caret_formatting_is_inherited_and_code_is_exclusive() {
+        let mut buffer = RichTextBuffer::from_markdown("ab");
+        buffer.move_to(1);
+        assert!(buffer.toggle_italic());
+        assert!(buffer.replace_selection("λ"));
+        assert_eq!(buffer.markdown(), "a*λ*b");
+
+        buffer.select_all();
+        assert!(buffer.toggle_bold());
+        assert!(buffer.toggle_code());
+        assert!(buffer.code_active());
+        assert!(!buffer.bold_active());
+        assert!(!buffer.italic_active());
+    }
+
+    #[test]
+    fn replacement_across_runs_preserves_outer_fragments() {
+        let mut buffer = RichTextBuffer::from_markdown("**ab**cd*ef*");
+        buffer.set_selection(1..5, false);
+        assert!(buffer.replace_selection("X"));
+        assert_eq!(buffer.text(), "aXf");
+        assert!(buffer.style_runs().first().unwrap().style().bold());
+        assert!(buffer.style_runs().last().unwrap().style().italic());
+    }
+
+    #[test]
+    fn block_operations_cover_touched_lines_only() {
+        let mut buffer = RichTextBuffer::from_markdown("one\ntwo\nthree");
+        buffer.set_selection(0..4, false); // Includes `one\n`, not `two`.
+        assert!(buffer.toggle_bulleted_list());
+        assert_eq!(buffer.markdown(), "- one\ntwo\nthree");
+
+        buffer.set_selection(4..7, false);
+        assert!(buffer.set_block(BlockKind::Quote));
+        assert_eq!(buffer.markdown(), "- one\n> two\nthree");
+
+        buffer.select_all();
+        assert!(buffer.toggle_numbered_list());
+        assert_eq!(buffer.markdown(), "1. one\n1. two\n1. three");
+    }
+
+    #[test]
+    fn newline_continues_lists_exits_empty_items_and_ends_headings() {
+        let mut list = RichTextBuffer::from_markdown("- first");
+        assert!(list.insert_newline());
+        assert_eq!(list.markdown(), "- first\n- ");
+        assert!(list.insert_newline());
+        assert_eq!(list.markdown(), "- first\n");
+        assert_eq!(
+            list.block_kinds(),
+            &[BlockKind::Bulleted, BlockKind::Paragraph]
+        );
+
+        let mut heading = RichTextBuffer::from_markdown("# Title");
+        assert!(heading.insert_newline());
+        assert_eq!(heading.markdown(), "# Title\n");
+        assert_eq!(
+            heading.block_kinds(),
+            &[BlockKind::Heading1, BlockKind::Paragraph]
+        );
+    }
+
+    #[test]
+    fn utf16_conversion_and_ime_composition_are_unicode_safe() {
+        let buffer = RichTextBuffer::from_markdown("A😀e\u{301}B");
+        assert_eq!(buffer.offset_to_utf16(1), 1);
+        assert_eq!(buffer.offset_to_utf16(5), 3);
+        assert_eq!(buffer.offset_from_utf16(2), 1);
+        assert_eq!(buffer.range_from_utf16(1..3), 1..5);
+
+        let mut buffer = RichTextBuffer::from_markdown("A😀B");
+        buffer.set_selection(1..5, false);
+        assert!(buffer.replace_and_mark_utf16(None, "漢字", Some(1..2)));
+        assert_eq!(buffer.text(), "A漢字B");
+        assert_eq!(buffer.marked_range(), Some(1..7));
+        assert_eq!(buffer.selection(), 4..7);
+        buffer.clear_marked_range();
+        assert_eq!(buffer.marked_range(), None);
+    }
+
+    #[test]
+    fn exact_multibyte_limit_is_accepted_and_overflow_is_atomic() {
+        let exact = "é".repeat(DEFAULT_MAX_MARKDOWN_BYTES / "é".len());
+        let mut buffer = RichTextBuffer::new();
+        assert!(buffer.replace_selection(&exact));
+        assert_eq!(buffer.markdown().len(), DEFAULT_MAX_MARKDOWN_BYTES);
+
+        buffer.move_to("é".len());
+        assert!(buffer.toggle_bold());
+        let before = buffer.clone();
+        assert!(!buffer.replace_selection("é"));
+        assert_eq!(buffer, before);
+    }
+
+    #[test]
+    fn rejected_native_replacement_preserves_reverse_selection() {
+        let exact = "é".repeat(DEFAULT_MAX_MARKDOWN_BYTES / "é".len());
+        let mut buffer = RichTextBuffer::from_markdown(&exact);
+        buffer.set_selection(2..6, true);
+        let before = buffer.clone();
+
+        assert!(!buffer.replace_text_utf16(Some(0..0), "漢"));
+        assert_eq!(buffer, before);
+    }
+
+    #[test]
+    fn formatting_and_escaping_overhead_obey_the_same_limit() {
+        let escaped_exact = "*".repeat(DEFAULT_MAX_MARKDOWN_BYTES / 2);
+        let mut escaped = RichTextBuffer::new();
+        assert!(escaped.replace_selection(&escaped_exact));
+        assert_eq!(escaped.markdown().len(), DEFAULT_MAX_MARKDOWN_BYTES);
+        let before_paste = escaped.clone();
+        assert!(!escaped.replace_selection("*"));
+        assert_eq!(escaped, before_paste);
+
+        let mut formatted = RichTextBuffer::from_markdown(&"x".repeat(DEFAULT_MAX_MARKDOWN_BYTES));
+        formatted.select_all();
+        let before_formatting = formatted.clone();
+        assert!(!formatted.toggle_bold());
+        assert_eq!(formatted, before_formatting);
+    }
+
+    #[test]
+    fn backspace_removes_combining_zwj_and_flag_clusters_together() {
+        for cluster in ["e\u{301}", "👩\u{200d}💻", "🇬🇧"] {
+            let mut buffer = RichTextBuffer::from_markdown(cluster);
+            assert!(buffer.backspace());
+            assert_eq!(buffer.text(), "");
+        }
+    }
+
+    #[test]
+    fn reverse_selection_keeps_a_stable_anchor() {
+        let mut buffer = RichTextBuffer::from_markdown("abcd");
+        buffer.move_to(3);
+        buffer.select_to(1);
+        assert_eq!(buffer.selection(), 1..3);
+        assert!(buffer.selection_is_reversed());
+        assert_eq!(buffer.cursor_offset(), 1);
+        buffer.select_to(4);
+        assert_eq!(buffer.selection(), 3..4);
+        assert!(!buffer.selection_is_reversed());
+    }
+
+    #[test]
+    fn serialization_traverses_many_lines_and_runs_linearly() {
+        let line_count = 640usize;
+        let markdown = (0..line_count)
+            .map(|index| format!("**b{index}** *i{index}* plain"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let buffer = RichTextBuffer::from_markdown(&markdown);
+        let structural_size = buffer.block_kinds().len() + buffer.style_runs().len();
+
+        let (serialized, markdown_operations) = buffer.markdown_with_run_operations();
+        let (fits, fit_operations) = markdown_fits_with_run_operations(
+            buffer.text(),
+            buffer.style_runs(),
+            buffer.block_kinds(),
+        );
+        assert_eq!(serialized, markdown);
+        assert!(fits);
+        assert!(markdown_operations <= structural_size * 3);
+        assert!(fit_operations <= structural_size * 3);
+    }
+
+    #[test]
+    fn newline_normalization_preserves_empty_lines_and_block_count() {
+        let buffer = RichTextBuffer::from_markdown("a\r\n- b\rc");
+        assert_eq!(buffer.text(), "a\nb\nc");
+        assert_eq!(
+            buffer.block_kinds(),
+            &[
+                BlockKind::Paragraph,
+                BlockKind::Bulleted,
+                BlockKind::Paragraph
+            ]
+        );
+        assert_eq!(buffer.markdown(), "a\n- b\nc");
+
+        for markdown in ["", "\n", "a\n", "\n\n"] {
+            let buffer = RichTextBuffer::from_markdown(markdown);
+            assert_eq!(buffer.markdown(), markdown);
+            assert_eq!(
+                buffer.block_kinds().len(),
+                buffer.text().bytes().filter(|byte| *byte == b'\n').count() + 1
+            );
+        }
+    }
+
+    #[test]
+    fn public_projection_views_are_normalized_and_read_only() {
+        let buffer = RichTextBuffer::try_from("**a**\n- b").unwrap();
+        assert_eq!(
+            buffer.block_kinds(),
+            &[BlockKind::Paragraph, BlockKind::Bulleted]
+        );
+        assert_eq!(line_ranges(buffer.text()), vec![(0, 1), (2, 3)]);
+        assert_eq!(line_at_offset(buffer.text(), 2), 1);
+        assert_eq!(buffer.style_runs().first().unwrap().range(), 0..1);
+        assert!(buffer.style_runs().first().unwrap().style().bold());
+
+        let mut cursor = StyleRunCursor::new(buffer.style_runs());
+        assert!(cursor.style_at(0).bold());
+        assert!(cursor.style_at(1).is_plain());
+    }
 }

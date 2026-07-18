@@ -2314,6 +2314,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "image",
+ "key-editor-core",
  "objc2-app-kit",
  "open",
  "pdfium-render",
@@ -3064,6 +3065,10 @@ dependencies = [
  "futures-util",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "key-editor-core"
+version = "0.1.0"
 
 [[package]]
 name = "khronos-egl"
