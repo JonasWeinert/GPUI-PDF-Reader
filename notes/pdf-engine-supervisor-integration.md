@@ -17,30 +17,24 @@ Guarantees:
   window or accumulate an unbounded number of raster buffers.
 - Close, reopen, and detach cancel sessions and make old demands stale.
 
-Application migration order:
+Integration is complete:
 
-1. Create one supervisor in `ApplicationHost`, using a factory closure that
-   constructs `PdfiumEngine` on the supervisor thread. Do not construct a
-   PDFium engine before moving the factory.
-2. Replace each `PdfWorker::start` with `supervisor.attach`. Keep the returned
-   `DocumentClient` and event receiver in that document's controller.
-3. On `SupervisorEvent::Opened`, store the returned `DocumentSession` in the
-   controller. Build render, text, and preview demands from that session.
-4. Translate a settled viewport into one `replace_render_viewport` call. The
-   order-to-priority conversion and the existing 150 ms zoom debounce remain
-   in the per-view controller; latest-wins cancellation is then enforced by
-   the supervisor.
-5. Schedule visible text, copy, search, link resolution, and document analysis
-   through their separate `WorkClass` domains. Preserve the current short
-   quiet period before automatic visible-text extraction in the controller.
-6. Adapt tagged supervisor events back to the existing `WorkerEvent` model
-   while the UI is migrated. Route by `SupervisorDocumentId`; never infer the
-   destination from whichever window is active.
-7. Keep search and scientific-analysis state machines outside the engine
-   owner. They request one page of background text at a time and yield between
-   pages, allowing visible work from any document to run.
-8. Drop or explicitly close the document client when its document session is
-   evicted. Keep the supervisor itself alive until application shutdown.
-
-The old worker must not run alongside the supervisor after migration: two
-independent PDFium owner threads would violate the serialization invariant.
+- `ApplicationHost` constructs and owns exactly one supervisor. The engine
+  factory runs on its owner thread; no PDFium engine is created in a view.
+- Each `PdfReader` attaches a routed `DocumentClient`. Its document adapter
+  translates the established `WorkerCommand`/`WorkerEvent` UI seam while
+  search and scientific state machines remain outside the engine owner.
+- Visible tiles, prefetch, preview, visible text, copy, search, link text, and
+  scientific analysis retain independent replacement/cancellation domains.
+- The 150 ms zoom debounce and 200 ms automatic-text quiet period remain in
+  the view/document orchestration layers.
+- Commands and tagged supervisor events share one bounded document mailbox.
+  Raster publication is one-item bounded. A full route is retained and retried
+  by the supervisor without cloning a multi-megabyte bitmap.
+- `PdfWorker` keeps a client clone so caller-side replacement cancels engine
+  work immediately, before a queued adapter command is consumed.
+- The last `PdfWorker` handle sets an atomic shutdown flag and wakes its
+  adapter. This breaks the routed-sender/client ownership cycle even when the
+  mailbox is full, then detaches the document from the supervisor.
+- The previous per-reader PDFium engine path is no longer compiled. Running it
+  beside the supervisor would violate the serialization invariant.

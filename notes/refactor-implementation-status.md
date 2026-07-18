@@ -17,6 +17,29 @@
 - Standard and minimal bundles build from the same app. Minimal omits Wasmtime
   and scholarly networking.
 
+## Multi-file workspace and shared services
+
+- `key-workspace-core` defines typed item/view/window IDs, host-owned views,
+  split/dock placement, generic work scheduling, activity levels, resource
+  profiles, allocation, and stateful reconciliation without GPUI or PDF code.
+- The app now has one process `ApplicationHost` and a `WorkspaceWindow` root.
+  Different PDFs open in different windows, duplicate paths focus the existing
+  item, and an empty reader window is reused. Multiple command-line paths open
+  together. Settings is a real host-owned view with a real left window dock.
+- One process-wide PDFium supervisor fairly serves all documents. Per-document
+  cancellation, bounded backpressure, generation routing, and close cleanup
+  preserve the existing render, text, search, preview, and analysis behavior.
+- Annotation persistence uses one fair process writer. Link and scholarly
+  previews use one fixed bounded process executor with shared document
+  lifetimes and cache cleanup. Native pinch monitoring is also process-wide.
+- Resource Auto/Saver/Balanced/Performance modes use detected macOS RAM, CPU,
+  and Low Power Mode. View activation maintains a bounded warm/cold MRU set;
+  allocations directly control PDF tile/text cache ceilings and prefetch, and
+  suspended views release render/text state safely.
+- Theme and extension runtime ownership are application-scoped while reader
+  interaction state remains view-scoped. The current extension protocol still
+  intentionally publishes one active document scope.
+
 ## Extension platform
 
 - Rust and versioned WIT contracts are exhaustively mapped by tests. They
@@ -72,13 +95,18 @@
   checks.
 - The deterministic quality path passes the full workspace all-target suite,
   strict Clippy, the minimal feature build, dependency-boundary audit, 788-record
-  license audit, and the isolated PDFium tiled-render parity test.
-- The post-refactor native macOS E2E suite passes 15 real GPUI launches: three
+  789-record license audit, and the isolated PDFium tiled-render parity test.
+- The earlier post-refactor native macOS E2E suite passes 15 real GPUI launches: three
   rapid zoom/debounce cases, Classic feature creation and reload, Fluid feature
   creation and reload, four theme/PDF-appearance cases, TOC hover/navigation,
   internal-link navigation, link preview, and scientific-reference inference.
   Every case reached its exact quiet Ready state without a QA error, panic, or
   GPU/Metal fault.
+- The multi-file consolidation reran 120 app tests, 32 PDF runtime tests, 27
+  sidecar tests, 20 reference tests, and 15 workspace/resource tests. Native
+  validation passed a two-PDF/two-window settled launch, all three rapid zoom
+  churn cases, feature creation/search, and sidecar reload without a QA error,
+  panic, renderer fault, or lost annotation revision.
 - Installable third-party packages remain local/development distribution. A
   public store, signing trust service, notarization, and automatic update system
   are not implied by the development signature fixture.

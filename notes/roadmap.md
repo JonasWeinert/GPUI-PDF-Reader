@@ -38,6 +38,10 @@ an accepted product plan.
 - Calibrate Auto, Saver, Balanced, and Performance budgets on old and current
   Macs using measured CPU time, resident memory, GPU texture residency, input
   latency, and power use.
+- Measure the capped per-document orchestration adapter overhead with dozens of
+  open PDFs. If its bounded 512 KiB stack and sleeping mailbox are material,
+  replace adapters with a fair fixed-size actor pool without moving search or
+  scientific state onto the PDFium owner thread.
 - Consider an opt-in PDFium helper-process performance mode for machines with
   enough memory and cores. The default remains one process-wide PDFium owner
   because PDFium APIs are not thread-safe.

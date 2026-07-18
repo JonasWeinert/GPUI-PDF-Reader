@@ -3,7 +3,8 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 fixture="$root/tests/fixtures/interaction.pdf"
-binary="$root/target/debug/gpui-pdf-reader"
+target_dir=${CARGO_TARGET_DIR:-"$root/target"}
+binary="$target_dir/debug/gpui-pdf-reader"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/gpui-pdf-reader-e2e.XXXXXX")
 app_pid=""
 
