@@ -1959,6 +1959,73 @@ mod tests {
     }
 
     #[test]
+    fn individual_permission_changes_preserve_optional_runtime_and_revoke_required_runtime() {
+        let mut manifest = declarative("org.example.permission-controls");
+        manifest.permissions.push(PermissionRequest {
+            permission: Permission::AddSidePanel,
+            reason: "Show the extension panel".into(),
+            required: true,
+        });
+        manifest.permissions.push(PermissionRequest {
+            permission: Permission::OpenExternalUrl,
+            reason: "Open optional documentation".into(),
+            required: false,
+        });
+        let package = development_package(&manifest);
+        let mut host = ExtensionHost::new(Default::default());
+        let mut manager = InstallableExtensionManager::new().unwrap();
+        let installed = manager.install(&mut host, package.path()).unwrap();
+        manager
+            .grant_permissions_and_activate(&mut host, &installed.extension)
+            .unwrap();
+
+        manager
+            .set_permission_decision(
+                &mut host,
+                &installed.extension,
+                &Permission::OpenExternalUrl,
+                PermissionDecision::Granted,
+            )
+            .unwrap();
+        assert_eq!(
+            host.state(&installed.extension),
+            Some(LifecycleState::Active)
+        );
+        manager
+            .set_permission_decision(
+                &mut host,
+                &installed.extension,
+                &Permission::OpenExternalUrl,
+                PermissionDecision::Denied,
+            )
+            .unwrap();
+        assert_eq!(
+            host.state(&installed.extension),
+            Some(LifecycleState::Active),
+            "revoking optional authority must not unload an otherwise valid extension"
+        );
+
+        manager
+            .set_permission_decision(
+                &mut host,
+                &installed.extension,
+                &Permission::AddSidePanel,
+                PermissionDecision::Denied,
+            )
+            .unwrap();
+        assert_eq!(
+            host.state(&installed.extension),
+            Some(LifecycleState::Disabled),
+            "revoking required authority must unload the extension immediately"
+        );
+        let summary = manager.summaries(&host).pop().unwrap();
+        assert!(summary.permissions.iter().any(|(request, decision)| {
+            request.permission == Permission::AddSidePanel
+                && *decision == PermissionDecision::Denied
+        }));
+    }
+
+    #[test]
     fn unsigned_upgrade_reprompts_and_commits_only_reapproved_permissions() {
         let id = "org.example.permission-upgrade";
         let mut first_manifest = at_version(declarative(id), "1.0.0");

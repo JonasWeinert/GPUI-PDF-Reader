@@ -64,16 +64,16 @@ use gpui_component::{
     text::{TextView, TextViewStyle},
 };
 use image::{Frame, RgbaImage};
-#[cfg(feature = "installable-extensions")]
-use key_extension_api::LifecycleState;
 use key_extension_api::{
     ContributionId, ContributionSlot, DataValue, EffectResult, ExtensionEffect, ExtensionError,
     ExtensionErrorCode, ExtensionId, SnapshotKind,
 };
+#[cfg(feature = "installable-extensions")]
+use key_extension_api::{LifecycleState, Permission};
 use key_extension_gpui::{BoundedStateMap, DeclarativeView, InvokeExtensionCommand};
 use key_extension_host::ArbitratedEffect;
 #[cfg(feature = "installable-extensions")]
-use key_extension_host::OwnedCommand;
+use key_extension_host::{OwnedCommand, PermissionDecision};
 #[cfg(feature = "installable-extensions")]
 use key_extension_package::PackageSourceKind;
 use key_pdf_extension_api::{
@@ -1811,6 +1811,47 @@ impl PdfReader {
             }
         }
         self.refresh_active_extension_view(window, cx);
+        cx.notify();
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn set_extension_permission(
+        &mut self,
+        extension: ExtensionId,
+        permission: Permission,
+        grant: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let decision = if grant {
+            PermissionDecision::Granted
+        } else {
+            PermissionDecision::Denied
+        };
+        match self
+            .extensions
+            .set_package_permission(&extension, &permission, decision)
+        {
+            Ok(()) => {
+                self.warning = Some(
+                    if grant {
+                        "Extension permission allowed"
+                    } else {
+                        "Extension permission revoked"
+                    }
+                    .into(),
+                );
+                self.refresh_extension_manager_state();
+                crate::rebuild_application_menus(&mut self.extensions, cx);
+                self.refresh_active_extension_view(window, cx);
+                self.schedule_extension_snapshot_sync(window, cx);
+            }
+            Err(error) => {
+                self.warning =
+                    Some(format!("Could not update extension permission: {error}").into());
+                self.refresh_extension_manager_state();
+            }
+        }
         cx.notify();
     }
 
@@ -4290,6 +4331,9 @@ impl PdfReader {
                     let extension_for_toggle = extension.clone();
                     let extension_for_remove = extension.clone();
                     let name_for_remove = package.name.clone();
+                    let package_permissions = package.permissions.clone();
+                    let restoration_error = package.restoration_error.clone();
+                    let can_toggle = restoration_error.is_none();
                     let package_commands = commands
                         .iter()
                         .filter(|command| command.owner == extension)
@@ -4364,9 +4408,153 @@ impl PdfReader {
                                                     .text_xs()
                                                     .text_color(palette.text_secondary)
                                                     .child(label.to_owned())
-                                            }),
+                                        }),
                                     ),
                                 )
+                                .when_some(restoration_error, |card, error| {
+                                    card.child(
+                                        div()
+                                            .p_2()
+                                            .rounded_md()
+                                            .bg(palette.error_soft)
+                                            .text_xs()
+                                            .text_color(palette.error)
+                                            .child(error),
+                                    )
+                                })
+                                .when(!package_permissions.is_empty(), |card| {
+                                    card.child(
+                                        div()
+                                            .pt_1()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(palette.text_secondary)
+                                                    .child("Permissions"),
+                                            )
+                                            .children(
+                                                package_permissions.into_iter().enumerate().map(
+                                                    |(
+                                                        permission_index,
+                                                        (request, decision),
+                                                    )| {
+                                                        let granted =
+                                                            decision == PermissionDecision::Granted;
+                                                        let extension = extension.clone();
+                                                        let permission = request.permission.clone();
+                                                        let label =
+                                                            extension_permission_label(&permission);
+                                                        div()
+                                                            .id((
+                                                                "extension-permission",
+                                                                index * 100 + permission_index,
+                                                            ))
+                                                            .p_2()
+                                                            .flex()
+                                                            .items_start()
+                                                            .justify_between()
+                                                            .gap_2()
+                                                            .rounded_md()
+                                                            .bg(palette.surface_subtle)
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .min_w(px(0.0))
+                                                                    .child(
+                                                                        div()
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .gap_1()
+                                                                            .text_xs()
+                                                                            .font_weight(
+                                                                                FontWeight::MEDIUM,
+                                                                            )
+                                                                            .child(label)
+                                                                            .when(
+                                                                                request.required,
+                                                                                |row| {
+                                                                                    row.child(
+                                                                                        div()
+                                                                                            .px_1()
+                                                                                            .rounded_sm()
+                                                                                            .bg(palette.warning.opacity(0.14))
+                                                                                            .text_color(palette.warning)
+                                                                                            .child("Required"),
+                                                                                    )
+                                                                                },
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .mt_1()
+                                                                            .text_xs()
+                                                                            .text_color(
+                                                                                palette
+                                                                                    .text_secondary,
+                                                                            )
+                                                                            .child(request.reason),
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .id((
+                                                                        "extension-permission-toggle",
+                                                                        index * 100
+                                                                            + permission_index,
+                                                                    ))
+                                                                    .h(px(26.0))
+                                                                    .px_2()
+                                                                    .flex_none()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .rounded_md()
+                                                                    .cursor_pointer()
+                                                                    .text_xs()
+                                                                    .font_weight(FontWeight::MEDIUM)
+                                                                    .text_color(if granted {
+                                                                        palette.error
+                                                                    } else {
+                                                                        palette.accent
+                                                                    })
+                                                                    .hover(move |button| {
+                                                                        button.bg(if granted {
+                                                                            palette.error_soft
+                                                                        } else {
+                                                                            palette.accent_soft
+                                                                        })
+                                                                    })
+                                                                    .on_click(cx.listener(
+                                                                        move |reader,
+                                                                              _,
+                                                                              window,
+                                                                              cx| {
+                                                                            reader
+                                                                                .set_extension_permission(
+                                                                                    extension
+                                                                                        .clone(),
+                                                                                    permission
+                                                                                        .clone(),
+                                                                                    !granted,
+                                                                                    window,
+                                                                                    cx,
+                                                                                )
+                                                                        },
+                                                                    ))
+                                                                    .child(if granted {
+                                                                        "Revoke"
+                                                                    } else {
+                                                                        "Allow"
+                                                                    }),
+                                                            )
+                                                    },
+                                                ),
+                                            ),
+                                    )
+                                })
                                 .when(!package_commands.is_empty(), |card| {
                                     card.child(div().pt_1().flex().flex_col().gap_1().children(
                                         package_commands.into_iter().enumerate().map(
@@ -4424,32 +4612,41 @@ impl PdfReader {
                                                 .flex()
                                                 .items_center()
                                                 .rounded_md()
-                                                .cursor_pointer()
                                                 .border_1()
                                                 .border_color(palette.separator)
                                                 .text_xs()
                                                 .font_weight(FontWeight::MEDIUM)
-                                                .hover(move |button| {
-                                                    button.bg(palette.control_hover)
+                                                .when(can_toggle, |button| {
+                                                    button
+                                                        .cursor_pointer()
+                                                        .hover(move |button| {
+                                                            button.bg(palette.control_hover)
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |reader, _, window, cx| {
+                                                                if active {
+                                                                    reader.disable_extension(
+                                                                        extension_for_toggle
+                                                                            .clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                } else {
+                                                                    reader.enable_extension(
+                                                                        extension_for_toggle
+                                                                            .clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                }
+                                                            },
+                                                        ))
                                                 })
-                                                .on_click(cx.listener(
-                                                    move |reader, _, window, cx| {
-                                                        if active {
-                                                            reader.disable_extension(
-                                                                extension_for_toggle.clone(),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        } else {
-                                                            reader.enable_extension(
-                                                                extension_for_toggle.clone(),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        }
-                                                    },
-                                                ))
-                                                .child(if active { "Disable" } else { "Enable" }),
+                                                .child(if can_toggle {
+                                                    if active { "Disable" } else { "Enable" }
+                                                } else {
+                                                    "Unavailable"
+                                                }),
                                         )
                                         .child(
                                             div()
@@ -4498,7 +4695,6 @@ impl PdfReader {
     }
 }
 
-#[derive(Clone)]
 struct PaintPageOverlay {
     text: Option<Arc<TextLayer>>,
     annotations: Vec<PaintAnnotation>,
@@ -4506,7 +4702,6 @@ struct PaintPageOverlay {
     extension_overlays: Vec<PaintExtensionOverlay>,
 }
 
-#[derive(Clone)]
 struct PaintExtensionOverlay {
     regions: Vec<TextBounds>,
     appearance: OverlayAppearance,
@@ -4520,7 +4715,6 @@ struct PaintAnnotation {
     has_comment: bool,
 }
 
-#[derive(Clone)]
 struct PaintSnapshot {
     palette: ReaderPalette,
     canvas: PdfCanvasSnapshot<PaintPageOverlay>,
@@ -4880,6 +5074,25 @@ fn text_layer_statistics(text: &TextLayer) -> (usize, usize) {
         in_word = !whitespace;
     }
     (words, text.len())
+}
+
+#[cfg(feature = "installable-extensions")]
+fn extension_permission_label(permission: &Permission) -> &'static str {
+    match permission {
+        Permission::ReadDocumentMetadata => "Read document metadata",
+        Permission::ReadDocumentText(_) => "Read document text",
+        Permission::ReadSelection => "Read selected text",
+        Permission::NavigateDocument => "Navigate the document",
+        Permission::AddDocumentOverlays => "Draw document overlays",
+        Permission::AddSidePanel => "Add a side panel",
+        Permission::ReadAnnotations => "Read annotations",
+        Permission::WriteAnnotations => "Write annotations",
+        Permission::MutateDocument(_) => "Modify document content",
+        Permission::ClipboardWrite => "Copy to the clipboard",
+        Permission::OpenExternalUrl => "Open external links",
+        Permission::Storage(_) => "Use extension storage",
+        Permission::Network(_) => "Access declared websites",
+    }
 }
 
 #[cfg(feature = "installable-extensions")]

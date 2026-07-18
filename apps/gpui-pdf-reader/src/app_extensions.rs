@@ -87,8 +87,14 @@ struct ExtensionRestoreFailure {
 }
 
 impl ReaderExtensions {
+    #[cfg(test)]
     pub fn new(themes: &[ThemeConfig], safe_mode: bool) -> Result<Self, HostError> {
-        Self::new_with_assets(themes, safe_mode, Arc::new(ExtensionAssetStore::default()))
+        Self::new_with_assets_internal(
+            themes,
+            safe_mode,
+            Arc::new(ExtensionAssetStore::default()),
+            false,
+        )
     }
 
     pub fn new_with_assets(
@@ -96,6 +102,17 @@ impl ReaderExtensions {
         safe_mode: bool,
         extension_assets: Arc<ExtensionAssetStore>,
     ) -> Result<Self, HostError> {
+        Self::new_with_assets_internal(themes, safe_mode, extension_assets, true)
+    }
+
+    fn new_with_assets_internal(
+        themes: &[ThemeConfig],
+        safe_mode: bool,
+        extension_assets: Arc<ExtensionAssetStore>,
+        restore_installables: bool,
+    ) -> Result<Self, HostError> {
+        #[cfg(not(feature = "installable-extensions"))]
+        let _ = restore_installables;
         let extension = extension_id();
         let adapter = native_adapter_id();
         let theme_command = theme_command_id();
@@ -120,8 +137,19 @@ impl ReaderExtensions {
         host.activate(&extension)?;
 
         #[cfg(feature = "installable-extensions")]
-        let (packages, registry, restoration_failures, startup_error) =
-            restore_installable_extensions(&mut host, &extension_assets, safe_mode);
+        let (packages, registry, restoration_failures, startup_error) = if restore_installables {
+            restore_installable_extensions(&mut host, &extension_assets, safe_mode)
+        } else {
+            match InstallableExtensionManager::new() {
+                Ok(packages) => (Some(packages), None, BTreeMap::new(), None),
+                Err(error) => (
+                    None,
+                    None,
+                    BTreeMap::new(),
+                    Some(format!("Installable extensions are unavailable: {error}")),
+                ),
+            }
+        };
 
         Ok(Self {
             host,
@@ -147,6 +175,7 @@ impl ReaderExtensions {
     /// Keeps the product usable if a bundled package is corrupt or
     /// incompatible. The failed feature contributes no UI and the reason is
     /// surfaced by the reader instead of aborting application startup.
+    #[cfg(test)]
     pub fn disabled(safe_mode: bool, error: impl Into<String>) -> Self {
         Self::disabled_with_assets(safe_mode, error, Arc::new(ExtensionAssetStore::default()))
     }
@@ -659,7 +688,7 @@ fn restore_installable_extensions(
             );
         }
     };
-    let mut registry = match default_app_data_root().and_then(ExtensionRegistry::load_from_root) {
+    let registry = match default_app_data_root().and_then(ExtensionRegistry::load_from_root) {
         Ok(registry) => registry,
         Err(error) => {
             return (
@@ -978,6 +1007,11 @@ mod tests {
     fn theme_command_round_trips_through_host_arbitration() {
         let themes = [test_theme("Midnight", ThemeMode::Dark)];
         let mut extensions = ReaderExtensions::new(&themes, false).expect("host starts");
+        #[cfg(feature = "installable-extensions")]
+        assert!(
+            extensions.registry.is_none(),
+            "unit tests must never load or execute packages from the user's durable registry"
+        );
         let command = extensions.theme_command().clone();
         let effects = extensions
             .invoke_command(&command, Some(DataValue::String("Midnight".into())))
