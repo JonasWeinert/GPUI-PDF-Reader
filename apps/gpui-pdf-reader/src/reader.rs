@@ -1057,7 +1057,7 @@ impl PdfReader {
     }
 
     fn listen_for_native_pinch(entity: &Entity<Self>, window: &mut Window, cx: &mut App) {
-        let receiver = Arc::new(Mutex::new(crate::native_gestures::install_pinch_monitor()));
+        let receiver = Arc::new(Mutex::new(crate::native_gestures::subscribe_pinch_monitor()));
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
@@ -1070,6 +1070,9 @@ impl PdfReader {
                         break;
                     };
                     let _ = async_cx.update(|window, cx| {
+                        if !window.is_window_active() {
+                            return;
+                        }
                         let window_height = f32::from(window.viewport_size().height);
                         weak.update(cx, |reader, cx| {
                             let position = point(px(pinch.x), px(window_height - pinch.cocoa_y));

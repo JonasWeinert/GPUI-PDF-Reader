@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+
 #[derive(Clone, Copy, Debug)]
 pub struct NativePinch {
     pub x: f32,
@@ -6,18 +8,54 @@ pub struct NativePinch {
     pub delta: f32,
 }
 
+#[derive(Default)]
+struct PinchBroadcast {
+    subscribers: Mutex<Vec<mpsc::Sender<NativePinch>>>,
+}
+
+impl PinchBroadcast {
+    fn subscribe(&self) -> mpsc::Receiver<NativePinch> {
+        let (sender, receiver) = mpsc::channel();
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(sender);
+        receiver
+    }
+
+    fn publish(&self, pinch: NativePinch) {
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|subscriber| subscriber.send(pinch).is_ok());
+    }
+}
+
+static PINCH_BROADCAST: OnceLock<Arc<PinchBroadcast>> = OnceLock::new();
+
+/// Subscribes one window to the process-wide native magnification monitor.
+/// Readers still check GPUI activation before applying an event, so the one
+/// AppKit event is routed only to its active PDF window.
+pub fn subscribe_pinch_monitor() -> mpsc::Receiver<NativePinch> {
+    PINCH_BROADCAST
+        .get_or_init(|| {
+            let broadcast = Arc::new(PinchBroadcast::default());
+            install_platform_monitor(broadcast.clone());
+            broadcast
+        })
+        .subscribe()
+}
+
 #[cfg(target_os = "macos")]
-pub fn install_pinch_monitor() -> std::sync::mpsc::Receiver<NativePinch> {
+fn install_platform_monitor(broadcast: Arc<PinchBroadcast>) {
     use block2::RcBlock;
     use objc2_app_kit::{NSEvent, NSEventMask};
     use std::ptr::NonNull;
-    use std::sync::mpsc;
 
-    let (sender, receiver) = mpsc::channel();
     let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
         let event_ref = unsafe { event.as_ref() };
         let location = event_ref.locationInWindow();
-        let _ = sender.send(NativePinch {
+        broadcast.publish(NativePinch {
             x: location.x as f32,
             cocoa_y: location.y as f32,
             delta: event_ref.magnification() as f32,
@@ -25,18 +63,46 @@ pub fn install_pinch_monitor() -> std::sync::mpsc::Receiver<NativePinch> {
         event.as_ptr()
     });
 
-    // AppKit retains both the monitor token and a copy of the block. The app has
-    // one reader window, so this monitor intentionally lives for the process.
+    // AppKit owns the monitor for process lifetime. Unlike the old per-reader
+    // path this executes exactly once, regardless of the number of windows.
     if let Some(monitor) = unsafe {
         NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Magnify, &block)
     } {
         std::mem::forget(monitor);
     }
-    receiver
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn install_pinch_monitor() -> std::sync::mpsc::Receiver<NativePinch> {
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    receiver
+fn install_platform_monitor(_: Arc<PinchBroadcast>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_reaches_every_live_window_and_prunes_closed_ones() {
+        let broadcast = PinchBroadcast::default();
+        let first = broadcast.subscribe();
+        let second = broadcast.subscribe();
+        let pinch = NativePinch {
+            x: 10.0,
+            cocoa_y: 20.0,
+            delta: 0.25,
+        };
+        broadcast.publish(pinch);
+        assert_eq!(first.recv().unwrap().delta, 0.25);
+        assert_eq!(second.recv().unwrap().x, 10.0);
+
+        drop(first);
+        broadcast.publish(pinch);
+        assert_eq!(second.recv().unwrap().cocoa_y, 20.0);
+        assert_eq!(
+            broadcast
+                .subscribers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            1
+        );
+    }
 }
