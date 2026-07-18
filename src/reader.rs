@@ -42,11 +42,11 @@ use crate::{
 };
 use gpui::{
     Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners,
-    CursorStyle, Entity, FocusHandle, Focusable, FontWeight, IntoElement, ListAlignment, ListState,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point,
-    PromptButton, PromptLevel, Render, RenderImage, ScrollWheelEvent, SharedString, StyledText,
-    Task, TextRun, Transformation, UniformListScrollHandle, Window, WindowControlArea, canvas, div,
-    ease_in_out, font, img, list, percentage, point, prelude::*, px, quad, rems, size,
+    CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, ListAlignment,
+    ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, Point, PromptButton, PromptLevel, Render, RenderImage, ScrollWheelEvent, SharedString,
+    StyledText, Task, TextRun, Transformation, UniformListScrollHandle, Window, WindowControlArea,
+    canvas, div, ease_in_out, font, img, list, percentage, point, prelude::*, px, quad, rems, size,
     uniform_list,
 };
 #[cfg(debug_assertions)]
@@ -62,6 +62,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod animation;
+mod comments;
+mod ui;
+
+use animation::UnitTransition;
+use comments::{CommentEditorPresentation, CommentEmptyPresentation};
+use ui::{ChromeButtonStyle, chrome_button, empty_state, error_banner, icon_label};
 
 const TOOLBAR_HEIGHT: f32 = 52.0;
 const ERROR_BAR_HEIGHT: f32 = 34.0;
@@ -537,34 +545,7 @@ enum ReferenceSummaryTab {
     Abstract,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RevealState {
-    progress: f32,
-    target: f32,
-}
-
-impl Default for RevealState {
-    fn default() -> Self {
-        Self {
-            progress: 0.0,
-            target: 0.0,
-        }
-    }
-}
-
-impl RevealState {
-    fn is_animating(self) -> bool {
-        (self.progress - self.target).abs() > 0.001
-    }
-
-    fn advance(&mut self, dt: f32) {
-        let blend = 1.0 - (-22.0 * dt.clamp(1.0 / 240.0, 0.05)).exp();
-        self.progress += (self.target - self.progress) * blend;
-        if (self.target - self.progress).abs() < 0.001 {
-            self.progress = self.target;
-        }
-    }
-}
+type RevealState = UnitTransition;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum DemandTier {
@@ -598,6 +579,42 @@ enum ReaderView {
     Fluid,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommentListStyle {
+    Classic,
+    Fluid,
+}
+
+impl CommentListStyle {
+    fn list_id(self) -> &'static str {
+        match self {
+            Self::Classic => "comment-list",
+            Self::Fluid => "fluid-comment-list",
+        }
+    }
+
+    fn row_id(self) -> &'static str {
+        match self {
+            Self::Classic => "comment",
+            Self::Fluid => "fluid-comment",
+        }
+    }
+
+    fn row_height(self) -> f32 {
+        match self {
+            Self::Classic => 104.0,
+            Self::Fluid => 96.0,
+        }
+    }
+
+    fn preview_height(self) -> f32 {
+        match self {
+            Self::Classic => 44.0,
+            Self::Fluid => 42.0,
+        }
+    }
+}
+
 struct FluidPillState {
     available_width: f32,
     document_open: bool,
@@ -606,14 +623,6 @@ struct FluidPillState {
     zoom_label: SharedString,
     search_selected: bool,
     comments_selected: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ChromeButtonStyle {
-    Ghost,
-    Floating,
-    Selected,
-    Primary,
 }
 
 #[derive(Clone, Debug)]
@@ -691,12 +700,13 @@ impl SidebarState {
     }
 
     fn advance(&mut self, dt: f32) {
-        let blend = 1.0 - (-22.0 * dt.clamp(1.0 / 240.0, 0.05)).exp();
-        self.progress += (self.target - self.progress) * blend;
-        if (self.target - self.progress).abs() < 0.001 {
-            self.progress = self.target;
-        }
-        self.progress = self.progress.clamp(0.0, 1.0);
+        let mut transition = UnitTransition {
+            progress: self.progress,
+            target: self.target,
+        };
+        transition.advance(dt);
+        self.progress = transition.progress;
+        self.target = transition.target;
     }
 
     fn available_width(self, full_width: f32) -> f32 {
@@ -734,12 +744,13 @@ impl CommentPaneState {
     }
 
     fn advance(&mut self, dt: f32) {
-        let blend = 1.0 - (-24.0 * dt.clamp(1.0 / 240.0, 0.05)).exp();
-        self.progress += (self.target - self.progress) * blend;
-        if (self.target - self.progress).abs() < 0.001 {
-            self.progress = self.target;
-        }
-        self.progress = self.progress.clamp(0.0, 1.0);
+        let mut transition = UnitTransition {
+            progress: self.progress,
+            target: self.target,
+        };
+        transition.advance_with_response(dt, 24.0);
+        self.progress = transition.progress;
+        self.target = transition.target;
     }
 }
 
@@ -6136,71 +6147,11 @@ impl PdfReader {
         enabled: bool,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
-        let (background, border, text, hover, pressed) = match style {
-            ChromeButtonStyle::Ghost => (
-                palette.chrome,
-                palette.chrome,
-                palette.text_secondary,
-                palette.control_hover,
-                palette.control_pressed,
-            ),
-            ChromeButtonStyle::Floating => (
-                palette.surface,
-                palette.surface,
-                palette.text_secondary,
-                palette.control_hover,
-                palette.control_pressed,
-            ),
-            ChromeButtonStyle::Selected => (
-                palette.accent_soft,
-                palette.accent_border,
-                palette.accent,
-                palette.accent_soft_hover,
-                palette.control_pressed,
-            ),
-            ChromeButtonStyle::Primary => (
-                palette.accent,
-                palette.accent,
-                palette.accent_foreground,
-                palette.accent_hover,
-                palette.accent_active,
-            ),
-        };
-        div()
-            .id(id)
-            .h(px(32.0))
-            .min_w(px(32.0))
-            .px_3()
-            .flex()
-            .items_center()
-            .justify_center()
-            .overflow_hidden()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(background)
-            .text_color(text)
-            .text_sm()
-            .font_weight(FontWeight::MEDIUM)
-            .when(enabled, |button| {
-                button
-                    .cursor_pointer()
-                    .hover(move |button| button.bg(hover))
-                    .active(move |button| button.bg(pressed))
-                    .on_click(handler)
-            })
-            .when(!enabled, |button| button.opacity(0.42))
-            .child(label)
+        chrome_button(palette, id, label, style, enabled, handler)
     }
 
     fn icon_label(icon: IconName, label: impl IntoElement) -> gpui::AnyElement {
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(Icon::new(icon))
-            .child(label)
-            .into_any_element()
+        icon_label(icon, label)
     }
 
     fn segment_button(
@@ -9156,117 +9107,53 @@ impl PdfReader {
             .into_any_element()
     }
 
-    fn render_fluid_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
-        let list_header = div()
-            .h(px(54.0))
-            .flex_none()
-            .px_4()
-            .flex()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(palette.separator)
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Comments"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(Self::chrome_button(
-                        palette,
-                        "fluid-close-comments",
-                        Icon::new(IconName::Close).size(px(16.0)),
-                        ChromeButtonStyle::Ghost,
-                        true,
-                        cx.listener(|reader, _, window, cx| {
-                            reader.toggle_sidebar(SidePanel::Comments, window, cx)
-                        }),
-                    )),
-            );
-
-        let list_body = if self.comment_order.is_empty() {
-            div()
-                .flex_1()
-                .min_h(px(0.0))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .px_6()
-                .text_center()
-                .child(
-                    div()
-                        .size(px(38.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(palette.accent_soft)
-                        .text_color(palette.accent)
-                        .text_lg()
-                        .child(Icon::new(IconName::BookOpen)),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(palette.text)
-                        .child(if self.annotations_loading {
-                            "Loading comments…"
-                        } else if self.annotation_persistence_blocked {
-                            "Comments unavailable"
-                        } else {
-                            "No comments yet"
-                        }),
-                )
-                .child(
-                    div()
-                        .max_w(px(248.0))
-                        .text_xs()
-                        .line_height(px(18.0))
-                        .text_color(palette.text_secondary)
-                        .child(if self.annotation_persistence_blocked {
-                            "Resolve the annotation sidecar problem before adding comments."
-                        } else {
-                            "Select text, then use either floating Note control."
-                        }),
-                )
-                .into_any_element()
-        } else {
-            uniform_list(
-                "fluid-comment-list",
-                self.comment_order.len(),
-                cx.processor(move |reader, range: std::ops::Range<usize>, _window, cx| {
-                    range
-                        .filter_map(|index| {
-                            let id = *reader.comment_order.get(index)?;
-                            let annotation = reader.annotations.as_ref()?.get(id)?;
-                            let page = annotation.range().start().page;
-                            let markdown = annotation.comment_markdown().unwrap_or("");
-                            let preview = RichTextBuffer::try_from_markdown(markdown)
-                                .map(|buffer| compact_preview(buffer.text(), 96))
-                                .unwrap_or_else(|_| compact_preview(markdown, 96));
-                            let preview: SharedString = preview.into();
-                            let color = match annotation.highlight() {
-                                Some(HighlightColor::Yellow) => palette.yellow,
-                                Some(HighlightColor::Green) => palette.green,
-                                Some(HighlightColor::Blue) => palette.blue,
-                                Some(HighlightColor::Pink) => palette.pink,
-                                Some(HighlightColor::Purple) => palette.purple,
-                                None => palette.warning,
-                            };
-                            let active = reader.active_annotation == Some(id);
-                            Some(
-                                div().h(px(96.0)).w_full().px_3().py_1().child(
+    fn render_comment_list(
+        &mut self,
+        style: CommentListStyle,
+        palette: ReaderPalette,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        uniform_list(
+            style.list_id(),
+            self.comment_order.len(),
+            cx.processor(move |reader, range: std::ops::Range<usize>, _window, cx| {
+                range
+                    .filter_map(|index| {
+                        let id = *reader.comment_order.get(index)?;
+                        let (page, preview, color, active) =
+                            reader.comment_row_presentation(id, palette)?;
+                        let action = match style {
+                            CommentListStyle::Fluid => div()
+                                .text_color(if active {
+                                    palette.accent
+                                } else {
+                                    palette.text_secondary
+                                })
+                                .child(Self::icon_label(IconName::ArrowRight, "Open"))
+                                .into_any_element(),
+                            CommentListStyle::Classic => div()
+                                .id(("edit-comment", index))
+                                .px_2()
+                                .py_1()
+                                .overflow_hidden()
+                                .rounded_md()
+                                .text_color(palette.accent)
+                                .hover(|button| button.bg(palette.accent_soft))
+                                .on_click(cx.listener(move |reader, _, window, cx| {
+                                    reader.edit_comment(id, window, cx)
+                                }))
+                                .child("Edit")
+                                .into_any_element(),
+                        };
+                        Some(
+                            div()
+                                .h(px(style.row_height()))
+                                .w_full()
+                                .px_3()
+                                .py_1()
+                                .child(
                                     div()
-                                        .id(("fluid-comment", index))
+                                        .id((style.row_id(), index))
                                         .size_full()
                                         .overflow_hidden()
                                         .flex()
@@ -9310,20 +9197,23 @@ impl PdfReader {
                                                         .justify_between()
                                                         .text_xs()
                                                         .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(if active {
-                                                            palette.accent
-                                                        } else {
-                                                            palette.text_secondary
-                                                        })
-                                                        .child(format!("PAGE {}", page + 1))
-                                                        .child(Self::icon_label(
-                                                            IconName::ArrowRight,
-                                                            "Open",
-                                                        )),
+                                                        .child(
+                                                            div()
+                                                                .text_color(if active {
+                                                                    palette.accent
+                                                                } else {
+                                                                    palette.text_secondary
+                                                                })
+                                                                .child(format!(
+                                                                    "PAGE {}",
+                                                                    page + 1
+                                                                )),
+                                                        )
+                                                        .child(action),
                                                 )
                                                 .child(
                                                     div()
-                                                        .h(px(42.0))
+                                                        .h(px(style.preview_height()))
                                                         .overflow_hidden()
                                                         .text_sm()
                                                         .line_height(px(20.0))
@@ -9332,32 +9222,69 @@ impl PdfReader {
                                                 ),
                                         ),
                                 ),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                }),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(self.comment_list_scroll.clone())
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .bg(palette.surface_subtle)
+        .when(style == CommentListStyle::Fluid, |list| list.rounded_b_xl())
+        .into_any_element()
+    }
+
+    fn render_fluid_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let palette = ReaderPalette::from_theme(Theme::global(cx));
+        let list_header = div()
+            .h(px(54.0))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(palette.separator)
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Comments"),
             )
-            .track_scroll(self.comment_list_scroll.clone())
-            .flex_1()
-            .min_h(px(0.0))
-            .w_full()
-            .bg(palette.surface_subtle)
-            .rounded_b_xl()
-            .into_any_element()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(Self::chrome_button(
+                        palette,
+                        "fluid-close-comments",
+                        Icon::new(IconName::Close).size(px(16.0)),
+                        ChromeButtonStyle::Ghost,
+                        true,
+                        cx.listener(|reader, _, window, cx| {
+                            reader.toggle_sidebar(SidePanel::Comments, window, cx)
+                        }),
+                    )),
+            );
+
+        let list_body = if self.comment_order.is_empty() {
+            let empty = CommentEmptyPresentation::new(
+                self.annotations_loading,
+                self.annotation_persistence_blocked,
+                true,
+            );
+            empty_state(palette, IconName::BookOpen, empty.title, empty.detail)
+        } else {
+            self.render_comment_list(CommentListStyle::Fluid, palette, cx)
         };
 
-        let list_error = self.annotation_error.clone().map(|message| {
-            div()
-                .mx_4()
-                .mt_3()
-                .p_3()
-                .rounded_md()
-                .bg(palette.error_soft)
-                .text_xs()
-                .line_height(px(18.0))
-                .text_color(palette.error)
-                .child(message)
-        });
+        let list_error = self
+            .annotation_error
+            .clone()
+            .map(|message| error_banner(palette, message));
         let progress = self.comment_pane.progress;
         let list_pane = div()
             .absolute()
@@ -9374,37 +9301,23 @@ impl PdfReader {
             .child(list_body);
 
         let editor_pane = self.comment_editor.clone().map(|editor| {
-            let title = if self.editing_annotation.is_some() {
-                "Edit Comment"
-            } else {
-                "New Comment"
-            };
             let annotations_pending = self
                 .annotations
                 .as_ref()
                 .is_some_and(|annotations| annotations.revision() > self.annotation_saved_revision);
-            let save_status = if self.comment_draft_dirty
-                || self.comment_autosave_task.is_some()
-                || annotations_pending
-            {
-                "Saving…"
-            } else if self.editing_annotation.is_some() {
-                "Saved"
-            } else {
-                "Auto-save"
-            };
-            let editor_error = self.annotation_error.clone().map(|message| {
-                div()
-                    .mx_4()
-                    .mt_3()
-                    .p_3()
-                    .rounded_md()
-                    .bg(palette.error_soft)
-                    .text_xs()
-                    .line_height(px(18.0))
-                    .text_color(palette.error)
-                    .child(message)
-            });
+            let presentation = CommentEditorPresentation::new(
+                true,
+                self.editing_annotation.is_some(),
+                self.comment_draft_dirty
+                    || self.comment_autosave_task.is_some()
+                    || annotations_pending,
+            );
+            let title = presentation.title;
+            let save_status = presentation.save_status;
+            let editor_error = self
+                .annotation_error
+                .clone()
+                .map(|message| error_banner(palette, message));
             div()
                 .absolute()
                 .top_0()
@@ -9506,6 +9419,33 @@ impl PdfReader {
         }
     }
 
+    fn comment_row_presentation(
+        &self,
+        id: AnnotationId,
+        palette: ReaderPalette,
+    ) -> Option<(usize, SharedString, Hsla, bool)> {
+        let annotation = self.annotations.as_ref()?.get(id)?;
+        let page = annotation.range().start().page;
+        let markdown = annotation.comment_markdown().unwrap_or("");
+        let preview = RichTextBuffer::try_from_markdown(markdown)
+            .map(|buffer| compact_preview(buffer.text(), 96))
+            .unwrap_or_else(|_| compact_preview(markdown, 96));
+        let color = match annotation.highlight() {
+            Some(HighlightColor::Yellow) => palette.yellow,
+            Some(HighlightColor::Green) => palette.green,
+            Some(HighlightColor::Blue) => palette.blue,
+            Some(HighlightColor::Pink) => palette.pink,
+            Some(HighlightColor::Purple) => palette.purple,
+            None => palette.warning,
+        };
+        Some((
+            page,
+            preview.into(),
+            color,
+            self.active_annotation == Some(id),
+        ))
+    }
+
     fn render_classic_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let palette = ReaderPalette::from_theme(Theme::global(cx));
         let error = self.annotation_error.clone();
@@ -9514,25 +9454,13 @@ impl PdfReader {
             .annotations
             .as_ref()
             .is_some_and(|annotations| annotations.revision() > self.annotation_saved_revision);
-        let save_status = if self.comment_draft_dirty
-            || self.comment_autosave_task.is_some()
-            || annotations_pending
-        {
-            "Saving…"
-        } else if editor_open && self.editing_annotation.is_some() {
-            "Saved"
-        } else {
-            "Auto-save"
-        };
-        let title = if editor_open {
-            if self.editing_annotation.is_some() {
-                "Edit Comment"
-            } else {
-                "New Comment"
-            }
-        } else {
-            "Comments"
-        };
+        let presentation = CommentEditorPresentation::new(
+            editor_open,
+            self.editing_annotation.is_some(),
+            self.comment_draft_dirty || self.comment_autosave_task.is_some() || annotations_pending,
+        );
+        let save_status = presentation.save_status;
+        let title = presentation.title;
         let header = div()
             .h(px(54.0))
             .flex_none()
@@ -9614,180 +9542,14 @@ impl PdfReader {
                 .child(editor)
                 .into_any_element()
         } else if self.comment_order.is_empty() {
-            div()
-                .flex_1()
-                .min_h(px(0.0))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .px_6()
-                .text_center()
-                .child(
-                    div()
-                        .size(px(38.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(palette.accent_soft)
-                        .text_color(palette.accent)
-                        .text_lg()
-                        .child(Icon::new(IconName::BookOpen)),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(palette.text)
-                        .child(if self.annotations_loading {
-                            "Loading comments…"
-                        } else if self.annotation_persistence_blocked {
-                            "Comments unavailable"
-                        } else {
-                            "No comments yet"
-                        }),
-                )
-                .child(
-                    div()
-                        .max_w(px(248.0))
-                        .text_xs()
-                        .line_height(px(18.0))
-                        .text_color(palette.text_secondary)
-                        .child(if self.annotation_persistence_blocked {
-                            "Resolve the annotation sidecar problem before adding comments."
-                        } else {
-                            "Select text in the document, then choose New Comment."
-                        }),
-                )
-                .into_any_element()
+            let empty = CommentEmptyPresentation::new(
+                self.annotations_loading,
+                self.annotation_persistence_blocked,
+                false,
+            );
+            empty_state(palette, IconName::BookOpen, empty.title, empty.detail)
         } else {
-            uniform_list(
-                "comment-list",
-                self.comment_order.len(),
-                cx.processor(move |reader, range: std::ops::Range<usize>, _window, cx| {
-                    range
-                        .filter_map(|index| {
-                            let id = *reader.comment_order.get(index)?;
-                            let annotation = reader.annotations.as_ref()?.get(id)?;
-                            let page = annotation.range().start().page;
-                            let markdown = annotation.comment_markdown().unwrap_or("");
-                            let preview = RichTextBuffer::try_from_markdown(markdown)
-                                .map(|buffer| compact_preview(buffer.text(), 96))
-                                .unwrap_or_else(|_| compact_preview(markdown, 96));
-                            let preview: SharedString = preview.into();
-                            let color = match annotation.highlight() {
-                                Some(HighlightColor::Yellow) => palette.yellow,
-                                Some(HighlightColor::Green) => palette.green,
-                                Some(HighlightColor::Blue) => palette.blue,
-                                Some(HighlightColor::Pink) => palette.pink,
-                                Some(HighlightColor::Purple) => palette.purple,
-                                None => palette.warning,
-                            };
-                            let active = reader.active_annotation == Some(id);
-                            Some(
-                                div().h(px(104.0)).w_full().px_3().py_1().child(
-                                    div()
-                                        .id(("comment", index))
-                                        .size_full()
-                                        .overflow_hidden()
-                                        .flex()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(if active {
-                                            palette.accent_border
-                                        } else {
-                                            palette.separator
-                                        })
-                                        .bg(if active {
-                                            palette.accent_soft
-                                        } else {
-                                            palette.surface
-                                        })
-                                        .cursor_pointer()
-                                        .hover(move |row| {
-                                            row.bg(if active {
-                                                palette.accent_soft_hover
-                                            } else {
-                                                palette.surface_subtle
-                                            })
-                                        })
-                                        .on_click(cx.listener(move |reader, _, window, cx| {
-                                            reader.open_comment_from_list(id, window, cx);
-                                        }))
-                                        .child(div().w(px(4.0)).h_full().flex_none().bg(color))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .px_3()
-                                                .py_2()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .child(
-                                                            div()
-                                                                .text_color(if active {
-                                                                    palette.accent
-                                                                } else {
-                                                                    palette.text_secondary
-                                                                })
-                                                                .child(format!(
-                                                                    "PAGE {}",
-                                                                    page + 1
-                                                                )),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .id(("edit-comment", index))
-                                                                .px_2()
-                                                                .py_1()
-                                                                .overflow_hidden()
-                                                                .rounded_md()
-                                                                .text_color(palette.accent)
-                                                                .hover(|button| {
-                                                                    button.bg(palette.accent_soft)
-                                                                })
-                                                                .on_click(cx.listener(
-                                                                    move |reader, _, window, cx| {
-                                                                        reader.edit_comment(
-                                                                            id, window, cx,
-                                                                        )
-                                                                    },
-                                                                ))
-                                                                .child("Edit"),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .h(px(44.0))
-                                                        .overflow_hidden()
-                                                        .text_sm()
-                                                        .line_height(px(20.0))
-                                                        .text_color(palette.text)
-                                                        .child(preview),
-                                                ),
-                                        ),
-                                ),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .track_scroll(self.comment_list_scroll.clone())
-            .flex_1()
-            .min_h(px(0.0))
-            .w_full()
-            .bg(palette.surface_subtle)
-            .into_any_element()
+            self.render_comment_list(CommentListStyle::Classic, palette, cx)
         };
 
         div()
@@ -9797,18 +9559,7 @@ impl PdfReader {
             .bg(palette.surface)
             .text_color(palette.text)
             .child(header)
-            .children(error.map(|message| {
-                div()
-                    .mx_4()
-                    .mt_3()
-                    .p_3()
-                    .rounded_md()
-                    .bg(palette.error_soft)
-                    .text_xs()
-                    .line_height(px(18.0))
-                    .text_color(palette.error)
-                    .child(message)
-            }))
+            .children(error.map(|message| error_banner(palette, message)))
             .child(body)
             .into_any_element()
     }
