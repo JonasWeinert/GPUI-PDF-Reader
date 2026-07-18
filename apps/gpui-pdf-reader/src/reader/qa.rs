@@ -1,6 +1,21 @@
 use super::*;
 
 #[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QaReaderResourceSnapshot {
+    pub(crate) activity: ActivityLevel,
+    pub(crate) allocated_cpu_bytes: u64,
+    pub(crate) allocated_gpu_bytes: u64,
+    pub(crate) allocated_workers: u64,
+    pub(crate) cached_tile_bytes: u64,
+    pub(crate) estimated_tile_resident_bytes: u64,
+    pub(crate) tile_cache_limit_bytes: u64,
+    pub(crate) cached_tiles: u64,
+    pub(crate) pending_tiles: u64,
+    pub(crate) cached_text_pages: u64,
+}
+
+#[cfg(debug_assertions)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum QaFeaturePhase {
     Seed,
@@ -50,6 +65,27 @@ pub(super) enum QaExtensionPhase {
 }
 
 impl PdfReader {
+    #[cfg(debug_assertions)]
+    pub(crate) fn qa_resource_snapshot(&self) -> QaReaderResourceSnapshot {
+        let cached_tile_bytes = self
+            .rendered
+            .values()
+            .map(|tile| tile.byte_len as u64)
+            .sum::<u64>();
+        QaReaderResourceSnapshot {
+            activity: self.resource_allocation.activity,
+            allocated_cpu_bytes: self.resource_allocation.amount.cpu_memory_bytes,
+            allocated_gpu_bytes: self.resource_allocation.amount.gpu_memory_bytes,
+            allocated_workers: self.resource_allocation.amount.worker_slots,
+            cached_tile_bytes,
+            estimated_tile_resident_bytes: cached_tile_bytes.saturating_mul(2),
+            tile_cache_limit_bytes: self.max_cache_bytes as u64,
+            cached_tiles: self.rendered.len() as u64,
+            pending_tiles: self.pending.len() as u64,
+            cached_text_pages: self.page_text.len() as u64,
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub fn qa_report(&self) -> String {
         let cached_bytes = self

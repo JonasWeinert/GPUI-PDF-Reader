@@ -22,6 +22,8 @@ mod navigation_focus;
 mod pdf_capability_bridge;
 #[cfg(debug_assertions)]
 mod qa;
+#[cfg(debug_assertions)]
+mod qa_resources;
 mod reader;
 #[cfg(feature = "scholarly-network")]
 mod scholarly;

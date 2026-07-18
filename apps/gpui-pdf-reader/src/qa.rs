@@ -5,16 +5,20 @@
 //! exposes the narrow instrumentation hooks used by the native E2E scripts.
 
 use crate::reader::PdfReader;
+use crate::reader::qa::QaReaderResourceSnapshot;
 use crate::workspace_window::WorkspaceWindow;
 use gpui::{App, Entity, Keystroke, Point, Window, WindowHandle};
 use std::fmt::Display;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const DEFAULT_INTERVAL_MS: u64 = 180;
 const DEFAULT_TIMEOUT_MS: u64 = 20_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STABLE_VIEWPORT_DURATION: Duration = Duration::from_millis(250);
+const DEFAULT_RESOURCE_SAMPLE_MS: u64 = 100;
 
 struct QaConfig {
     keystrokes: Vec<Keystroke>,
@@ -35,6 +39,9 @@ struct QaConfig {
     reference_details: bool,
     extension_scenario: Option<String>,
     expected_window_count: Option<usize>,
+    resource_trace: bool,
+    resource_sample_interval: Duration,
+    resource_stress: bool,
 }
 
 impl QaConfig {
@@ -78,6 +85,13 @@ impl QaConfig {
             reference_details: flag("GPUI_PDF_READER_QA_REFERENCE_DETAILS"),
             extension_scenario: std::env::var("GPUI_PDF_READER_QA_EXTENSION_SCENARIO").ok(),
             expected_window_count: optional_value("GPUI_PDF_READER_QA_WINDOW_COUNT"),
+            resource_trace: flag("GPUI_PDF_READER_QA_RESOURCE_TRACE"),
+            resource_sample_interval: Duration::from_millis(
+                optional_value::<u64>("GPUI_PDF_READER_QA_RESOURCE_SAMPLE_MS")
+                    .unwrap_or(DEFAULT_RESOURCE_SAMPLE_MS)
+                    .clamp(20, 5_000),
+            ),
+            resource_stress: flag("GPUI_PDF_READER_QA_RESOURCE_STRESS"),
         }
     }
 
@@ -98,6 +112,8 @@ impl QaConfig {
             || self.reference_details
             || self.extension_scenario.is_some()
             || self.expected_window_count.is_some()
+            || self.resource_trace
+            || self.resource_stress
     }
 
     fn has_navigation_setup(&self) -> bool {
@@ -143,10 +159,16 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
         return;
     }
 
+    let resource_trace = config.resource_trace.then(QaResourceTrace::new);
+    if let Some(trace) = resource_trace.clone() {
+        install_resource_sampler(window, trace, config.resource_sample_interval, cx);
+    }
+
     window
         .update(cx, |_, window, cx| {
             window
                 .spawn(cx, async move |cx| {
+                    trace_marker(&resource_trace, "startup", "begin", cx);
                     let startup_deadline = Instant::now() + config.timeout;
                     loop {
                         let ready = cx
@@ -165,6 +187,7 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
                         }
                         cx.background_executor().timer(POLL_INTERVAL).await;
                     }
+                    trace_marker(&resource_trace, "startup", "settled", cx);
 
                     if let Some(expected) = config.expected_window_count {
                         let deadline = Instant::now() + config.timeout;
@@ -201,6 +224,76 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
                             }
                             cx.background_executor().timer(POLL_INTERVAL).await;
                         }
+                    }
+
+                    if config.resource_stress {
+                        trace_marker(&resource_trace, "resource-stress", "before", cx);
+                        let handles = cx
+                            .update(|_, cx| {
+                                cx.windows()
+                                    .into_iter()
+                                    .filter_map(|handle| handle.downcast::<WorkspaceWindow>())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        for (window_index, handle) in handles.into_iter().enumerate() {
+                            for (wheel_index, delta) in
+                                [80.0_f32; 8].into_iter().chain([-80.0_f32; 4]).enumerate()
+                            {
+                                let operation = format!(
+                                    "stress-{window_index}-wheel-{wheel_index}-delta-{delta}"
+                                );
+                                trace_marker(&resource_trace, &operation, "before", cx);
+                                let outcome = handle.update(cx, |workspace, window, cx| {
+                                    window.activate_window();
+                                    let Some(reader) = workspace.reader() else {
+                                        return Err("resource stress reader is unavailable".to_owned());
+                                    };
+                                    let viewport = window.viewport_size();
+                                    let position =
+                                        Point::new(viewport.width / 2.0, viewport.height / 2.0);
+                                    reader.update(cx, |reader, cx| {
+                                        reader.qa_command_wheel(delta, position, window, cx)
+                                    });
+                                    Ok(())
+                                });
+                                match outcome {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(message)) => {
+                                        fail_and_quit(
+                                            cx,
+                                            &format!("resource stress failed: {message}"),
+                                        );
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        fail_and_quit(
+                                            cx,
+                                            &format!("resource stress window failed: {error}"),
+                                        );
+                                        return;
+                                    }
+                                }
+                                cx.background_executor().timer(config.interval).await;
+                                trace_marker(&resource_trace, &operation, "after", cx);
+                            }
+                        }
+
+                        let settle_deadline = Instant::now() + config.timeout;
+                        loop {
+                            let (_, pdf_views, settled) = cx
+                                .update(|window, cx| workspace_window_counts(window, cx))
+                                .unwrap_or_default();
+                            if pdf_views > 0 && settled == pdf_views {
+                                break;
+                            }
+                            if Instant::now() >= settle_deadline {
+                                fail_and_quit(cx, "resource stress did not settle every PDF view");
+                                return;
+                            }
+                            cx.background_executor().timer(POLL_INTERVAL).await;
+                        }
+                        trace_marker(&resource_trace, "resource-stress", "settled", cx);
                     }
 
                     if config.has_navigation_setup() {
@@ -377,13 +470,20 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
                         }
                     }
 
-                    for keystroke in config.keystrokes {
+                    for (index, keystroke) in config.keystrokes.into_iter().enumerate() {
+                        let operation =
+                            trace_operation_label("key", index, &format!("{keystroke:?}"));
+                        trace_marker(&resource_trace, &operation, "before", cx);
                         let _ = cx.update(|window, cx| {
                             window.dispatch_keystroke(keystroke, cx);
                         });
                         cx.background_executor().timer(config.interval).await;
+                        trace_marker(&resource_trace, &operation, "after", cx);
                     }
-                    for delta_y in config.wheel_deltas {
+                    for (index, delta_y) in config.wheel_deltas.into_iter().enumerate() {
+                        let operation =
+                            trace_operation_label("wheel", index, &delta_y.to_string());
+                        trace_marker(&resource_trace, &operation, "before", cx);
                         let _ = cx.update(|window, cx| {
                             let viewport = window.viewport_size();
                             let position =
@@ -395,6 +495,7 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
                             }
                         });
                         cx.background_executor().timer(config.interval).await;
+                        trace_marker(&resource_trace, &operation, "after", cx);
                     }
 
                     if config.report || config.exit_after_report {
@@ -423,6 +524,7 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
                             }
                             cx.background_executor().timer(POLL_INTERVAL).await;
                         }
+                        trace_marker(&resource_trace, "viewport", "settled", cx);
                         let _ = cx.update(|window, cx| {
                             if config.report
                                 && let Some(reader) = reader_entity(window, cx)
@@ -518,6 +620,193 @@ fn workspace_window_counts(current: &Window, cx: &App) -> (usize, usize, usize) 
     (windows.len(), pdf_views, settled)
 }
 
+#[derive(Clone)]
+struct QaResourceTrace {
+    started: Instant,
+    sequence: Arc<AtomicU64>,
+    system: key_workspace_core::SystemResources,
+}
+
+impl QaResourceTrace {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            sequence: Arc::new(AtomicU64::new(0)),
+            system: crate::system_resources::detect(),
+        }
+    }
+
+    fn emit(&self, operation: &str, phase: &str, window: &Window, cx: &App) {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let elapsed_us = self.started.elapsed().as_micros();
+        let allocator = crate::qa_resources::allocator_snapshot();
+        let process = crate::qa_resources::process_memory_snapshot().unwrap_or_default();
+        let views = workspace_resource_totals(window, cx);
+        eprintln!(
+            "GPUI_PDF_READER_QA_RESOURCE seq={sequence} elapsed_us={elapsed_us} operation={operation} phase={phase} physical_memory={} low_power={} virtual={} resident={} resident_peak={} alloc_live={} alloc_peak={} alloc_calls={} dealloc_calls={} realloc_calls={} allocated_bytes={} deallocated_bytes={} views={} interactive={} idle={} warm={} cold={} suspended={} allocation_cpu={} allocation_gpu={} allocation_workers={} tile_bytes={} tile_resident_estimate={} tile_limit={} tiles={} pending_tiles={} text_pages={}",
+            self.system.physical_memory_bytes,
+            u8::from(self.system.low_power_mode),
+            process.virtual_bytes,
+            process.resident_bytes,
+            process.peak_resident_bytes,
+            allocator.live_bytes,
+            allocator.peak_live_bytes,
+            allocator.alloc_calls,
+            allocator.dealloc_calls,
+            allocator.realloc_calls,
+            allocator.allocated_bytes,
+            allocator.deallocated_bytes,
+            views.views,
+            views.interactive,
+            views.idle,
+            views.warm,
+            views.cold,
+            views.suspended,
+            views.allocated_cpu_bytes,
+            views.allocated_gpu_bytes,
+            views.allocated_workers,
+            views.cached_tile_bytes,
+            views.estimated_tile_resident_bytes,
+            views.tile_cache_limit_bytes,
+            views.cached_tiles,
+            views.pending_tiles,
+            views.cached_text_pages,
+        );
+    }
+}
+
+fn install_resource_sampler(
+    window: WindowHandle<WorkspaceWindow>,
+    trace: QaResourceTrace,
+    interval: Duration,
+    cx: &mut App,
+) {
+    window
+        .update(cx, |_, window, cx| {
+            window
+                .spawn(cx, async move |cx| {
+                    loop {
+                        let sampled = cx
+                            .update(|window, cx| trace.emit("timeline", "sample", window, cx))
+                            .is_ok();
+                        if !sampled {
+                            break;
+                        }
+                        cx.background_executor().timer(interval).await;
+                    }
+                })
+                .detach();
+        })
+        .ok();
+}
+
+fn trace_marker(
+    trace: &Option<QaResourceTrace>,
+    operation: &str,
+    phase: &str,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let _ = cx.update(|window, cx| trace.emit(operation, phase, window, cx));
+}
+
+fn trace_operation_label(kind: &str, index: usize, detail: &str) -> String {
+    let detail = detail
+        .chars()
+        .take(80)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{kind}-{index}-{detail}")
+}
+
+#[derive(Default)]
+struct QaWorkspaceResourceTotals {
+    views: u64,
+    interactive: u64,
+    idle: u64,
+    warm: u64,
+    cold: u64,
+    suspended: u64,
+    allocated_cpu_bytes: u64,
+    allocated_gpu_bytes: u64,
+    allocated_workers: u64,
+    cached_tile_bytes: u64,
+    estimated_tile_resident_bytes: u64,
+    tile_cache_limit_bytes: u64,
+    cached_tiles: u64,
+    pending_tiles: u64,
+    cached_text_pages: u64,
+}
+
+impl QaWorkspaceResourceTotals {
+    fn add(&mut self, snapshot: QaReaderResourceSnapshot) {
+        use key_workspace_core::ActivityLevel;
+        self.views += 1;
+        match snapshot.activity {
+            ActivityLevel::ForegroundInteractive => self.interactive += 1,
+            ActivityLevel::ForegroundIdle => self.idle += 1,
+            ActivityLevel::BackgroundWarm => self.warm += 1,
+            ActivityLevel::BackgroundCold => self.cold += 1,
+            ActivityLevel::Suspended => self.suspended += 1,
+        }
+        self.allocated_cpu_bytes = self
+            .allocated_cpu_bytes
+            .saturating_add(snapshot.allocated_cpu_bytes);
+        self.allocated_gpu_bytes = self
+            .allocated_gpu_bytes
+            .saturating_add(snapshot.allocated_gpu_bytes);
+        self.allocated_workers = self
+            .allocated_workers
+            .saturating_add(snapshot.allocated_workers);
+        self.cached_tile_bytes = self
+            .cached_tile_bytes
+            .saturating_add(snapshot.cached_tile_bytes);
+        self.estimated_tile_resident_bytes = self
+            .estimated_tile_resident_bytes
+            .saturating_add(snapshot.estimated_tile_resident_bytes);
+        self.tile_cache_limit_bytes = self
+            .tile_cache_limit_bytes
+            .saturating_add(snapshot.tile_cache_limit_bytes);
+        self.cached_tiles = self.cached_tiles.saturating_add(snapshot.cached_tiles);
+        self.pending_tiles = self.pending_tiles.saturating_add(snapshot.pending_tiles);
+        self.cached_text_pages = self
+            .cached_text_pages
+            .saturating_add(snapshot.cached_text_pages);
+    }
+}
+
+fn workspace_resource_totals(current: &Window, cx: &App) -> QaWorkspaceResourceTotals {
+    let mut totals = QaWorkspaceResourceTotals::default();
+    let current_handle = current.window_handle();
+    for handle in cx.windows() {
+        if handle == current_handle {
+            if let Some(reader) = reader_entity(current, cx) {
+                totals.add(reader.read(cx).qa_resource_snapshot());
+            }
+            continue;
+        }
+        let Some(handle) = handle.downcast::<WorkspaceWindow>() else {
+            continue;
+        };
+        let Ok(workspace) = handle.read(cx) else {
+            continue;
+        };
+        let Some(reader) = workspace.reader() else {
+            continue;
+        };
+        totals.add(reader.read(cx).qa_resource_snapshot());
+    }
+    totals
+}
+
 fn fail_and_quit(cx: &mut gpui::AsyncWindowContext, message: &str) {
     eprintln!("GPUI_PDF_READER_QA_ERROR {message}");
     let _ = cx.update(|_, cx| cx.quit());
@@ -548,6 +837,9 @@ mod tests {
             reference_details: false,
             extension_scenario: None,
             expected_window_count: None,
+            resource_trace: false,
+            resource_sample_interval: Duration::from_millis(DEFAULT_RESOURCE_SAMPLE_MS),
+            resource_stress: false,
         };
 
         assert!(!config.requested());
