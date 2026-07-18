@@ -852,7 +852,19 @@ impl RenderOnce for TabSearchPopover {
 
 #[cfg(test)]
 mod tests {
-    use super::{tab_hover_card_x, tab_search_popover_x};
+    use super::{TabPresentation, tab_hover_card_x, tab_search_popover_x};
+
+    #[test]
+    fn compound_tab_presentation_keeps_typed_child_identity_and_bounds_selection() {
+        let tab = TabPresentation::new("First", "p 1/2")
+            .view(41)
+            .split(42, "Second", "p 2/2", 9);
+        assert_eq!(tab.view, 41);
+        assert_eq!(tab.active_segment, 1);
+        let second = tab.secondary.expect("split builder adds a second segment");
+        assert_eq!(second.view, 42);
+        assert_eq!(second.title.as_ref(), "Second");
+    }
 
     #[test]
     fn search_popover_stays_near_its_control_and_inside_narrow_windows() {
