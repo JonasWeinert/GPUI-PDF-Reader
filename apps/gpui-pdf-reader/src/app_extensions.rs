@@ -37,7 +37,7 @@ use key_extension_host::{
 };
 #[cfg(feature = "installable-extensions")]
 use key_extension_package::PackageSourceKind;
-use key_pdf_extension_api::{PDF_EXTENSION_API_VERSION, PdfCapability};
+use key_pdf_extension_api::{PDF_EXTENSION_API_VERSION, PageIndex, PdfCapability};
 use key_sidecar_store::{DocumentKey, JsonExtensionStorage, extension_document_namespace};
 
 use crate::extension_assets::ExtensionAssetStore;
@@ -139,6 +139,22 @@ impl ReaderExtensions {
         }));
         host.install(theme_manifest(themes), PackageMetadata::bundled())?;
         host.activate(&extension)?;
+        host.register_native_adapter(key_pdf_toc::native_adapter());
+        let toc_manifest = key_pdf_toc::manifest();
+        let toc_startup_error = (|| -> Result<(), HostError> {
+            host.install(toc_manifest.clone(), PackageMetadata::bundled())?;
+            for request in &toc_manifest.permissions {
+                host.set_permission_decision(
+                    toc_manifest.id.clone(),
+                    request.permission.clone(),
+                    PermissionDecision::Granted,
+                );
+            }
+            host.activate(&toc_manifest.id)?;
+            Ok(())
+        })()
+        .err()
+        .map(|error| format!("PDF outline extension is unavailable: {error}"));
 
         #[cfg(feature = "installable-extensions")]
         let (packages, registry, restoration_failures, mut startup_error) = if restore_installables
@@ -155,16 +171,11 @@ impl ReaderExtensions {
                 ),
             }
         };
-        let (services, extension_storage, storage_error) = extension_services(restore_installables);
-        #[cfg(feature = "installable-extensions")]
-        if let Some(storage_error) = storage_error {
-            startup_error = Some(match startup_error {
-                Some(existing) => format!("{existing}\n{storage_error}"),
-                None => storage_error,
-            });
-        }
         #[cfg(not(feature = "installable-extensions"))]
-        let _ = storage_error;
+        let mut startup_error = None;
+        append_startup_error(&mut startup_error, toc_startup_error);
+        let (services, extension_storage, storage_error) = extension_services(restore_installables);
+        append_startup_error(&mut startup_error, storage_error);
 
         Ok(Self {
             host,
@@ -173,9 +184,6 @@ impl ReaderExtensions {
             theme_command,
             pdf_capabilities,
             extension_assets,
-            #[cfg(not(feature = "installable-extensions"))]
-            startup_error: None,
-            #[cfg(feature = "installable-extensions")]
             startup_error,
             last_snapshots: Vec::new(),
             #[cfg(feature = "installable-extensions")]
@@ -359,6 +367,20 @@ impl ReaderExtensions {
         self.host
             .invoke_command(command, payload.unwrap_or(DataValue::Null))?;
         Ok(self.host.process_tick().effects)
+    }
+
+    pub fn invoke_toc_navigation(
+        &mut self,
+        title: impl Into<String>,
+        page: usize,
+    ) -> Result<Vec<ArbitratedEffect>, HostError> {
+        let page = u32::try_from(page).map_err(|_| {
+            HostError::EventRejected("TOC destination page does not fit the PDF API".into())
+        })?;
+        self.invoke_command(
+            &key_pdf_toc::navigate_command_id(),
+            Some(key_pdf_toc::TocSelection::new(title, PageIndex(page)).into_payload()),
+        )
     }
 
     pub fn complete_effect(
@@ -1063,6 +1085,15 @@ fn extension_services(
     }
 }
 
+fn append_startup_error(current: &mut Option<String>, error: Option<String>) {
+    if let Some(error) = error {
+        *current = Some(match current.take() {
+            Some(existing) => format!("{existing}\n{error}"),
+            None => error,
+        });
+    }
+}
+
 fn extension_id() -> ExtensionId {
     ExtensionId::parse(THEME_EXTENSION).expect("static extension ID is valid")
 }
@@ -1164,6 +1195,24 @@ mod tests {
         extensions
             .complete_effect(&effects[0], Ok(DataValue::Null))
             .expect("effect completion is accepted");
+    }
+
+    #[test]
+    fn bundled_toc_navigation_enters_the_permissioned_capability_chain() {
+        let mut extensions = ReaderExtensions::new(&[], false).expect("host starts");
+        let effects = extensions
+            .invoke_toc_navigation("Results", 3)
+            .expect("bundled TOC command dispatches");
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0].request.effect,
+            ExtensionEffect::CapabilityCall {
+                capability,
+                operation,
+                input: DataValue::Null,
+            } if capability == &PdfCapability::DocumentMetadata.capability_id()
+                && operation == "active-document"
+        ));
     }
 
     #[test]

@@ -27,6 +27,7 @@ key-pdf-core = { path = "../../crates/key-pdf-core" }
 key-pdf-extension-api = { path = "../../crates/key-pdf-extension-api" }
 key-pdf-gpui = { path = "../../crates/key-pdf-gpui" }
 key-pdf-runtime = { path = "../../crates/key-pdf-runtime" }
+key-pdf-toc = { path = "../../extensions/key-pdf-toc" }
 key-pdfium = { path = "../../crates/key-pdfium" }
 key-reference = { path = "../../extensions/key-reference", optional = true }
 key-sidecar-store = { path = "../../crates/key-sidecar-store" }

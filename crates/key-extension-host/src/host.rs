@@ -557,7 +557,7 @@ impl ExtensionHost {
         self.pending_effects.clear();
         for runtime in self.runtimes.values_mut() {
             if let Some(instance) = runtime.instance.as_mut() {
-                instance.cancel_deferred_events();
+                instance.invalidate_document_scope();
             }
             for namespace in &namespaces {
                 runtime.state.remove(*namespace);

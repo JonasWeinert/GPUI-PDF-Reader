@@ -1,0 +1,22 @@
+[package]
+name = "key-pdf-toc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "First-party native TOC pilot for the Key PDF extension contract"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+key-extension-api = { path = "../../crates/key-extension-api" }
+key-extension-host = { path = "../../crates/key-extension-host" }
+key-pdf-extension-api = { path = "../../crates/key-pdf-extension-api" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

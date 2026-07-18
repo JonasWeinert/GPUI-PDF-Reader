@@ -2533,6 +2533,7 @@ dependencies = [
  "key-pdf-extension-api",
  "key-pdf-gpui",
  "key-pdf-runtime",
+ "key-pdf-toc",
  "key-pdfium",
  "key-reference",
  "key-sidecar-store",
@@ -3408,6 +3409,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "key-pdf-toc"
+version = "0.1.0"
+dependencies = [
+ "key-extension-api",
+ "key-extension-host",
+ "key-pdf-extension-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "key-pdfium"
 version = "0.1.0"
 dependencies = [
@@ -3440,9 +3452,12 @@ dependencies = [
 name = "key-sidecar-store"
 version = "0.1.0"
 dependencies = [
+ "key-extension-api",
+ "key-extension-host",
  "key-pdf-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

@@ -292,6 +292,18 @@ impl PdfReader {
         self.pending_toc_navigation = None;
 
         if self.page_text.contains_key(&page) {
+            if self.navigate_toc_through_extension(&title, page, window, cx) {
+                #[cfg(debug_assertions)]
+                if self
+                    .page_text
+                    .get(&page)
+                    .and_then(|text| toc_title_match(&title, text))
+                    .is_some()
+                {
+                    self.qa_toc_text_matches += 1;
+                }
+                return;
+            }
             let bridge = self.pdf_capabilities();
             if let Ok(receipt) = bridge.activate_live_outline(&title, page) {
                 if receipt.destination.text_range.is_some() {
@@ -348,6 +360,18 @@ impl PdfReader {
             return;
         }
         self.pending_toc_navigation = None;
+        if self.navigate_toc_through_extension(&title, page, window, cx) {
+            #[cfg(debug_assertions)]
+            if self
+                .page_text
+                .get(&page)
+                .and_then(|text| toc_title_match(&title, text))
+                .is_some()
+            {
+                self.qa_toc_text_matches += 1;
+            }
+            return;
+        }
         let bridge = self.pdf_capabilities();
         if let Ok(receipt) = bridge.activate_live_outline(&title, page) {
             if receipt.destination.text_range.is_some() {
@@ -373,6 +397,23 @@ impl PdfReader {
             self.qa_toc_text_matches += 1;
         }
         self.scroll_to_toc_destination(page, resolved.y, resolved.text_runs, window, cx);
+    }
+
+    fn navigate_toc_through_extension(
+        &mut self,
+        title: &str,
+        page: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Ok(effects) = self
+            .extensions
+            .invoke_toc_navigation(title.to_owned(), page)
+        else {
+            return false;
+        };
+        self.execute_extension_effects(effects, window, cx);
+        true
     }
 
     fn scroll_to_toc_destination(

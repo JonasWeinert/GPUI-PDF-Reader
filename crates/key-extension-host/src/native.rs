@@ -87,6 +87,17 @@ pub trait NativeExtension: Send {
     /// retaining the extension instance and lifecycle operations.
     fn cancel_deferred_events(&mut self) {}
 
+    /// Establishes a new document-generation boundary inside the adapter.
+    ///
+    /// The host has already discarded queued events and outstanding effect
+    /// tokens when it calls this hook. Inline adapters should clear any
+    /// document-scoped state machines or cached opaque resources. Deferred
+    /// adapters inherit cancellation as the safe default, so prior-generation
+    /// guest results cannot cross the boundary.
+    fn invalidate_document_scope(&mut self) {
+        self.cancel_deferred_events();
+    }
+
     fn suspend(&mut self, _reason: &str) -> Result<(), ExtensionError> {
         Ok(())
     }
