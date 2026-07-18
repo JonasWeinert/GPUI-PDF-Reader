@@ -5,7 +5,9 @@ package key:extension-api@0.1.0;
 /// Recursive Rust values are represented as bounded index arenas because WIT
 /// types cannot be directly recursive. `data-value.root` and every child index
 /// address `data-value.nodes`; `ui-tree.root`, UI child indices, and menu child
-/// indices follow the same rule. A host validates all indices and limits before
+/// indices follow the same rule. Arenas must be acyclic, all nodes must be
+/// reachable exactly through valid indices, and record/state keys must be
+/// unique. A host validates these invariants and all configured limits before
 /// dispatch. This is a typed contract, not authority to access host resources.
 interface types {
   type extension-id = string;
@@ -822,6 +824,10 @@ interface types {
     code: validation-code,
     path: string,
     message: string,
+  }
+
+  record validation-errors {
+    errors: list<validation-error>,
   }
 
   record validation-limits {

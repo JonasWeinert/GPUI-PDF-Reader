@@ -4,17 +4,20 @@ use std::path::PathBuf;
 
 use key_extension_api::{
     BooleanSource, CapabilityGrant, CapabilityRequest, CapabilityRequirements, CapabilityScope,
-    CapabilitySnapshot, CauseContext, CauseId, CommandBehaviorAction, CommandDefinition,
-    ContributionOrder, ContributionSet, ContributionSlot, DataKind, DataValue, DocumentAccess,
-    DocumentMutation, EXTENSION_API_VERSION, EffectRequest, EventEnvelope, EventSource,
-    EventSubscription, ExtensionEffect, ExtensionEntrypoint, ExtensionError, ExtensionErrorCode,
-    ExtensionEvent, ExtensionManifest, ExtensionUpdate, GenerationId, IconRef, LifecycleEvent,
-    LifecycleState, MenuItem, MenuItemKind, MetricFormat, NetworkScope, NotificationTone,
-    Permission, PermissionRequest, Platform, ResourceHandle, SettingType, SnapshotKind,
-    StorageArea, StorageRequirements, TextEmphasis, UiNode, UiNodeKind, UiTone, ValidationCode,
-    ValidationError, ValidationLimits,
+    CapabilitySnapshot, CauseContext, CauseId, CommandBehavior, CommandBehaviorAction,
+    CommandDefinition, ContributionOrder, ContributionSet, ContributionSlot, DataKind, DataValue,
+    DocumentAccess, DocumentMutation, EXTENSION_API_VERSION, EffectRequest, EventEnvelope,
+    EventSource, EventSubscription, ExtensionDependency, ExtensionEffect, ExtensionEntrypoint,
+    ExtensionError, ExtensionErrorCode, ExtensionEvent, ExtensionManifest, ExtensionUpdate,
+    GenerationId, HostCompatibility, IconRef, LifecycleEvent, LifecycleState, MenuContribution,
+    MenuItem, MenuItemKind, MenuItemOrder, MetricFormat, NetworkScope, NotificationTone,
+    Permission, PermissionRequest, Platform, PlatformRequirement, ProvidedCapability, Publisher,
+    ResourceHandle, SelectOption, SettingChoice, SettingDefinition, SettingType, SettingsSchema,
+    SnapshotKind, StorageArea, StoragePermission, StorageRequirements, TextEmphasis, TextSpan,
+    UiContribution, UiNode, UiNodeKind, UiTab, UiTone, ValidationCode, ValidationError,
+    ValidationLimits,
 };
-use wit_parser::{PackageId, Resolve, TypeDefKind};
+use wit_parser::{PackageId, Resolve, Type, TypeDefKind, WorldItem};
 
 fn wit_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -65,6 +68,137 @@ fn assert_record_fields(resolve: &Resolve, package_id: PackageId, name: &str, ex
     assert_eq!(actual, expected, "Rust/WIT fields diverged for {name}");
 }
 
+fn type_name(resolve: &Resolve, ty: Type) -> Option<&str> {
+    let Type::Id(type_id) = ty else {
+        return None;
+    };
+    resolve.types[type_id].name.as_deref()
+}
+
+fn type_label(resolve: &Resolve, ty: Type) -> &str {
+    match ty {
+        Type::Bool => "bool",
+        Type::U8 => "u8",
+        Type::U16 => "u16",
+        Type::U32 => "u32",
+        Type::U64 => "u64",
+        Type::S8 => "s8",
+        Type::S16 => "s16",
+        Type::S32 => "s32",
+        Type::S64 => "s64",
+        Type::F32 => "f32",
+        Type::F64 => "f64",
+        Type::Char => "char",
+        Type::String => "string",
+        Type::ErrorContext => "error-context",
+        Type::Id(type_id) => resolve.types[type_id]
+            .name
+            .as_deref()
+            .unwrap_or_else(|| resolve.types[type_id].kind.as_str()),
+    }
+}
+
+fn type_shape(resolve: &Resolve, ty: Type) -> String {
+    let Type::Id(type_id) = ty else {
+        return type_label(resolve, ty).to_owned();
+    };
+    let definition = &resolve.types[type_id];
+    if let Some(name) = &definition.name {
+        return name.clone();
+    }
+    match &definition.kind {
+        TypeDefKind::List(item) => format!("list<{}>", type_shape(resolve, *item)),
+        TypeDefKind::Option(item) => format!("option<{}>", type_shape(resolve, *item)),
+        TypeDefKind::Result(result) => format!(
+            "result<{},{}>",
+            result
+                .ok
+                .map_or_else(|| "_".into(), |ok| type_shape(resolve, ok)),
+            result
+                .err
+                .map_or_else(|| "_".into(), |error| type_shape(resolve, error))
+        ),
+        TypeDefKind::Type(inner) => type_shape(resolve, *inner),
+        kind => kind.as_str().to_owned(),
+    }
+}
+
+fn assert_variant_payloads(
+    resolve: &Resolve,
+    package_id: PackageId,
+    name: &str,
+    expected: &[(&str, Option<&str>)],
+) {
+    let TypeDefKind::Variant(variant) = type_kind(resolve, package_id, name) else {
+        panic!("WIT type {name} must remain a variant");
+    };
+    let actual = variant
+        .cases
+        .iter()
+        .map(|case| {
+            (
+                case.name.as_str(),
+                case.ty.map(|ty| type_label(resolve, ty)),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "WIT payload types diverged for {name}");
+}
+
+fn assert_record_field_types(
+    resolve: &Resolve,
+    package_id: PackageId,
+    name: &str,
+    expected: &[(&str, &str)],
+) {
+    let TypeDefKind::Record(record) = type_kind(resolve, package_id, name) else {
+        panic!("WIT type {name} must remain a record");
+    };
+    let actual = record
+        .fields
+        .iter()
+        .map(|field| (field.name.as_str(), type_shape(resolve, field.ty)))
+        .collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .map(|(field, shape)| (*field, (*shape).to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "WIT field types diverged for {name}");
+}
+
+fn assert_named_type(resolve: &Resolve, ty: Type, expected: &str) {
+    assert_eq!(type_name(resolve, ty), Some(expected));
+}
+
+fn assert_list_of_named_type(resolve: &Resolve, ty: Type, expected: &str) {
+    let Type::Id(type_id) = ty else {
+        panic!("expected a named WIT list type");
+    };
+    let TypeDefKind::List(item) = resolve.types[type_id].kind else {
+        panic!("expected a WIT list type");
+    };
+    assert_named_type(resolve, item, expected);
+}
+
+fn assert_result_type(
+    resolve: &Resolve,
+    ty: Type,
+    expected_ok: Option<&str>,
+    expected_error: &str,
+) {
+    let Type::Id(type_id) = ty else {
+        panic!("expected a named WIT result type");
+    };
+    let TypeDefKind::Result(result) = &resolve.types[type_id].kind else {
+        panic!("expected a WIT result type");
+    };
+    assert_eq!(result.ok.and_then(|ok| type_name(resolve, ok)), expected_ok);
+    assert_eq!(
+        result.err.and_then(|error| type_name(resolve, error)),
+        Some(expected_error)
+    );
+}
+
 /// Produces the WIT cases from one exhaustive Rust enum match. Adding a Rust
 /// case therefore makes this test fail to compile until the WIT mapping is
 /// deliberately updated; removing or renaming a WIT case fails at runtime.
@@ -107,6 +241,23 @@ fn versioned_semantic_wit_package_parses() {
     assert!(package.worlds.contains_key("semantic-extension"));
 
     let guest = package.interfaces["guest"];
+    let types = package.interfaces["types"];
+    let world = &resolve.worlds[package.worlds["semantic-extension"]];
+    assert_eq!(world.imports.len(), 1);
+    assert!(
+        world
+            .imports
+            .values()
+            .all(|item| { matches!(item, WorldItem::Interface { id, .. } if *id == types) })
+    );
+    assert_eq!(world.exports.len(), 1);
+    assert!(
+        world
+            .exports
+            .values()
+            .any(|item| { matches!(item, WorldItem::Interface { id, .. } if *id == guest) })
+    );
+
     assert_eq!(
         resolve.interfaces[guest]
             .functions
@@ -122,11 +273,62 @@ fn versioned_semantic_wit_package_parses() {
             "unload",
         ]
     );
+    let functions = &resolve.interfaces[guest].functions;
+    assert!(functions["subscriptions"].params.is_empty());
+    assert_list_of_named_type(
+        &resolve,
+        functions["subscriptions"]
+            .result
+            .expect("subscriptions returns a list"),
+        "event-subscription",
+    );
+    for function_name in ["activate", "resume"] {
+        let function = &functions[function_name];
+        assert_eq!(function.params.len(), 1);
+        assert_eq!(function.params[0].name, "context");
+        assert_named_type(&resolve, function.params[0].ty, "activation-context");
+        assert_result_type(
+            &resolve,
+            function.result.expect("activation returns a result"),
+            Some("extension-update"),
+            "extension-error",
+        );
+    }
+    let handle_event = &functions["handle-event"];
+    assert_eq!(handle_event.params.len(), 1);
+    assert_eq!(handle_event.params[0].name, "event");
+    assert_named_type(&resolve, handle_event.params[0].ty, "event-envelope");
+    assert_result_type(
+        &resolve,
+        handle_event
+            .result
+            .expect("event handling returns a result"),
+        Some("extension-update"),
+        "extension-error",
+    );
+    let suspend = &functions["suspend"];
+    assert_eq!(suspend.params.len(), 1);
+    assert_eq!(suspend.params[0].name, "reason");
+    assert_eq!(suspend.params[0].ty, Type::String);
+    assert_result_type(
+        &resolve,
+        suspend.result.expect("suspension returns a result"),
+        None,
+        "extension-error",
+    );
+    assert!(functions["unload"].params.is_empty());
+    assert!(functions["unload"].result.is_none());
 
     let source = std::fs::read_to_string(wit_dir().join("extension-api.wit"))
         .expect("semantic WIT source is readable");
     assert!(!source.contains("list<u8>"));
-    assert!(!source.to_ascii_lowercase().contains("json"));
+    let source = source.to_ascii_lowercase();
+    for forbidden in ["json", "gpui", "pdfium", "wasmtime", "filesystem", "socket"] {
+        assert!(
+            !source.contains(forbidden),
+            "semantic WIT leaked implementation term {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -461,6 +663,265 @@ fn declarative_ui_and_contribution_cases_map_one_to_one() {
 }
 
 #[test]
+fn semantic_variants_keep_their_typed_payloads() {
+    let (resolve, package_id) = load_wit();
+
+    for (name, payloads) in [
+        (
+            "data-node",
+            &[
+                ("null", None),
+                ("boolean", Some("bool")),
+                ("integer", Some("s64")),
+                ("number", Some("f64")),
+                ("string", Some("string")),
+                ("list", Some("list")),
+                ("record", Some("list")),
+            ][..],
+        ),
+        (
+            "boolean-source",
+            &[
+                ("constant", Some("bool")),
+                ("binding", Some("state-binding")),
+            ],
+        ),
+        (
+            "lifecycle-event",
+            &[
+                ("installed", None),
+                ("validated", None),
+                ("activated", None),
+                ("application-ready", None),
+                ("document-opening", Some("lifecycle-document-event")),
+                ("document-opened", Some("lifecycle-document-event")),
+                ("document-closing", Some("lifecycle-document-event")),
+                ("document-closed", Some("lifecycle-document-event")),
+                ("suspended", Some("lifecycle-suspended-event")),
+                ("resumed", None),
+                ("settings-changed", Some("lifecycle-settings-changed-event")),
+                ("upgrading", Some("lifecycle-upgrading-event")),
+                ("unloading", None),
+            ],
+        ),
+        (
+            "event-source",
+            &[("host", None), ("extension", Some("extension-id"))],
+        ),
+        (
+            "event-subscription",
+            &[
+                ("lifecycle", None),
+                ("commands", None),
+                ("capabilities", None),
+                ("snapshot", Some("snapshot-kind")),
+                ("effect-results", None),
+                ("custom", Some("namespaced-id")),
+            ],
+        ),
+        (
+            "extension-event",
+            &[
+                ("lifecycle", Some("lifecycle-extension-event")),
+                ("command-invoked", Some("command-invoked-event")),
+                ("capabilities-changed", Some("capabilities-changed-event")),
+                ("snapshot-changed", Some("snapshot-changed-event")),
+                ("effect-completed", Some("effect-completed-event")),
+                ("task-cancelled", Some("task-cancelled-event")),
+                ("custom", Some("custom-event")),
+            ],
+        ),
+        (
+            "extension-effect",
+            &[
+                ("capability-call", Some("capability-call-effect")),
+                ("open-contribution", Some("contribution-effect")),
+                ("close-contribution", Some("contribution-effect")),
+                ("storage-get", Some("storage-get-effect")),
+                ("storage-put", Some("storage-put-effect")),
+                ("storage-delete", Some("storage-delete-effect")),
+                ("copy-text", Some("copy-text-effect")),
+                ("open-browser-url", Some("open-browser-url-effect")),
+                ("notify", Some("notify-effect")),
+                ("confirm", Some("confirm-effect")),
+                ("start-task", Some("start-task-effect")),
+                ("cancel-task", Some("cancel-task-effect")),
+            ],
+        ),
+        (
+            "capability-scope",
+            &[
+                ("application", None),
+                ("active-document", None),
+                ("document-set", None),
+                ("namespaced-storage", Some("storage-area")),
+                ("domains", Some("capability-domains")),
+            ],
+        ),
+        (
+            "network-scope",
+            &[
+                ("none", None),
+                ("declared-domains", Some("network-domains")),
+                ("declared-and-user-approved", Some("network-domains")),
+                ("public-internet", None),
+            ],
+        ),
+        (
+            "permission",
+            &[
+                ("read-document-metadata", None),
+                ("read-document-text", Some("document-access")),
+                ("read-selection", None),
+                ("navigate-document", None),
+                ("add-document-overlays", None),
+                ("add-side-panel", None),
+                ("read-annotations", None),
+                ("write-annotations", None),
+                ("mutate-document", Some("document-mutation")),
+                ("clipboard-write", None),
+                ("open-external-url", None),
+                ("storage", Some("storage-permission")),
+                ("network", Some("network-scope")),
+            ],
+        ),
+        (
+            "extension-entrypoint",
+            &[
+                ("declarative", Some("declarative-entrypoint")),
+                ("wasm-component", Some("wasm-component-entrypoint")),
+                ("native-builtin", Some("native-builtin-entrypoint")),
+            ],
+        ),
+        (
+            "setting-type",
+            &[
+                ("boolean", None),
+                ("integer", Some("integer-setting")),
+                ("number", Some("number-setting")),
+                ("string", Some("string-setting")),
+                ("choice", Some("choice-setting")),
+                ("string-list", Some("string-list-setting")),
+            ],
+        ),
+        (
+            "command-behavior-action",
+            &[
+                ("set-state", Some("set-state-behavior")),
+                ("open-contribution", Some("contribution-behavior")),
+                ("close-contribution", Some("contribution-behavior")),
+            ],
+        ),
+        (
+            "icon-ref",
+            &[("host", Some("string")), ("asset", Some("package-path"))],
+        ),
+        (
+            "menu-item-kind",
+            &[
+                ("command", Some("menu-command-item")),
+                ("submenu", Some("menu-submenu-item")),
+                ("separator", None),
+            ],
+        ),
+        (
+            "ui-node-kind",
+            &[
+                ("column", Some("ui-children")),
+                ("row", Some("ui-children")),
+                ("stack", Some("ui-children")),
+                ("text", Some("text-node")),
+                ("styled-text", Some("styled-text-node")),
+                ("metric", Some("metric-node")),
+                ("markdown", Some("markdown-node")),
+                ("button", Some("button-node")),
+                ("icon-button", Some("icon-button-node")),
+                ("toggle", Some("toggle-node")),
+                ("select", Some("select-node")),
+                ("text-field", Some("text-field-node")),
+                ("list", Some("ui-children")),
+                ("tabs", Some("tabs-node")),
+                ("badge", Some("badge-node")),
+                ("divider", None),
+                ("image", Some("image-node")),
+                ("progress", Some("progress-node")),
+                ("spacer", None),
+            ],
+        ),
+    ] {
+        assert_variant_payloads(&resolve, package_id, name, payloads);
+    }
+}
+
+#[test]
+fn recursive_and_batch_semantics_use_typed_bounded_containers() {
+    let (resolve, package_id) = load_wit();
+
+    for (name, fields) in [
+        (
+            "data-record-entry",
+            &[("key", "string"), ("value", "u32")][..],
+        ),
+        (
+            "data-value",
+            &[("nodes", "list<data-node>"), ("root", "u32")],
+        ),
+        (
+            "extension-update",
+            &[
+                ("state", "option<list<state-entry>>"),
+                ("effects", "list<effect-request>"),
+            ],
+        ),
+        (
+            "capability-requirements",
+            &[
+                ("required", "list<capability-request>"),
+                ("optional", "list<capability-request>"),
+                ("provided", "list<provided-capability>"),
+            ],
+        ),
+        (
+            "capability-snapshot",
+            &[
+                ("granted", "list<capability-grant>"),
+                ("missing-optional", "list<capability-id>"),
+            ],
+        ),
+        ("ui-children", &[("children", "list<u32>")]),
+        ("ui-tree", &[("nodes", "list<ui-node>"), ("root", "u32")]),
+        (
+            "menu-submenu-item",
+            &[
+                ("label", "string"),
+                ("icon", "option<icon-ref>"),
+                ("children", "list<u32>"),
+            ],
+        ),
+        (
+            "menu-tree",
+            &[("items", "list<menu-item>"), ("roots", "list<u32>")],
+        ),
+        ("validation-errors", &[("errors", "list<validation-error>")]),
+    ] {
+        assert_record_field_types(&resolve, package_id, name, fields);
+    }
+
+    let TypeDefKind::Result(effect_result) = type_kind(&resolve, package_id, "effect-result")
+    else {
+        panic!("effect-result must remain a typed WIT result");
+    };
+    assert_eq!(
+        effect_result.ok.map(|ok| type_shape(&resolve, ok)),
+        Some("data-value".into())
+    );
+    assert_eq!(
+        effect_result.err.map(|error| type_shape(&resolve, error)),
+        Some("extension-error".into())
+    );
+}
+
+#[test]
 fn major_rust_records_have_matching_typed_wit_shapes() {
     let (resolve, package_id) = load_wit();
 
@@ -488,6 +949,7 @@ fn major_rust_records_have_matching_typed_wit_shapes() {
         retryable,
     });
     complete_record!(CapabilityRequest { id, version, scope });
+    complete_record!(ProvidedCapability { id, version });
     complete_record!(CapabilityRequirements {
         required,
         optional,
@@ -507,18 +969,50 @@ fn major_rust_records_have_matching_typed_wit_shapes() {
         granted,
         missing_optional,
     });
+    complete_record!(StoragePermission { area, quota_bytes });
+    complete_record!(Publisher { id, name });
+    complete_record!(PlatformRequirement {
+        platform,
+        minimum_version,
+    });
+    complete_record!(HostCompatibility {
+        extension_api,
+        minimum_host,
+        platforms,
+    });
+    complete_record!(ExtensionDependency {
+        id,
+        version,
+        optional,
+    });
     complete_record!(StorageRequirements {
         settings_bytes,
         document_bytes,
         ephemeral_cache_bytes,
     });
+    complete_record!(SettingChoice { label, value });
+    complete_record!(SettingDefinition {
+        key,
+        label,
+        description,
+        value_type,
+        default,
+        sensitive,
+    });
+    complete_record!(SettingsSchema { version, fields });
     complete_record!(CommandDefinition {
         id,
         title,
         description,
         category,
     });
+    complete_record!(CommandBehavior { command, action });
     complete_record!(ContributionOrder {
+        priority,
+        before,
+        after,
+    });
+    complete_record!(MenuItemOrder {
         priority,
         before,
         after,
@@ -529,6 +1023,18 @@ fn major_rust_records_have_matching_typed_wit_shapes() {
         menus,
         views,
     });
+    complete_record!(UiContribution {
+        id,
+        slot,
+        order,
+        root,
+    });
+    complete_record!(MenuContribution {
+        id,
+        slot,
+        order,
+        items,
+    });
     complete_record!(UiNode { id, visible, kind });
     complete_record!(MenuItem {
         id,
@@ -536,6 +1042,9 @@ fn major_rust_records_have_matching_typed_wit_shapes() {
         visible,
         kind,
     });
+    complete_record!(TextSpan { text, emphasis });
+    complete_record!(SelectOption { label, value });
+    complete_record!(UiTab { id, label, content });
     complete_record!(ValidationError {
         code,
         path,
@@ -582,35 +1091,131 @@ fn major_rust_records_have_matching_typed_wit_shapes() {
     });
 
     for (name, fields) in [
+        ("data-record-entry", &["key", "value"][..]),
+        ("data-value", &["nodes", "root"]),
+        ("state-binding", &["segments"]),
         ("cause-id", &["high", "low"][..]),
         ("cause-context", &["id", "parent", "depth"]),
         ("generation-id", &["value"]),
         ("resource-handle", &["kind", "generation", "id"]),
+        ("lifecycle-document-event", &["generation"]),
+        ("lifecycle-suspended-event", &["reason"]),
+        ("lifecycle-settings-changed-event", &["keys"]),
+        ("lifecycle-upgrading-event", &["from", "to"]),
+        ("command-invoked-event", &["command", "payload"]),
+        ("capabilities-changed-event", &["snapshot"]),
+        ("snapshot-changed-event", &["snapshot", "value"]),
+        ("effect-completed-event", &["effect", "result"]),
+        ("task-cancelled-event", &["task", "reason"]),
+        ("custom-event", &["event", "payload"]),
+        ("lifecycle-extension-event", &["event"]),
         ("event-envelope", &["cause", "source", "sequence", "event"]),
+        ("state-entry", &["key", "value"]),
         ("extension-update", &["state", "effects"]),
         ("effect-request", &["id", "cause", "effect"]),
         ("extension-error", &["code", "message", "retryable"]),
+        (
+            "capability-call-effect",
+            &["capability", "operation", "input"],
+        ),
+        ("contribution-effect", &["contribution"]),
+        ("storage-get-effect", &["area", "key"]),
+        ("storage-put-effect", &["area", "key", "value"]),
+        ("storage-delete-effect", &["area", "key"]),
+        ("copy-text-effect", &["text"]),
+        ("open-browser-url-effect", &["url"]),
+        ("notify-effect", &["message", "tone"]),
+        ("confirm-effect", &["title", "message", "destructive"]),
+        ("start-task-effect", &["task", "operation", "input"]),
+        ("cancel-task-effect", &["task"]),
+        ("domain-pattern", &["value"]),
+        ("capability-domains", &["domains"]),
         ("capability-request", &["id", "version", "scope"]),
+        ("provided-capability", &["id", "version"]),
         (
             "capability-requirements",
             &["required", "optional", "provided"],
         ),
+        ("storage-permission", &["area", "quota-bytes"]),
+        ("network-domains", &["domains"]),
         ("permission-request", &["permission", "reason", "required"]),
         ("capability-grant", &["extension", "capability", "scope"]),
         ("capability-snapshot", &["granted", "missing-optional"]),
+        ("publisher", &["id", "name"]),
+        ("platform-requirement", &["platform", "minimum-version"]),
+        (
+            "host-compatibility",
+            &["extension-api", "minimum-host", "platforms"],
+        ),
+        ("declarative-entrypoint", &["ui"]),
+        ("wasm-component-entrypoint", &["component", "world", "ui"]),
+        ("native-builtin-entrypoint", &["adapter", "ui"]),
+        ("extension-dependency", &["id", "version", "optional"]),
         (
             "storage-requirements",
             &["settings-bytes", "document-bytes", "ephemeral-cache-bytes"],
         ),
+        ("integer-setting", &["minimum", "maximum"]),
+        ("number-setting", &["minimum", "maximum"]),
+        ("string-setting", &["maximum-bytes"]),
+        ("choice-setting", &["options"]),
+        (
+            "string-list-setting",
+            &["maximum-items", "maximum-item-bytes"],
+        ),
+        ("setting-choice", &["label", "value"]),
+        (
+            "setting-definition",
+            &[
+                "key",
+                "label",
+                "description",
+                "value-type",
+                "default",
+                "sensitive",
+            ],
+        ),
+        ("settings-schema", &["version", "fields"]),
         (
             "command-definition",
             &["id", "title", "description", "category"],
         ),
+        ("set-state-behavior", &["binding"]),
+        ("contribution-behavior", &["contribution"]),
+        ("command-behavior", &["command", "action"]),
         ("contribution-order", &["priority", "before", "after"]),
+        ("menu-item-order", &["priority", "before", "after"]),
+        (
+            "menu-command-item",
+            &["label", "command", "payload", "icon", "enabled", "checked"],
+        ),
+        ("menu-submenu-item", &["label", "icon", "children"]),
+        ("menu-contribution", &["id", "slot", "order", "items"]),
+        ("ui-children", &["children"]),
+        ("text-node", &["text", "selectable"]),
+        ("text-span", &["text", "emphasis"]),
+        ("styled-text-node", &["spans", "selectable"]),
+        ("metric-node", &["label", "value", "format"]),
+        ("markdown-node", &["markdown", "selectable"]),
+        ("button-node", &["label", "command", "payload"]),
+        ("icon-button-node", &["icon", "label", "command"]),
+        ("toggle-node", &["label", "value", "command"]),
+        ("select-option", &["label", "value"]),
+        ("select-node", &["label", "value", "options", "command"]),
+        (
+            "text-field-node",
+            &["label", "value", "command", "maximum-bytes"],
+        ),
+        ("ui-tab", &["id", "label", "content"]),
+        ("tabs-node", &["tabs", "selected", "command"]),
+        ("badge-node", &["label", "tone"]),
+        ("image-node", &["asset", "alternative-text"]),
+        ("progress-node", &["label", "basis-points"]),
         (
             "contribution-set",
             &["commands", "command-behaviors", "menus", "views"],
         ),
+        ("ui-contribution", &["id", "slot", "order", "root"]),
         ("ui-node", &["id", "visible", "kind"]),
         ("ui-tree", &["nodes", "root"]),
         ("menu-item", &["id", "order", "visible", "kind"]),
@@ -620,6 +1225,7 @@ fn major_rust_records_have_matching_typed_wit_shapes() {
             &["extension", "generation", "cause", "capabilities"],
         ),
         ("validation-error", &["code", "path", "message"]),
+        ("validation-errors", &["errors"]),
     ] {
         assert_record_fields(&resolve, package_id, name, fields);
     }

@@ -12,9 +12,10 @@ storage, tasks, manifests, and host-rendered UI contributions.
 
 Rust has recursive `DataValue`, `UiNode`, and `MenuItem` trees. WIT cannot
 directly express recursive value types, so their WIT forms use bounded index
-arenas. Hosts must validate the root and every child index, depth, node count,
-string size, and payload size before retaining or dispatching a value. These
-arenas are structural data; they do not expose host memory or resources.
+arenas. Hosts must validate the root and every child index, acyclicity,
+reachability, unique record/state keys, depth, node count, string size, and
+payload size before retaining or dispatching a value. These arenas are
+structural data; they do not expose host memory or resources.
 
 `key-extension-wasm/wit/extension.wit` remains the compatibility transport for
 the first local Wasm components. It carries the same versioned semantic events
