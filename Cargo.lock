@@ -3082,6 +3082,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "key-extension-host"
+version = "0.1.0"
+dependencies = [
+ "key-extension-api",
+]
+
+[[package]]
 name = "key-pdf-core"
 version = "0.1.0"
 dependencies = [

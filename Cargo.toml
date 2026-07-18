@@ -3,12 +3,12 @@ members = [
     "apps/gpui-pdf-reader",
     "crates/key-editor-core",
     "crates/key-extension-api",
+    "crates/key-extension-host",
     "crates/key-pdf-core",
     "crates/key-pdf-runtime",
 ]
 default-members = ["apps/gpui-pdf-reader"]
 exclude = [
-    "crates/key-extension-host",
     "crates/key-extension-gpui",
     "crates/key-extension-package",
     "crates/key-extension-wasm",

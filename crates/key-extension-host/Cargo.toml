@@ -1,0 +1,15 @@
+[package]
+name = "key-extension-host"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Deterministic lifecycle and arbitration host for Key extensions"
+
+[dependencies]
+key-extension-api = { path = "../key-extension-api" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
