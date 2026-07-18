@@ -2315,6 +2315,7 @@ dependencies = [
  "gpui-component-assets",
  "image",
  "key-editor-core",
+ "key-pdf-core",
  "objc2-app-kit",
  "open",
  "pdfium-render",
@@ -3069,6 +3070,13 @@ dependencies = [
 [[package]]
 name = "key-editor-core"
 version = "0.1.0"
+
+[[package]]
+name = "key-pdf-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "khronos-egl"

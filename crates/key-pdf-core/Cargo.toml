@@ -1,0 +1,15 @@
+[package]
+name = "key-pdf-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Pure PDF document, text, search, link, and navigation domain logic for Key applications"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
+
+[lints.rust]
+unsafe_code = "forbid"
