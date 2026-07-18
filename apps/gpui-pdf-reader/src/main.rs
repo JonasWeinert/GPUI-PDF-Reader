@@ -1,4 +1,5 @@
 mod annotations;
+mod app_extensions;
 mod backend;
 mod document_jump;
 mod floating_panel;
@@ -20,8 +21,8 @@ mod theme;
 #[cfg(target_os = "macos")]
 use gpui::TitlebarOptions;
 use gpui::{
-    App, Application, Bounds, KeyBinding, Menu, MenuItem, Point, SharedString, WindowBounds,
-    WindowOptions, actions, px, size,
+    App, Application, Bounds, KeyBinding, Menu, MenuItem, Point, WindowBounds, WindowOptions,
+    actions, px, size,
 };
 use markdown_editor::{
     CommentBackspace, CommentCancel, CommentDelete, CommentDown, CommentEnd, CommentHome,
@@ -70,12 +71,6 @@ actions!(
     ]
 );
 
-#[derive(Clone, PartialEq, gpui::Action)]
-#[action(namespace = gpui_pdf_reader, no_json)]
-pub struct SelectTheme {
-    pub name: SharedString,
-}
-
 fn main() {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
 
@@ -83,6 +78,31 @@ fn main() {
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
         bind_keys(cx);
+        let safe_mode = std::env::var_os("GPUI_PDF_READER_SAFE_MODE").is_some();
+        let mut extensions =
+            app_extensions::ReaderExtensions::new(theme::bundled_themes(), safe_mode)
+                .unwrap_or_else(|error| {
+                    app_extensions::ReaderExtensions::disabled(
+                        safe_mode,
+                        format!("Reader themes could not start: {error}"),
+                    )
+                });
+        let theme_menu_items = extensions.native_menu_items("view.appearance");
+        let mut view_items = vec![
+            MenuItem::action("Classic View", ClassicView),
+            MenuItem::action("Fluid View", FluidView),
+            MenuItem::separator(),
+        ];
+        view_items.extend(theme_menu_items);
+        view_items.extend([
+            MenuItem::separator(),
+            MenuItem::action("Zoom In", ZoomIn),
+            MenuItem::action("Zoom Out", ZoomOut),
+            MenuItem::action("Actual Size", ActualSize),
+            MenuItem::action("Fit Width", FitWidth),
+            MenuItem::separator(),
+            MenuItem::action("Comments", ToggleComments),
+        ]);
         cx.set_menus(vec![
             Menu {
                 name: "File".into(),
@@ -109,19 +129,7 @@ fn main() {
             },
             Menu {
                 name: "View".into(),
-                items: vec![
-                    MenuItem::action("Classic View", ClassicView),
-                    MenuItem::action("Fluid View", FluidView),
-                    MenuItem::separator(),
-                    theme::theme_menu(),
-                    MenuItem::separator(),
-                    MenuItem::action("Zoom In", ZoomIn),
-                    MenuItem::action("Zoom Out", ZoomOut),
-                    MenuItem::action("Actual Size", ActualSize),
-                    MenuItem::action("Fit Width", FitWidth),
-                    MenuItem::separator(),
-                    MenuItem::action("Comments", ToggleComments),
-                ],
+                items: view_items,
             },
         ]);
         let bounds = Bounds {
@@ -151,7 +159,7 @@ fn main() {
         };
         let window = cx
             .open_window(window_options, move |window, cx| {
-                reader::PdfReader::new(initial_path.clone(), window, cx)
+                reader::PdfReader::new(initial_path.clone(), extensions, window, cx)
             })
             .expect("failed to open the GPUI PDF Reader window");
 

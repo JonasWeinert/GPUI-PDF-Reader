@@ -1,6 +1,5 @@
-use crate::SelectTheme;
-use gpui::{App, Hsla, Menu, MenuItem, Rgba, SharedString, Window};
-use gpui_component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry, ThemeSet};
+use gpui::{App, Hsla, Rgba, SharedString, Window};
+use gpui_component::{Theme, ThemeConfig, ThemeRegistry, ThemeSet};
 use std::{rc::Rc, sync::LazyLock};
 
 const BUNDLED_THEMES_JSON: &str = include_str!("../../../assets/themes/gpui-component.json");
@@ -30,41 +29,6 @@ impl ThemePreference {
 
 pub fn bundled_themes() -> &'static [ThemeConfig] {
     &BUNDLED_THEMES.themes
-}
-
-pub fn theme_menu() -> MenuItem {
-    let mode_menu = |name: &'static str, mode: ThemeMode| {
-        MenuItem::submenu(Menu {
-            name: name.into(),
-            items: bundled_themes()
-                .iter()
-                .filter(|theme| theme.mode == mode)
-                .map(|theme| {
-                    MenuItem::action(
-                        theme.name.clone(),
-                        SelectTheme {
-                            name: theme.name.clone(),
-                        },
-                    )
-                })
-                .collect(),
-        })
-    };
-
-    MenuItem::submenu(Menu {
-        name: "Theme".into(),
-        items: vec![
-            MenuItem::action(
-                "Follow System (Default)",
-                SelectTheme {
-                    name: SharedString::default(),
-                },
-            ),
-            MenuItem::separator(),
-            mode_menu("Light", ThemeMode::Light),
-            mode_menu("Dark", ThemeMode::Dark),
-        ],
-    })
 }
 
 pub fn apply_selection(name: &str, window: &mut Window, cx: &mut App) -> Option<SharedString> {
@@ -191,7 +155,7 @@ impl ReaderPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_component::ThemeColor;
+    use gpui_component::{ThemeColor, ThemeMode};
 
     #[test]
     fn preferences_have_stable_qa_names() {

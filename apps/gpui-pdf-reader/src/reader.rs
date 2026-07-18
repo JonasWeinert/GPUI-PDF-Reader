@@ -2,6 +2,7 @@ use crate::annotations::{
     AnnotationId, AnnotationSet, DocumentIdentity, HighlightColor, MAX_TEXT_CHARACTER_INDEX,
     TextRange, load_sidecar, save_sidecar,
 };
+use crate::app_extensions::ReaderExtensions;
 use crate::backend::{
     PdfWorker, PreviewSpec, RenderAppearance, RenderColor, TileRequest, WorkerEvent,
 };
@@ -38,7 +39,7 @@ use crate::{
     ActualSize, AddComment, ClassicView, CopySelection, EditCopy, EditCut, EditPaste,
     EditSelectAll, Find, FirstPage, FitWidth, FluidView, LastPage, NextSearchResult, OpenDocument,
     PageDown, PageUp, PreviousSearchResult, Quit, ScrollDown, ScrollLeft, ScrollRight, ScrollUp,
-    SelectAll, SelectTheme, ToggleComments, ZoomIn, ZoomOut,
+    SelectAll, ToggleComments, ZoomIn, ZoomOut,
 };
 use gpui::{
     Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners,
@@ -56,7 +57,12 @@ use gpui_component::{
     text::{TextView, TextViewStyle},
 };
 use image::{Frame, RgbaImage};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use key_extension_api::{
+    DataValue, EffectResult, ExtensionEffect, ExtensionError, ExtensionErrorCode,
+};
+use key_extension_gpui::InvokeExtensionCommand;
+use key_extension_host::ArbitratedEffect;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
@@ -1140,6 +1146,7 @@ enum ReaderStatus {
 }
 
 pub struct PdfReader {
+    extensions: ReaderExtensions,
     worker: PdfWorker,
     annotation_io: AnnotationIo,
     link_preview_fetcher: LinkPreviewFetcher,
@@ -1264,11 +1271,19 @@ pub struct PdfReader {
 }
 
 impl PdfReader {
-    pub fn new(initial_path: Option<PathBuf>, window: &mut Window, cx: &mut App) -> Entity<Self> {
+    pub fn new(
+        initial_path: Option<PathBuf>,
+        extensions: ReaderExtensions,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
         let (worker, events) = PdfWorker::start();
         let (annotation_io, annotation_events) = AnnotationIo::start();
         let (link_preview_fetcher, link_preview_events) = LinkPreviewFetcher::new();
         let (scholarly_fetcher, scholarly_events) = ScholarlyFetcher::new();
+        let extension_warning = extensions
+            .startup_error()
+            .map(|message| SharedString::from(message.to_owned()));
         let search_field =
             cx.new(|cx| TextField::new(cx, "Search document", MAX_SEARCH_QUERY_BYTES));
         let search_field_for_reader = search_field.clone();
@@ -1288,6 +1303,7 @@ impl PdfReader {
             )
             .detach();
             Self {
+                extensions,
                 worker,
                 annotation_io,
                 link_preview_fetcher,
@@ -1356,7 +1372,7 @@ impl PdfReader {
                 selected_theme: None,
                 render_appearance: render_appearance_from_theme(Theme::global(cx), true),
                 pdf_dark_mode_enabled: true,
-                warning: None,
+                warning: extension_warning,
                 focus_handle: cx.focus_handle(),
                 zoom: 1.0,
                 fit_width: false,
@@ -1860,13 +1876,12 @@ impl PdfReader {
         {
             return false;
         }
-        self.select_theme(
-            &SelectTheme {
-                name: if name == "system" {
-                    SharedString::default()
-                } else {
-                    name.to_owned().into()
-                },
+        let command = self.extensions.theme_command().clone();
+        let selected = if name == "system" { "" } else { name };
+        self.invoke_extension_command(
+            &InvokeExtensionCommand {
+                command,
+                payload: Some(DataValue::String(selected.to_owned())),
             },
             window,
             cx,
@@ -3609,14 +3624,99 @@ impl PdfReader {
         self.set_view_mode(ReaderView::Fluid, window, cx);
     }
 
-    fn select_theme(&mut self, action: &SelectTheme, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_theme = theme::apply_selection(action.name.as_ref(), window, cx);
+    fn apply_theme_selection(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_theme = theme::apply_selection(name, window, cx);
         self.theme_preference = if self.selected_theme.is_some() {
             ThemePreference::Named
         } else {
             ThemePreference::System
         };
         self.update_render_appearance(window, cx);
+    }
+
+    fn invoke_extension_command(
+        &mut self,
+        action: &InvokeExtensionCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let effects = match self
+            .extensions
+            .invoke_command(&action.command, action.payload.clone())
+        {
+            Ok(effects) => effects,
+            Err(error) => {
+                let detail = self
+                    .extensions
+                    .latest_diagnostic_message()
+                    .unwrap_or_else(|| error.to_string());
+                self.warning = Some(format!("Extension command failed: {detail}").into());
+                cx.notify();
+                return;
+            }
+        };
+        self.execute_extension_effects(effects, window, cx);
+    }
+
+    fn execute_extension_effects(
+        &mut self,
+        effects: Vec<ArbitratedEffect>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const MAX_COMPLETION_CHAIN: usize = 64;
+        let mut pending = VecDeque::from(effects);
+        let mut completed = 0;
+        while let Some(effect) = pending.pop_front() {
+            if completed >= MAX_COMPLETION_CHAIN {
+                self.warning = Some("Extension effect chain exceeded the reader limit".into());
+                break;
+            }
+            completed += 1;
+            let result = self.execute_extension_effect(&effect, window, cx);
+            match self.extensions.complete_effect(&effect, result) {
+                Ok(report) => pending.extend(report.effects),
+                Err(error) => {
+                    self.warning = Some(format!("Extension completion failed: {error}").into());
+                    break;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn execute_extension_effect(
+        &mut self,
+        effect: &ArbitratedEffect,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> EffectResult {
+        match &effect.request.effect {
+            ExtensionEffect::CapabilityCall {
+                capability,
+                operation,
+                input: DataValue::String(name),
+            } if capability.as_str() == "key:ui/theme" && operation == "select" => {
+                self.apply_theme_selection(name, window, cx);
+                Ok(DataValue::Null)
+            }
+            ExtensionEffect::CopyText { text } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                Ok(DataValue::Null)
+            }
+            ExtensionEffect::OpenBrowserUrl { url } => open::that_detached(url)
+                .map(|_| DataValue::Null)
+                .map_err(|error| ExtensionError {
+                    code: ExtensionErrorCode::Internal,
+                    message: error.to_string(),
+                    retryable: true,
+                }),
+            _ => Err(ExtensionError {
+                code: ExtensionErrorCode::CapabilityUnavailable,
+                message: "the reader does not implement this extension effect yet".into(),
+                retryable: false,
+            }),
+        }
     }
 
     fn update_render_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -10553,7 +10653,7 @@ impl Render for PdfReader {
             .on_action(cx.listener(Self::previous_search_result))
             .on_action(cx.listener(Self::use_classic_view))
             .on_action(cx.listener(Self::use_fluid_view))
-            .on_action(cx.listener(Self::select_theme))
+            .on_action(cx.listener(Self::invoke_extension_command))
             .on_action(cx.listener(Self::quit_application))
             .child(toolbar)
             .children(error_bar)
