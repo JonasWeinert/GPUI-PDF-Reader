@@ -1,12 +1,13 @@
 //! Process-global services, workspace identity, and window lifecycle.
 
 use crate::app_extensions::ReaderExtensions;
+use crate::theme::ThemePreference;
 use crate::workspace_window::WorkspaceWindow;
 #[cfg(target_os = "macos")]
 use gpui::TitlebarOptions;
 use gpui::{
-    AnyWindowHandle, App, Bounds, Entity, Point, WindowBounds, WindowHandle, WindowOptions, px,
-    size,
+    AnyWindowHandle, App, Bounds, Entity, Point, SharedString, WindowBounds, WindowHandle,
+    WindowOptions, px, size,
 };
 use key_workspace_core::{
     Capability, Generation, IdGenerator, ItemKind, ItemSource, ResourceCoordinator, ResourceMode,
@@ -35,6 +36,8 @@ pub(crate) struct ApplicationHost {
     settings_window: Option<WindowId>,
     active_view: Option<ViewId>,
     resources: ResourceCoordinator,
+    theme_preference: ThemePreference,
+    selected_theme: Option<SharedString>,
 }
 
 impl ApplicationHost {
@@ -59,6 +62,8 @@ impl ApplicationHost {
                     low_power_mode: false,
                 },
             ),
+            theme_preference: ThemePreference::System,
+            selected_theme: None,
         }
     }
 
@@ -68,6 +73,19 @@ impl ApplicationHost {
 
     pub(crate) fn resource_coordinator(&self) -> ResourceCoordinator {
         self.resources
+    }
+
+    pub(crate) fn theme_selection(&self) -> (ThemePreference, Option<SharedString>) {
+        (self.theme_preference, self.selected_theme.clone())
+    }
+
+    pub(crate) fn set_theme_selection(
+        &mut self,
+        preference: ThemePreference,
+        selected: Option<SharedString>,
+    ) {
+        self.theme_preference = preference;
+        self.selected_theme = selected;
     }
 
     pub(crate) fn set_active_view(&mut self, view: ViewId) -> bool {

@@ -865,7 +865,8 @@ impl PdfReader {
         Self::listen_for_native_pinch(&entity, window, cx);
         entity.update(cx, |_, cx| {
             cx.observe_window_appearance(window, |reader, window, cx| {
-                if reader.theme_preference == ThemePreference::System {
+                if reader._application_host.read(cx).theme_selection().0 == ThemePreference::System
+                {
                     Theme::sync_system_appearance(Some(window), cx);
                     reader.update_render_appearance(window, cx);
                 }
@@ -2796,6 +2797,10 @@ impl PdfReader {
     }
 
     pub(crate) fn activate_extension_scope(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (preference, selected) = self._application_host.read(cx).theme_selection();
+        self.theme_preference = preference;
+        self.selected_theme = selected;
+        self.update_render_appearance(window, cx);
         self.extensions.borrow_mut().invalidate_document_scope();
         if let Some(document) = &self.document
             && let Err(error) = self
@@ -2824,6 +2829,9 @@ impl PdfReader {
         } else {
             ThemePreference::System
         };
+        self._application_host.update(cx, |host, _| {
+            host.set_theme_selection(self.theme_preference, self.selected_theme.clone())
+        });
         self.update_render_appearance(window, cx);
     }
 
