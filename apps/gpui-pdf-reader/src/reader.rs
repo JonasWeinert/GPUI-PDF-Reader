@@ -100,6 +100,7 @@ use key_pdf_gpui::{
     inflate_tile_rect as viewport_inflate_tile_rect,
     plan_visible_tiles as viewport_plan_visible_tiles,
 };
+use key_workspace_core::{ViewId, WindowId};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -519,6 +520,8 @@ enum ReaderStatus {
 
 pub struct PdfReader {
     _application_host: Entity<ApplicationHost>,
+    workspace_window_id: WindowId,
+    workspace_view_id: ViewId,
     extensions: Rc<RefCell<ReaderExtensions>>,
     pdf_capabilities: Arc<PdfCapabilityBridge>,
     extension_contribution: Option<ExtensionContributionPane>,
@@ -670,6 +673,8 @@ impl PdfReader {
     pub fn new(
         initial_path: Option<PathBuf>,
         application_host: Entity<ApplicationHost>,
+        workspace_window_id: WindowId,
+        workspace_view_id: ViewId,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -703,6 +708,8 @@ impl PdfReader {
             .detach();
             Self {
                 _application_host: application_host,
+                workspace_window_id,
+                workspace_view_id,
                 extensions,
                 pdf_capabilities,
                 extension_contribution: None,
@@ -879,6 +886,37 @@ impl PdfReader {
 
     pub fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    fn open_dialog(&mut self, _: &OpenDocument, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open PDF".into()),
+        });
+        let weak = cx.weak_entity();
+        let host = self._application_host.clone();
+        let source = self.workspace_window_id;
+        window
+            .spawn(cx, async move |cx| {
+                if let Ok(Ok(Some(paths))) = prompt.await
+                    && let Some(path) = paths.into_iter().next()
+                {
+                    let _ = cx.update(|_, cx| {
+                        if let Err(error) =
+                            crate::application_host::open_pdf_from(host, source, path, cx)
+                        {
+                            weak.update(cx, |reader, cx| {
+                                reader.warning = Some(error.into());
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    });
+                }
+            })
+            .detach();
     }
 
     fn listen_for_worker_events(
@@ -1076,10 +1114,11 @@ impl PdfReader {
                 ) {
                     self.record_pdf_capability_error("document snapshot", error);
                 }
-                if let Err(error) = self
-                    .extensions
-                    .borrow()
-                    .begin_document_storage(path.clone(), pages.len())
+                if window.is_window_active()
+                    && let Err(error) = self
+                        .extensions
+                        .borrow()
+                        .begin_document_storage(path.clone(), pages.len())
                 {
                     self.warning =
                         Some(format!("Extension document storage is unavailable: {error}").into());
@@ -1516,28 +1555,6 @@ impl PdfReader {
         }
         self.schedule_extension_snapshot_sync(window, cx);
         cx.notify();
-    }
-
-    fn open_dialog(&mut self, _: &OpenDocument, window: &mut Window, cx: &mut Context<Self>) {
-        let prompt = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Open PDF".into()),
-        });
-        let weak = cx.weak_entity();
-        window
-            .spawn(cx, async move |cx| {
-                if let Ok(Ok(Some(paths))) = prompt.await
-                    && let Some(path) = paths.into_iter().next()
-                {
-                    let _ = cx.update(|window, cx| {
-                        weak.update(cx, |reader, cx| reader.open_path(path, window, cx))
-                            .ok();
-                    });
-                }
-            })
-            .detach();
     }
 
     #[cfg(feature = "installable-extensions")]
@@ -2142,7 +2159,7 @@ impl PdfReader {
             .detach();
     }
 
-    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.comment_draft_needs_confirmation() {
             self.confirm_discard_comment(DraftDiscardAction::Open(path), window, cx);
             return;
@@ -2189,7 +2206,9 @@ impl PdfReader {
 
     fn begin_open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_open = None;
-        self.extensions.borrow_mut().invalidate_document_scope();
+        if window.is_window_active() {
+            self.extensions.borrow_mut().invalidate_document_scope();
+        }
         self.generation = self.generation.wrapping_add(1);
         self.close_pdf_capability_generation();
         self.link_preview_fetcher.begin_document(self.generation);
@@ -2700,6 +2719,9 @@ impl PdfReader {
     /// Executes bounded host ticks from event/animation callbacks, never from
     /// `Render`. High-frequency navigation is coalesced by snapshot equality.
     fn flush_extension_snapshots(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.extension_view_is_active(cx) {
+            return;
+        }
         let completions = self.extensions.borrow_mut().poll_service_completions(32);
         for completion in completions {
             let completion_result = self
@@ -2748,6 +2770,9 @@ impl PdfReader {
     }
 
     fn schedule_extension_snapshot_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.extension_view_is_active(cx) {
+            return;
+        }
         if !self.extension_snapshot_dispatch.request() {
             return;
         }
@@ -2765,6 +2790,28 @@ impl PdfReader {
                 .ok();
             });
         }));
+    }
+
+    pub(crate) fn activate_extension_scope(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.extensions.borrow_mut().invalidate_document_scope();
+        if let Some(document) = &self.document
+            && let Err(error) = self
+                .extensions
+                .borrow()
+                .begin_document_storage(document.path.clone(), document.pages.len())
+        {
+            self.warning =
+                Some(format!("Extension document storage is unavailable: {error}").into());
+        }
+        self.extension_snapshot_dispatch = ExtensionSnapshotDispatch::default();
+        self.schedule_extension_snapshot_sync(window, cx);
+        cx.notify();
+    }
+
+    fn extension_view_is_active(&self, cx: &App) -> bool {
+        self._application_host
+            .read(cx)
+            .is_active_view(self.workspace_view_id)
     }
 
     fn apply_theme_selection(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {

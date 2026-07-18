@@ -32,6 +32,7 @@ key-pdfium = { path = "../../crates/key-pdfium" }
 key-reference = { path = "../../extensions/key-reference", optional = true }
 key-sidecar-store = { path = "../../crates/key-sidecar-store" }
 key-ui-gpui = { path = "../../crates/key-ui-gpui" }
+key-workspace-core = { path = "../../crates/key-workspace-core" }
 open.workspace = true
 serde.workspace = true
 serde_json.workspace = true

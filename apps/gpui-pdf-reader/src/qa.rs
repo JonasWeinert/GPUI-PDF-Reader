@@ -5,7 +5,8 @@
 //! exposes the narrow instrumentation hooks used by the native E2E scripts.
 
 use crate::reader::PdfReader;
-use gpui::{App, Keystroke, Point, WindowHandle};
+use crate::workspace_window::WorkspaceWindow;
+use gpui::{App, Entity, Keystroke, Point, Window, WindowHandle};
 use std::fmt::Display;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -132,7 +133,7 @@ where
 }
 
 /// Installs the opt-in native QA driver for a reader window.
-pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
+pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
     apply_initial_overrides(window, cx);
     let config = QaConfig::from_environment();
     if !config.requested() {
@@ -147,7 +148,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                     loop {
                         let ready = cx
                             .update(|window, cx| {
-                                window.root::<PdfReader>().flatten().is_some_and(|reader| {
+                                reader_entity(window, cx).is_some_and(|reader| {
                                     reader.read(cx).qa_viewport_is_settled()
                                 })
                             })
@@ -165,7 +166,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                     if config.has_navigation_setup() {
                         let outcome = cx
                             .update(|window, cx| {
-                                let Some(Some(reader)) = window.root::<PdfReader>() else {
+                                let Some(reader) = reader_entity(window, cx) else {
                                     return Err("TOC QA reader is unavailable".to_owned());
                                 };
                                 reader.update(cx, |reader, cx| {
@@ -214,7 +215,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         loop {
                             let outcome = cx
                                 .update(|window, cx| {
-                                    let Some(Some(reader)) = window.root::<PdfReader>() else {
+                                    let Some(reader) = reader_entity(window, cx) else {
                                         return Err(
                                             "reference details reader is unavailable".to_owned()
                                         );
@@ -249,7 +250,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         loop {
                             let outcome = cx
                                 .update(|window, cx| {
-                                    let Some(Some(reader)) = window.root::<PdfReader>() else {
+                                    let Some(reader) = reader_entity(window, cx) else {
                                         return Ok(false);
                                     };
                                     reader.update(cx, |reader, cx| {
@@ -291,7 +292,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         loop {
                             let outcome = cx
                                 .update(|window, cx| {
-                                    let Some(Some(reader)) = window.root::<PdfReader>() else {
+                                    let Some(reader) = reader_entity(window, cx) else {
                                         return Ok(false);
                                     };
                                     reader.update(cx, |reader, cx| {
@@ -317,7 +318,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                             }
                             if Instant::now() >= deadline {
                                 let _ = cx.update(|window, cx| {
-                                    if let Some(Some(reader)) = window.root::<PdfReader>() {
+                                    if let Some(reader) = reader_entity(window, cx) {
                                         eprintln!(
                                             "GPUI_PDF_READER_QA_EXTENSION_TIMEOUT {}",
                                             reader.read(cx).qa_report()
@@ -347,7 +348,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                             let viewport = window.viewport_size();
                             let position =
                                 Point::new(viewport.width / 2.0, viewport.height / 2.0);
-                            if let Some(Some(reader)) = window.root::<PdfReader>() {
+                            if let Some(reader) = reader_entity(window, cx) {
                                 reader.update(cx, |reader, cx| {
                                     reader.qa_command_wheel(delta_y, position, window, cx);
                                 });
@@ -362,7 +363,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         loop {
                             let settled = cx
                                 .update(|window, cx| {
-                                    window.root::<PdfReader>().flatten().is_some_and(|reader| {
+                                    reader_entity(window, cx).is_some_and(|reader| {
                                         reader.read(cx).qa_viewport_is_settled()
                                     })
                                 })
@@ -384,7 +385,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         }
                         let _ = cx.update(|window, cx| {
                             if config.report
-                                && let Some(Some(reader)) = window.root::<PdfReader>()
+                                && let Some(reader) = reader_entity(window, cx)
                             {
                                 eprintln!("{}", reader.read(cx).qa_report());
                             }
@@ -399,21 +400,27 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
         .ok();
 }
 
-fn apply_initial_overrides(window: WindowHandle<PdfReader>, cx: &mut App) {
+fn apply_initial_overrides(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
     if flag("GPUI_PDF_READER_QA_FLUID_VIEW") {
         window
-            .update(cx, |reader, window, cx| {
-                reader.qa_use_fluid_view(window, cx);
+            .update(cx, |workspace, window, cx| {
+                if let Some(reader) = workspace.reader() {
+                    reader.update(cx, |reader, cx| reader.qa_use_fluid_view(window, cx));
+                }
             })
             .ok();
     }
     if let Ok(theme_name) = std::env::var("GPUI_PDF_READER_QA_THEME") {
         window
-            .update(cx, |reader, window, cx| {
-                assert!(
-                    reader.qa_select_theme(&theme_name, window, cx),
-                    "unknown GPUI_PDF_READER_QA_THEME: {theme_name}"
-                );
+            .update(cx, |workspace, window, cx| {
+                if let Some(reader) = workspace.reader() {
+                    reader.update(cx, |reader, cx| {
+                        assert!(
+                            reader.qa_select_theme(&theme_name, window, cx),
+                            "unknown GPUI_PDF_READER_QA_THEME: {theme_name}"
+                        );
+                    });
+                }
             })
             .ok();
     }
@@ -424,11 +431,22 @@ fn apply_initial_overrides(window: WindowHandle<PdfReader>, cx: &mut App) {
             _ => panic!("invalid GPUI_PDF_READER_QA_PDF_DARK: {value}"),
         };
         window
-            .update(cx, |reader, window, cx| {
-                reader.qa_set_pdf_dark_mode(enabled, window, cx);
+            .update(cx, |workspace, window, cx| {
+                if let Some(reader) = workspace.reader() {
+                    reader.update(cx, |reader, cx| {
+                        reader.qa_set_pdf_dark_mode(enabled, window, cx)
+                    });
+                }
             })
             .ok();
     }
+}
+
+fn reader_entity(window: &Window, cx: &App) -> Option<Entity<PdfReader>> {
+    window
+        .root::<WorkspaceWindow>()
+        .flatten()
+        .and_then(|workspace| workspace.read(cx).reader())
 }
 
 fn fail_and_quit(cx: &mut gpui::AsyncWindowContext, message: &str) {

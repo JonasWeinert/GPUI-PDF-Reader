@@ -974,7 +974,6 @@ impl Render for PdfReader {
             .flex()
             .flex_col()
             .bg(palette.canvas)
-            .on_action(cx.listener(Self::open_dialog))
             .on_action(cx.listener(Self::install_extension_dialog))
             .on_action(cx.listener(Self::manage_extensions))
             .on_action(cx.listener(Self::open_extension_details_action))

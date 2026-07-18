@@ -2538,6 +2538,7 @@ dependencies = [
  "key-reference",
  "key-sidecar-store",
  "key-ui-gpui",
+ "key-workspace-core",
  "objc2-app-kit",
  "open",
  "serde",

@@ -32,13 +32,9 @@ mod scientific;
 mod search;
 mod text_field;
 mod theme;
+mod workspace_window;
 
-#[cfg(target_os = "macos")]
-use gpui::TitlebarOptions;
-use gpui::{
-    App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, Point, WindowBounds,
-    WindowOptions, actions, px, size,
-};
+use gpui::{App, AppContext, Application, KeyBinding, Menu, MenuItem, actions};
 use markdown_editor::{
     CommentBackspace, CommentCancel, CommentDelete, CommentDown, CommentEnd, CommentHome,
     CommentLeft, CommentNewline, CommentRight, CommentSave, CommentSelectDown, CommentSelectLeft,
@@ -91,6 +87,7 @@ actions!(
         NextSearchResult,
         PreviousSearchResult,
         FluidView,
+        OpenSettings,
         Quit,
     ]
 );
@@ -120,48 +117,27 @@ fn main() {
         });
         rebuild_application_menus(&mut extensions, cx);
         let application_host = cx.new(|_| application_host::ApplicationHost::new(extensions));
-        let bounds = Bounds {
-            origin: Point::new(px(120.0), px(80.0)),
-            size: size(px(1180.0), px(820.0)),
-        };
-        let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            // The side panel needs room for both its editor/list and a usable
-            // document viewport. Prevent a focused editor from becoming
-            // invisible in an impossibly narrow window.
-            window_min_size: Some(size(px(700.0), px(480.0))),
-            focus: true,
-            ..Default::default()
-        };
-        #[cfg(target_os = "macos")]
-        let window_options = WindowOptions {
-            // GPUI owns the chrome so the toolbar and macOS traffic lights read
-            // as one continuous titlebar. Other platforms retain their native
-            // decorations until their platform-specific chrome is developed.
-            titlebar: Some(TitlebarOptions {
-                title: None,
-                appears_transparent: true,
-                traffic_light_position: Some(Point::new(px(14.0), px(18.0))),
-            }),
-            ..window_options
-        };
-        let host_for_window = application_host.clone();
-        let window = cx
-            .open_window(window_options, move |window, cx| {
-                reader::PdfReader::new(initial_path.clone(), host_for_window, window, cx)
-            })
+        let window = application_host::open_pdf_window(application_host.clone(), initial_path, cx)
             .expect("failed to open the GPUI PDF Reader window");
 
         window
-            .update(cx, |reader, window, cx| {
-                window.focus(&reader.focus_handle(cx));
+            .update(cx, |workspace, window, cx| {
+                workspace.focus_content(window, cx);
             })
             .ok();
 
         // Native QA remains debug-only and is isolated from application startup.
         #[cfg(debug_assertions)]
         qa::install(window, cx);
-        cx.on_window_closed(|cx| cx.quit()).detach();
+        let host_for_close = application_host.clone();
+        cx.on_window_closed(move |cx| {
+            let open = cx.windows();
+            host_for_close.update(cx, |host, _| host.prune_closed_windows(&open));
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.activate(true);
     });
 }
@@ -192,7 +168,10 @@ pub(crate) fn rebuild_application_menus(
         MenuItem::separator(),
         MenuItem::action("Comments", ToggleComments),
     ]);
-    let mut file_items = vec![MenuItem::action("Open…", OpenDocument)];
+    let mut file_items = vec![
+        MenuItem::action("Open…", OpenDocument),
+        MenuItem::action("Settings…", OpenSettings),
+    ];
     #[cfg(feature = "installable-extensions")]
     file_items.extend([
         MenuItem::separator(),
@@ -274,6 +253,7 @@ pub(crate) fn rebuild_application_menus(
 fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenDocument, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-=", ZoomIn, None),
         KeyBinding::new("cmd-+", ZoomIn, None),
         KeyBinding::new("cmd--", ZoomOut, None),
