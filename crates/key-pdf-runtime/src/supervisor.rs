@@ -135,6 +135,17 @@ impl fmt::Display for SupervisorSendError {
 
 impl std::error::Error for SupervisorSendError {}
 
+/// Back-pressure result returned by a routed supervisor event sink.
+///
+/// A route must return the original event when it is temporarily full so the
+/// owner thread can retain and retry it without cloning multi-megabyte raster
+/// buffers. A disconnected route detaches only its document.
+#[derive(Debug)]
+pub enum SupervisorRouteError<E> {
+    Full(SupervisorEvent<E>),
+    Disconnected,
+}
+
 #[derive(Debug)]
 pub enum SupervisorEvent<E> {
     Attached {
@@ -180,6 +191,9 @@ pub enum SupervisorEvent<E> {
 }
 
 pub type SupervisorEvents<E> = mpsc::Receiver<SupervisorEvent<E>>;
+
+type EventRoute<E> =
+    Box<dyn Fn(SupervisorEvent<E>) -> Result<(), SupervisorRouteError<E>> + Send + 'static>;
 
 type EngineDocuments<E> = HashMap<
     SupervisorDocumentId,
@@ -257,6 +271,26 @@ where
     pub fn attach(
         &self,
     ) -> Result<(DocumentClient<S, E>, SupervisorEvents<E>), SupervisorSendError> {
+        let (events, receiver) = mpsc::sync_channel(self.inner.policy.event_channel_capacity());
+        let client = self.attach_routed(move |event| match events.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(event)) => Err(SupervisorRouteError::Full(event)),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(SupervisorRouteError::Disconnected),
+        })?;
+        Ok((client, receiver))
+    }
+
+    /// Attaches a document to a caller-provided bounded route.
+    ///
+    /// This lets a controller merge supervisor events with its own command
+    /// mailbox and block on one receiver, avoiding both polling and a second
+    /// forwarding thread. The route is invoked only on the engine owner
+    /// thread and must therefore be non-blocking; return `Full(event)` to
+    /// apply per-document back-pressure.
+    pub fn attach_routed<F>(&self, route: F) -> Result<DocumentClient<S, E>, SupervisorSendError>
+    where
+        F: Fn(SupervisorEvent<E>) -> Result<(), SupervisorRouteError<E>> + Send + 'static,
+    {
         let raw = self
             .inner
             .next_document
@@ -267,21 +301,20 @@ where
         let id = NonZeroU64::new(raw)
             .map(SupervisorDocumentId)
             .ok_or(SupervisorSendError::DocumentIdsExhausted)?;
-        let (events, receiver) = mpsc::sync_channel(self.inner.policy.event_channel_capacity());
         self.inner
             .commands
-            .send(Command::Attach { id, events })
+            .send(Command::Attach {
+                id,
+                events: Box::new(route),
+            })
             .map_err(|_| SupervisorSendError::Disconnected)?;
-        Ok((
-            DocumentClient {
-                inner: Arc::new(DocumentClientInner {
-                    id,
-                    supervisor: self.inner.clone(),
-                    cancellations: Mutex::new(ClientCancellations::default()),
-                }),
-            },
-            receiver,
-        ))
+        Ok(DocumentClient {
+            inner: Arc::new(DocumentClientInner {
+                id,
+                supervisor: self.inner.clone(),
+                cancellations: Mutex::new(ClientCancellations::default()),
+            }),
+        })
     }
 }
 
@@ -465,7 +498,7 @@ where
 enum Command<S, E> {
     Attach {
         id: SupervisorDocumentId,
-        events: mpsc::SyncSender<SupervisorEvent<E>>,
+        events: EventRoute<E>,
     },
     Open {
         id: SupervisorDocumentId,
@@ -541,14 +574,14 @@ struct ManagedDocument<D, S, E> {
     document: Option<D>,
     document_handle: Option<ResourceHandle<DocumentResource>>,
     descriptor: Option<DocumentDescriptor>,
-    events: mpsc::SyncSender<SupervisorEvent<E>>,
+    events: EventRoute<E>,
     pending_events: VecDeque<SupervisorEvent<E>>,
     pending: HashMap<WorkKey, PendingWork<S>>,
     next_sequence: u128,
 }
 
 impl<D, S, E> ManagedDocument<D, S, E> {
-    fn new(events: mpsc::SyncSender<SupervisorEvent<E>>) -> Self {
+    fn new(events: EventRoute<E>) -> Self {
         Self {
             sessions: DocumentSessionManager::new(),
             document: None,
@@ -828,13 +861,13 @@ fn flush_pending_events<D, S, E>(
     let mut disconnected = Vec::new();
     for (id, document) in documents.iter_mut() {
         while let Some(event) = document.pending_events.pop_front() {
-            match document.events.try_send(event) {
+            match (document.events)(event) {
                 Ok(()) => {}
-                Err(mpsc::TrySendError::Full(event)) => {
+                Err(SupervisorRouteError::Full(event)) => {
                     document.pending_events.push_front(event);
                     break;
                 }
-                Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(SupervisorRouteError::Disconnected) => {
                     disconnected.push(*id);
                     break;
                 }

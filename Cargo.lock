@@ -2540,6 +2540,7 @@ dependencies = [
  "key-ui-gpui",
  "key-workspace-core",
  "objc2-app-kit",
+ "objc2-foundation",
  "open",
  "serde",
  "serde_json",

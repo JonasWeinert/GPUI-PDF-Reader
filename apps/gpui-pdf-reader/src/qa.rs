@@ -170,7 +170,7 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
                         let deadline = Instant::now() + config.timeout;
                         loop {
                             let (windows, pdf_views, settled) = cx
-                                .update(|_, cx| workspace_window_counts(cx))
+                                .update(|window, cx| workspace_window_counts(window, cx))
                                 .unwrap_or_default();
                             if windows == expected
                                 && pdf_views == expected
@@ -489,11 +489,20 @@ fn reader_entity(window: &Window, cx: &App) -> Option<Entity<PdfReader>> {
         .and_then(|workspace| workspace.read(cx).reader())
 }
 
-fn workspace_window_counts(cx: &App) -> (usize, usize, usize) {
+fn workspace_window_counts(current: &Window, cx: &App) -> (usize, usize, usize) {
     let windows = cx.windows();
+    let current_handle = current.window_handle();
     let mut pdf_views = 0;
     let mut settled = 0;
     for handle in &windows {
+        if *handle == current_handle {
+            let Some(reader) = reader_entity(current, cx) else {
+                continue;
+            };
+            pdf_views += 1;
+            settled += usize::from(reader.read(cx).qa_viewport_is_settled());
+            continue;
+        }
         let Some(handle) = handle.downcast::<WorkspaceWindow>() else {
             continue;
         };

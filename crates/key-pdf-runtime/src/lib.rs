@@ -37,6 +37,6 @@ pub use session::{
 };
 pub use supervisor::{
     DocumentClient, EngineSupervisor, SupervisorDocumentId, SupervisorEvent, SupervisorEvents,
-    SupervisorPolicy, SupervisorPolicyError, SupervisorSendError, WorkClass,
+    SupervisorPolicy, SupervisorPolicyError, SupervisorRouteError, SupervisorSendError, WorkClass,
     start_engine_supervisor,
 };

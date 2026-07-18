@@ -7,6 +7,25 @@ use crate::annotations::{AnnotationStore, DocumentKey, JsonSidecarStore};
 use gpui_component::{ThemeColor, ThemeMode};
 
 #[test]
+fn resource_cache_limits_scale_and_suspend_without_hidden_minimums() {
+    assert_eq!(resource_cache_limits(ResourceAmount::default()), (0, 0, 0));
+    let saver = resource_cache_limits(ResourceAmount {
+        cpu_memory_bytes: 24 * RESOURCE_MIB,
+        gpu_memory_bytes: 16 * RESOURCE_MIB,
+        worker_slots: 0,
+        network_slots: 0,
+    });
+    let performance = resource_cache_limits(ResourceAmount {
+        cpu_memory_bytes: 192 * RESOURCE_MIB,
+        gpu_memory_bytes: 128 * RESOURCE_MIB,
+        worker_slots: 2,
+        network_slots: 2,
+    });
+    assert_eq!(saver, (16 * 1024 * 1024, 4, 6));
+    assert_eq!(performance, (128 * 1024 * 1024, 32, 48));
+}
+
+#[test]
 fn extension_statistics_count_known_text_without_copying_it_into_snapshots() {
     let text = TextLayer::new(
         "one  two\nthree"

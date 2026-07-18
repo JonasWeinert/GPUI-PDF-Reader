@@ -100,7 +100,7 @@ use key_pdf_gpui::{
     inflate_tile_rect as viewport_inflate_tile_rect,
     plan_visible_tiles as viewport_plan_visible_tiles,
 };
-use key_workspace_core::{ViewId, WindowId};
+use key_workspace_core::{ActivityLevel, ResourceAllocation, ResourceAmount, ViewId, WindowId};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -121,7 +121,7 @@ mod tests;
 mod toc;
 mod ui;
 
-use annotation_io::{AnnotationIo, AnnotationIoEvent, AnnotationIoOperation};
+use annotation_io::{AnnotationIo, AnnotationIoEvent, AnnotationIoEvents, AnnotationIoOperation};
 use key_ui_gpui::UnitTransition;
 #[cfg(debug_assertions)]
 use qa::{QaExtensionPhase, QaFeaturePhase, QaFluidPhase};
@@ -153,6 +153,7 @@ use ui::{ChromeButtonStyle, chrome_button, empty_state, error_banner, icon_label
 const TOOLBAR_HEIGHT: f32 = 52.0;
 const ERROR_BAR_HEIGHT: f32 = 34.0;
 const MAX_COPY_TEXT_BYTES: usize = 64 * 1024 * 1024;
+const RESOURCE_MIB: u64 = 1024 * 1024;
 const MAX_VISIBLE_SEARCH_HIGHLIGHT_RUNS: usize = 4_000;
 const MAX_VISIBLE_ANNOTATION_QUADS: usize = 8_000;
 const MAX_VISIBLE_SELECTION_QUADS: usize = 8_000;
@@ -173,6 +174,28 @@ const LINK_CARD_GAP: f32 = 8.0;
 const LINK_HOVER_HANDOFF_DELAY: Duration = Duration::from_millis(180);
 const LINK_HOVER_CLOSE_DELAY: Duration = Duration::from_millis(320);
 const LINK_HOVER_STABILITY_RADIUS: f32 = 3.0;
+
+fn resource_cache_limits(amount: ResourceAmount) -> (usize, usize, usize) {
+    if amount.gpu_memory_bytes == 0 && amount.cpu_memory_bytes == 0 {
+        return (0, 0, 0);
+    }
+    let cache_bytes = usize::try_from(amount.gpu_memory_bytes)
+        .unwrap_or(usize::MAX)
+        .min(512 * 1024 * 1024);
+    let tiles = if cache_bytes == 0 {
+        0
+    } else {
+        (cache_bytes / (4 * 1024 * 1024)).clamp(2, 128)
+    };
+    let text_pages = if amount.cpu_memory_bytes == 0 {
+        0
+    } else {
+        usize::try_from(amount.cpu_memory_bytes / (4 * RESOURCE_MIB))
+            .unwrap_or(128)
+            .clamp(2, 128)
+    };
+    (cache_bytes, tiles, text_pages)
+}
 const LINK_CARD_MOVE_DEBOUNCE: Duration = Duration::from_millis(45);
 const DOI_COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(1_100);
 
@@ -667,6 +690,11 @@ pub struct PdfReader {
     zoom_render_revision: u64,
     render_debounce_until: Option<Instant>,
     zoom_render_task: Option<Task<()>>,
+    resource_allocation: ResourceAllocation,
+    max_cache_bytes: usize,
+    max_cached_tiles: usize,
+    max_cached_text_pages: usize,
+    allow_prefetch: bool,
 }
 
 impl PdfReader {
@@ -678,10 +706,20 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        let (worker, events) = PdfWorker::start();
-        let (annotation_io, annotation_events) = AnnotationIo::start();
-        let (link_preview_fetcher, link_preview_events) = LinkPreviewFetcher::new();
-        let (scholarly_fetcher, scholarly_events) = ScholarlyFetcher::new();
+        let (worker, events) = PdfWorker::start(application_host.read(cx).pdf_engine());
+        let annotation_service = application_host.read(cx).annotation_service();
+        let (annotation_io, annotation_events) = AnnotationIo::attach(&annotation_service);
+        #[cfg(feature = "scholarly-network")]
+        let ((link_preview_fetcher, link_preview_events), (scholarly_fetcher, scholarly_events)) = {
+            let scope = application_host.read(cx).reference_document_scope();
+            (
+                LinkPreviewFetcher::with_scope(scope.clone()),
+                ScholarlyFetcher::with_scope(scope),
+            )
+        };
+        #[cfg(not(feature = "scholarly-network"))]
+        let ((link_preview_fetcher, link_preview_events), (scholarly_fetcher, scholarly_events)) =
+            (LinkPreviewFetcher::new(), ScholarlyFetcher::new());
         let extensions = application_host.read(cx).extensions();
         let extension_warning = extensions
             .borrow()
@@ -855,6 +893,22 @@ impl PdfReader {
                 zoom_render_revision: 0,
                 render_debounce_until: None,
                 zoom_render_task: None,
+                resource_allocation: ResourceAllocation {
+                    id: key_workspace_core::ResourceParticipantId::from_raw(
+                        workspace_view_id.get(),
+                    ),
+                    activity: ActivityLevel::ForegroundInteractive,
+                    amount: ResourceAmount {
+                        cpu_memory_bytes: MAX_CACHE_BYTES as u64,
+                        gpu_memory_bytes: MAX_CACHE_BYTES as u64,
+                        worker_slots: 2,
+                        network_slots: 2,
+                    },
+                },
+                max_cache_bytes: MAX_CACHE_BYTES,
+                max_cached_tiles: MAX_CACHED_TILES,
+                max_cached_text_pages: MAX_CACHED_TEXT_PAGES,
+                allow_prefetch: true,
             }
         });
 
@@ -887,6 +941,55 @@ impl PdfReader {
 
     pub fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    pub(crate) fn apply_resource_allocation(
+        &mut self,
+        allocation: ResourceAllocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.resource_allocation == allocation {
+            return;
+        }
+        self.resource_allocation = allocation;
+        let (max_cache_bytes, max_cached_tiles, max_cached_text_pages) =
+            resource_cache_limits(allocation.amount);
+        self.max_cache_bytes = max_cache_bytes;
+        self.max_cached_tiles = max_cached_tiles;
+        self.max_cached_text_pages = max_cached_text_pages;
+        self.allow_prefetch = matches!(
+            allocation.activity,
+            ActivityLevel::ForegroundIdle | ActivityLevel::ForegroundInteractive
+        ) && allocation.amount.worker_slots > 0;
+
+        if allocation.activity == ActivityLevel::Suspended {
+            if matches!(self.status, ReaderStatus::Ready) {
+                let _ = self.worker.render_viewport(
+                    self.generation,
+                    self.render_appearance,
+                    &[],
+                    0,
+                    &[],
+                );
+            }
+            self.pending.clear();
+            self.text_pending.clear();
+            self.render_viewport.clear();
+            self.text_viewport.clear();
+            self.page_text.clear();
+            self.drop_all_images(window, cx);
+        } else {
+            self.evict_distant_tiles(window, cx);
+            self.evict_distant_text();
+            if matches!(
+                allocation.activity,
+                ActivityLevel::ForegroundIdle | ActivityLevel::ForegroundInteractive
+            ) {
+                self.request_visible_tiles(window);
+            }
+        }
+        cx.notify();
     }
 
     fn open_dialog(&mut self, _: &OpenDocument, window: &mut Window, cx: &mut Context<Self>) {
@@ -951,7 +1054,7 @@ impl PdfReader {
 
     fn listen_for_annotation_events(
         entity: &Entity<Self>,
-        events: mpsc::Receiver<AnnotationIoEvent>,
+        events: AnnotationIoEvents,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -3099,13 +3202,19 @@ impl PdfReader {
         // `update_viewport()` has already synchronized the window scale. The
         // shared controller therefore owns both visibility and tile priority.
         let plan = self.viewport.plan_tiles();
-        let planned = &plan.tiles;
+        let planned = plan
+            .tiles
+            .iter()
+            .filter(|tile| self.allow_prefetch || tile.tier == DemandTier::Visible)
+            .copied()
+            .collect::<Vec<_>>();
+        let planned = &planned;
         let mut viewport: Vec<_> = planned
             .iter()
             .map(|tile| (tile.request.key, tile.tier))
             .collect();
         viewport.sort_by_key(|(key, tier)| (*tier, *key));
-        let text_viewport = plan.text_pages(MAX_CACHED_TEXT_PAGES);
+        let text_viewport = plan.text_pages(self.max_cached_text_pages);
 
         // Completion does not change these full desired signatures. That
         // matters: re-sending shrinking lists after every result can race the
@@ -3233,7 +3342,7 @@ impl PdfReader {
             .values()
             .map(|tile| tile.byte_len)
             .sum::<usize>();
-        if self.rendered.len() <= MAX_CACHED_TILES && cached_bytes <= MAX_CACHE_BYTES {
+        if self.rendered.len() <= self.max_cached_tiles && cached_bytes <= self.max_cache_bytes {
             Self::retire_images(retired, window, cx);
             return;
         }
@@ -3266,7 +3375,8 @@ impl PdfReader {
             )
         });
         for key in candidates {
-            if self.rendered.len() <= MAX_CACHED_TILES && cached_bytes <= MAX_CACHE_BYTES {
+            if self.rendered.len() <= self.max_cached_tiles && cached_bytes <= self.max_cache_bytes
+            {
                 break;
             }
             if let Some(cache) = self.rendered.remove(&key) {
@@ -3278,7 +3388,7 @@ impl PdfReader {
     }
 
     fn evict_distant_text(&mut self) {
-        if self.page_text.len() <= MAX_CACHED_TEXT_PAGES {
+        if self.page_text.len() <= self.max_cached_text_pages {
             return;
         }
         let current_page = self
@@ -3308,7 +3418,7 @@ impl PdfReader {
         });
         candidates.sort_by_key(|page| std::cmp::Reverse(page.abs_diff(current_page)));
         for page in candidates {
-            if self.page_text.len() <= MAX_CACHED_TEXT_PAGES {
+            if self.page_text.len() <= self.max_cached_text_pages {
                 break;
             }
             self.page_text.remove(&page);

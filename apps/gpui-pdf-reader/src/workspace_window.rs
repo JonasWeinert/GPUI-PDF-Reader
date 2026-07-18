@@ -1,6 +1,9 @@
 //! GPUI window shell shared by document and host-owned workspace views.
 
-use crate::application_host::{ApplicationHost, open_pdf_from, open_settings_window};
+use crate::application_host::{
+    ApplicationHost, activate_workspace_view, open_pdf_from, open_settings_window,
+    set_resource_mode,
+};
 use crate::reader::PdfReader;
 use crate::{OpenDocument, OpenSettings};
 use gpui::{
@@ -10,8 +13,8 @@ use gpui::{
 use gpui_component::{Icon, IconName, Theme};
 use key_ui_gpui::ThemeTokens;
 use key_workspace_core::{
-    DockPanel, ItemKind, WorkspaceItemDescriptor, WorkspaceLayout, WorkspaceViewDescriptor,
-    WorkspaceWindowDescriptor,
+    DockPanel, ItemKind, ResourceAllocation, ResourceMode, WorkspaceItemDescriptor,
+    WorkspaceLayout, WorkspaceViewDescriptor, WorkspaceWindowDescriptor,
 };
 use std::path::PathBuf;
 
@@ -112,10 +115,24 @@ impl WorkspaceWindow {
             return;
         }
         let view = self.view.id;
-        let changed = self.host.update(cx, |host, _| host.set_active_view(view));
+        let changed = activate_workspace_view(self.host.clone(), view, cx);
         if changed && let WorkspaceContent::Pdf(reader) = &self.content {
             reader.update(cx, |reader, cx| reader.activate_extension_scope(window, cx));
         }
+    }
+
+    pub(crate) fn apply_resource_allocation(
+        &mut self,
+        allocation: ResourceAllocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let WorkspaceContent::Pdf(reader) = &self.content {
+            reader.update(cx, |reader, cx| {
+                reader.apply_resource_allocation(allocation, window, cx)
+            });
+        }
+        cx.notify();
     }
 
     pub(crate) fn focus_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -187,10 +204,11 @@ impl WorkspaceWindow {
         }
     }
 
-    fn render_settings(&self, cx: &App) -> gpui::AnyElement {
+    fn render_settings(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let tokens = ThemeTokens::from_theme(Theme::global(cx));
         let plan = self.host.read(cx).resource_coordinator().plan(&[]);
-        let resource_mode: SharedString = format!("{:?}", plan.effective_mode).into();
+        let requested_mode = self.host.read(cx).requested_resource_mode();
+        let effective_mode: SharedString = format!("{:?}", plan.effective_mode).into();
         let section = |title: &'static str, detail: &'static str| {
             div()
                 .p_4()
@@ -260,25 +278,47 @@ impl WorkspaceWindow {
                                     .rounded_lg()
                                     .bg(tokens.action.accent_soft)
                                     .flex()
-                                    .items_center()
-                                    .justify_between()
+                                    .flex_col()
+                                    .gap_3()
                                     .child(
                                         div()
                                             .flex()
                                             .flex_col()
                                             .gap_1()
                                             .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child("Resource mode"))
-                                            .child(div().text_sm().text_color(tokens.content.secondary).child("Automatically adapts budgets to activity and system availability")),
+                                            .child(div().text_sm().text_color(tokens.content.secondary).child(format!("Coordinates cache and background-work budgets across every view. Auto currently resolves to {effective_mode}."))),
                                     )
                                     .child(
                                         div()
-                                            .px_3()
-                                            .py_1()
-                                            .rounded_full()
-                                            .bg(tokens.action.accent)
-                                            .text_color(tokens.content.on_accent)
-                                            .text_sm()
-                                            .child(resource_mode),
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .children([
+                                                ResourceMode::Auto,
+                                                ResourceMode::Saver,
+                                                ResourceMode::Balanced,
+                                                ResourceMode::Performance,
+                                            ].into_iter().enumerate().map(|(index, mode)| {
+                                                let host = self.host.clone();
+                                                let selected = mode == requested_mode;
+                                                div()
+                                                    .id(("resource-mode", index))
+                                                    .px_3()
+                                                    .py_1()
+                                                    .rounded_full()
+                                                    .border_1()
+                                                    .border_color(if selected { tokens.action.accent } else { tokens.surface.border })
+                                                    .bg(if selected { tokens.action.accent } else { tokens.surface.overlay })
+                                                    .text_color(if selected { tokens.content.on_accent } else { tokens.content.primary })
+                                                    .text_sm()
+                                                    .cursor_pointer()
+                                                    .hover(|style| style.bg(tokens.action.accent_hover))
+                                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                                        set_resource_mode(host.clone(), mode, cx);
+                                                        cx.notify();
+                                                    }))
+                                                    .child(format!("{mode:?}"))
+                                            })),
                                     ),
                             ),
                     ),

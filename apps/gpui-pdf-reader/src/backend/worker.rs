@@ -1,46 +1,83 @@
-mod engine;
+//! Document-local orchestration over the process-wide PDF engine supervisor.
+//!
+//! This thread performs scheduling, text caching, search matching, and
+//! scientific-document analysis. It never owns a PDFium engine or document;
+//! every PDF operation is submitted through `DocumentClient` and runs on the
+//! single owner thread created by `ApplicationHost`.
 
-use self::engine::{
-    extract_runtime_text, pdfium_library_config, process_preview_work, process_render_work,
-    process_text_work,
-};
 #[cfg(test)]
 use super::client::WorkerCancellations;
 use super::protocol::{RenderAppearance, RenderRequest, WorkerCommand, WorkerEvent};
 #[cfg(test)]
 use super::{PdfWorker, PreviewSpec, RenderColor, TileRequest};
 #[cfg(test)]
-use crate::model::PixelRect;
-use crate::model::{RasterSize, TextLayer, TileKey};
+use crate::model::{PixelRect, TileKey};
+use crate::model::{RasterSize, TextLayer};
 use crate::scientific::ScientificAnalyzer;
 use crate::search::{
     MAX_SEARCH_RESULTS, SearchPageOutcome, SearchPageResults, SearchQuery, search_page,
 };
 use key_pdf_runtime::{
-    CachePolicy, CancellationSource, CompletionDisposition, DemandIntent, DemandPriority,
-    DocumentEvent, LatestWinsQueue, PdfRuntime, PreviewDemand, RenderDemand, ScheduleOutcome,
-    ScheduledDemand, TextDemandPurpose,
+    CachePolicy, CancellationSource, DemandIntent, DemandPriority, DocumentClient,
+    DocumentGeneration, DocumentSession, EngineSupervisor, PixelFormat, PreviewEvent, RenderEvent,
+    RequestId, SupervisorEvent, SupervisorPolicy, TextDemandPurpose, TextEvent, WorkClass,
+    start_engine_supervisor,
 };
 #[cfg(test)]
 use key_pdf_runtime::{ColorMode, PixelColor};
-#[cfg(test)]
-use key_pdfium::PdfiumLibraryConfig;
-use key_pdfium::{PdfiumDocumentSource, PdfiumEngine};
-use std::collections::{BTreeSet, HashMap, VecDeque};
-#[cfg(test)]
+use key_pdfium::{PdfiumDocumentSource, PdfiumEngine, PdfiumEngineError, PdfiumLibraryConfig};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const AUTOMATIC_TEXT_IDLE_DELAY: Duration = Duration::from_millis(200);
 const MAX_SEARCH_HIGHLIGHT_RUNS: usize = 100_000;
-const MAX_PENDING_RENDER_DEMANDS_PER_TIER: usize = 4_096;
+const MAX_PENDING_ENGINE_WORK_PER_DOCUMENT: usize = 8_192;
 
-#[derive(Clone, Debug)]
-struct QueuedRender {
-    request: RenderRequest,
-    demand: RenderDemand,
-    cancellation: CancellationSource,
+pub(crate) type PdfEngineSupervisor = EngineSupervisor<PdfiumDocumentSource, PdfiumEngineError>;
+pub(crate) type PdfDocumentClient = DocumentClient<PdfiumDocumentSource, PdfiumEngineError>;
+type DemandKey = (DocumentGeneration, RequestId);
+
+pub(crate) enum AdapterInput {
+    Command(WorkerCommand),
+    Supervisor(SupervisorEvent<PdfiumEngineError>),
+    Shutdown,
+}
+
+pub(crate) fn start_pdf_engine_supervisor() -> std::io::Result<PdfEngineSupervisor> {
+    let config = pdfium_library_config();
+    let policy = SupervisorPolicy::new(MAX_PENDING_ENGINE_WORK_PER_DOCUMENT, 1)
+        .expect("the PDF supervisor policy is statically valid");
+    start_engine_supervisor("pdfium-engine-owner", policy, move || {
+        PdfiumEngine::new(config)
+    })
+}
+
+fn pdfium_library_config() -> PdfiumLibraryConfig {
+    let mut candidates = Vec::new();
+    if let Some(configured) = std::env::var_os("PDFIUM_DYNAMIC_LIB_PATH") {
+        candidates.push(PathBuf::from(configured));
+    }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        candidates.push(directory.to_path_buf());
+        candidates.push(directory.join("../Resources"));
+    }
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("vendor/pdfium/lib"),
+    );
+    PdfiumLibraryConfig::new(candidates).with_system_fallback(true)
+}
+
+#[derive(Clone, Copy)]
+enum RenderTier {
+    Visible,
+    Prefetch,
 }
 
 #[derive(Clone, Debug)]
@@ -48,8 +85,21 @@ struct PreviewRequest {
     generation: u64,
     revision: u64,
     appearance: RenderAppearance,
-    demand: PreviewDemand,
-    cancellation: CancellationSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingTextKind {
+    Visible,
+    Copy,
+    Search { revision: u64 },
+    Analysis,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingText {
+    generation: u64,
+    page: usize,
+    kind: PendingTextKind,
 }
 
 #[derive(Clone, Debug)]
@@ -64,429 +114,926 @@ struct SearchJob {
     skipped_pages: usize,
     truncated: bool,
     cancellation: CancellationSource,
+    waiting: bool,
 }
 
 struct ScientificJob {
     generation: u64,
     analyzer: ScientificAnalyzer,
     next_page: usize,
+    waiting: bool,
 }
 
-#[derive(Clone, Copy)]
-enum RenderTier {
-    Visible,
-    Prefetch,
-}
-
-struct RenderQueues {
-    visible: LatestWinsQueue<TileKey, QueuedRender>,
-    prefetch: LatestWinsQueue<TileKey, QueuedRender>,
-}
-
-impl RenderQueues {
-    fn new() -> Self {
-        Self {
-            visible: LatestWinsQueue::new(MAX_PENDING_RENDER_DEMANDS_PER_TIER),
-            prefetch: LatestWinsQueue::new(MAX_PENDING_RENDER_DEMANDS_PER_TIER),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.visible.is_empty() && self.prefetch.is_empty()
-    }
-
-    fn clear_pending(&mut self) {
-        self.visible.clear_pending();
-        self.prefetch.clear_pending();
-    }
-
-    fn schedule(
-        &mut self,
-        tier: RenderTier,
-        queued: QueuedRender,
-    ) -> ScheduleOutcome<TileKey, QueuedRender> {
-        let key = queued.request.tile.key;
-        let priority = queued.demand.stamp().priority();
-        match tier {
-            RenderTier::Visible => self.visible.schedule(key, priority, queued),
-            RenderTier::Prefetch => self.prefetch.schedule(key, priority, queued),
-        }
-    }
-
-    fn pop_visible(&mut self) -> Option<ScheduledDemand<TileKey, QueuedRender>> {
-        self.visible.pop_next()
-    }
-
-    fn pop_prefetch(&mut self) -> Option<ScheduledDemand<TileKey, QueuedRender>> {
-        self.prefetch.pop_next()
-    }
-
-    fn finish(
-        &mut self,
-        tier: RenderTier,
-        demand: &ScheduledDemand<TileKey, QueuedRender>,
-    ) -> CompletionDisposition {
-        match tier {
-            RenderTier::Visible => self.visible.finish(demand),
-            RenderTier::Prefetch => self.prefetch.finish(demand),
-        }
-    }
+struct VisibleTextDemand {
+    due: Instant,
+    pages: Vec<usize>,
 }
 
 struct WorkerState {
-    runtime: PdfRuntime<PdfiumEngine>,
     generation: Option<u64>,
-    document_cancellation: CancellationSource,
-    automatic_text_cancellation: CancellationSource,
-    explicit_text_cancellation: CancellationSource,
-    text_cache: HashMap<usize, Arc<TextLayer>>,
-    automatic_text_needs_quiet: bool,
+    path: Option<PathBuf>,
+    session: Option<DocumentSession>,
     page_count: usize,
-    search: Option<SearchJob>,
+    text_cache: HashMap<usize, Arc<TextLayer>>,
     latest_search_revision: Option<u64>,
+    search: Option<SearchJob>,
     scientific: Option<ScientificJob>,
-    renders: RenderQueues,
-    previews: LatestWinsQueue<(), PreviewRequest>,
+    visible_text: Option<VisibleTextDemand>,
+    pending_renders: HashMap<DemandKey, RenderRequest>,
+    pending_preview: HashMap<DemandKey, PreviewRequest>,
+    pending_text: HashMap<DemandKey, PendingText>,
 }
 
-pub(super) fn run_worker(
-    commands: mpsc::Receiver<WorkerCommand>,
-    events: mpsc::SyncSender<WorkerEvent>,
-) {
-    // Constructing the adapter on this thread permanently binds PDFium and all
-    // documents to the single renderer owner thread.
-    let engine = PdfiumEngine::new(pdfium_library_config());
-    let runtime = PdfRuntime::new(engine, CachePolicy::default());
-    let mut state = WorkerState {
-        runtime,
-        generation: None,
-        document_cancellation: CancellationSource::new(),
-        automatic_text_cancellation: CancellationSource::new(),
-        explicit_text_cancellation: CancellationSource::new(),
-        text_cache: HashMap::new(),
-        automatic_text_needs_quiet: false,
-        page_count: 0,
-        search: None,
-        latest_search_revision: None,
-        scientific: None,
-        renders: RenderQueues::new(),
-        previews: LatestWinsQueue::new(1),
-    };
-    if events.send(WorkerEvent::Ready).is_err() {
-        return;
+impl WorkerState {
+    fn new() -> Self {
+        Self {
+            generation: None,
+            path: None,
+            session: None,
+            page_count: 0,
+            text_cache: HashMap::new(),
+            latest_search_revision: None,
+            search: None,
+            scientific: None,
+            visible_text: None,
+            pending_renders: HashMap::new(),
+            pending_preview: HashMap::new(),
+            pending_text: HashMap::new(),
+        }
     }
 
-    let mut explicit_text = BTreeSet::<usize>::new();
-    let mut automatic_text = VecDeque::<usize>::new();
+    fn reset_for_open(&mut self, generation: u64, path: PathBuf) {
+        self.generation = Some(generation);
+        self.path = Some(path);
+        self.session = None;
+        self.page_count = 0;
+        self.text_cache.clear();
+        self.latest_search_revision = None;
+        self.search = None;
+        self.scientific = None;
+        self.visible_text = None;
+        self.pending_renders.clear();
+        self.pending_preview.clear();
+        self.pending_text.clear();
+    }
+}
 
+pub(crate) fn run_worker(
+    mailbox: mpsc::Receiver<AdapterInput>,
+    events: mpsc::SyncSender<WorkerEvent>,
+    document: PdfDocumentClient,
+    supervisor_event_pending: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut state = WorkerState::new();
     loop {
-        if state.renders.is_empty()
-            && state.previews.is_empty()
-            && explicit_text.is_empty()
-            && automatic_text.is_empty()
-            && state.search.is_none()
-            && state.scientific.is_none()
-        {
-            match commands.recv() {
-                Ok(command) => {
-                    if !accept_command(
-                        command,
-                        &events,
-                        &mut state,
-                        &mut explicit_text,
-                        &mut automatic_text,
-                    ) {
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        while let Ok(input) = mailbox.try_recv() {
+            if matches!(&input, AdapterInput::Supervisor(_)) {
+                supervisor_event_pending.store(false, Ordering::Release);
+            }
+            if !accept_input(input, &events, &document, &mut state) {
+                return;
+            }
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+        }
+
+        if !schedule_visible_text_if_due(&events, &document, &mut state) {
+            return;
+        }
+        if drive_one_background_step(&events, &document, &mut state) {
+            continue;
+        }
+
+        let received = match state.visible_text.as_ref() {
+            Some(visible) => {
+                mailbox.recv_timeout(visible.due.saturating_duration_since(Instant::now()))
+            }
+            None => match mailbox.recv() {
+                Ok(input) => {
+                    if matches!(&input, AdapterInput::Supervisor(_)) {
+                        supervisor_event_pending.store(false, Ordering::Release);
+                    }
+                    if !accept_input(input, &events, &document, &mut state) {
                         return;
                     }
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    continue;
                 }
                 Err(_) => return,
-            }
-        }
-
-        if !accept_available_commands(
-            &commands,
-            &events,
-            &mut state,
-            &mut explicit_text,
-            &mut automatic_text,
-        ) {
-            return;
-        }
-
-        if let Some(demand) = state.renders.pop_visible() {
-            if !process_render_work(
-                RenderTier::Visible,
-                demand,
-                &commands,
-                &events,
-                &mut state,
-                &mut explicit_text,
-                &mut automatic_text,
-            ) {
-                return;
-            }
-            continue;
-        }
-
-        if let Some(demand) = state.previews.pop_next() {
-            if !process_preview_work(
-                demand,
-                &commands,
-                &events,
-                &mut state,
-                &mut explicit_text,
-                &mut automatic_text,
-            ) {
-                return;
-            }
-            continue;
-        }
-
-        if let Some(page) = explicit_text.pop_first() {
-            if !process_text_work(
-                page,
-                true,
-                &commands,
-                &events,
-                &mut state,
-                &mut explicit_text,
-                &mut automatic_text,
-            ) {
-                return;
-            }
-            continue;
-        }
-
-        if let Some(page) = automatic_text.front().copied() {
-            if !state.text_cache.contains_key(&page) && state.automatic_text_needs_quiet {
-                // Automatic text work waits briefly for a settled viewport so
-                // rapid zooming converges on the newest demand before PDFium's
-                // synchronous character walk begins.
-                match commands.recv_timeout(AUTOMATIC_TEXT_IDLE_DELAY) {
-                    Ok(command) => {
-                        if !accept_command(
-                            command,
-                            &events,
-                            &mut state,
-                            &mut explicit_text,
-                            &mut automatic_text,
-                        ) {
-                            return;
-                        }
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        state.automatic_text_needs_quiet = false;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            },
+        };
+        match received {
+            Ok(input) => {
+                if matches!(&input, AdapterInput::Supervisor(_)) {
+                    supervisor_event_pending.store(false, Ordering::Release);
+                }
+                if !accept_input(input, &events, &document, &mut state) {
+                    return;
+                }
+                if shutdown.load(Ordering::Acquire) {
+                    return;
                 }
             }
-            let Some(page) = automatic_text.pop_front() else {
-                continue;
-            };
-            if !process_text_work(
-                page,
-                false,
-                &commands,
-                &events,
-                &mut state,
-                &mut explicit_text,
-                &mut automatic_text,
-            ) {
-                return;
-            }
-            continue;
-        }
-
-        if state.search.is_some() {
-            if !process_search_work(
-                &commands,
-                &events,
-                &mut state,
-                &mut explicit_text,
-                &mut automatic_text,
-            ) {
-                return;
-            }
-            continue;
-        }
-
-        if let Some(demand) = state.renders.pop_prefetch() {
-            if !process_render_work(
-                RenderTier::Prefetch,
-                demand,
-                &commands,
-                &events,
-                &mut state,
-                &mut explicit_text,
-                &mut automatic_text,
-            ) {
-                return;
-            }
-            continue;
-        }
-
-        if state.scientific.is_some()
-            && !process_scientific_work(
-                &commands,
-                &events,
-                &mut state,
-                &mut explicit_text,
-                &mut automatic_text,
-            )
-        {
-            return;
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }
 
-fn accept_available_commands(
-    commands: &mpsc::Receiver<WorkerCommand>,
+fn accept_input(
+    input: AdapterInput,
     events: &mpsc::SyncSender<WorkerEvent>,
+    document: &PdfDocumentClient,
     state: &mut WorkerState,
-    explicit_text: &mut BTreeSet<usize>,
-    automatic_text: &mut VecDeque<usize>,
 ) -> bool {
-    loop {
-        match commands.try_recv() {
-            Ok(command) => {
-                if !accept_command(command, events, state, explicit_text, automatic_text) {
-                    return false;
-                }
-            }
-            Err(mpsc::TryRecvError::Empty) => return true,
-            Err(mpsc::TryRecvError::Disconnected) => return false,
-        }
+    match input {
+        AdapterInput::Command(command) => accept_command(command, events, document, state),
+        AdapterInput::Supervisor(event) => accept_supervisor_event(event, events, document, state),
+        AdapterInput::Shutdown => false,
     }
 }
 
-fn collect_available_commands(
-    commands: &mpsc::Receiver<WorkerCommand>,
-    deferred: &mut Vec<WorkerCommand>,
-) -> bool {
-    loop {
-        match commands.try_recv() {
-            Ok(command) => deferred.push(command),
-            Err(mpsc::TryRecvError::Empty) => return true,
-            Err(mpsc::TryRecvError::Disconnected) => return false,
-        }
-    }
-}
-
-fn accept_deferred_commands(
-    deferred: Vec<WorkerCommand>,
+fn accept_command(
+    command: WorkerCommand,
     events: &mpsc::SyncSender<WorkerEvent>,
+    document: &PdfDocumentClient,
     state: &mut WorkerState,
-    explicit_text: &mut BTreeSet<usize>,
-    automatic_text: &mut VecDeque<usize>,
 ) -> bool {
-    for command in deferred {
-        if !accept_command(command, events, state, explicit_text, automatic_text) {
-            return false;
+    match command {
+        WorkerCommand::Open {
+            generation,
+            path,
+            cancellation,
+        } => {
+            if cancellation.is_cancelled() {
+                return true;
+            }
+            state.reset_for_open(generation, path.clone());
+            if let Err(error) = document.open(PdfiumDocumentSource::file(path)) {
+                return send_error(
+                    events,
+                    Some(generation),
+                    format!("Could not open PDF: {error}"),
+                );
+            }
+        }
+        WorkerCommand::RenderViewport {
+            generation,
+            requests,
+            text_pages,
+            cancellation,
+        } => {
+            if state.generation != Some(generation) || cancellation.is_cancelled() {
+                return true;
+            }
+            if !replace_render_viewport(document, state, events, requests) {
+                return false;
+            }
+            clear_text_kind(state, PendingTextKind::Visible);
+            let _ = document.cancel(WorkClass::VisibleText);
+            state.visible_text = Some(VisibleTextDemand {
+                due: Instant::now() + AUTOMATIC_TEXT_IDLE_DELAY,
+                pages: deduplicate_pages(text_pages, state.page_count),
+            });
+        }
+        WorkerCommand::ExtractText {
+            generation,
+            page,
+            cancellation,
+        } => {
+            if state.generation == Some(generation)
+                && !cancellation.is_cancelled()
+                && !replace_copy_text(document, state, events, generation, vec![page])
+            {
+                return false;
+            }
+        }
+        WorkerCommand::EnsureTextPages {
+            generation,
+            pages,
+            cancellation,
+        } => {
+            if state.generation == Some(generation)
+                && !cancellation.is_cancelled()
+                && !replace_copy_text(document, state, events, generation, pages)
+            {
+                return false;
+            }
+        }
+        WorkerCommand::CancelExplicitText { generation } => {
+            if state.generation == Some(generation) {
+                clear_text_kind(state, PendingTextKind::Copy);
+                let _ = document.cancel(WorkClass::CopyText);
+            }
+        }
+        WorkerCommand::Search {
+            generation,
+            revision,
+            query,
+            cancellation,
+        } => {
+            if !accept_search_demand(
+                state,
+                events,
+                document,
+                generation,
+                revision,
+                query,
+                cancellation,
+            ) {
+                return false;
+            }
+        }
+        WorkerCommand::CancelSearch {
+            generation,
+            next_revision,
+        } => {
+            cancel_searches_before(state, generation, next_revision);
+            clear_text_kind_matches(state, |kind| matches!(kind, PendingTextKind::Search { .. }));
+            let _ = document.cancel(WorkClass::SearchText);
+        }
+        WorkerCommand::RenderPreview {
+            generation,
+            revision,
+            appearance,
+            spec,
+            cancellation,
+        } => {
+            if state.generation == Some(generation)
+                && !cancellation.is_cancelled()
+                && !replace_preview(
+                    document, state, events, generation, revision, appearance, spec,
+                )
+            {
+                return false;
+            }
         }
     }
     true
 }
 
-fn process_search_work(
-    commands: &mpsc::Receiver<WorkerCommand>,
+fn accept_supervisor_event(
+    event: SupervisorEvent<PdfiumEngineError>,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    document: &PdfDocumentClient,
+    state: &mut WorkerState,
+) -> bool {
+    match event {
+        SupervisorEvent::Attached { document: id, .. } => {
+            debug_assert_eq!(id, document.id());
+            events.send(WorkerEvent::Ready).is_ok()
+        }
+        SupervisorEvent::Opened {
+            document: id,
+            session,
+            descriptor,
+            ..
+        } => {
+            debug_assert_eq!(id, document.id());
+            let (Some(generation), Some(path)) = (state.generation, state.path.clone()) else {
+                return true;
+            };
+            state.session = Some(session);
+            state.page_count = descriptor.page_count();
+            state.scientific = Some(ScientificJob {
+                generation,
+                analyzer: ScientificAnalyzer::new(descriptor.page_count(), descriptor.links()),
+                next_page: 0,
+                waiting: false,
+            });
+            events
+                .send(WorkerEvent::Opened {
+                    generation,
+                    path,
+                    pages: descriptor.pages().to_vec(),
+                    toc: descriptor.table_of_contents().to_vec(),
+                    links: descriptor.links().to_vec(),
+                })
+                .is_ok()
+        }
+        SupervisorEvent::OpenFailed {
+            generation: _,
+            error,
+            ..
+        } => send_error(
+            events,
+            state.generation,
+            format!("Could not open PDF: {error}"),
+        ),
+        SupervisorEvent::OpenCancelled { .. } | SupervisorEvent::Closed { .. } => true,
+        SupervisorEvent::Rendered { event, .. } => accept_render_event(event, events, state),
+        SupervisorEvent::PreviewRendered { event, .. } => {
+            accept_preview_event(event, events, state)
+        }
+        SupervisorEvent::TextExtracted { event, .. } => {
+            accept_text_event(event, events, document, state)
+        }
+        SupervisorEvent::WorkRejected {
+            class, rejected, ..
+        } => {
+            // A later settled viewport/search revision will naturally replace
+            // evicted work. Keep this non-fatal; the queue is deliberately a
+            // hard memory bound rather than an application failure.
+            debug_assert!(rejected > 0, "empty rejection event for {class:?}");
+            true
+        }
+    }
+}
+
+fn replace_render_viewport(
+    document: &PdfDocumentClient,
+    state: &mut WorkerState,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    requests: Vec<RenderRequest>,
+) -> bool {
+    state.pending_renders.clear();
+    let Some(session) = state.session.as_ref() else {
+        return true;
+    };
+    let mut demands = Vec::with_capacity(requests.len());
+    for request in requests {
+        let (_, priority, intent) = render_priority(&request);
+        match session.render_demand(
+            request.tile.key,
+            request.tile.core_rect,
+            request.tile.render_rect,
+            request.appearance.color_mode(),
+            priority,
+            intent,
+        ) {
+            Ok(demand) => {
+                state.pending_renders.insert(
+                    (demand.stamp().generation(), demand.stamp().request()),
+                    request,
+                );
+                demands.push(demand);
+            }
+            Err(error) => {
+                if events
+                    .send(WorkerEvent::TileFailed {
+                        generation: request.generation,
+                        appearance: request.appearance,
+                        key: request.tile.key,
+                        message: error.to_string(),
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    if let Err(error) = document.replace_render_viewport(demands) {
+        return send_error(events, state.generation, error.to_string());
+    }
+    true
+}
+
+fn accept_render_event(
+    event: RenderEvent<PdfiumEngineError>,
     events: &mpsc::SyncSender<WorkerEvent>,
     state: &mut WorkerState,
-    explicit_text: &mut BTreeSet<usize>,
-    automatic_text: &mut VecDeque<usize>,
+) -> bool {
+    match event {
+        RenderEvent::Ready { demand, tile } => {
+            let key = (demand.stamp().generation(), demand.stamp().request());
+            let Some(request) = state.pending_renders.remove(&key) else {
+                return true;
+            };
+            if tile.image.format() != PixelFormat::Bgra8Premultiplied {
+                return events
+                    .send(WorkerEvent::TileFailed {
+                        generation: request.generation,
+                        appearance: request.appearance,
+                        key: request.tile.key,
+                        message: "PDF engine returned an unsupported pixel format".into(),
+                    })
+                    .is_ok();
+            }
+            events
+                .send(WorkerEvent::TileRendered {
+                    generation: request.generation,
+                    appearance: request.appearance,
+                    key: request.tile.key,
+                    core_rect: request.tile.core_rect,
+                    render_rect: request.tile.render_rect,
+                    width: tile.image.width(),
+                    height: tile.image.height(),
+                    bgra: tile.image.pixels().to_vec(),
+                })
+                .is_ok()
+        }
+        RenderEvent::Failed { stamp, error } => {
+            let Some(request) = state
+                .pending_renders
+                .remove(&(stamp.generation(), stamp.request()))
+            else {
+                return true;
+            };
+            events
+                .send(WorkerEvent::TileFailed {
+                    generation: request.generation,
+                    appearance: request.appearance,
+                    key: request.tile.key,
+                    message: format!(
+                        "Could not render page {}: {error}",
+                        request.tile.key.page + 1
+                    ),
+                })
+                .is_ok()
+        }
+        RenderEvent::Cancelled { stamp } | RenderEvent::Discarded { stamp } => {
+            state
+                .pending_renders
+                .remove(&(stamp.generation(), stamp.request()));
+            true
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_preview(
+    document: &PdfDocumentClient,
+    state: &mut WorkerState,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    generation: u64,
+    revision: u64,
+    appearance: RenderAppearance,
+    spec: super::PreviewSpec,
+) -> bool {
+    state.pending_preview.clear();
+    let Some(session) = state.session.as_ref() else {
+        return events
+            .send(WorkerEvent::PreviewFailed {
+                generation,
+                revision,
+                message: "no document is open".into(),
+            })
+            .is_ok();
+    };
+    let demand = match session.preview_demand(
+        spec.page,
+        spec.raster,
+        RasterSize {
+            width: 360,
+            height: 204,
+        },
+        spec.center_x,
+        spec.center_y,
+        appearance.color_mode(),
+        DemandPriority::INTERACTIVE,
+    ) {
+        Ok(demand) => demand,
+        Err(error) => {
+            return events
+                .send(WorkerEvent::PreviewFailed {
+                    generation,
+                    revision,
+                    message: error.to_string(),
+                })
+                .is_ok();
+        }
+    };
+    state.pending_preview.insert(
+        (demand.stamp().generation(), demand.stamp().request()),
+        PreviewRequest {
+            generation,
+            revision,
+            appearance,
+        },
+    );
+    if let Err(error) = document.replace_preview(Some(demand)) {
+        return events
+            .send(WorkerEvent::PreviewFailed {
+                generation,
+                revision,
+                message: error.to_string(),
+            })
+            .is_ok();
+    }
+    true
+}
+
+fn accept_preview_event(
+    event: PreviewEvent<PdfiumEngineError>,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    state: &mut WorkerState,
+) -> bool {
+    match event {
+        PreviewEvent::Ready { demand, preview } => {
+            let Some(request) = state
+                .pending_preview
+                .remove(&(demand.stamp().generation(), demand.stamp().request()))
+            else {
+                return true;
+            };
+            if preview.image.format() != PixelFormat::Bgra8Premultiplied {
+                return events
+                    .send(WorkerEvent::PreviewFailed {
+                        generation: request.generation,
+                        revision: request.revision,
+                        message: "PDF engine returned an unsupported pixel format".into(),
+                    })
+                    .is_ok();
+            }
+            events
+                .send(WorkerEvent::PreviewRendered {
+                    generation: request.generation,
+                    revision: request.revision,
+                    appearance: request.appearance,
+                    width: preview.image.width(),
+                    height: preview.image.height(),
+                    bgra: preview.image.pixels().to_vec(),
+                })
+                .is_ok()
+        }
+        PreviewEvent::Failed { stamp, error } => {
+            let Some(request) = state
+                .pending_preview
+                .remove(&(stamp.generation(), stamp.request()))
+            else {
+                return true;
+            };
+            events
+                .send(WorkerEvent::PreviewFailed {
+                    generation: request.generation,
+                    revision: request.revision,
+                    message: error.to_string(),
+                })
+                .is_ok()
+        }
+        PreviewEvent::Cancelled { stamp } | PreviewEvent::Discarded { stamp } => {
+            state
+                .pending_preview
+                .remove(&(stamp.generation(), stamp.request()));
+            true
+        }
+    }
+}
+
+fn schedule_visible_text_if_due(
+    events: &mpsc::SyncSender<WorkerEvent>,
+    document: &PdfDocumentClient,
+    state: &mut WorkerState,
+) -> bool {
+    if state
+        .visible_text
+        .as_ref()
+        .is_none_or(|demand| demand.due > Instant::now())
+    {
+        return true;
+    }
+    let visible = state
+        .visible_text
+        .take()
+        .expect("visible demand checked above");
+    let Some(generation) = state.generation else {
+        return true;
+    };
+    schedule_text_pages(
+        document,
+        state,
+        events,
+        generation,
+        visible.pages,
+        PendingTextKind::Visible,
+        WorkClass::VisibleText,
+        TextDemandPurpose::VisibleLayer,
+        DemandPriority::new(32_767),
+        DemandIntent::Visible,
+        true,
+    )
+}
+
+fn replace_copy_text(
+    document: &PdfDocumentClient,
+    state: &mut WorkerState,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    generation: u64,
+    pages: Vec<usize>,
+) -> bool {
+    schedule_text_pages(
+        document,
+        state,
+        events,
+        generation,
+        deduplicate_pages(pages, state.page_count),
+        PendingTextKind::Copy,
+        WorkClass::CopyText,
+        TextDemandPurpose::Copy,
+        DemandPriority::INTERACTIVE,
+        DemandIntent::Explicit,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_text_pages(
+    document: &PdfDocumentClient,
+    state: &mut WorkerState,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    generation: u64,
+    pages: Vec<usize>,
+    kind: PendingTextKind,
+    class: WorkClass,
+    purpose: TextDemandPurpose,
+    priority: DemandPriority,
+    intent: DemandIntent,
+    publish_cached: bool,
+) -> bool {
+    clear_text_kind_matches(state, |candidate| same_text_domain(candidate, kind));
+    let Some(session) = state.session.as_ref().cloned() else {
+        return true;
+    };
+    let mut demands = Vec::new();
+    for page in pages {
+        if let Some(text) = state.text_cache.get(&page).cloned() {
+            if publish_cached
+                && events
+                    .send(WorkerEvent::TextExtracted {
+                        generation,
+                        page,
+                        text,
+                    })
+                    .is_err()
+            {
+                return false;
+            }
+            continue;
+        }
+        match session.text_demand(page, purpose, priority, intent) {
+            Ok(demand) => {
+                state.pending_text.insert(
+                    (demand.stamp().generation(), demand.stamp().request()),
+                    PendingText {
+                        generation,
+                        page,
+                        kind,
+                    },
+                );
+                demands.push(demand);
+            }
+            Err(error) => {
+                if !handle_text_failure(
+                    events,
+                    document,
+                    state,
+                    PendingText {
+                        generation,
+                        page,
+                        kind,
+                    },
+                    error.to_string(),
+                ) {
+                    return false;
+                }
+            }
+        }
+    }
+    if let Err(error) = document.replace_text(class, demands) {
+        return send_error(events, Some(generation), error.to_string());
+    }
+    true
+}
+
+fn accept_text_event(
+    event: TextEvent<PdfiumEngineError>,
+    events: &mpsc::SyncSender<WorkerEvent>,
+    document: &PdfDocumentClient,
+    state: &mut WorkerState,
+) -> bool {
+    match event {
+        TextEvent::Ready { demand, text } => {
+            let Some(pending) = state
+                .pending_text
+                .remove(&(demand.stamp().generation(), demand.stamp().request()))
+            else {
+                return true;
+            };
+            let layer = cache_completed_text(state, pending.page, text.layer);
+            handle_text_ready(events, document, state, pending, layer)
+        }
+        TextEvent::Failed { stamp, error } => {
+            let Some(pending) = state
+                .pending_text
+                .remove(&(stamp.generation(), stamp.request()))
+            else {
+                return true;
+            };
+            handle_text_failure(events, document, state, pending, error.to_string())
+        }
+        TextEvent::Cancelled { stamp } | TextEvent::Discarded { stamp } => {
+            state
+                .pending_text
+                .remove(&(stamp.generation(), stamp.request()));
+            true
+        }
+    }
+}
+
+fn handle_text_ready(
+    events: &mpsc::SyncSender<WorkerEvent>,
+    _document: &PdfDocumentClient,
+    state: &mut WorkerState,
+    pending: PendingText,
+    text: Arc<TextLayer>,
+) -> bool {
+    match pending.kind {
+        PendingTextKind::Visible | PendingTextKind::Copy => events
+            .send(WorkerEvent::TextExtracted {
+                generation: pending.generation,
+                page: pending.page,
+                text,
+            })
+            .is_ok(),
+        PendingTextKind::Search { revision } => {
+            let Some(search) = state.search.as_mut() else {
+                return true;
+            };
+            if search.generation != pending.generation || search.revision != revision {
+                return true;
+            }
+            search.waiting = false;
+            process_search_page(events, state, pending.page, text)
+        }
+        PendingTextKind::Analysis => {
+            let Some(job) = state.scientific.as_mut() else {
+                return true;
+            };
+            if job.generation != pending.generation {
+                return true;
+            }
+            job.waiting = false;
+            ingest_scientific_page(events, state, pending.page, text)
+        }
+    }
+}
+
+fn handle_text_failure(
+    events: &mpsc::SyncSender<WorkerEvent>,
+    _document: &PdfDocumentClient,
+    state: &mut WorkerState,
+    pending: PendingText,
+    message: String,
+) -> bool {
+    let empty = cache_completed_text(state, pending.page, Arc::new(TextLayer::empty()));
+    match pending.kind {
+        PendingTextKind::Visible | PendingTextKind::Copy => events
+            .send(WorkerEvent::TextFailed {
+                generation: pending.generation,
+                page: pending.page,
+                message: format!(
+                    "Text selection is unavailable on page {}: {message}",
+                    pending.page + 1
+                ),
+            })
+            .is_ok(),
+        PendingTextKind::Search { revision } => {
+            let Some(search) = state.search.as_mut() else {
+                return true;
+            };
+            if search.generation != pending.generation || search.revision != revision {
+                return true;
+            }
+            search.waiting = false;
+            search.next_page = search.next_page.max(pending.page + 1);
+            search.skipped_pages += 1;
+            events
+                .send(WorkerEvent::SearchWarning {
+                    generation: pending.generation,
+                    revision,
+                    page: pending.page,
+                    message: format!("Could not search page {}: {message}", pending.page + 1),
+                })
+                .is_ok()
+        }
+        PendingTextKind::Analysis => {
+            if let Some(job) = state.scientific.as_mut() {
+                job.waiting = false;
+            }
+            ingest_scientific_page(events, state, pending.page, empty)
+        }
+    }
+}
+
+fn drive_one_background_step(
+    events: &mpsc::SyncSender<WorkerEvent>,
+    document: &PdfDocumentClient,
+    state: &mut WorkerState,
+) -> bool {
+    if drive_search(events, document, state) {
+        return true;
+    }
+    drive_scientific(events, document, state)
+}
+
+fn drive_search(
+    events: &mpsc::SyncSender<WorkerEvent>,
+    document: &PdfDocumentClient,
+    state: &mut WorkerState,
+) -> bool {
+    let Some(search) = state.search.as_ref() else {
+        return false;
+    };
+    if search.waiting {
+        return false;
+    }
+    if search.cancellation.is_cancelled() {
+        state.search = None;
+        return true;
+    }
+    if search.next_page >= search.page_count {
+        let finished = state.search.take().expect("search checked above");
+        return send_search_finished(events, &finished);
+    }
+    let page = search.next_page;
+    if let Some(text) = state.text_cache.get(&page).cloned() {
+        return process_search_page(events, state, page, text);
+    }
+    let (generation, revision) = (search.generation, search.revision);
+    let Some(session) = state.session.as_ref() else {
+        return false;
+    };
+    let demand = match session.text_demand(
+        page,
+        TextDemandPurpose::Search,
+        DemandPriority::new(32_766),
+        DemandIntent::Explicit,
+    ) {
+        Ok(demand) => demand,
+        Err(error) => {
+            return handle_text_failure(
+                events,
+                document,
+                state,
+                PendingText {
+                    generation,
+                    page,
+                    kind: PendingTextKind::Search { revision },
+                },
+                error.to_string(),
+            );
+        }
+    };
+    state.pending_text.insert(
+        (demand.stamp().generation(), demand.stamp().request()),
+        PendingText {
+            generation,
+            page,
+            kind: PendingTextKind::Search { revision },
+        },
+    );
+    if let Some(search) = state.search.as_mut() {
+        search.waiting = true;
+    }
+    if let Err(error) = document.replace_text(WorkClass::SearchText, vec![demand]) {
+        let _ = send_error(events, Some(generation), error.to_string());
+    }
+    false
+}
+
+fn process_search_page(
+    events: &mpsc::SyncSender<WorkerEvent>,
+    state: &mut WorkerState,
+    page: usize,
+    text: Arc<TextLayer>,
 ) -> bool {
     let Some(active) = state.search.clone() else {
         return true;
     };
-    if state.generation != Some(active.generation) {
-        state.search = None;
-        return true;
-    }
-    if active.next_page >= active.page_count {
-        state.search = None;
-        return send_search_finished(events, &active);
-    }
-
-    let page = active.next_page;
-    let text = if let Some(text) = state.text_cache.get(&page).cloned() {
-        text
-    } else {
-        let search_cancellation = active.cancellation.token();
-        let extracted =
-            extract_runtime_text(state, page, TextDemandPurpose::Search, &search_cancellation);
-        let mut deferred = Vec::new();
-        let connected = collect_available_commands(commands, &mut deferred);
-        if !connected {
-            return false;
-        }
-        if !accept_deferred_commands(deferred, events, state, explicit_text, automatic_text) {
-            return false;
-        }
-        if !search_job_is_current(state.search.as_ref(), &active) {
-            return true;
-        }
-        match extracted {
-            Ok(text) => cache_completed_text(state, page, text),
-            Err(message) => {
-                if let Some(search) = state.search.as_mut() {
-                    search.next_page += 1;
-                    search.skipped_pages += 1;
-                }
-                return events
-                    .send(WorkerEvent::SearchWarning {
-                        generation: active.generation,
-                        revision: active.revision,
-                        page,
-                        message: format!("Could not search page {}: {message}", page + 1),
-                    })
-                    .is_ok();
-            }
-        }
-    };
-
-    if !search_job_is_current(state.search.as_ref(), &active) {
+    if active.next_page != page || active.cancellation.is_cancelled() {
         return true;
     }
     let remaining = MAX_SEARCH_RESULTS.saturating_sub(active.total_results);
-    let mut deferred = Vec::new();
-    let mut connected = true;
-    let outcome = search_page(page, text.as_slice(), &active.query, remaining, || {
-        connected &= collect_available_commands(commands, &mut deferred);
-        !connected || !deferred.is_empty()
-    });
-    if !connected {
-        return false;
-    }
-    connected &= collect_available_commands(commands, &mut deferred);
-    if !connected {
-        return false;
-    }
-    if !accept_deferred_commands(deferred, events, state, explicit_text, automatic_text) {
-        return false;
-    }
-    if !search_job_is_current(state.search.as_ref(), &active) {
-        return true;
-    }
-    let SearchPageOutcome::Complete(mut results) = outcome else {
+    let SearchPageOutcome::Complete(mut results) =
+        search_page(page, text.as_slice(), &active.query, remaining, || {
+            active.cancellation.is_cancelled()
+        })
+    else {
         return true;
     };
-
+    if active.cancellation.is_cancelled() {
+        return true;
+    }
     let remaining_runs = MAX_SEARCH_HIGHLIGHT_RUNS.saturating_sub(active.total_highlight_runs);
     let added_runs = cap_search_highlight_runs(&mut results, remaining_runs);
     let added_results = results.matches.len();
     let stop = results.truncated;
     let finished = {
-        let search = state
-            .search
-            .as_mut()
-            .expect("the current search job was checked above");
+        let search = state.search.as_mut().expect("search checked above");
         search.next_page += 1;
         search.total_results += added_results;
         search.total_highlight_runs += added_runs;
         search.truncated |= stop;
         (stop || search.next_page >= search.page_count).then(|| search.clone())
     };
-
     if !send_search_page_results(events, active.generation, active.revision, results) {
         return false;
     }
@@ -497,22 +1044,20 @@ fn process_search_work(
     true
 }
 
-fn process_scientific_work(
-    commands: &mpsc::Receiver<WorkerCommand>,
+fn drive_scientific(
     events: &mpsc::SyncSender<WorkerEvent>,
+    document: &PdfDocumentClient,
     state: &mut WorkerState,
-    explicit_text: &mut BTreeSet<usize>,
-    automatic_text: &mut VecDeque<usize>,
 ) -> bool {
     let Some(job) = state.scientific.as_ref() else {
-        return true;
+        return false;
     };
     let generation = job.generation;
-    if state.generation != Some(generation) {
-        state.scientific = None;
-        return true;
-    }
+    let waiting = job.waiting;
     let page = job.analyzer.page_order().get(job.next_page).copied();
+    if waiting {
+        return false;
+    }
     let Some(page) = page else {
         let analysis = state
             .scientific
@@ -527,291 +1072,54 @@ fn process_scientific_work(
             })
             .is_ok();
     };
-
-    let text = if let Some(text) = state.text_cache.get(&page).cloned() {
-        text
-    } else {
-        let document_cancellation = state.document_cancellation.token();
-        let extracted = extract_runtime_text(
-            state,
-            page,
-            TextDemandPurpose::DocumentAnalysis,
-            &document_cancellation,
-        );
-        let mut deferred = Vec::new();
-        if !collect_available_commands(commands, &mut deferred) {
-            return false;
-        }
-        if !accept_deferred_commands(deferred, events, state, explicit_text, automatic_text) {
-            return false;
-        }
-        if state.generation != Some(generation) || state.scientific.is_none() {
-            return true;
-        }
-        match extracted {
-            Ok(text) => cache_completed_text(state, page, text),
-            Err(_) => Arc::new(TextLayer::empty()),
+    if let Some(text) = state.text_cache.get(&page).cloned() {
+        return ingest_scientific_page(events, state, page, text);
+    }
+    let Some(session) = state.session.as_ref() else {
+        return false;
+    };
+    let demand = match session.text_demand(
+        page,
+        TextDemandPurpose::DocumentAnalysis,
+        DemandPriority::BACKGROUND,
+        DemandIntent::Background,
+    ) {
+        Ok(demand) => demand,
+        Err(_) => {
+            return ingest_scientific_page(events, state, page, Arc::new(TextLayer::empty()));
         }
     };
+    state.pending_text.insert(
+        (demand.stamp().generation(), demand.stamp().request()),
+        PendingText {
+            generation,
+            page,
+            kind: PendingTextKind::Analysis,
+        },
+    );
+    if let Some(job) = state.scientific.as_mut() {
+        job.waiting = true;
+    }
+    if let Err(error) = document.replace_text(WorkClass::DocumentAnalysisText, vec![demand]) {
+        let _ = send_error(events, Some(generation), error.to_string());
+    }
+    false
+}
 
+fn ingest_scientific_page(
+    _events: &mpsc::SyncSender<WorkerEvent>,
+    state: &mut WorkerState,
+    page: usize,
+    text: Arc<TextLayer>,
+) -> bool {
     let Some(job) = state.scientific.as_mut() else {
         return true;
     };
-    if job.generation != generation
-        || job.analyzer.page_order().get(job.next_page).copied() != Some(page)
-    {
+    if job.analyzer.page_order().get(job.next_page).copied() != Some(page) {
         return true;
     }
     job.analyzer.ingest_page(page, &text);
     job.next_page += 1;
-    true
-}
-
-fn accept_command(
-    command: WorkerCommand,
-    events: &mpsc::SyncSender<WorkerEvent>,
-    state: &mut WorkerState,
-    explicit_text: &mut BTreeSet<usize>,
-    automatic_text: &mut VecDeque<usize>,
-) -> bool {
-    match command {
-        WorkerCommand::Open {
-            generation,
-            path,
-            cancellation,
-        } => {
-            if cancellation.is_cancelled() {
-                return true;
-            }
-            state.renders.clear_pending();
-            state.previews.clear_pending();
-            explicit_text.clear();
-            automatic_text.clear();
-            state.text_cache.clear();
-            state.automatic_text_needs_quiet = false;
-            reset_search_for_open(state);
-            state.generation = Some(generation);
-            state.document_cancellation = cancellation;
-            state.automatic_text_cancellation = CancellationSource::new();
-            state.explicit_text_cancellation = CancellationSource::new();
-
-            let opened = state.runtime.open_with_cancellation(
-                PdfiumDocumentSource::file(path.clone()),
-                &state.document_cancellation.token(),
-            );
-            match opened {
-                Ok(DocumentEvent::Opened { descriptor, .. }) => {
-                    let pages = descriptor.pages().to_vec();
-                    let toc = descriptor.table_of_contents().to_vec();
-                    let links = descriptor.links().to_vec();
-                    state.page_count = pages.len();
-                    state.scientific = Some(ScientificJob {
-                        generation,
-                        analyzer: ScientificAnalyzer::new(pages.len(), &links),
-                        next_page: 0,
-                    });
-                    events
-                        .send(WorkerEvent::Opened {
-                            generation,
-                            path,
-                            pages,
-                            toc,
-                            links,
-                        })
-                        .is_ok()
-                }
-                Ok(DocumentEvent::Failed { error, .. }) => events
-                    .send(WorkerEvent::Error {
-                        generation: Some(generation),
-                        message: format!("Could not open PDF: {error}"),
-                    })
-                    .is_ok(),
-                Ok(DocumentEvent::Cancelled { .. } | DocumentEvent::Closed { .. }) => true,
-                Err(error) => events
-                    .send(WorkerEvent::Error {
-                        generation: Some(generation),
-                        message: format!("Could not open PDF: {error}"),
-                    })
-                    .is_ok(),
-            }
-        }
-        WorkerCommand::RenderViewport {
-            generation,
-            requests,
-            text_pages,
-            cancellation,
-        } => {
-            if state.generation == Some(generation) {
-                state.automatic_text_cancellation = cancellation.clone();
-                if !replace_render_demand(state, events, requests, cancellation) {
-                    return false;
-                }
-                replace_automatic_text_demand(text_pages, automatic_text);
-                state.automatic_text_needs_quiet = !automatic_text.is_empty();
-            }
-            true
-        }
-        WorkerCommand::ExtractText {
-            generation,
-            page,
-            cancellation,
-        } => {
-            if state.generation == Some(generation) && page < state.page_count {
-                state.explicit_text_cancellation = cancellation;
-                explicit_text.clear();
-                explicit_text.insert(page);
-            }
-            true
-        }
-        WorkerCommand::EnsureTextPages {
-            generation,
-            pages,
-            cancellation,
-        } => {
-            if state.generation == Some(generation) {
-                state.explicit_text_cancellation = cancellation;
-                explicit_text.extend(pages.into_iter().filter(|page| *page < state.page_count));
-            }
-            true
-        }
-        WorkerCommand::CancelExplicitText { generation } => {
-            if state.generation == Some(generation) {
-                state.explicit_text_cancellation.cancel();
-                explicit_text.clear();
-            }
-            true
-        }
-        WorkerCommand::Search {
-            generation,
-            revision,
-            query,
-            cancellation,
-        } => accept_search_demand(state, events, generation, revision, query, cancellation),
-        WorkerCommand::CancelSearch {
-            generation,
-            next_revision,
-        } => {
-            if let Some(search) = state.search.as_ref() {
-                search.cancellation.cancel();
-            }
-            cancel_searches_before(state, generation, next_revision);
-            true
-        }
-        WorkerCommand::RenderPreview {
-            generation,
-            revision,
-            appearance,
-            spec,
-            cancellation,
-        } => {
-            if state.generation != Some(generation) {
-                return true;
-            }
-            let Some(session) = state.runtime.session() else {
-                return events
-                    .send(WorkerEvent::PreviewFailed {
-                        generation,
-                        revision,
-                        message: "no document is open".into(),
-                    })
-                    .is_ok();
-            };
-            let demand = session.preview_demand(
-                spec.page,
-                spec.raster,
-                RasterSize {
-                    width: 360,
-                    height: 204,
-                },
-                spec.center_x,
-                spec.center_y,
-                appearance.color_mode(),
-                DemandPriority::INTERACTIVE,
-            );
-            match demand {
-                Ok(demand) => {
-                    let request = PreviewRequest {
-                        generation,
-                        revision,
-                        appearance,
-                        demand,
-                        cancellation,
-                    };
-                    let _ = state
-                        .previews
-                        .schedule((), DemandPriority::INTERACTIVE, request);
-                    true
-                }
-                Err(error) => events
-                    .send(WorkerEvent::PreviewFailed {
-                        generation,
-                        revision,
-                        message: error.to_string(),
-                    })
-                    .is_ok(),
-            }
-        }
-    }
-}
-
-fn replace_render_demand(
-    state: &mut WorkerState,
-    events: &mpsc::SyncSender<WorkerEvent>,
-    requests: Vec<RenderRequest>,
-    cancellation: CancellationSource,
-) -> bool {
-    state.renders.clear_pending();
-    let Some(session) = state.runtime.session() else {
-        return true;
-    };
-    for request in requests {
-        let (tier, priority, intent) = render_priority(&request);
-        let demand = session.render_demand(
-            request.tile.key,
-            request.tile.core_rect,
-            request.tile.render_rect,
-            request.appearance.color_mode(),
-            priority,
-            intent,
-        );
-        let demand = match demand {
-            Ok(demand) => demand,
-            Err(error) => {
-                if events
-                    .send(WorkerEvent::TileFailed {
-                        generation: request.generation,
-                        appearance: request.appearance,
-                        key: request.tile.key,
-                        message: error.to_string(),
-                    })
-                    .is_err()
-                {
-                    return false;
-                }
-                continue;
-            }
-        };
-        let outcome = state.renders.schedule(
-            tier,
-            QueuedRender {
-                request,
-                demand,
-                cancellation: cancellation.clone(),
-            },
-        );
-        if let ScheduleOutcome::Rejected { value } = outcome
-            && events
-                .send(WorkerEvent::TileFailed {
-                    generation: value.request.generation,
-                    appearance: value.request.appearance,
-                    key: value.request.tile.key,
-                    message: "The bounded PDF render queue is full".into(),
-                })
-                .is_err()
-        {
-            return false;
-        }
-    }
     true
 }
 
@@ -832,32 +1140,55 @@ fn render_priority(request: &RenderRequest) -> (RenderTier, DemandPriority, Dema
     }
 }
 
-fn command_supersedes_text(
-    command: &WorkerCommand,
-    current_page: usize,
-    current_is_explicit: bool,
-) -> bool {
-    match command {
-        WorkerCommand::ExtractText { page, .. } => *page != current_page,
-        WorkerCommand::EnsureTextPages { .. } => false,
-        WorkerCommand::CancelExplicitText { .. } => current_is_explicit,
-        WorkerCommand::Open { .. }
-        | WorkerCommand::RenderViewport { .. }
-        | WorkerCommand::Search { .. }
-        | WorkerCommand::CancelSearch { .. }
-        | WorkerCommand::RenderPreview { .. } => false,
-    }
+fn deduplicate_pages(pages: Vec<usize>, page_count: usize) -> Vec<usize> {
+    let mut unique = BTreeSet::new();
+    pages
+        .into_iter()
+        .filter(|page| *page < page_count && unique.insert(*page))
+        .collect()
 }
 
-fn replace_automatic_text_demand(pages: Vec<usize>, pending: &mut VecDeque<usize>) {
-    pending.clear();
-    for page in pages {
-        if !pending.contains(&page) {
-            pending.push_back(page);
-        }
-    }
+fn same_text_domain(left: PendingTextKind, right: PendingTextKind) -> bool {
+    matches!(
+        (left, right),
+        (PendingTextKind::Visible, PendingTextKind::Visible)
+            | (PendingTextKind::Copy, PendingTextKind::Copy)
+            | (
+                PendingTextKind::Search { .. },
+                PendingTextKind::Search { .. }
+            )
+            | (PendingTextKind::Analysis, PendingTextKind::Analysis)
+    )
 }
 
+fn clear_text_kind(state: &mut WorkerState, kind: PendingTextKind) {
+    clear_text_kind_matches(state, |candidate| same_text_domain(candidate, kind));
+}
+
+fn clear_text_kind_matches(state: &mut WorkerState, matches: impl Fn(PendingTextKind) -> bool) {
+    state
+        .pending_text
+        .retain(|_, pending| !matches(pending.kind));
+}
+
+fn cache_completed_text(
+    state: &mut WorkerState,
+    page: usize,
+    text: Arc<TextLayer>,
+) -> Arc<TextLayer> {
+    if let Some(cached) = state.text_cache.get(&page) {
+        return cached.clone();
+    }
+    state.text_cache.insert(page, text.clone());
+    evict_text_cache(
+        &mut state.text_cache,
+        CachePolicy::default().text_pages(),
+        page,
+    );
+    text
+}
+
+#[cfg(test)]
 fn cache_text_layer(
     cache: &mut HashMap<usize, Arc<TextLayer>>,
     max_pages: usize,
@@ -873,8 +1204,6 @@ fn cache_text_layer(
             (Some(extracted), None)
         }
         Err(message) => {
-            // A malformed text layer must not invalidate a successfully
-            // rendered page. Cache an empty layer to avoid repeated failures.
             let empty = Arc::new(TextLayer::empty());
             cache.insert(page, empty.clone());
             (
@@ -888,23 +1217,6 @@ fn cache_text_layer(
     };
     evict_text_cache(cache, max_pages, page);
     result
-}
-
-fn cache_completed_text(
-    state: &mut WorkerState,
-    page: usize,
-    text: Arc<TextLayer>,
-) -> Arc<TextLayer> {
-    if let Some(cached) = state.text_cache.get(&page) {
-        return cached.clone();
-    }
-    state.text_cache.insert(page, text.clone());
-    evict_text_cache(
-        &mut state.text_cache,
-        state.runtime.cache_policy().text_pages(),
-        page,
-    );
-    text
 }
 
 fn evict_text_cache(cache: &mut HashMap<usize, Arc<TextLayer>>, max_pages: usize, page: usize) {
@@ -970,12 +1282,6 @@ fn send_search_page_results(
             .is_ok()
 }
 
-fn search_job_is_current(current: Option<&SearchJob>, expected: &SearchJob) -> bool {
-    current.is_some_and(|current| {
-        current.generation == expected.generation && current.revision == expected.revision
-    })
-}
-
 fn revision_is_newer(candidate: u64, current: u64) -> bool {
     let distance = candidate.wrapping_sub(current);
     distance != 0 && distance < (1_u64 << 63)
@@ -1000,9 +1306,11 @@ fn advance_search_revision(state: &mut WorkerState, generation: u64, revision: u
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_search_demand(
     state: &mut WorkerState,
     events: &mpsc::SyncSender<WorkerEvent>,
+    document: &PdfDocumentClient,
     generation: u64,
     revision: u64,
     query: SearchQuery,
@@ -1011,7 +1319,7 @@ fn accept_search_demand(
     if cancellation.is_cancelled() {
         return true;
     }
-    if state.generation.is_none() {
+    if state.session.is_none() {
         return events
             .send(WorkerEvent::SearchFailed {
                 generation,
@@ -1023,15 +1331,8 @@ fn accept_search_demand(
     if !advance_search_revision(state, generation, revision) {
         return true;
     }
-    if state.runtime.descriptor().is_none() {
-        return events
-            .send(WorkerEvent::SearchFailed {
-                generation,
-                revision,
-                message: "Cannot search because no PDF document is open".into(),
-            })
-            .is_ok();
-    }
+    clear_text_kind_matches(state, |kind| matches!(kind, PendingTextKind::Search { .. }));
+    let _ = document.cancel(WorkClass::SearchText);
     state.search = Some(SearchJob {
         generation,
         revision,
@@ -1043,6 +1344,7 @@ fn accept_search_demand(
         skipped_pages: 0,
         truncated: false,
         cancellation,
+        waiting: false,
     });
     true
 }
@@ -1063,21 +1365,23 @@ fn cancel_searches_before(state: &mut WorkerState, generation: u64, next_revisio
         .search
         .as_ref()
         .is_some_and(|search| revision_is_newer(next_revision, search.revision))
+        && let Some(search) = state.search.take()
     {
-        if let Some(search) = state.search.as_ref() {
-            search.cancellation.cancel();
-        }
-        state.search = None;
+        search.cancellation.cancel();
     }
 }
 
-fn reset_search_for_open(state: &mut WorkerState) {
-    state.page_count = 0;
-    if let Some(search) = state.search.take() {
-        search.cancellation.cancel();
-    }
-    state.latest_search_revision = None;
-    state.scientific = None;
+fn send_error(
+    events: &mpsc::SyncSender<WorkerEvent>,
+    generation: Option<u64>,
+    message: String,
+) -> bool {
+    events
+        .send(WorkerEvent::Error {
+            generation,
+            message,
+        })
+        .is_ok()
 }
 
 #[cfg(test)]

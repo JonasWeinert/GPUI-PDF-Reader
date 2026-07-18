@@ -30,6 +30,7 @@ mod scholarly;
 mod scholarly;
 mod scientific;
 mod search;
+mod system_resources;
 mod text_field;
 mod theme;
 mod workspace_window;
@@ -141,7 +142,7 @@ fn main() {
         let host_for_close = application_host.clone();
         cx.on_window_closed(move |cx| {
             let open = cx.windows();
-            host_for_close.update(cx, |host, _| host.prune_closed_windows(&open));
+            application_host::prune_workspace_windows(host_for_close.clone(), &open, cx);
             if cx.windows().is_empty() {
                 cx.quit();
             }

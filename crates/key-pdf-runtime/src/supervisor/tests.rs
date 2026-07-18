@@ -4,7 +4,7 @@ use key_pdf_core::{PageSize, PixelRect, RasterSize, TextLayer, TileKey};
 use std::{
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, ThreadId},
@@ -521,4 +521,30 @@ fn text_demands_cannot_be_sent_through_a_raster_replacement_domain() {
         client.replace_text(WorkClass::Preview, vec![text]),
         Err(SupervisorSendError::InvalidWorkClass)
     );
+}
+
+#[test]
+fn routed_attachment_retries_full_events_without_cloning_or_polling() {
+    let probe = Arc::new(Probe::default());
+    let supervisor = supervisor(probe, SupervisorPolicy::default());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_route = attempts.clone();
+    let (routed, events) = mpsc::channel();
+    let client = supervisor
+        .attach_routed(move |event| {
+            if attempts_for_route.fetch_add(1, Ordering::AcqRel) == 0 {
+                Err(SupervisorRouteError::Full(event))
+            } else {
+                routed
+                    .send(event)
+                    .map_err(|_| SupervisorRouteError::Disconnected)
+            }
+        })
+        .unwrap();
+
+    assert!(matches!(
+        events.recv_timeout(TIMEOUT).unwrap(),
+        SupervisorEvent::Attached { document, .. } if document == client.id()
+    ));
+    assert!(attempts.load(Ordering::Acquire) >= 2);
 }
