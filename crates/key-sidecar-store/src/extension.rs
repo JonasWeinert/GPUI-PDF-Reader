@@ -14,6 +14,7 @@ use std::{
 use key_extension_api::{DataValue, ExtensionError, ExtensionErrorCode, ExtensionId, StorageArea};
 use key_extension_host::ExtensionStorage;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::DocumentKey;
 
@@ -273,19 +274,27 @@ struct StoredValues {
 /// Stable document namespace derived from canonical path and exact revision.
 #[must_use]
 pub fn extension_document_namespace(document: &DocumentKey) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in document.source_path().as_os_str().as_encoded_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
     let identity = document.identity();
-    format!(
-        "{hash:016x}-{:016x}-{:016x}-{:08x}-{:08x}",
-        identity.byte_len(),
-        identity.modified_unix_seconds() as u64,
-        identity.modified_nanos(),
-        identity.page_count()
-    )
+    let mut digest = Sha256::new();
+    let path = document.source_path().as_os_str().as_encoded_bytes();
+    digest.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_le_bytes());
+    digest.update(path);
+    digest.update(identity.byte_len().to_le_bytes());
+    digest.update(identity.modified_unix_seconds().to_le_bytes());
+    digest.update(identity.modified_nanos().to_le_bytes());
+    digest.update(
+        u64::try_from(identity.page_count())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    digest
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut encoded, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "{byte:02x}");
+            encoded
+        })
 }
 
 fn validate_key(key: &str) -> Result<(), ExtensionError> {

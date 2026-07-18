@@ -14,6 +14,7 @@ key-extension-host = { path = "../key-extension-host" }
 key-pdf-core = { path = "../key-pdf-core" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha2.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
