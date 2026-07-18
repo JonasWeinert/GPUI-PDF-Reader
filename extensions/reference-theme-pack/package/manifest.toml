@@ -1,0 +1,281 @@
+schema_version = 1
+id = "org.key.reference.theme-pack"
+name = "Reference Theme Pack"
+version = "1.0.0"
+description = "Declarative theme preset and nested menubar reference package."
+license = "MIT"
+dependencies = []
+permissions = []
+
+[publisher]
+id = "key-reference"
+name = "Key Reference Extensions"
+
+[compatibility]
+extension_api = "^0.1"
+minimum_host = "0.1.0"
+platforms = []
+
+[entrypoint]
+kind = "declarative"
+ui = "ui.json"
+
+[capabilities]
+required = []
+optional = []
+provided = []
+
+[[contributions.commands]]
+id = "org.key.reference.theme-pack/apply-preset"
+title = "Apply reference theme preset"
+description = "Select a host-rendered semantic theme preset."
+category = "Appearance"
+
+[[contributions.command_behaviors]]
+command = "org.key.reference.theme-pack/apply-preset"
+kind = "set_state"
+binding = [
+    "settings",
+    "theme-preset",
+]
+
+[[contributions.menus]]
+id = "org.key.reference.theme-pack/appearance-menu"
+slot = "view.appearance"
+
+[contributions.menus.order]
+priority = 0
+before = []
+after = []
+
+[[contributions.menus.items]]
+id = "reference-themes"
+kind = "submenu"
+label = "Reference themes"
+
+[contributions.menus.items.order]
+priority = 0
+before = []
+after = []
+
+[contributions.menus.items.visible]
+source = "constant"
+value = true
+
+[contributions.menus.items.icon]
+kind = "host"
+value = "palette"
+
+[[contributions.menus.items.children]]
+id = "preset-0"
+kind = "command"
+label = "Warm Paper"
+command = "org.key.reference.theme-pack/apply-preset"
+
+[contributions.menus.items.children.order]
+priority = 0
+before = []
+after = []
+
+[contributions.menus.items.children.visible]
+source = "constant"
+value = true
+
+[contributions.menus.items.children.payload]
+type = "string"
+value = "warm-paper"
+
+[contributions.menus.items.children.icon]
+kind = "host"
+value = "palette"
+
+[contributions.menus.items.children.enabled]
+source = "constant"
+value = true
+
+[[contributions.menus.items.children]]
+id = "preset-1"
+kind = "command"
+label = "Graphite"
+command = "org.key.reference.theme-pack/apply-preset"
+
+[contributions.menus.items.children.order]
+priority = 0
+before = []
+after = []
+
+[contributions.menus.items.children.visible]
+source = "constant"
+value = true
+
+[contributions.menus.items.children.payload]
+type = "string"
+value = "graphite"
+
+[contributions.menus.items.children.icon]
+kind = "host"
+value = "palette"
+
+[contributions.menus.items.children.enabled]
+source = "constant"
+value = true
+
+[[contributions.menus.items.children]]
+id = "preset-2"
+kind = "command"
+label = "High Contrast"
+command = "org.key.reference.theme-pack/apply-preset"
+
+[contributions.menus.items.children.order]
+priority = 0
+before = []
+after = []
+
+[contributions.menus.items.children.visible]
+source = "constant"
+value = true
+
+[contributions.menus.items.children.payload]
+type = "string"
+value = "high-contrast"
+
+[contributions.menus.items.children.icon]
+kind = "host"
+value = "palette"
+
+[contributions.menus.items.children.enabled]
+source = "constant"
+value = true
+
+[[contributions.views]]
+id = "org.key.reference.theme-pack/settings"
+slot = "settings_panel"
+
+[contributions.views.order]
+priority = 0
+before = []
+after = []
+
+[contributions.views.root]
+id = "settings-root"
+kind = "column"
+
+[contributions.views.root.visible]
+source = "constant"
+value = true
+
+[[contributions.views.root.children]]
+id = "intro"
+kind = "markdown"
+markdown = """
+### Reference themes
+Presets use host-owned semantic tokens; packages do not inject GPUI code or arbitrary styles."""
+selectable = true
+
+[contributions.views.root.children.visible]
+source = "constant"
+value = true
+
+[[contributions.views.root.children]]
+id = "preset"
+kind = "select"
+label = "Theme preset"
+value = [
+    "settings",
+    "theme-preset",
+]
+command = "org.key.reference.theme-pack/apply-preset"
+
+[contributions.views.root.children.visible]
+source = "constant"
+value = true
+
+[[contributions.views.root.children.options]]
+label = "Warm Paper"
+
+[contributions.views.root.children.options.value]
+type = "string"
+value = "warm-paper"
+
+[[contributions.views.root.children.options]]
+label = "Graphite"
+
+[contributions.views.root.children.options.value]
+type = "string"
+value = "graphite"
+
+[[contributions.views.root.children.options]]
+label = "High Contrast"
+
+[contributions.views.root.children.options.value]
+type = "string"
+value = "high-contrast"
+
+[settings]
+version = 1
+
+[[settings.fields]]
+key = "theme-preset"
+label = "Theme preset"
+description = "Host-rendered semantic palette preset."
+sensitive = false
+
+[settings.fields.value_type]
+kind = "choice"
+
+[[settings.fields.value_type.options]]
+label = "Warm Paper"
+
+[settings.fields.value_type.options.value]
+type = "string"
+value = "warm-paper"
+
+[[settings.fields.value_type.options]]
+label = "Graphite"
+
+[settings.fields.value_type.options.value]
+type = "string"
+value = "graphite"
+
+[[settings.fields.value_type.options]]
+label = "High Contrast"
+
+[settings.fields.value_type.options.value]
+type = "string"
+value = "high-contrast"
+
+[settings.fields.default]
+type = "string"
+value = "warm-paper"
+
+[[settings.fields]]
+key = "display-name"
+label = "Preset label"
+description = "A short local label shown with this preset."
+sensitive = false
+
+[settings.fields.value_type]
+kind = "string"
+maximum_bytes = 80
+
+[settings.fields.default]
+type = "string"
+value = "Reading palette"
+
+[[settings.fields]]
+key = "follow-document"
+label = "Follow document appearance"
+description = "Allow the preset to respond to document appearance changes."
+sensitive = false
+
+[settings.fields.value_type]
+kind = "boolean"
+
+[settings.fields.default]
+type = "boolean"
+value = true
+
+[storage]
+settings_bytes = 4096
+document_bytes = 0
+ephemeral_cache_bytes = 0

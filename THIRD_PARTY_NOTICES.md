@@ -6,17 +6,19 @@ Keep them with redistributed source and binary bundles.
 
 ## Rust dependency graph
 
-The supported `aarch64-apple-darwin` normal/build graph currently contains 511
-unique packages. Every active package declares MIT, Apache-2.0, or a
-more-permissive option: BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0,
-CC0-1.0, MIT-0, Unlicense, BSL-1.0, or Apache-2.0 with LLVM exception. No active
-package declares GPL, LGPL, AGPL, MPL, EPL, CDDL, or SSPL, and none lacks
-license metadata.
+The default standard `aarch64-apple-darwin` normal/build graph currently
+contains 577 unique package records; the minimal `--no-default-features` graph
+contains 525. The repository guard currently checks 788 unique host and
+cross-target normal/build/dev records across the workspace. Every selected
+record has an MIT, Apache-2.0, or more-permissive license choice:
+BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, CC0-1.0, MIT-0, Unlicense,
+BSL-1.0, NCSA, or Apache-2.0 with LLVM exception. None lacks license metadata.
 
-The full lock also contains target-inactive `r-efi` packages whose expression
-is `MIT OR Apache-2.0 OR LGPL-2.1-or-later`; GPUI PDF Reader uses the
-MIT/Apache option, and those packages are not selected by the supported macOS
-build.
+Some multi-license declarations include a reciprocal alternative, including
+`Apache-2.0 OR GPL-2.0-only` and
+`MIT OR Apache-2.0 OR LGPL-2.1-or-later`. GPUI PDF Reader elects the explicit
+Apache/MIT branch; no GPL/LGPL branch is used. Expressions that require a
+reciprocal license with `AND` are rejected by the guard.
 
 Key direct components include:
 
@@ -26,6 +28,9 @@ Key direct components include:
 | `gpui-component` and its icon assets 0.5.1 | Apache-2.0 |
 | `pdfium-render` 0.9.2 plus GPUI PDF Reader tile patch | MIT (upstream also offers Apache-2.0) |
 | `image` 0.25 | MIT OR Apache-2.0 |
+| `wasmtime` 45 (standard bundle only) | Apache-2.0 WITH LLVM-exception |
+| `zed-reqwest`/`reqwest` (standard scholarly bundle only) | MIT OR Apache-2.0 |
+| `zip` 8 (installable package loader only) | MIT |
 | `block2` | MIT |
 | `objc2-app-kit` and Objective-C support crates | MIT OR Apache-2.0 OR Zlib |
 
@@ -101,3 +106,16 @@ sh scripts/audit-licenses.sh x86_64-apple-darwin
 The script is a guard against missing metadata and prohibited license-family
 identifiers. Final release review must still inspect compound `OR` expressions,
 bundled native code, copyright notices, and the generated distribution bundle.
+
+Generate the distribution inventory and retained notices for a supported app
+configuration with:
+
+```sh
+python3 scripts/generate-bundle-notices.py standard /tmp/gpui-pdf-notices
+python3 scripts/generate-bundle-notices.py minimal /tmp/gpui-pdf-notices-minimal
+```
+
+The macOS app assembler runs this automatically. Each output is derived from
+the locked normal/build graph for the selected feature set, applies the same
+explicit permissive SPDX policy, copies every package-level notice file present
+in the resolved source, and retains the complete PDFium and theme notice trees.

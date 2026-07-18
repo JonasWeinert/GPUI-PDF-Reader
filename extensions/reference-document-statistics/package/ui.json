@@ -1,0 +1,25 @@
+{
+  "bindings": {
+    "character_count": [
+      "document",
+      "statistics",
+      "character-count"
+    ],
+    "page_count": [
+      "document",
+      "statistics",
+      "page-count"
+    ],
+    "runtime_ready": [
+      "runtime-ready"
+    ],
+    "word_count": [
+      "document",
+      "statistics",
+      "word-count"
+    ]
+  },
+  "kind": "document_statistics",
+  "schema_version": 1,
+  "updates_from": "snapshot_changed"
+}

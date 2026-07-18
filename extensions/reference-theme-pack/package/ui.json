@@ -1,0 +1,12 @@
+{
+  "kind": "theme_preset_pack",
+  "note": "The trusted host maps semantic theme tokens to GPUI styling.",
+  "schema_version": 1,
+  "state": {
+    "selected_preset": [
+      "settings",
+      "theme-preset"
+    ]
+  },
+  "tokens_only": true
+}

@@ -1,0 +1,20 @@
+[package]
+name = "key-pdf-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embeddable GPUI PDF viewport state, input, rendering, and demand planning"
+
+[dependencies]
+key-pdf-core = { path = "../key-pdf-core" }
+key-pdf-runtime = { path = "../key-pdf-runtime" }
+key-ui-gpui = { path = "../key-ui-gpui" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

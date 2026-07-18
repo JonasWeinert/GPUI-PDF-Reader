@@ -1,0 +1,883 @@
+package key:extension-api@0.1.0;
+
+/// Runtime-neutral semantic types shared by native and component extensions.
+///
+/// Recursive Rust values are represented as bounded index arenas because WIT
+/// types cannot be directly recursive. `data-value.root` and every child index
+/// address `data-value.nodes`; `ui-tree.root`, UI child indices, and menu child
+/// indices follow the same rule. Arenas must be acyclic, all nodes must be
+/// reachable exactly through valid indices, and record/state keys must be
+/// unique. A host validates these invariants and all configured limits before
+/// dispatch. This is a typed contract, not authority to access host resources.
+interface types {
+  type extension-id = string;
+  type namespaced-id = string;
+  type command-id = namespaced-id;
+  type contribution-id = namespaced-id;
+  type task-id = namespaced-id;
+  type effect-id = namespaced-id;
+  type native-adapter-id = namespaced-id;
+  type local-id = string;
+  type capability-id = string;
+  type menu-slot-id = string;
+  type package-path = string;
+  type extension-version = string;
+  type compatible-version = string;
+
+  variant data-node {
+    null,
+    boolean(bool),
+    integer(s64),
+    number(f64),
+    %string(string),
+    %list(list<u32>),
+    %record(list<data-record-entry>),
+  }
+
+  record data-record-entry {
+    key: string,
+    value: u32,
+  }
+
+  record data-value {
+    nodes: list<data-node>,
+    root: u32,
+  }
+
+  enum data-kind {
+    null,
+    boolean,
+    integer,
+    number,
+    %string,
+    %list,
+    %record,
+  }
+
+  record state-binding {
+    segments: list<string>,
+  }
+
+  variant boolean-source {
+    constant(bool),
+    binding(state-binding),
+  }
+
+  record cause-id {
+    high: u64,
+    low: u64,
+  }
+
+  record cause-context {
+    id: cause-id,
+    parent: option<cause-id>,
+    depth: u16,
+  }
+
+  record generation-id {
+    value: u64,
+  }
+
+  record resource-handle {
+    kind: string,
+    generation: generation-id,
+    id: u64,
+  }
+
+  enum lifecycle-state {
+    installed,
+    validated,
+    active,
+    suspended,
+    disabled,
+    failed,
+    unloading,
+    removed,
+  }
+
+  record lifecycle-document-event {
+    generation: generation-id,
+  }
+
+  record lifecycle-suspended-event {
+    reason: string,
+  }
+
+  record lifecycle-settings-changed-event {
+    keys: list<string>,
+  }
+
+  record lifecycle-upgrading-event {
+    %from: extension-version,
+    to: extension-version,
+  }
+
+  variant lifecycle-event {
+    installed,
+    validated,
+    activated,
+    application-ready,
+    document-opening(lifecycle-document-event),
+    document-opened(lifecycle-document-event),
+    document-closing(lifecycle-document-event),
+    document-closed(lifecycle-document-event),
+    suspended(lifecycle-suspended-event),
+    resumed,
+    settings-changed(lifecycle-settings-changed-event),
+    upgrading(lifecycle-upgrading-event),
+    unloading,
+  }
+
+  variant event-source {
+    host,
+    extension(extension-id),
+  }
+
+  enum snapshot-kind {
+    application,
+    document,
+    viewport,
+    selection,
+    annotation,
+    theme,
+    capabilities,
+  }
+
+  variant event-subscription {
+    lifecycle,
+    commands,
+    capabilities,
+    snapshot(snapshot-kind),
+    effect-results,
+    custom(namespaced-id),
+  }
+
+  record command-invoked-event {
+    command: command-id,
+    payload: data-value,
+  }
+
+  record capabilities-changed-event {
+    snapshot: capability-snapshot,
+  }
+
+  record snapshot-changed-event {
+    snapshot: snapshot-kind,
+    value: data-value,
+  }
+
+  record effect-completed-event {
+    effect: effect-id,
+    %result: effect-result,
+  }
+
+  record task-cancelled-event {
+    task: task-id,
+    reason: string,
+  }
+
+  record custom-event {
+    event: namespaced-id,
+    payload: data-value,
+  }
+
+  record lifecycle-extension-event {
+    event: lifecycle-event,
+  }
+
+  variant extension-event {
+    lifecycle(lifecycle-extension-event),
+    command-invoked(command-invoked-event),
+    capabilities-changed(capabilities-changed-event),
+    snapshot-changed(snapshot-changed-event),
+    effect-completed(effect-completed-event),
+    task-cancelled(task-cancelled-event),
+    custom(custom-event),
+  }
+
+  record event-envelope {
+    cause: cause-context,
+    source: event-source,
+    sequence: u64,
+    event: extension-event,
+  }
+
+  record state-entry {
+    key: string,
+    value: data-value,
+  }
+
+  record extension-update {
+    state: option<list<state-entry>>,
+    effects: list<effect-request>,
+  }
+
+  enum extension-error-code {
+    permission-denied,
+    capability-unavailable,
+    invalid-request,
+    stale-resource,
+    not-found,
+    conflict,
+    quota-exceeded,
+    cancelled,
+    deadline-exceeded,
+    temporarily-unavailable,
+    internal,
+  }
+
+  record extension-error {
+    code: extension-error-code,
+    message: string,
+    retryable: bool,
+  }
+
+  type effect-result = result<data-value, extension-error>;
+
+  enum notification-tone {
+    informational,
+    success,
+    warning,
+    %error,
+  }
+
+  record capability-call-effect {
+    capability: capability-id,
+    operation: string,
+    input: data-value,
+  }
+
+  record contribution-effect {
+    contribution: contribution-id,
+  }
+
+  record storage-get-effect {
+    area: storage-area,
+    key: string,
+  }
+
+  record storage-put-effect {
+    area: storage-area,
+    key: string,
+    value: data-value,
+  }
+
+  record storage-delete-effect {
+    area: storage-area,
+    key: string,
+  }
+
+  record copy-text-effect {
+    text: string,
+  }
+
+  record open-browser-url-effect {
+    url: string,
+  }
+
+  record notify-effect {
+    message: string,
+    tone: notification-tone,
+  }
+
+  record confirm-effect {
+    title: string,
+    message: string,
+    destructive: bool,
+  }
+
+  record start-task-effect {
+    task: task-id,
+    operation: string,
+    input: data-value,
+  }
+
+  record cancel-task-effect {
+    task: task-id,
+  }
+
+  variant extension-effect {
+    capability-call(capability-call-effect),
+    open-contribution(contribution-effect),
+    close-contribution(contribution-effect),
+    storage-get(storage-get-effect),
+    storage-put(storage-put-effect),
+    storage-delete(storage-delete-effect),
+    copy-text(copy-text-effect),
+    open-browser-url(open-browser-url-effect),
+    notify(notify-effect),
+    confirm(confirm-effect),
+    start-task(start-task-effect),
+    cancel-task(cancel-task-effect),
+  }
+
+  record effect-request {
+    id: effect-id,
+    cause: cause-context,
+    effect: extension-effect,
+  }
+
+  enum storage-area {
+    settings,
+    document,
+    ephemeral-cache,
+  }
+
+  record domain-pattern {
+    value: string,
+  }
+
+  record capability-domains {
+    domains: list<domain-pattern>,
+  }
+
+  variant capability-scope {
+    application,
+    active-document,
+    document-set,
+    namespaced-storage(storage-area),
+    domains(capability-domains),
+  }
+
+  record capability-request {
+    id: capability-id,
+    version: compatible-version,
+    scope: capability-scope,
+  }
+
+  record provided-capability {
+    id: capability-id,
+    version: extension-version,
+  }
+
+  record capability-requirements {
+    required: list<capability-request>,
+    optional: list<capability-request>,
+    provided: list<provided-capability>,
+  }
+
+  enum document-access {
+    active-document,
+    user-approved-documents,
+  }
+
+  enum document-mutation {
+    redact,
+    edit-annotations,
+    rewrite-document,
+  }
+
+  record storage-permission {
+    area: storage-area,
+    quota-bytes: u64,
+  }
+
+  record network-domains {
+    domains: list<domain-pattern>,
+  }
+
+  variant network-scope {
+    none,
+    declared-domains(network-domains),
+    declared-and-user-approved(network-domains),
+    public-internet,
+  }
+
+  variant permission {
+    read-document-metadata,
+    read-document-text(document-access),
+    read-selection,
+    navigate-document,
+    add-document-overlays,
+    add-side-panel,
+    read-annotations,
+    write-annotations,
+    mutate-document(document-mutation),
+    clipboard-write,
+    open-external-url,
+    storage(storage-permission),
+    network(network-scope),
+  }
+
+  record permission-request {
+    permission: permission,
+    reason: string,
+    required: bool,
+  }
+
+  record capability-grant {
+    extension: extension-id,
+    capability: capability-id,
+    scope: capability-scope,
+  }
+
+  record capability-snapshot {
+    granted: list<capability-grant>,
+    missing-optional: list<capability-id>,
+  }
+
+  record publisher {
+    id: string,
+    name: string,
+  }
+
+  enum platform {
+    macos,
+    windows,
+    linux,
+  }
+
+  record platform-requirement {
+    platform: platform,
+    minimum-version: option<string>,
+  }
+
+  record host-compatibility {
+    extension-api: compatible-version,
+    minimum-host: option<extension-version>,
+    platforms: list<platform-requirement>,
+  }
+
+  record declarative-entrypoint {
+    ui: package-path,
+  }
+
+  record wasm-component-entrypoint {
+    component: package-path,
+    %world: string,
+    ui: option<package-path>,
+  }
+
+  record native-builtin-entrypoint {
+    adapter: native-adapter-id,
+    ui: option<package-path>,
+  }
+
+  variant extension-entrypoint {
+    declarative(declarative-entrypoint),
+    wasm-component(wasm-component-entrypoint),
+    native-builtin(native-builtin-entrypoint),
+  }
+
+  record extension-dependency {
+    id: extension-id,
+    version: compatible-version,
+    optional: bool,
+  }
+
+  record storage-requirements {
+    settings-bytes: u64,
+    document-bytes: u64,
+    ephemeral-cache-bytes: u64,
+  }
+
+  record integer-setting {
+    minimum: option<s64>,
+    maximum: option<s64>,
+  }
+
+  record number-setting {
+    minimum: option<f64>,
+    maximum: option<f64>,
+  }
+
+  record string-setting {
+    maximum-bytes: option<u32>,
+  }
+
+  record choice-setting {
+    options: list<setting-choice>,
+  }
+
+  record string-list-setting {
+    maximum-items: option<u32>,
+    maximum-item-bytes: option<u32>,
+  }
+
+  variant setting-type {
+    boolean,
+    integer(integer-setting),
+    number(number-setting),
+    %string(string-setting),
+    choice(choice-setting),
+    string-list(string-list-setting),
+  }
+
+  record setting-choice {
+    label: string,
+    value: data-value,
+  }
+
+  record setting-definition {
+    key: string,
+    label: string,
+    description: string,
+    value-type: setting-type,
+    default: data-value,
+    sensitive: bool,
+  }
+
+  record settings-schema {
+    version: u32,
+    fields: list<setting-definition>,
+  }
+
+  record command-definition {
+    id: command-id,
+    title: string,
+    description: string,
+    category: string,
+  }
+
+  record set-state-behavior {
+    binding: state-binding,
+  }
+
+  record contribution-behavior {
+    contribution: contribution-id,
+  }
+
+  variant command-behavior-action {
+    set-state(set-state-behavior),
+    open-contribution(contribution-behavior),
+    close-contribution(contribution-behavior),
+  }
+
+  record command-behavior {
+    command: command-id,
+    action: command-behavior-action,
+  }
+
+  enum contribution-slot {
+    command-palette,
+    top-toolbar,
+    pdf-floating-toolbar,
+    selection-context-pill,
+    document-overlay,
+    hover-card,
+    side-panel,
+    context-menu,
+    status-area,
+    settings-panel,
+  }
+
+  record contribution-order {
+    priority: s16,
+    before: list<contribution-id>,
+    after: list<contribution-id>,
+  }
+
+  record menu-item-order {
+    priority: s16,
+    before: list<local-id>,
+    after: list<local-id>,
+  }
+
+  variant icon-ref {
+    host(string),
+    asset(package-path),
+  }
+
+  record menu-command-item {
+    label: string,
+    command: command-id,
+    payload: option<data-value>,
+    icon: option<icon-ref>,
+    enabled: boolean-source,
+    checked: option<boolean-source>,
+  }
+
+  record menu-submenu-item {
+    label: string,
+    icon: option<icon-ref>,
+    children: list<u32>,
+  }
+
+  variant menu-item-kind {
+    command(menu-command-item),
+    submenu(menu-submenu-item),
+    separator,
+  }
+
+  record menu-item {
+    id: local-id,
+    order: menu-item-order,
+    visible: boolean-source,
+    kind: menu-item-kind,
+  }
+
+  record menu-tree {
+    items: list<menu-item>,
+    roots: list<u32>,
+  }
+
+  record menu-contribution {
+    id: contribution-id,
+    slot: menu-slot-id,
+    order: contribution-order,
+    items: menu-tree,
+  }
+
+  enum text-emphasis {
+    normal,
+    muted,
+    strong,
+    code,
+  }
+
+  enum metric-format {
+    integer,
+    decimal,
+    percentage,
+    bytes,
+  }
+
+  enum ui-tone {
+    neutral,
+    accent,
+    positive,
+    caution,
+    critical,
+  }
+
+  record ui-children {
+    children: list<u32>,
+  }
+
+  record text-node {
+    text: string,
+    selectable: bool,
+  }
+
+  record text-span {
+    text: string,
+    emphasis: text-emphasis,
+  }
+
+  record styled-text-node {
+    spans: list<text-span>,
+    selectable: bool,
+  }
+
+  record metric-node {
+    label: string,
+    value: state-binding,
+    format: metric-format,
+  }
+
+  record markdown-node {
+    markdown: string,
+    selectable: bool,
+  }
+
+  record button-node {
+    label: string,
+    command: command-id,
+    payload: option<data-value>,
+  }
+
+  record icon-button-node {
+    icon: icon-ref,
+    label: string,
+    command: command-id,
+  }
+
+  record toggle-node {
+    label: string,
+    value: state-binding,
+    command: command-id,
+  }
+
+  record select-option {
+    label: string,
+    value: data-value,
+  }
+
+  record select-node {
+    label: string,
+    value: state-binding,
+    options: list<select-option>,
+    command: command-id,
+  }
+
+  record text-field-node {
+    label: string,
+    value: state-binding,
+    command: command-id,
+    maximum-bytes: u32,
+  }
+
+  record ui-tab {
+    id: local-id,
+    label: string,
+    content: u32,
+  }
+
+  record tabs-node {
+    tabs: list<ui-tab>,
+    selected: state-binding,
+    command: command-id,
+  }
+
+  record badge-node {
+    label: string,
+    tone: ui-tone,
+  }
+
+  record image-node {
+    asset: package-path,
+    alternative-text: string,
+  }
+
+  record progress-node {
+    label: string,
+    basis-points: u16,
+  }
+
+  variant ui-node-kind {
+    column(ui-children),
+    row(ui-children),
+    stack(ui-children),
+    text(text-node),
+    styled-text(styled-text-node),
+    metric(metric-node),
+    markdown(markdown-node),
+    button(button-node),
+    icon-button(icon-button-node),
+    toggle(toggle-node),
+    select(select-node),
+    text-field(text-field-node),
+    %list(ui-children),
+    tabs(tabs-node),
+    badge(badge-node),
+    divider,
+    image(image-node),
+    progress(progress-node),
+    spacer,
+  }
+
+  record ui-node {
+    id: local-id,
+    visible: boolean-source,
+    kind: ui-node-kind,
+  }
+
+  record ui-tree {
+    nodes: list<ui-node>,
+    root: u32,
+  }
+
+  record ui-contribution {
+    id: contribution-id,
+    slot: contribution-slot,
+    order: contribution-order,
+    root: ui-tree,
+  }
+
+  record contribution-set {
+    commands: list<command-definition>,
+    command-behaviors: list<command-behavior>,
+    menus: list<menu-contribution>,
+    views: list<ui-contribution>,
+  }
+
+  record extension-manifest {
+    schema-version: u16,
+    id: extension-id,
+    name: string,
+    version: extension-version,
+    publisher: publisher,
+    description: string,
+    license: string,
+    compatibility: host-compatibility,
+    entrypoint: extension-entrypoint,
+    dependencies: list<extension-dependency>,
+    capabilities: capability-requirements,
+    permissions: list<permission-request>,
+    contributions: contribution-set,
+    settings: settings-schema,
+    storage: storage-requirements,
+  }
+
+  enum validation-code {
+    unsupported-schema,
+    invalid-identifier,
+    invalid-package-path,
+    invalid-entrypoint,
+    invalid-field,
+    string-too-long,
+    limit-exceeded,
+    duplicate,
+    foreign-namespace,
+    unknown-command,
+    unknown-contribution,
+    missing-dependency,
+    incompatible-dependency,
+    dependency-cycle,
+    ordering-cycle,
+    invalid-domain,
+    invalid-setting,
+    invalid-value,
+  }
+
+  record validation-error {
+    code: validation-code,
+    path: string,
+    message: string,
+  }
+
+  record validation-errors {
+    errors: list<validation-error>,
+  }
+
+  record validation-limits {
+    maximum-dependencies: u64,
+    maximum-capabilities: u64,
+    maximum-permissions: u64,
+    maximum-contributions: u64,
+    maximum-commands: u64,
+    maximum-ui-nodes: u64,
+    maximum-ui-depth: u64,
+    maximum-children-per-node: u64,
+    maximum-menu-items: u64,
+    maximum-menu-depth: u64,
+    maximum-string-bytes: u64,
+    maximum-list-items: u64,
+    maximum-value-nodes: u64,
+    maximum-value-depth: u64,
+    maximum-binding-segments: u64,
+    maximum-storage-bytes-per-area: u64,
+    maximum-settings: u64,
+    maximum-effect-batch: u64,
+    maximum-event-batch: u64,
+    maximum-dispatch-depth: u16,
+  }
+
+  record activation-context {
+    extension: extension-id,
+    generation: generation-id,
+    cause: cause-context,
+    capabilities: capability-snapshot,
+  }
+}
+
+/// The typed component contract corresponding to the native extension adapter.
+/// The current runtime may adapt this world through its compatibility transport;
+/// hosts still arbitrate every returned effect and never grant ambient WASI.
+interface guest {
+  use types.{activation-context, event-envelope, event-subscription, extension-error, extension-update};
+
+  subscriptions: func() -> list<event-subscription>;
+  activate: func(context: activation-context) -> result<extension-update, extension-error>;
+  handle-event: func(event: event-envelope) -> result<extension-update, extension-error>;
+  suspend: func(reason: string) -> result<_, extension-error>;
+  resume: func(context: activation-context) -> result<extension-update, extension-error>;
+  unload: func();
+}
+
+/// Conformance world for the generic semantic extension boundary. Capability
+/// interfaces such as `key:pdf-extension` are linked separately and only when
+/// the host has granted their required permissions.
+world semantic-extension {
+  export guest;
+}

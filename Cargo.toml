@@ -1,26 +1,48 @@
-[package]
-name = "gpui-pdf-reader"
+[workspace]
+members = [
+    "apps/gpui-pdf-reader",
+    "crates/key-editor-core",
+    "crates/key-editor-gpui",
+    "crates/key-extension-api",
+    "crates/key-extension-gpui",
+    "crates/key-extension-host",
+    "crates/key-extension-package",
+    "crates/key-extension-wasm",
+    "crates/key-pdf-core",
+    "crates/key-pdf-extension-api",
+    "crates/key-pdf-gpui",
+    "crates/key-pdf-runtime",
+    "crates/key-pdfium",
+    "crates/key-safe-http",
+    "crates/key-sidecar-store",
+    "crates/key-ui-gpui",
+    "extensions/key-reference",
+    "extensions/key-pdf-toc",
+]
+default-members = ["apps/gpui-pdf-reader"]
+# This patched dependency has its own focused engine-parity test command. Keep
+# it outside the product workspace so Cargo can execute that manifest directly.
+exclude = ["vendor/pdfium-render-tile"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "A fast native PDF reader built with GPUI and PDFium"
 
-[dependencies]
+[workspace.dependencies]
 image = { version = "0.25.1", default-features = false }
 open = "5.4.0"
 pdfium-render = { version = "=0.9.2", default-features = false, features = ["pdfium_7763"] }
 reqwest = { package = "zed-reqwest", version = "=0.12.15-zed", default-features = false, features = ["blocking"] }
+semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha2 = "0.10.9"
 tempfile = "3.24.0"
+toml = "0.8.23"
 url = "2.5.8"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-block2 = { version = "0.6.2", default-features = false, features = ["std"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSEvent"] }
-gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
-gpui-component = "=0.5.1"
-gpui-component-assets = "=0.5.1"
+zip = { version = "8.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [patch.crates-io]
 pdfium-render = { path = "vendor/pdfium-render-tile" }
@@ -35,9 +57,9 @@ cbindgen = { path = "vendor/cbindgen-compat" }
 # zed-font-kit uses dirs on macOS; dirs declares this MPL-only utility. This
 # independently written MIT implementation supplies its three-method API.
 option-ext = { path = "vendor/option-ext-compat" }
-# zed-font-kit also declares the MPL-only dwrote package for Windows. GPUI PDF Reader
-# is macOS-only, so this MIT placeholder is never compiled, but keeps even the
-# resolved lock graph inside the project's license policy.
+# zed-font-kit also declares the MPL-only dwrote package for Windows. GPUI PDF
+# Reader is macOS-only, so this MIT placeholder is never compiled, but keeps
+# even the resolved lock graph inside the project's license policy.
 dwrote = { path = "vendor/dwrote-compat" }
 
 [profile.release]

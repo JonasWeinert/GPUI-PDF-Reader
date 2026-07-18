@@ -1,7 +1,12 @@
 # Rust build output. The vendored crate has its own Cargo target directory.
 /target/
 /vendor/*/target/
+**/target/
 **/*.rs.bk
+
+# Python tooling caches produced by packaging helpers.
+__pycache__/
+*.py[cod]
 
 # Local annotation sidecars and interrupted atomic-save temporaries.
 *.gpui-pdf-reader.json

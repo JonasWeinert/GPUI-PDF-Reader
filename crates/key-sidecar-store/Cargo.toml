@@ -1,0 +1,20 @@
+[package]
+name = "key-sidecar-store"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Reusable atomic annotation sidecar storage for Key applications"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+key-extension-api = { path = "../key-extension-api" }
+key-extension-host = { path = "../key-extension-host" }
+key-pdf-core = { path = "../key-pdf-core" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

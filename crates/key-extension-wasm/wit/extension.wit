@@ -1,0 +1,16 @@
+package key:extension-runtime@0.1.0;
+
+/// Compatibility transport world used by the first extension runtime adapter.
+/// The typed, runtime-neutral contract lives in
+/// `key:extension-api/semantic-extension@0.1.0`; this byte transport preserves
+/// already-built local development components while generated typed adapters
+/// are introduced. Event and update bytes use the versioned `ExtensionUpdate`
+/// JSON representation from key-extension-api (an optional immutable UI state
+/// snapshot plus effects). Host capabilities are deliberately absent: a host
+/// must explicitly link a separately permissioned WIT interface before a
+/// component can import it.
+world extension {
+    export activate: func();
+    export handle-event: func(event-json: list<u8>) -> list<u8>;
+    export deactivate: func();
+}
