@@ -2,12 +2,13 @@
 
 ## Status
 
-Draft for discussion. This document authorizes no implementation work.
+Approved and implemented through the read-only extension pilots on the
+`modularisation` branch. The evidence and intentionally deferred boundaries are
+tracked in `notes/refactor-implementation-status.md`.
 
-The refactor starts only after the owner and implementer have reviewed this
-order, resolved the decisions marked as gates, and explicitly approved the
-first phase. Later high-risk phases require their own approval even if earlier
-work has begun.
+The mutation/redaction design and the future multi-document Key application
+remain separate approval gates. This implementation does not treat the earlier
+approval of the workspace refactor as authority for those product changes.
 
 ## Related decisions
 

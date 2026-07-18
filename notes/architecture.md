@@ -20,6 +20,9 @@ release cadence, and compatibility policy.
   `key-extension-host` owns lifecycle and policy, `key-extension-gpui` renders
   bounded data trees, and optional `key-extension-wasm` executes Component
   Model guests without WASI.
+- `key-pdf-toc` is the first host-managed PDF feature pilot. Its trusted rail
+  dispatches through extension lifecycle, permissions, outline, and navigation
+  capabilities rather than receiving engine handles.
 - `gpui-pdf-reader` owns product policy: windows, menus, file dialogs, PDFium
   discovery, default features, permission prompts, and release packaging.
 
@@ -65,7 +68,8 @@ pointer authority.
   Nested menus are supported only in product-owned slots; packages cannot
   invent global z-order or arbitrary native views.
 - Wasm packages get isolated stores, fuel, epoch deadlines, memory/table/stack
-  limits, bounded inputs and outputs, and no default WASI imports.
+  limits, bounded input/result mailboxes, cancellable off-GPUI execution, and
+  no default WASI imports.
 - The PDF capability bridge publishes generation-scoped metadata, text,
   selection, viewport, outline, and link snapshots. Navigation and overlays
   return through the shared jump and paint abstractions.
@@ -81,6 +85,9 @@ annotates PDFs through the same core/runtime boundaries.
 - Annotation stores use compare-and-save semantics and atomic replacement.
   The standalone app injects adjacent JSON sidecars; a future app can inject a
   database without changing the editor or PDF domain.
+- Extension settings and document state are separately namespaced, atomically
+  persisted, and quota-enforced. Ephemeral extension cache and tasks are
+  invalidated before a new document generation becomes visible.
 - Keep website preview and scholarly networking outside the PDFium worker.
   `key-safe-http` bounds domains, redirects, resolved addresses, time, bytes,
   content types, image dimensions, concurrency, and cancellation.

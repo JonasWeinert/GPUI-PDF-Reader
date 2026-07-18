@@ -4,6 +4,10 @@
 **/target/
 **/*.rs.bk
 
+# Python tooling caches produced by packaging helpers.
+__pycache__/
+*.py[cod]
+
 # Local annotation sidecars and interrupted atomic-save temporaries.
 *.gpui-pdf-reader.json
 *.gpui-pdf-reader.json.tmp-*

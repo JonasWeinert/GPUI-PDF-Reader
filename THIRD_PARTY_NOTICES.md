@@ -7,8 +7,8 @@ Keep them with redistributed source and binary bundles.
 ## Rust dependency graph
 
 The default standard `aarch64-apple-darwin` normal/build graph currently
-contains 576 unique package records; the minimal `--no-default-features` graph
-contains 524. The repository guard currently checks 787 unique host and
+contains 577 unique package records; the minimal `--no-default-features` graph
+contains 525. The repository guard currently checks 788 unique host and
 cross-target normal/build/dev records across the workspace. Every selected
 record has an MIT, Apache-2.0, or more-permissive license choice:
 BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, CC0-1.0, MIT-0, Unlicense,
