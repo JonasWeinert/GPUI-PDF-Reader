@@ -62,8 +62,14 @@ assert_scenario_report() {
   case "$assert_scenario" in
     reference)
       case "$assert_report" in
-        *"extension_packages=2 "*"extension_active=2 "*"extension_suspended=0 "*"extension_panel=org.key.reference.document-statistics "*"extension_checks=7 "*"extension_native_rejected=0 "*) ;;
+        *"extension_packages=2 "*"extension_active=2 "*"extension_suspended=0 "*"extension_panel=org.key.reference.document-statistics "*"extension_checks=11 "*"extension_native_rejected=0 "*) ;;
         *) fail_case "$assert_name" "reference packages did not exercise the expected live app surfaces" ;;
+      esac
+      ;;
+    manager)
+      case "$assert_report" in
+        *"extension_packages=1 "*"extension_active=1 "*"extension_suspended=0 "*"extension_panel=none "*"extension_checks=6 "*"extension_native_rejected=0 "*) ;;
+        *) fail_case "$assert_name" "extension manager review and settings flow did not complete" ;;
       esac
       ;;
     restore)
@@ -146,5 +152,6 @@ cd "$root"
 cargo build --locked
 
 run_case install_and_use reference "$reference_data"
+run_case review_and_configure manager "$tmp_dir/manager-data"
 run_case restore_and_use restore "$reference_data"
 run_case contain_hostile adversarial "$adversarial_data"

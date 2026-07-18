@@ -26,6 +26,8 @@
   capabilities, contributions, events, effects, quotas, cause chains, settings,
   lifecycle, safe mode, and document generations.
 - Menubar contributions support typed host-owned slots and nested submenus.
+  Every active local package receives a Tools → Extensions entry with a
+  declared direct-command trigger or a detail/settings fallback.
 - Declarative packages use bounded host-rendered GPUI nodes and validated
   assets. The reference theme pack proves no-code installation.
 - Wasm components run on bounded workers outside GPUI callbacks. Queue memory,
@@ -34,7 +36,10 @@
   builds do not include Wasmtime.
 - Installed package source hashes, enablement, permission decisions, settings,
   assets, and restoration failures are durable. The manager exposes individual
-  permission grants and revocation. Asynchronous Wasm upgrades stay provisional
+  permission grants and revocation. Install review and bounded manifest settings
+  are rendered in sliding host-owned manager pages without a second system
+  confirmation; contributed extension UI uses an independent floating panel.
+  Asynchronous Wasm upgrades stay provisional
   until their worker settles; failure restores the prior package, adapter,
   authority snapshot, durable registry entry, and assets.
 - Host semantic services execute namespaced storage and registered cancellable

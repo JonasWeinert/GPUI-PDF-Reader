@@ -830,7 +830,6 @@ impl Render for PdfReader {
             SidePanel::Comments => self.render_comments_panel(cx),
             SidePanel::Search => self.render_search_panel(cx),
             SidePanel::Extensions => self.render_extensions_panel(cx),
-            SidePanel::Contribution => self.render_extension_contribution_panel(cx),
         };
         let workspace = match self.view_mode {
             ReaderView::Classic => {
@@ -966,6 +965,7 @@ impl Render for PdfReader {
 
         let reference_details_panel =
             self.render_reference_details_panel(palette, full_width, window, cx);
+        let extension_ui_panel = self.render_extension_ui_floating_panel(palette, full_width, cx);
         div()
             .key_context("PdfReader")
             .track_focus(&self.focus_handle)
@@ -977,6 +977,7 @@ impl Render for PdfReader {
             .on_action(cx.listener(Self::open_dialog))
             .on_action(cx.listener(Self::install_extension_dialog))
             .on_action(cx.listener(Self::manage_extensions))
+            .on_action(cx.listener(Self::open_extension_details_action))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::actual_size))
@@ -1007,6 +1008,7 @@ impl Render for PdfReader {
             .child(toolbar)
             .children(error_bar)
             .child(workspace)
+            .children(extension_ui_panel)
             .children(reference_details_panel)
     }
 }

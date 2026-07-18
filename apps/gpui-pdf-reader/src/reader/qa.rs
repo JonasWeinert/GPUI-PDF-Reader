@@ -518,9 +518,76 @@ impl PdfReader {
     ) -> Result<bool, String> {
         match scenario {
             "reference" => self.qa_drive_reference_extensions(window, cx),
+            "manager" => self.qa_drive_extension_manager(window, cx),
             "restore" => self.qa_drive_restored_extensions(window, cx),
             "adversarial" => self.qa_drive_adversarial_extension(window, cx),
             _ => Err(format!("unknown extension QA scenario {scenario:?}")),
+        }
+    }
+
+    #[cfg(all(debug_assertions, feature = "installable-extensions"))]
+    fn qa_drive_extension_manager(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        const THEME: &str = "org.key.reference.theme-pack";
+        match self.qa_extension_phase {
+            QaExtensionPhase::Seed => {
+                self.install_extension_path(
+                    qa_extension_package_path("reference-theme-pack"),
+                    window,
+                    cx,
+                );
+                self.qa_extension_phase = QaExtensionPhase::WaitReference;
+                Ok(false)
+            }
+            QaExtensionPhase::WaitReference => {
+                if !self.qa_viewport_is_settled() {
+                    return Ok(false);
+                }
+                let review_is_open = matches!(
+                    self.extension_manager_page,
+                    Some(ExtensionManagerPage::InstallReview { ref preview, .. })
+                        if preview.extension.as_str() == THEME
+                );
+                if !review_is_open
+                    || self.sidebar.panel != SidePanel::Extensions
+                    || self.sidebar.progress < 0.999
+                {
+                    return Err("extension install review did not open inside the manager".into());
+                }
+                self.qa_extension_checks += 2;
+                self.confirm_extension_install(window, cx);
+                self.qa_extension_phase = QaExtensionPhase::WaitReferencePanel;
+                Ok(false)
+            }
+            QaExtensionPhase::WaitReferencePanel => {
+                if !self.qa_viewport_is_settled() {
+                    return Ok(false);
+                }
+                self.refresh_extension_manager_state();
+                let theme = ExtensionId::parse(THEME).expect("static QA extension ID");
+                let details_are_open = matches!(
+                    self.extension_manager_page,
+                    Some(ExtensionManagerPage::Details(ref extension)) if extension == &theme
+                );
+                if !details_are_open
+                    || !qa_packages_are_active(&self.extension_packages, &[THEME])
+                    || !self.extension_setting_inputs.contains_key("display-name")
+                    || self.extension_contribution.is_some()
+                    || self.extension_ui_panel.value() > 0.001
+                {
+                    return Err(
+                        "reviewed extension did not reach its host-rendered settings detail".into(),
+                    );
+                }
+                self.qa_extension_checks += 4;
+                self.qa_extension_phase = QaExtensionPhase::Complete;
+                Ok(true)
+            }
+            QaExtensionPhase::Complete => Ok(true),
+            _ => Err("extension manager scenario entered an invalid phase".into()),
         }
     }
 
@@ -656,7 +723,63 @@ impl PdfReader {
                         self.extension_commands.len()
                     ));
                 }
-                self.qa_extension_checks += 3;
+                let tool_entries = self.extensions.extension_tool_entries();
+                let theme = ExtensionId::parse(THEME).expect("static QA extension ID");
+                let statistics = ExtensionId::parse(STATISTICS).expect("static QA extension ID");
+                if tool_entries.len() != 2
+                    || tool_entries
+                        .iter()
+                        .find(|entry| entry.extension == theme)
+                        .is_none_or(|entry| entry.action.is_some())
+                    || tool_entries
+                        .iter()
+                        .find(|entry| entry.extension == statistics)
+                        .and_then(|entry| entry.action.as_ref())
+                        .is_none_or(|action| action.command.as_str() != STATISTICS_COMMAND)
+                {
+                    return Err(
+                        "Tools → Extensions entries did not honor trigger/fallback declarations"
+                            .into(),
+                    );
+                }
+                self.extensions
+                    .set_package_setting(
+                        &theme,
+                        "display-name",
+                        DataValue::String("QA palette".into()),
+                    )
+                    .map_err(|error| format!("string setting update failed: {error}"))?;
+                self.extensions
+                    .set_package_setting(&theme, "follow-document", DataValue::Boolean(false))
+                    .map_err(|error| format!("boolean setting update failed: {error}"))?;
+                self.refresh_extension_manager_state();
+                let theme_summary = self
+                    .extension_packages
+                    .iter()
+                    .find(|package| package.extension == theme)
+                    .ok_or_else(|| "theme summary disappeared after setting update".to_owned())?;
+                if qa_nested_state(
+                    &match theme_summary.settings.as_ref() {
+                        Some(DataValue::Record(settings)) => settings.clone(),
+                        _ => return Err("theme settings were not persisted as a record".into()),
+                    },
+                    &["display-name"],
+                ) != Some(&DataValue::String("QA palette".into()))
+                {
+                    return Err("host-rendered string setting was not persisted".into());
+                }
+                self.open_extension_details(theme, window, cx);
+                if !self.extension_setting_inputs.contains_key("display-name")
+                    || !matches!(
+                        self.extension_manager_page,
+                        Some(ExtensionManagerPage::Details(_))
+                    )
+                {
+                    return Err(
+                        "extension details did not prepare its host-rendered settings".into(),
+                    );
+                }
+                self.qa_extension_checks += 7;
                 self.invoke_extension_command(
                     &InvokeExtensionCommand {
                         command: key_extension_api::CommandId::parse(STATISTICS_COMMAND)
@@ -678,8 +801,7 @@ impl PdfReader {
                     .extension_contribution
                     .as_ref()
                     .is_none_or(|pane| pane.owner != expected)
-                    || self.sidebar.panel != SidePanel::Contribution
-                    || self.sidebar.progress < 0.999
+                    || self.extension_ui_panel.value() < 0.999
                 {
                     return Ok(false);
                 }
@@ -749,7 +871,7 @@ impl PdfReader {
                     .extension_contribution
                     .as_ref()
                     .is_none_or(|pane| pane.owner != expected)
-                    || self.sidebar.progress < 0.999
+                    || self.extension_ui_panel.value() < 0.999
                 {
                     return Ok(false);
                 }
@@ -898,6 +1020,17 @@ impl PdfReader {
             || self.reference_details_transition.is_animating()
             || self.reference_citation_expansion.is_animating()
             || self.reference_summary_transition.is_animating()
+            || self.extension_ui_panel.is_animating()
+            || {
+                #[cfg(feature = "installable-extensions")]
+                {
+                    self.extension_manager_transition.is_animating()
+                }
+                #[cfg(not(feature = "installable-extensions"))]
+                {
+                    false
+                }
+            }
             || self.doi_copy_started.is_some()
             || self.link_card_expansion.is_animating()
             || self.link_card_pointer_is_animating()

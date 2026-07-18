@@ -1,3 +1,4 @@
+use crate::OpenExtensionDetails;
 use crate::annotations::{
     AnnotationId, AnnotationSet, DocumentIdentity, HighlightColor, MAX_TEXT_CHARACTER_INDEX,
     TextRange,
@@ -69,7 +70,7 @@ use key_extension_api::{
     ExtensionErrorCode, ExtensionId, SnapshotKind,
 };
 #[cfg(feature = "installable-extensions")]
-use key_extension_api::{LifecycleState, Permission};
+use key_extension_api::{LifecycleState, Permission, SettingType};
 use key_extension_gpui::{BoundedStateMap, DeclarativeView, InvokeExtensionCommand};
 use key_extension_host::{ArbitratedEffect, ServiceDispatch};
 #[cfg(feature = "installable-extensions")]
@@ -105,6 +106,7 @@ use std::time::{Duration, Instant};
 
 mod annotation_io;
 mod comments;
+mod extensions;
 #[cfg(debug_assertions)]
 mod qa;
 mod references;
@@ -315,7 +317,16 @@ enum SidePanel {
     Comments,
     Search,
     Extensions,
-    Contribution,
+}
+
+#[cfg(feature = "installable-extensions")]
+#[derive(Clone)]
+enum ExtensionManagerPage {
+    InstallReview {
+        path: PathBuf,
+        preview: Box<PackageInstallPreview>,
+    },
+    Details(ExtensionId),
 }
 
 struct ExtensionContributionPane {
@@ -506,10 +517,17 @@ enum ReaderStatus {
 pub struct PdfReader {
     extensions: ReaderExtensions,
     extension_contribution: Option<ExtensionContributionPane>,
+    extension_ui_panel: RevealState,
     #[cfg(feature = "installable-extensions")]
     extension_packages: Vec<InstalledPackageSummary>,
     #[cfg(feature = "installable-extensions")]
     extension_commands: Vec<OwnedCommand>,
+    #[cfg(feature = "installable-extensions")]
+    extension_manager_page: Option<ExtensionManagerPage>,
+    #[cfg(feature = "installable-extensions")]
+    extension_manager_transition: RevealState,
+    #[cfg(feature = "installable-extensions")]
+    extension_setting_inputs: HashMap<String, Entity<TextField>>,
     extension_text_statistics: HashMap<usize, (usize, usize)>,
     extension_snapshot_dispatch: ExtensionSnapshotDispatch,
     extension_snapshot_task: Option<Task<()>>,
@@ -678,10 +696,17 @@ impl PdfReader {
             Self {
                 extensions,
                 extension_contribution: None,
+                extension_ui_panel: RevealState::default(),
                 #[cfg(feature = "installable-extensions")]
                 extension_packages: Vec::new(),
                 #[cfg(feature = "installable-extensions")]
                 extension_commands: Vec::new(),
+                #[cfg(feature = "installable-extensions")]
+                extension_manager_page: None,
+                #[cfg(feature = "installable-extensions")]
+                extension_manager_transition: RevealState::default(),
+                #[cfg(feature = "installable-extensions")]
+                extension_setting_inputs: HashMap::new(),
                 extension_text_statistics: HashMap::new(),
                 extension_snapshot_dispatch: ExtensionSnapshotDispatch::default(),
                 extension_snapshot_task: None,
@@ -1558,9 +1583,8 @@ impl PdfReader {
                 };
 
                 // NSOpenPanel resolves its completion before AppKit has fully
-                // dismissed the sheet. Starting the permission-review prompt
-                // in that callback can silently drop the second modal. Cross
-                // one foreground turn before opening the review UI.
+                // dismissed the sheet. Cross one foreground turn before
+                // moving the Extensions panel to the in-app review page.
                 cx.background_executor()
                     .timer(Duration::from_millis(50))
                     .await;
@@ -1602,61 +1626,14 @@ impl PdfReader {
                 return;
             }
         };
-        let source = match preview.source {
-            PackageSourceKind::KeyextArchive => "Package archive",
-            PackageSourceKind::DevelopmentDirectory => "Local development directory",
-        };
-        let trust = if preview.publisher_verified {
-            "Publisher signature verified"
-        } else {
-            "Publisher identity is not verified"
-        };
-        let ui_kind = preview.ui_kind.as_deref().unwrap_or("host-rendered");
-        let permissions = if preview.required_permissions.is_empty() {
-            "No required permissions requested.".to_owned()
-        } else {
-            preview
-                .required_permissions
-                .iter()
-                .map(|request| format!("• {:?}: {}", request.permission, request.reason))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let detail = format!(
-            "{} {}\nLicense: {}\nTrust: {trust}\nSource: {source}\nUI: {ui_kind}\n\nRequired permissions\n{permissions}",
-            preview.name, preview.version, preview.license
-        );
-        let title = if preview.is_upgrade {
-            "Review extension update"
-        } else {
-            "Review extension installation"
-        };
-        let action = if preview.is_upgrade {
-            "Update and Enable"
-        } else {
-            "Install and Enable"
-        };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            title,
-            Some(&detail),
-            &[PromptButton::cancel("Cancel"), PromptButton::ok(action)],
+        self.open_extension_manager_page(
+            ExtensionManagerPage::InstallReview {
+                path,
+                preview: Box::new(preview),
+            },
+            window,
             cx,
         );
-        let weak = cx.weak_entity();
-        window
-            .spawn(cx, async move |cx| {
-                if answer.await.ok() != Some(1) {
-                    return;
-                }
-                let _ = cx.update(|window, cx| {
-                    weak.update(cx, |reader, cx| {
-                        reader.install_extension_after_review(path, preview, window, cx)
-                    })
-                    .ok();
-                });
-            })
-            .detach();
     }
 
     #[cfg(feature = "installable-extensions")]
@@ -1734,95 +1711,21 @@ impl PdfReader {
                 crate::rebuild_application_menus(&mut self.extensions, cx);
             }
             PackageActivation::AwaitingPermissions(permissions) => {
-                let permission_detail = permissions
-                    .iter()
-                    .map(|request| format!("• {:?}: {}", request.permission, request.reason))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let trust = if report.publisher_verified {
-                    "Publisher signature verified."
-                } else {
-                    "Local package; publisher identity is not verified."
-                };
-                let detail = format!(
-                    "{} {}\nLicense: {}\n{trust}\n\n{permission_detail}",
-                    report.name, report.version, report.license
+                self.warning = Some(
+                    format!(
+                        "{} needs {} required permission{} before it can be enabled",
+                        report.name,
+                        permissions.len(),
+                        if permissions.len() == 1 { "" } else { "s" }
+                    )
+                    .into(),
                 );
-                let extension = report.extension;
-                let name = report.name;
-                let version = report.version;
-                let answer = window.prompt(
-                    PromptLevel::Warning,
-                    "Allow extension permissions?",
-                    Some(&detail),
-                    &[
-                        PromptButton::cancel("Keep Disabled"),
-                        PromptButton::ok("Allow and Enable"),
-                    ],
+                self.refresh_extension_manager_state();
+                self.open_extension_manager_page(
+                    ExtensionManagerPage::Details(report.extension),
+                    window,
                     cx,
                 );
-                let weak = cx.weak_entity();
-                window
-                    .spawn(cx, async move |cx| {
-                        let allow = answer.await.ok() == Some(1);
-                        let _ = cx.update(|window, cx| {
-                            weak.update(cx, |reader, cx| {
-                                if allow {
-                                    match reader.extensions.approve_package(&extension) {
-                                        Ok(report)
-                                            if report.activation == PackageActivation::Active =>
-                                        {
-                                            reader.warning = Some(
-                                                format!("{verb} {name} {version}").into(),
-                                            );
-                                        }
-                                        Ok(report) => {
-                                            reader.warning = Some(
-                                                format!(
-                                                    "Installed {name}, but activation remains {:?}",
-                                                    report.activation
-                                                )
-                                                .into(),
-                                            );
-                                        }
-                                        Err(error) => {
-                                            reader.warning = Some(
-                                                format!("Could not enable {name}: {error}").into(),
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    match reader.extensions.deny_package_permissions(&extension) {
-                                        Ok(()) => {
-                                            reader.warning = Some(
-                                                if verb == "Updated" {
-                                                    format!(
-                                                        "Kept the current {name} version; update not applied"
-                                                    )
-                                                } else {
-                                                    format!("Kept {name} disabled")
-                                                }
-                                                .into(),
-                                            );
-                                        }
-                                        Err(error) => {
-                                            reader.warning = Some(
-                                                format!("Could not keep {name} disabled: {error}")
-                                                    .into(),
-                                            );
-                                        }
-                                    }
-                                }
-                                reader.refresh_extension_manager_state();
-                                crate::rebuild_application_menus(&mut reader.extensions, cx);
-                                reader.refresh_active_extension_view(window, cx);
-                                reader.schedule_extension_snapshot_sync(window, cx);
-                                cx.notify();
-                            })
-                            .ok();
-                        });
-                    })
-                    .detach();
             }
         }
         cx.notify();
@@ -1835,8 +1738,232 @@ impl PdfReader {
         cx: &mut Context<Self>,
     ) {
         #[cfg(feature = "installable-extensions")]
-        self.refresh_extension_manager_state();
+        {
+            self.refresh_extension_manager_state();
+            self.show_extension_manager_overview(window, cx);
+        }
         self.show_sidebar(SidePanel::Extensions, window, cx);
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn open_extension_manager_page(
+        &mut self,
+        page: ExtensionManagerPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.extension_setting_inputs.clear();
+        if let ExtensionManagerPage::Details(extension) = &page {
+            self.prepare_extension_setting_inputs(extension.clone(), window, cx);
+        }
+        self.extension_manager_page = Some(page);
+        self.extension_manager_transition = RevealState::default();
+        self.extension_manager_transition.set_target(1.0);
+        self.show_sidebar(SidePanel::Extensions, window, cx);
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn show_extension_manager_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.extension_manager_page.is_none() {
+            return;
+        }
+        self.extension_manager_transition.set_target(0.0);
+        self.start_animation(window, cx);
+        cx.notify();
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn open_extension_details(
+        &mut self,
+        extension: ExtensionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_extension_manager_state();
+        if self
+            .extension_packages
+            .iter()
+            .any(|package| package.extension == extension)
+        {
+            self.open_extension_manager_page(ExtensionManagerPage::Details(extension), window, cx);
+        }
+    }
+
+    fn open_extension_details_action(
+        &mut self,
+        action: &OpenExtensionDetails,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(feature = "installable-extensions")]
+        self.open_extension_details(action.extension.clone(), window, cx);
+        #[cfg(not(feature = "installable-extensions"))]
+        {
+            let _ = (action, window, cx);
+        }
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn confirm_extension_install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ExtensionManagerPage::InstallReview { path, preview }) =
+            self.extension_manager_page.take()
+        else {
+            return;
+        };
+        let extension = preview.extension.clone();
+        self.install_extension_after_review(path, *preview, window, cx);
+        self.refresh_extension_manager_state();
+        if self
+            .extension_packages
+            .iter()
+            .any(|package| package.extension == extension)
+        {
+            self.open_extension_manager_page(ExtensionManagerPage::Details(extension), window, cx);
+        } else {
+            self.show_extension_manager_overview(window, cx);
+        }
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn prepare_extension_setting_inputs(
+        &mut self,
+        extension: ExtensionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(package) = self
+            .extension_packages
+            .iter()
+            .find(|package| package.extension == extension)
+            .cloned()
+        else {
+            return;
+        };
+        for setting in package.settings_schema.fields.iter().filter(|setting| {
+            !setting.sensitive
+                && matches!(
+                    setting.value_type,
+                    SettingType::String { .. }
+                        | SettingType::Integer { .. }
+                        | SettingType::Number { .. }
+                )
+        }) {
+            let maximum_bytes = match &setting.value_type {
+                SettingType::String { maximum_bytes } => {
+                    maximum_bytes.unwrap_or(4_096).min(64 * 1024) as usize
+                }
+                _ => 128,
+            };
+            let current = extension_setting_value(&package, &setting.key)
+                .map(extension_setting_text)
+                .unwrap_or_default();
+            let placeholder = setting.label.clone();
+            let field = cx.new(|cx| {
+                let mut field = TextField::new(cx, placeholder, maximum_bytes);
+                let _ = field.set_text(&current, cx);
+                field
+            });
+            let field_for_event = field.clone();
+            let extension_for_event = extension.clone();
+            let key = setting.key.clone();
+            cx.subscribe_in(
+                &field,
+                window,
+                move |reader, _, event, window, cx| match event {
+                    TextFieldEvent::Submit => {
+                        let text = field_for_event.read(cx).text().to_owned();
+                        reader.apply_extension_setting_text(
+                            extension_for_event.clone(),
+                            key.clone(),
+                            text,
+                            window,
+                            cx,
+                        );
+                    }
+                    TextFieldEvent::Rejected(rejection) => {
+                        reader.warning = Some(rejection.to_string().into());
+                        cx.notify();
+                    }
+                    TextFieldEvent::Changed(_) | TextFieldEvent::Cancel => {}
+                },
+            )
+            .detach();
+            self.extension_setting_inputs
+                .insert(setting.key.clone(), field);
+        }
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn apply_extension_setting_text(
+        &mut self,
+        extension: ExtensionId,
+        key: String,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(setting) = self
+            .extension_packages
+            .iter()
+            .find(|package| package.extension == extension)
+            .and_then(|package| {
+                package
+                    .settings_schema
+                    .fields
+                    .iter()
+                    .find(|setting| setting.key == key)
+            })
+        else {
+            return;
+        };
+        let value = match &setting.value_type {
+            SettingType::String { .. } => DataValue::String(text),
+            SettingType::Integer { .. } => match text.parse::<i64>() {
+                Ok(value) => DataValue::Integer(value),
+                Err(_) => {
+                    self.warning = Some(format!("{} must be a whole number", setting.label).into());
+                    cx.notify();
+                    return;
+                }
+            },
+            SettingType::Number { .. } => match text.parse::<f64>() {
+                Ok(value) if value.is_finite() => DataValue::Number(value),
+                _ => {
+                    self.warning = Some(format!("{} must be a number", setting.label).into());
+                    cx.notify();
+                    return;
+                }
+            },
+            _ => return,
+        };
+        self.apply_extension_setting(extension, key, value, window, cx);
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn apply_extension_setting(
+        &mut self,
+        extension: ExtensionId,
+        key: String,
+        value: DataValue,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.extensions.set_package_setting(&extension, &key, value) {
+            Ok(effects) => {
+                self.execute_extension_effects(effects, window, cx);
+                self.refresh_extension_manager_state();
+                if self.extensions.has_pending_extension_work() {
+                    self.schedule_extension_snapshot_sync(window, cx);
+                }
+                self.warning = Some("Extension setting saved".into());
+            }
+            Err(error) => {
+                self.warning = Some(format!("Could not save extension setting: {error}").into());
+            }
+        }
+        cx.notify();
     }
 
     #[cfg(feature = "installable-extensions")]
@@ -1870,8 +1997,8 @@ impl PdfReader {
                     .as_ref()
                     .is_some_and(|pane| pane.owner == extension)
                 {
-                    self.extension_contribution = None;
-                    self.sidebar.panel = SidePanel::Extensions;
+                    self.extension_ui_panel.set_target(0.0);
+                    self.start_animation(window, cx);
                 }
                 self.warning = Some("Extension disabled".into());
                 self.refresh_extension_manager_state();
@@ -1956,11 +2083,18 @@ impl PdfReader {
                                     .as_ref()
                                     .is_some_and(|pane| pane.owner == extension)
                                 {
-                                    reader.extension_contribution = None;
-                                    reader.sidebar.panel = SidePanel::Extensions;
+                                    reader.extension_ui_panel.set_target(0.0);
+                                    reader.start_animation(window, cx);
                                 }
                                 reader.warning = Some(format!("Removed {name}").into());
                                 reader.refresh_extension_manager_state();
+                                if matches!(
+                                    reader.extension_manager_page,
+                                    Some(ExtensionManagerPage::Details(ref shown))
+                                        if shown == &extension
+                                ) {
+                                    reader.show_extension_manager_overview(window, cx);
+                                }
                                 crate::rebuild_application_menus(&mut reader.extensions, cx);
                             }
                             Err(error) => {
@@ -2366,10 +2500,8 @@ impl PdfReader {
             return;
         };
         let Some(owned) = self.extensions.contribution_view(&id) else {
-            self.extension_contribution = None;
-            if self.sidebar.panel == SidePanel::Contribution {
-                self.sidebar.panel = SidePanel::Extensions;
-            }
+            self.extension_ui_panel.set_target(0.0);
+            self.start_animation(window, cx);
             return;
         };
         let Ok(state) = BoundedStateMap::new(owned.state, Default::default()) else {
@@ -2424,7 +2556,11 @@ impl PdfReader {
             title,
             view,
         });
-        self.show_sidebar(SidePanel::Contribution, window, cx);
+        if self.sidebar.target > 0.5 {
+            self.toggle_sidebar(self.sidebar.panel, window, cx);
+        }
+        self.extension_ui_panel.set_target(1.0);
+        self.start_animation(window, cx);
         Ok(DataValue::Null)
     }
 
@@ -2441,10 +2577,8 @@ impl PdfReader {
         }) {
             return Ok(DataValue::Null);
         }
-        if self.sidebar.panel == SidePanel::Contribution && self.sidebar.target > 0.5 {
-            self.toggle_sidebar(SidePanel::Contribution, window, cx);
-        }
-        self.extension_contribution = None;
+        self.extension_ui_panel.set_target(0.0);
+        self.start_animation(window, cx);
         Ok(DataValue::Null)
     }
 
@@ -3231,6 +3365,22 @@ impl PdfReader {
         if self.reference_summary_transition.is_animating() {
             self.reference_summary_transition.advance(dt);
         }
+        #[cfg(feature = "installable-extensions")]
+        if self.extension_manager_transition.is_animating() {
+            self.extension_manager_transition.advance(dt);
+            if !self.extension_manager_transition.is_animating()
+                && self.extension_manager_transition.target() <= 0.0
+            {
+                self.extension_manager_page = None;
+                self.extension_setting_inputs.clear();
+            }
+        }
+        if self.extension_ui_panel.is_animating() {
+            self.extension_ui_panel.advance(dt);
+            if !self.extension_ui_panel.is_animating() && self.extension_ui_panel.target() <= 0.0 {
+                self.extension_contribution = None;
+            }
+        }
         if self
             .doi_copy_started
             .is_some_and(|started| now.duration_since(started) >= DOI_COPY_FEEDBACK_DURATION)
@@ -3254,6 +3404,17 @@ impl PdfReader {
             && !self.reference_details_transition.is_animating()
             && !self.reference_citation_expansion.is_animating()
             && !self.reference_summary_transition.is_animating()
+            && !self.extension_ui_panel.is_animating()
+            && {
+                #[cfg(feature = "installable-extensions")]
+                {
+                    !self.extension_manager_transition.is_animating()
+                }
+                #[cfg(not(feature = "installable-extensions"))]
+                {
+                    true
+                }
+            }
             && self.doi_copy_started.is_none()
             && !self.link_card_expansion.is_animating()
             && !self.link_card_pointer_is_animating()
@@ -4246,567 +4407,6 @@ impl PdfReader {
             ))
             .into_any_element()
     }
-
-    fn render_extension_contribution_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
-        let Some(pane) = self.extension_contribution.as_ref() else {
-            return empty_state(
-                palette,
-                IconName::LayoutDashboard,
-                "No extension panel",
-                "Open a contribution from the Extensions overview.",
-            );
-        };
-        let title = pane.title.clone();
-        let view = pane.view.clone();
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(palette.surface)
-            .text_color(palette.text)
-            .child(
-                div()
-                    .h(px(54.0))
-                    .flex_none()
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(palette.separator)
-                    .child(Self::chrome_button(
-                        palette,
-                        "extension-contribution-back",
-                        Self::icon_label(IconName::ChevronLeft, "Extensions"),
-                        ChromeButtonStyle::Ghost,
-                        true,
-                        cx.listener(|reader, _, window, cx| {
-                            reader.manage_extensions(&ManageExtensions, window, cx)
-                        }),
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .child(Self::chrome_button(
-                        palette,
-                        "close-extension-contribution",
-                        Icon::new(IconName::Close).size(px(16.0)),
-                        ChromeButtonStyle::Ghost,
-                        true,
-                        cx.listener(|reader, _, window, cx| {
-                            let _ = reader.close_extension_contribution(None, window, cx);
-                        }),
-                    )),
-            )
-            .child(
-                div()
-                    .id("extension-contribution-scroll")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .p_4()
-                    .child(view),
-            )
-            .into_any_element()
-    }
-
-    fn render_extensions_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
-        let header = div()
-            .h(px(54.0))
-            .flex_none()
-            .px_4()
-            .flex()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(palette.separator)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Icon::new(IconName::LayoutDashboard).size(px(17.0)))
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Extensions"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(Self::chrome_button(
-                        palette,
-                        "install-extension-from-manager",
-                        Icon::new(IconName::Plus).size(px(16.0)),
-                        ChromeButtonStyle::Ghost,
-                        cfg!(feature = "installable-extensions"),
-                        cx.listener(|reader, _, window, cx| {
-                            reader.install_extension_dialog(&InstallExtension, window, cx)
-                        }),
-                    ))
-                    .child(Self::chrome_button(
-                        palette,
-                        "close-extensions",
-                        Icon::new(IconName::Close).size(px(16.0)),
-                        ChromeButtonStyle::Ghost,
-                        true,
-                        cx.listener(|reader, _, window, cx| {
-                            reader.toggle_sidebar(SidePanel::Extensions, window, cx)
-                        }),
-                    )),
-            );
-
-        #[cfg(not(feature = "installable-extensions"))]
-        let body = empty_state(
-            palette,
-            IconName::SquareTerminal,
-            "Installable extensions are not included",
-            "Use the standard build to install declarative or sandboxed WebAssembly packages.",
-        );
-
-        #[cfg(feature = "installable-extensions")]
-        let body = if self.extension_packages.is_empty() {
-            div()
-                .id("extensions-scroll")
-                .flex_1()
-                .min_h(px(0.0))
-                .flex()
-                .flex_col()
-                .child(empty_state(
-                    palette,
-                    IconName::SquareTerminal,
-                    "No local extensions",
-                    "Install a .keyext archive or a development package. Native code is never loaded.",
-                ))
-                .child(
-                    div()
-                        .flex_none()
-                        .p_4()
-                        .pt_0()
-                        .flex()
-                        .justify_center()
-                        .child(Self::chrome_button(
-                            palette,
-                            "install-first-extension",
-                            Self::icon_label(IconName::Plus, "Install or Update…"),
-                            ChromeButtonStyle::Primary,
-                            true,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.install_extension_dialog(&InstallExtension, window, cx)
-                            }),
-                        )),
-                )
-                .into_any_element()
-        } else {
-            let packages = self.extension_packages.clone();
-            let commands = self.extension_commands.clone();
-            div()
-                .id("extensions-scroll")
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_y_scroll()
-                .p_3()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .children(packages.into_iter().enumerate().map(|(index, package)| {
-                    let active = package.state == LifecycleState::Active;
-                    let (state_label, state_color) =
-                        extension_state_presentation(package.state, palette);
-                    let source = match package.source {
-                        PackageSourceKind::KeyextArchive => "Archive",
-                        PackageSourceKind::DevelopmentDirectory => "Development",
-                    };
-                    let trust = if package.publisher_verified {
-                        "Verified publisher"
-                    } else {
-                        "Local · unverified"
-                    };
-                    let ui_kind = package
-                        .ui_kind
-                        .clone()
-                        .unwrap_or_else(|| "host-rendered".into());
-                    let license = format!("License · {}", package.license);
-                    let extension = package.extension.clone();
-                    let extension_for_toggle = extension.clone();
-                    let extension_for_remove = extension.clone();
-                    let name_for_remove = package.name.clone();
-                    let package_permissions = package.permissions.clone();
-                    let restoration_error = package.restoration_error.clone();
-                    let can_toggle = restoration_error.is_none();
-                    let package_commands = commands
-                        .iter()
-                        .filter(|command| command.owner == extension)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    div()
-                        .id(("extension-package", index))
-                        .w_full()
-                        .overflow_hidden()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(palette.separator)
-                        .bg(palette.surface)
-                        .child(
-                            div()
-                                .p_3()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_start()
-                                        .justify_between()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .child(
-                                                    div()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .text_sm()
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .child(package.name.clone()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .mt_1()
-                                                        .text_xs()
-                                                        .text_color(palette.text_secondary)
-                                                        .child(format!(
-                                                            "{} · v{}",
-                                                            package.extension, package.version
-                                                        )),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_2()
-                                                .py_1()
-                                                .rounded_full()
-                                                .bg(state_color.opacity(0.12))
-                                                .text_xs()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(state_color)
-                                                .child(state_label),
-                                        ),
-                                )
-                                .child(
-                                    div().flex().flex_wrap().gap_1().children(
-                                        [source, trust, ui_kind.as_str(), license.as_str()]
-                                            .into_iter()
-                                            .map(|label| {
-                                                div()
-                                                    .px_2()
-                                                    .py_1()
-                                                    .rounded_full()
-                                                    .bg(palette.surface_subtle)
-                                                    .text_xs()
-                                                    .text_color(palette.text_secondary)
-                                                    .child(label.to_owned())
-                                        }),
-                                    ),
-                                )
-                                .when_some(restoration_error, |card, error| {
-                                    card.child(
-                                        div()
-                                            .p_2()
-                                            .rounded_md()
-                                            .bg(palette.error_soft)
-                                            .text_xs()
-                                            .text_color(palette.error)
-                                            .child(error),
-                                    )
-                                })
-                                .when(!package_permissions.is_empty(), |card| {
-                                    card.child(
-                                        div()
-                                            .pt_1()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(palette.text_secondary)
-                                                    .child("Permissions"),
-                                            )
-                                            .children(
-                                                package_permissions.into_iter().enumerate().map(
-                                                    |(
-                                                        permission_index,
-                                                        (request, decision),
-                                                    )| {
-                                                        let granted =
-                                                            decision == PermissionDecision::Granted;
-                                                        let extension = extension.clone();
-                                                        let permission = request.permission.clone();
-                                                        let label =
-                                                            extension_permission_label(&permission);
-                                                        div()
-                                                            .id((
-                                                                "extension-permission",
-                                                                index * 100 + permission_index,
-                                                            ))
-                                                            .p_2()
-                                                            .flex()
-                                                            .items_start()
-                                                            .justify_between()
-                                                            .gap_2()
-                                                            .rounded_md()
-                                                            .bg(palette.surface_subtle)
-                                                            .child(
-                                                                div()
-                                                                    .flex_1()
-                                                                    .min_w(px(0.0))
-                                                                    .child(
-                                                                        div()
-                                                                            .flex()
-                                                                            .items_center()
-                                                                            .gap_1()
-                                                                            .text_xs()
-                                                                            .font_weight(
-                                                                                FontWeight::MEDIUM,
-                                                                            )
-                                                                            .child(label)
-                                                                            .when(
-                                                                                request.required,
-                                                                                |row| {
-                                                                                    row.child(
-                                                                                        div()
-                                                                                            .px_1()
-                                                                                            .rounded_sm()
-                                                                                            .bg(palette.warning.opacity(0.14))
-                                                                                            .text_color(palette.warning)
-                                                                                            .child("Required"),
-                                                                                    )
-                                                                                },
-                                                                            ),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .mt_1()
-                                                                            .text_xs()
-                                                                            .text_color(
-                                                                                palette
-                                                                                    .text_secondary,
-                                                                            )
-                                                                            .child(request.reason),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .id((
-                                                                        "extension-permission-toggle",
-                                                                        index * 100
-                                                                            + permission_index,
-                                                                    ))
-                                                                    .h(px(26.0))
-                                                                    .px_2()
-                                                                    .flex_none()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .rounded_md()
-                                                                    .cursor_pointer()
-                                                                    .text_xs()
-                                                                    .font_weight(FontWeight::MEDIUM)
-                                                                    .text_color(if granted {
-                                                                        palette.error
-                                                                    } else {
-                                                                        palette.accent
-                                                                    })
-                                                                    .hover(move |button| {
-                                                                        button.bg(if granted {
-                                                                            palette.error_soft
-                                                                        } else {
-                                                                            palette.accent_soft
-                                                                        })
-                                                                    })
-                                                                    .on_click(cx.listener(
-                                                                        move |reader,
-                                                                              _,
-                                                                              window,
-                                                                              cx| {
-                                                                            reader
-                                                                                .set_extension_permission(
-                                                                                    extension
-                                                                                        .clone(),
-                                                                                    permission
-                                                                                        .clone(),
-                                                                                    !granted,
-                                                                                    window,
-                                                                                    cx,
-                                                                                )
-                                                                        },
-                                                                    ))
-                                                                    .child(if granted {
-                                                                        "Revoke"
-                                                                    } else {
-                                                                        "Allow"
-                                                                    }),
-                                                            )
-                                                    },
-                                                ),
-                                            ),
-                                    )
-                                })
-                                .when(!package_commands.is_empty(), |card| {
-                                    card.child(div().pt_1().flex().flex_col().gap_1().children(
-                                        package_commands.into_iter().enumerate().map(
-                                            |(command_index, command)| {
-                                                let title = command.command.title.clone();
-                                                let action = InvokeExtensionCommand {
-                                                    command: command.command.id,
-                                                    payload: None,
-                                                };
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "extension-command-{index}-{command_index}"
-                                                    )))
-                                                    .h(px(30.0))
-                                                    .w_full()
-                                                    .px_2()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .rounded_md()
-                                                    .cursor_pointer()
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(palette.accent)
-                                                    .hover(move |button| {
-                                                        button.bg(palette.accent_soft)
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        move |reader, _, window, cx| {
-                                                            reader.invoke_extension_command(
-                                                                &action, window, cx,
-                                                            )
-                                                        },
-                                                    ))
-                                                    .child(title)
-                                                    .child(
-                                                        Icon::new(IconName::ArrowRight)
-                                                            .size(px(14.0)),
-                                                    )
-                                            },
-                                        ),
-                                    ))
-                                })
-                                .child(
-                                    div()
-                                        .pt_1()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .id(("extension-toggle", index))
-                                                .h(px(28.0))
-                                                .px_3()
-                                                .flex()
-                                                .items_center()
-                                                .rounded_md()
-                                                .border_1()
-                                                .border_color(palette.separator)
-                                                .text_xs()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .when(can_toggle, |button| {
-                                                    button
-                                                        .cursor_pointer()
-                                                        .hover(move |button| {
-                                                            button.bg(palette.control_hover)
-                                                        })
-                                                        .on_click(cx.listener(
-                                                            move |reader, _, window, cx| {
-                                                                if active {
-                                                                    reader.disable_extension(
-                                                                        extension_for_toggle
-                                                                            .clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                } else {
-                                                                    reader.enable_extension(
-                                                                        extension_for_toggle
-                                                                            .clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                }
-                                                            },
-                                                        ))
-                                                })
-                                                .child(if can_toggle {
-                                                    if active { "Disable" } else { "Enable" }
-                                                } else {
-                                                    "Unavailable"
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(("extension-remove", index))
-                                                .h(px(28.0))
-                                                .px_3()
-                                                .flex()
-                                                .items_center()
-                                                .rounded_md()
-                                                .cursor_pointer()
-                                                .text_xs()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(palette.error)
-                                                .hover(move |button| button.bg(palette.error_soft))
-                                                .on_click(cx.listener(
-                                                    move |reader, _, window, cx| {
-                                                        reader.confirm_remove_extension(
-                                                            extension_for_remove.clone(),
-                                                            name_for_remove.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    },
-                                                ))
-                                                .child("Remove"),
-                                        ),
-                                ),
-                        )
-                }))
-                .into_any_element()
-        };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .when(self.view_mode == ReaderView::Fluid, |panel| {
-                panel.rounded_xl()
-            })
-            .overflow_hidden()
-            .bg(palette.surface)
-            .text_color(palette.text)
-            .child(header)
-            .child(body)
-            .into_any_element()
-    }
 }
 
 struct PaintPageOverlay {
@@ -5234,5 +4834,30 @@ fn extension_state_presentation(
         LifecycleState::Installed | LifecycleState::Validated => ("Ready", palette.accent),
         LifecycleState::Unloading => ("Stopping", palette.warning),
         LifecycleState::Removed => ("Removed", palette.text_tertiary),
+    }
+}
+
+#[cfg(feature = "installable-extensions")]
+fn extension_setting_value<'a>(
+    package: &'a InstalledPackageSummary,
+    key: &str,
+) -> Option<&'a DataValue> {
+    let mut value = package.settings.as_ref()?;
+    for segment in key.split('.') {
+        let DataValue::Record(record) = value else {
+            return None;
+        };
+        value = record.get(segment)?;
+    }
+    Some(value)
+}
+
+#[cfg(feature = "installable-extensions")]
+fn extension_setting_text(value: &DataValue) -> String {
+    match value {
+        DataValue::String(value) => value.clone(),
+        DataValue::Integer(value) => value.to_string(),
+        DataValue::Number(value) => value.to_string(),
+        _ => String::new(),
     }
 }

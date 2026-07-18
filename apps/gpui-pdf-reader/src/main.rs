@@ -55,6 +55,12 @@ pub use key_editor_gpui::{
     MarkdownSelectAll as EditSelectAll,
 };
 
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = gpui_pdf_reader, no_json)]
+pub struct OpenExtensionDetails {
+    pub extension: key_extension_api::ExtensionId,
+}
+
 const READER_NAVIGATION_CONTEXT: &str = "PdfReader && !TextField && !MarkdownEditor";
 
 actions!(
@@ -166,6 +172,8 @@ pub(crate) fn rebuild_application_menus(
 ) {
     let theme_menu_items = extensions.native_menu_items("view.appearance");
     let analysis_menu_items = extensions.native_menu_items("tools.analysis");
+    #[cfg(feature = "installable-extensions")]
+    let extension_entries = extensions.extension_tool_entries();
     let mut view_items = vec![
         MenuItem::action("Classic View", ClassicView),
         MenuItem::action("Fluid View", FluidView),
@@ -202,11 +210,26 @@ pub(crate) fn rebuild_application_menus(
         tools_items.push(MenuItem::separator());
     }
     let extension_tools = {
-        let items = vec![
-            #[cfg(feature = "installable-extensions")]
-            MenuItem::action("Install or Update…", InstallExtension),
-            MenuItem::action("Manage…", ManageExtensions),
-        ];
+        let mut items = Vec::new();
+        #[cfg(feature = "installable-extensions")]
+        for entry in extension_entries {
+            if let Some(action) = entry.action {
+                items.push(MenuItem::action(entry.name, action));
+            } else {
+                items.push(MenuItem::action(
+                    entry.name,
+                    OpenExtensionDetails {
+                        extension: entry.extension,
+                    },
+                ));
+            }
+        }
+        if !items.is_empty() {
+            items.push(MenuItem::separator());
+        }
+        #[cfg(feature = "installable-extensions")]
+        items.push(MenuItem::action("Install or Update…", InstallExtension));
+        items.push(MenuItem::action("Manage…", ManageExtensions));
         MenuItem::submenu(Menu {
             name: "Extensions".into(),
             items,

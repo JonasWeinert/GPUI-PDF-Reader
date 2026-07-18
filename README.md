@@ -173,8 +173,9 @@ implemented yet.
 | Search document | Toolbar or `Command-F` |
 | Next / previous search result | `Command-G` / `Command-Shift-G` |
 | Show / hide comments | Comments control in the toolbar |
-| Install or update an extension | File → Install or Update Extension |
-| Manage installed extensions | Tools → Extensions → Manage |
+| Install or update an extension | File → Install or Update Extension, then review it in the Extensions panel |
+| Open an active extension | Tools → Extensions → extension name |
+| Manage extension settings | Tools → Extensions → Manage |
 
 The comment editor displays formatted content directly while storing Markdown.
 Its hovering formatting pill provides bold, italic, inline code, bulleted-list,

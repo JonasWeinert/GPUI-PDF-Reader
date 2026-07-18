@@ -14,10 +14,11 @@ component.wasm      # only for a wasm_component entrypoint
 assets/             # only bounded, declared package assets
 ```
 
-Use File → Install or Update Extension, then review every required permission.
-Installed contributions can appear in product-owned menu slots and in the
-Extensions panel. Safe mode starts the reader with third-party packages
-disabled:
+Use File → Install or Update Extension. The Extensions panel slides to an
+in-app review page showing identity, license, source, and every required
+permission before the package is installed and enabled. It does not use a
+second system confirmation dialog. Safe mode starts the reader with
+third-party packages disabled:
 
 ```sh
 GPUI_PDF_READER_SAFE_MODE=1 cargo run --locked
@@ -26,6 +27,21 @@ GPUI_PDF_READER_SAFE_MODE=1 cargo run --locked
 The contract is intentionally `0.1`. Packages must declare the compatible host
 and extension API range. See `notes/extension-api-policy.md` before depending on
 it outside this workspace.
+
+## Settings and Tools entry
+
+Non-sensitive manifest settings are rendered by the host on the extension's
+detail page. The current controls cover booleans, bounded strings, bounded
+integers and numbers, and declared choices. Values are validated against the
+manifest, persisted atomically, and delivered to an active runtime as a
+`settings_changed` lifecycle event. Extensions do not construct these GPUI
+controls and sensitive settings never enter this form.
+
+Every active local extension gets one Tools → Extensions entry. To make that
+entry run a command, contribute one enabled direct command to the reserved
+`tools.extensions` menu slot. If no such command exists, the entry opens the
+extension's detail and settings page. A contributed side/settings view opens
+in its own floating panel; it is not embedded in the extension manager.
 
 ## Reference packages
 

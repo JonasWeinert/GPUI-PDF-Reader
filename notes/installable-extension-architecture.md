@@ -338,6 +338,18 @@ Useful contribution slots include:
 Slots have typed contracts. An extension cannot invent a new global z-index or
 place an unbounded surface over the entire application.
 
+The host reserves `tools.extensions` for one optional direct trigger per active
+extension. If an extension contributes an enabled command there, its
+Tools → Extensions entry invokes that command. Otherwise the entry opens the
+host-owned detail/settings page. Nested or additional extension commands remain
+available through their normal contribution surfaces; they do not create an
+unbounded application menu.
+
+Install review, permissions, and manifest settings are host UI. Extension-owned
+side/settings contributions are different: the host places them in a separate
+bounded floating panel. This keeps package administration usable even when an
+extension's own UI is unavailable or malformed.
+
 ## State and effect model
 
 Use an event/update/view model:
