@@ -414,11 +414,30 @@ impl<E: PdfEngine> PdfRuntime<E> {
     }
 
     pub fn open(&mut self, source: E::Source) -> Result<DocumentEvent<E::Error>, SessionError> {
+        self.open_inner(source, None)
+    }
+
+    /// Opens a document with caller-owned cancellation in addition to the
+    /// runtime's session cancellation. This lets a UI supersede a synchronous
+    /// open before the engine-owner thread can drain its command queue.
+    pub fn open_with_cancellation(
+        &mut self,
+        source: E::Source,
+        operation_cancellation: &CancellationToken,
+    ) -> Result<DocumentEvent<E::Error>, SessionError> {
+        self.open_inner(source, Some(operation_cancellation))
+    }
+
+    fn open_inner(
+        &mut self,
+        source: E::Source,
+        operation_cancellation: Option<&CancellationToken>,
+    ) -> Result<DocumentEvent<E::Error>, SessionError> {
         self.document = None;
         self.document_handle = None;
         let session = self.sessions.begin()?;
         let generation = session.generation();
-        let cancellation = session.cancellation();
+        let cancellation = composed_cancellation(&session, operation_cancellation);
         match self.engine.open(source, &cancellation) {
             Ok(document) if cancellation.is_cancelled() => {
                 drop(document);
@@ -996,6 +1015,22 @@ mod tests {
             TextEvent::Discarded { .. }
         ));
         assert_eq!(runtime.document.as_ref().unwrap().text_extractions, 0);
+    }
+
+    #[test]
+    fn caller_can_cancel_document_open_before_engine_work_starts() {
+        let mut runtime = PdfRuntime::new(MockEngine::default(), CachePolicy::default());
+        let cancellation = crate::CancellationSource::new();
+        cancellation.cancel();
+
+        assert!(matches!(
+            runtime
+                .open_with_cancellation(2, &cancellation.token())
+                .unwrap(),
+            DocumentEvent::Cancelled { .. }
+        ));
+        assert_eq!(runtime.engine().opens, 0);
+        assert!(runtime.document.is_none());
     }
 
     #[test]

@@ -6,20 +6,112 @@ use crate::search::{
     MAX_SEARCH_RESULTS, SearchPageOutcome, SearchPageResults, SearchQuery, search_page,
 };
 use key_pdf_runtime::{
-    CachePolicy, ColorMode, CompletionDisposition, DemandIntent, DemandPriority, DocumentEvent,
-    LatestWinsQueue, PdfRuntime, PixelColor, PixelFormat, PreviewDemand, PreviewEvent,
-    RenderDemand, RenderEvent, ScheduleOutcome, ScheduledDemand, TextDemandPurpose, TextEvent,
+    CachePolicy, CancellationSource, CancellationToken, ColorMode, CompletionDisposition,
+    DemandIntent, DemandPriority, DocumentEvent, LatestWinsQueue, PdfRuntime, PixelColor,
+    PixelFormat, PreviewDemand, PreviewEvent, RenderDemand, RenderEvent, ScheduleOutcome,
+    ScheduledDemand, TextDemandPurpose, TextEvent,
 };
 use key_pdfium::{PdfiumDocumentSource, PdfiumEngine, PdfiumLibraryConfig};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
 const AUTOMATIC_TEXT_IDLE_DELAY: Duration = Duration::from_millis(200);
 const MAX_SEARCH_HIGHLIGHT_RUNS: usize = 100_000;
 const MAX_PENDING_RENDER_DEMANDS_PER_TIER: usize = 4_096;
+
+#[derive(Debug)]
+struct WorkerCancellationState {
+    document: CancellationSource,
+    render: Option<CancellationSource>,
+    preview: Option<CancellationSource>,
+    explicit_text: Option<CancellationSource>,
+    search: Option<CancellationSource>,
+}
+
+impl Default for WorkerCancellationState {
+    fn default() -> Self {
+        Self {
+            document: CancellationSource::new(),
+            render: None,
+            preview: None,
+            explicit_text: None,
+            search: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct WorkerCancellations {
+    state: Mutex<WorkerCancellationState>,
+}
+
+impl WorkerCancellations {
+    fn begin_document(&self) -> CancellationSource {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.document.cancel();
+        cancel_slot(&mut state.render);
+        cancel_slot(&mut state.preview);
+        cancel_slot(&mut state.explicit_text);
+        cancel_slot(&mut state.search);
+        state.document = CancellationSource::new();
+        state.document.clone()
+    }
+
+    fn replace_render(&self) -> CancellationSource {
+        self.replace(|state| &mut state.render)
+    }
+
+    fn replace_preview(&self) -> CancellationSource {
+        self.replace(|state| &mut state.preview)
+    }
+
+    fn replace_explicit_text(&self) -> CancellationSource {
+        self.replace(|state| &mut state.explicit_text)
+    }
+
+    fn retain_or_begin_explicit_text(&self) -> CancellationSource {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .explicit_text
+            .get_or_insert_with(CancellationSource::new)
+            .clone()
+    }
+
+    fn replace_search(&self) -> CancellationSource {
+        self.replace(|state| &mut state.search)
+    }
+
+    fn cancel_explicit_text(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        cancel_slot(&mut state.explicit_text);
+    }
+
+    fn cancel_search(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        cancel_slot(&mut state.search);
+    }
+
+    fn replace(
+        &self,
+        select: impl FnOnce(&mut WorkerCancellationState) -> &mut Option<CancellationSource>,
+    ) -> CancellationSource {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let slot = select(&mut state);
+        cancel_slot(slot);
+        let source = CancellationSource::new();
+        *slot = Some(source.clone());
+        source
+    }
+}
+
+fn cancel_slot(slot: &mut Option<CancellationSource>) {
+    if let Some(source) = slot.take() {
+        source.cancel();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderColor {
@@ -164,6 +256,7 @@ pub enum WorkerEvent {
 #[derive(Clone, Debug)]
 pub struct PdfWorker {
     commands: mpsc::Sender<WorkerCommand>,
+    cancellations: Arc<WorkerCancellations>,
 }
 
 impl PdfWorker {
@@ -172,6 +265,7 @@ impl PdfWorker {
         // A tile is under five MiB. Back-pressure prevents bitmap copies from
         // accumulating if the UI thread is temporarily busy.
         let (event_tx, event_rx) = mpsc::sync_channel(1);
+        let cancellations = Arc::new(WorkerCancellations::default());
 
         thread::Builder::new()
             .name("pdfium-renderer".into())
@@ -181,14 +275,20 @@ impl PdfWorker {
         (
             Self {
                 commands: command_tx,
+                cancellations,
             },
             event_rx,
         )
     }
 
     pub fn open(&self, generation: u64, path: PathBuf) -> bool {
+        let cancellation = self.cancellations.begin_document();
         self.commands
-            .send(WorkerCommand::Open { generation, path })
+            .send(WorkerCommand::Open {
+                generation,
+                path,
+                cancellation,
+            })
             .is_ok()
     }
 
@@ -200,6 +300,7 @@ impl PdfWorker {
         visible_tile_count: usize,
         text_pages: &[usize],
     ) -> bool {
+        let cancellation = self.cancellations.replace_render();
         let requests = tiles
             .iter()
             .copied()
@@ -217,34 +318,48 @@ impl PdfWorker {
                 generation,
                 requests,
                 text_pages: text_pages.to_vec(),
+                cancellation,
             })
             .is_ok()
     }
 
     pub fn extract_text(&self, generation: u64, page: usize) -> bool {
+        let cancellation = self.cancellations.replace_explicit_text();
         self.commands
-            .send(WorkerCommand::ExtractText { generation, page })
+            .send(WorkerCommand::ExtractText {
+                generation,
+                page,
+                cancellation,
+            })
             .is_ok()
     }
 
     pub fn ensure_text_pages(&self, generation: u64, pages: Vec<usize>) -> bool {
+        let cancellation = self.cancellations.retain_or_begin_explicit_text();
         self.commands
-            .send(WorkerCommand::EnsureTextPages { generation, pages })
+            .send(WorkerCommand::EnsureTextPages {
+                generation,
+                pages,
+                cancellation,
+            })
             .is_ok()
     }
 
     pub fn cancel_explicit_text(&self, generation: u64) -> bool {
+        self.cancellations.cancel_explicit_text();
         self.commands
             .send(WorkerCommand::CancelExplicitText { generation })
             .is_ok()
     }
 
     pub fn search(&self, generation: u64, revision: u64, query: SearchQuery) -> bool {
+        let cancellation = self.cancellations.replace_search();
         self.commands
             .send(WorkerCommand::Search {
                 generation,
                 revision,
                 query,
+                cancellation,
             })
             .is_ok()
     }
@@ -252,6 +367,7 @@ impl PdfWorker {
     /// Cancels search revisions older than `next_revision` immediately while
     /// allowing a debounced replacement with `next_revision` to start later.
     pub fn cancel_search(&self, generation: u64, next_revision: u64) -> bool {
+        self.cancellations.cancel_search();
         self.commands
             .send(WorkerCommand::CancelSearch {
                 generation,
@@ -267,12 +383,14 @@ impl PdfWorker {
         appearance: RenderAppearance,
         spec: PreviewSpec,
     ) -> bool {
+        let cancellation = self.cancellations.replace_preview();
         self.commands
             .send(WorkerCommand::RenderPreview {
                 generation,
                 revision,
                 appearance,
                 spec,
+                cancellation,
             })
             .is_ok()
     }
@@ -283,19 +401,23 @@ enum WorkerCommand {
     Open {
         generation: u64,
         path: PathBuf,
+        cancellation: CancellationSource,
     },
     RenderViewport {
         generation: u64,
         requests: Vec<RenderRequest>,
         text_pages: Vec<usize>,
+        cancellation: CancellationSource,
     },
     ExtractText {
         generation: u64,
         page: usize,
+        cancellation: CancellationSource,
     },
     EnsureTextPages {
         generation: u64,
         pages: Vec<usize>,
+        cancellation: CancellationSource,
     },
     CancelExplicitText {
         generation: u64,
@@ -304,6 +426,7 @@ enum WorkerCommand {
         generation: u64,
         revision: u64,
         query: SearchQuery,
+        cancellation: CancellationSource,
     },
     CancelSearch {
         generation: u64,
@@ -314,6 +437,7 @@ enum WorkerCommand {
         revision: u64,
         appearance: RenderAppearance,
         spec: PreviewSpec,
+        cancellation: CancellationSource,
     },
 }
 
@@ -330,6 +454,7 @@ struct RenderRequest {
 struct QueuedRender {
     request: RenderRequest,
     demand: RenderDemand,
+    cancellation: CancellationSource,
 }
 
 #[derive(Clone, Debug)]
@@ -338,6 +463,7 @@ struct PreviewRequest {
     revision: u64,
     appearance: RenderAppearance,
     demand: PreviewDemand,
+    cancellation: CancellationSource,
 }
 
 #[derive(Clone, Debug)]
@@ -351,6 +477,7 @@ struct SearchJob {
     total_highlight_runs: usize,
     skipped_pages: usize,
     truncated: bool,
+    cancellation: CancellationSource,
 }
 
 struct ScientificJob {
@@ -423,6 +550,9 @@ impl RenderQueues {
 struct WorkerState {
     runtime: PdfRuntime<PdfiumEngine>,
     generation: Option<u64>,
+    document_cancellation: CancellationSource,
+    automatic_text_cancellation: CancellationSource,
+    explicit_text_cancellation: CancellationSource,
     text_cache: HashMap<usize, Arc<TextLayer>>,
     automatic_text_needs_quiet: bool,
     page_count: usize,
@@ -441,6 +571,9 @@ fn run_worker(commands: mpsc::Receiver<WorkerCommand>, events: mpsc::SyncSender<
     let mut state = WorkerState {
         runtime,
         generation: None,
+        document_cancellation: CancellationSource::new(),
+        automatic_text_cancellation: CancellationSource::new(),
+        explicit_text_cancellation: CancellationSource::new(),
         text_cache: HashMap::new(),
         automatic_text_needs_quiet: false,
         page_count: 0,
@@ -646,7 +779,14 @@ fn process_render_work(
     explicit_text: &mut BTreeSet<usize>,
     automatic_text: &mut VecDeque<usize>,
 ) -> bool {
-    let runtime_event = state.runtime.render(scheduled.value().demand.clone());
+    let operation_cancellation = state
+        .document_cancellation
+        .token()
+        .combined(&scheduled.value().cancellation.token())
+        .combined(&scheduled.cancellation());
+    let runtime_event = state
+        .runtime
+        .render_with_cancellation(scheduled.value().demand.clone(), &operation_cancellation);
 
     // Apply replacement viewport/open commands before deciding whether an
     // in-flight completion is still current.
@@ -709,9 +849,15 @@ fn process_preview_work(
     explicit_text: &mut BTreeSet<usize>,
     automatic_text: &mut VecDeque<usize>,
 ) -> bool {
-    let runtime_event = state
-        .runtime
-        .render_preview(scheduled.value().demand.clone());
+    let operation_cancellation = state
+        .document_cancellation
+        .token()
+        .combined(&scheduled.value().cancellation.token())
+        .combined(&scheduled.cancellation());
+    let runtime_event = state.runtime.render_preview_with_cancellation(
+        scheduled.value().demand.clone(),
+        &operation_cancellation,
+    );
     if !accept_available_commands(commands, events, state, explicit_text, automatic_text) {
         return false;
     }
@@ -784,7 +930,12 @@ fn process_text_work(
     } else {
         TextDemandPurpose::VisibleLayer
     };
-    let extracted = extract_runtime_text(state, page, purpose);
+    let operation_cancellation = if explicit {
+        state.explicit_text_cancellation.token()
+    } else {
+        state.automatic_text_cancellation.token()
+    };
+    let extracted = extract_runtime_text(state, page, purpose, &operation_cancellation);
 
     let mut deferred = Vec::new();
     if !collect_available_commands(commands, &mut deferred) {
@@ -839,6 +990,7 @@ fn extract_runtime_text(
     state: &mut WorkerState,
     page: usize,
     purpose: TextDemandPurpose,
+    operation_cancellation: &CancellationToken,
 ) -> Result<Arc<TextLayer>, String> {
     let session = state
         .runtime
@@ -856,7 +1008,14 @@ fn extract_runtime_text(
     let demand = session
         .text_demand(page, purpose, priority, intent)
         .map_err(|error| error.to_string())?;
-    match state.runtime.extract_text(demand) {
+    let cancellation = state
+        .document_cancellation
+        .token()
+        .combined(operation_cancellation);
+    match state
+        .runtime
+        .extract_text_with_cancellation(demand, &cancellation)
+    {
         TextEvent::Ready { text, .. } => Ok(text.layer),
         TextEvent::Failed { error, .. } => Err(error.to_string()),
         TextEvent::Cancelled { .. } => Err("text extraction was cancelled".into()),
@@ -935,7 +1094,9 @@ fn process_search_work(
     let text = if let Some(text) = state.text_cache.get(&page).cloned() {
         text
     } else {
-        let extracted = extract_runtime_text(state, page, TextDemandPurpose::Search);
+        let search_cancellation = active.cancellation.token();
+        let extracted =
+            extract_runtime_text(state, page, TextDemandPurpose::Search, &search_cancellation);
         let mut deferred = Vec::new();
         let connected = collect_available_commands(commands, &mut deferred);
         if !connected {
@@ -1053,7 +1214,13 @@ fn process_scientific_work(
     let text = if let Some(text) = state.text_cache.get(&page).cloned() {
         text
     } else {
-        let extracted = extract_runtime_text(state, page, TextDemandPurpose::DocumentAnalysis);
+        let document_cancellation = state.document_cancellation.token();
+        let extracted = extract_runtime_text(
+            state,
+            page,
+            TextDemandPurpose::DocumentAnalysis,
+            &document_cancellation,
+        );
         let mut deferred = Vec::new();
         if !collect_available_commands(commands, &mut deferred) {
             return false;
@@ -1091,7 +1258,14 @@ fn accept_command(
     automatic_text: &mut VecDeque<usize>,
 ) -> bool {
     match command {
-        WorkerCommand::Open { generation, path } => {
+        WorkerCommand::Open {
+            generation,
+            path,
+            cancellation,
+        } => {
+            if cancellation.is_cancelled() {
+                return true;
+            }
             state.renders.clear_pending();
             state.previews.clear_pending();
             explicit_text.clear();
@@ -1100,8 +1274,14 @@ fn accept_command(
             state.automatic_text_needs_quiet = false;
             reset_search_for_open(state);
             state.generation = Some(generation);
+            state.document_cancellation = cancellation;
+            state.automatic_text_cancellation = CancellationSource::new();
+            state.explicit_text_cancellation = CancellationSource::new();
 
-            let opened = state.runtime.open(PdfiumDocumentSource::file(path.clone()));
+            let opened = state.runtime.open_with_cancellation(
+                PdfiumDocumentSource::file(path.clone()),
+                &state.document_cancellation.token(),
+            );
             match opened {
                 Ok(DocumentEvent::Opened { descriptor, .. }) => {
                     let pages = descriptor.pages().to_vec();
@@ -1142,9 +1322,11 @@ fn accept_command(
             generation,
             requests,
             text_pages,
+            cancellation,
         } => {
             if state.generation == Some(generation) {
-                if !replace_render_demand(state, events, requests) {
+                state.automatic_text_cancellation = cancellation.clone();
+                if !replace_render_demand(state, events, requests, cancellation) {
                     return false;
                 }
                 replace_automatic_text_demand(text_pages, automatic_text);
@@ -1152,21 +1334,32 @@ fn accept_command(
             }
             true
         }
-        WorkerCommand::ExtractText { generation, page } => {
+        WorkerCommand::ExtractText {
+            generation,
+            page,
+            cancellation,
+        } => {
             if state.generation == Some(generation) && page < state.page_count {
+                state.explicit_text_cancellation = cancellation;
                 explicit_text.clear();
                 explicit_text.insert(page);
             }
             true
         }
-        WorkerCommand::EnsureTextPages { generation, pages } => {
+        WorkerCommand::EnsureTextPages {
+            generation,
+            pages,
+            cancellation,
+        } => {
             if state.generation == Some(generation) {
+                state.explicit_text_cancellation = cancellation;
                 explicit_text.extend(pages.into_iter().filter(|page| *page < state.page_count));
             }
             true
         }
         WorkerCommand::CancelExplicitText { generation } => {
             if state.generation == Some(generation) {
+                state.explicit_text_cancellation.cancel();
                 explicit_text.clear();
             }
             true
@@ -1175,11 +1368,15 @@ fn accept_command(
             generation,
             revision,
             query,
-        } => accept_search_demand(state, events, generation, revision, query),
+            cancellation,
+        } => accept_search_demand(state, events, generation, revision, query, cancellation),
         WorkerCommand::CancelSearch {
             generation,
             next_revision,
         } => {
+            if let Some(search) = state.search.as_ref() {
+                search.cancellation.cancel();
+            }
             cancel_searches_before(state, generation, next_revision);
             true
         }
@@ -1188,6 +1385,7 @@ fn accept_command(
             revision,
             appearance,
             spec,
+            cancellation,
         } => {
             if state.generation != Some(generation) {
                 return true;
@@ -1220,6 +1418,7 @@ fn accept_command(
                         revision,
                         appearance,
                         demand,
+                        cancellation,
                     };
                     let _ = state
                         .previews
@@ -1242,6 +1441,7 @@ fn replace_render_demand(
     state: &mut WorkerState,
     events: &mpsc::SyncSender<WorkerEvent>,
     requests: Vec<RenderRequest>,
+    cancellation: CancellationSource,
 ) -> bool {
     state.renders.clear_pending();
     let Some(session) = state.runtime.session() else {
@@ -1274,9 +1474,14 @@ fn replace_render_demand(
                 continue;
             }
         };
-        let outcome = state
-            .renders
-            .schedule(tier, QueuedRender { request, demand });
+        let outcome = state.renders.schedule(
+            tier,
+            QueuedRender {
+                request,
+                demand,
+                cancellation: cancellation.clone(),
+            },
+        );
         if let ScheduleOutcome::Rejected { value } = outcome
             && events
                 .send(WorkerEvent::TileFailed {
@@ -1472,7 +1677,9 @@ fn advance_search_revision(state: &mut WorkerState, generation: u64, revision: u
         return false;
     }
     state.latest_search_revision = Some(revision);
-    state.search = None;
+    if let Some(search) = state.search.take() {
+        search.cancellation.cancel();
+    }
     true
 }
 
@@ -1482,7 +1689,11 @@ fn accept_search_demand(
     generation: u64,
     revision: u64,
     query: SearchQuery,
+    cancellation: CancellationSource,
 ) -> bool {
+    if cancellation.is_cancelled() {
+        return true;
+    }
     if state.generation.is_none() {
         return events
             .send(WorkerEvent::SearchFailed {
@@ -1514,6 +1725,7 @@ fn accept_search_demand(
         total_highlight_runs: 0,
         skipped_pages: 0,
         truncated: false,
+        cancellation,
     });
     true
 }
@@ -1535,13 +1747,18 @@ fn cancel_searches_before(state: &mut WorkerState, generation: u64, next_revisio
         .as_ref()
         .is_some_and(|search| revision_is_newer(next_revision, search.revision))
     {
+        if let Some(search) = state.search.as_ref() {
+            search.cancellation.cancel();
+        }
         state.search = None;
     }
 }
 
 fn reset_search_for_open(state: &mut WorkerState) {
     state.page_count = 0;
-    state.search = None;
+    if let Some(search) = state.search.take() {
+        search.cancellation.cancel();
+    }
     state.latest_search_revision = None;
     state.scientific = None;
 }
@@ -1559,6 +1776,9 @@ mod tests {
                 CachePolicy::default(),
             ),
             generation: Some(generation),
+            document_cancellation: CancellationSource::new(),
+            automatic_text_cancellation: CancellationSource::new(),
+            explicit_text_cancellation: CancellationSource::new(),
             text_cache: HashMap::new(),
             automatic_text_needs_quiet: false,
             page_count: 3,
@@ -1581,7 +1801,23 @@ mod tests {
             total_highlight_runs: 0,
             skipped_pages: 0,
             truncated: false,
+            cancellation: CancellationSource::new(),
         }
+    }
+
+    #[test]
+    fn caller_side_replacement_cancels_in_flight_work_immediately() {
+        let cancellations = WorkerCancellations::default();
+        let first_render = cancellations.replace_render();
+        let second_render = cancellations.replace_render();
+        assert!(first_render.is_cancelled());
+        assert!(!second_render.is_cancelled());
+
+        let search = cancellations.replace_search();
+        let document = cancellations.begin_document();
+        assert!(second_render.is_cancelled());
+        assert!(search.is_cancelled());
+        assert!(!document.is_cancelled());
     }
 
     #[test]
