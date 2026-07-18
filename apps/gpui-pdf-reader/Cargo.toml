@@ -19,7 +19,6 @@ key-pdf-core = { path = "../../crates/key-pdf-core" }
 key-pdf-runtime = { path = "../../crates/key-pdf-runtime" }
 key-pdfium = { path = "../../crates/key-pdfium" }
 open.workspace = true
-pdfium-render.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

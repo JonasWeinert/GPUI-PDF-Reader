@@ -2532,7 +2532,6 @@ dependencies = [
  "key-pdfium",
  "objc2-app-kit",
  "open",
- "pdfium-render",
  "serde",
  "serde_json",
  "tempfile",
