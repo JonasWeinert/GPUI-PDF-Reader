@@ -2527,9 +2527,14 @@ dependencies = [
  "key-extension-api",
  "key-extension-gpui",
  "key-extension-host",
+ "key-extension-package",
+ "key-extension-wasm",
  "key-pdf-core",
+ "key-pdf-extension-api",
+ "key-pdf-gpui",
  "key-pdf-runtime",
  "key-pdfium",
+ "key-safe-http",
  "key-sidecar-store",
  "key-ui-gpui",
  "objc2-app-kit",
@@ -2537,6 +2542,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toml 0.8.23",
  "url",
  "zed-reqwest",
 ]
@@ -3370,6 +3376,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "key-pdf-extension-api"
+version = "0.1.0"
+dependencies = [
+ "key-extension-api",
+ "key-pdf-core",
+ "serde",
+ "serde_json",
+ "wit-parser",
+]
+
+[[package]]
+name = "key-pdf-gpui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "key-pdf-core",
+ "key-pdf-runtime",
+ "key-ui-gpui",
+]
+
+[[package]]
 name = "key-pdf-runtime"
 version = "0.1.0"
 dependencies = [
@@ -3384,6 +3411,15 @@ dependencies = [
  "key-pdf-runtime",
  "pdfium-render",
  "url",
+]
+
+[[package]]
+name = "key-safe-http"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "url",
+ "zed-reqwest",
 ]
 
 [[package]]

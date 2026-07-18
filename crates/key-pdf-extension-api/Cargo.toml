@@ -1,0 +1,23 @@
+[package]
+name = "key-pdf-extension-api"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Pre-stable, runtime-neutral PDF capability contracts for Key extensions"
+
+[dependencies]
+key-extension-api = { path = "../key-extension-api" }
+key-pdf-core = { path = "../key-pdf-core" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+wit-parser = "=0.248.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

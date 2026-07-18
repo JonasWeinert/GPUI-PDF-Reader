@@ -1,0 +1,428 @@
+package key:pdf-extension@0.1.0;
+
+/// Value types for the pre-stable, read-only PDF extension boundary.
+interface types {
+  enum capability {
+    document-metadata,
+    page-metadata,
+    outline,
+    links,
+    text,
+    selection,
+    viewport,
+    navigation,
+    overlays,
+  }
+
+  record generation-id {
+    value: u64,
+  }
+
+  record document-handle {
+    generation: generation-id,
+    id: u64,
+  }
+
+  record page-handle {
+    generation: generation-id,
+    id: u64,
+  }
+
+  record overlay-set-handle {
+    generation: generation-id,
+    id: u64,
+  }
+
+  record snapshot-revision {
+    value: u64,
+  }
+
+  record page-index {
+    value: u32,
+  }
+
+  record normalized-point {
+    x: f32,
+    y: f32,
+  }
+
+  record normalized-rect {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+  }
+
+  record text-location {
+    page: page-index,
+    character: u32,
+  }
+
+  record text-selection-range {
+    anchor: text-location,
+    focus: text-location,
+  }
+
+  record text-target-hint {
+    text: string,
+    occurrence: u16,
+  }
+
+  record document-destination {
+    page: page-index,
+    x-fraction: option<f32>,
+    y-fraction: option<f32>,
+    text-range: option<text-selection-range>,
+    text-hint: option<text-target-hint>,
+  }
+
+  enum input-error-kind {
+    not-finite,
+    outside-normalized-range,
+    empty-or-reversed-rect,
+    empty,
+    reversed-range,
+    invalid-identifier,
+    invalid-unicode-scalar,
+    stale-revision,
+  }
+
+  record stale-generation-error {
+    expected: generation-id,
+    actual: generation-id,
+  }
+
+  record invalid-handle-kind-error {
+    expected: string,
+    actual: string,
+  }
+
+  record resource-not-found-error {
+    kind: string,
+    id: u64,
+  }
+
+  record page-out-of-bounds-error {
+    page: u32,
+    page-count: u32,
+  }
+
+  record invalid-input-error {
+    field: string,
+    reason: input-error-kind,
+  }
+
+  record limit-exceeded-error {
+    field: string,
+    limit: u64,
+    actual: u64,
+  }
+
+  variant pdf-error {
+    capability-unavailable(capability),
+    permission-denied(capability),
+    no-active-document,
+    stale-generation(stale-generation-error),
+    invalid-handle-kind(invalid-handle-kind-error),
+    resource-not-found(resource-not-found-error),
+    page-out-of-bounds(page-out-of-bounds-error),
+    invalid-input(invalid-input-error),
+    limit-exceeded(limit-exceeded-error),
+    cancelled,
+    busy,
+    unsupported(string),
+    internal(string),
+  }
+
+  record document-metadata-snapshot {
+    document: document-handle,
+    revision: snapshot-revision,
+    page-count: u32,
+    title: option<string>,
+    author: option<string>,
+    subject: option<string>,
+    keywords: option<string>,
+    creator: option<string>,
+    producer: option<string>,
+    language: option<string>,
+    format-version: option<string>,
+    tagged: bool,
+    encrypted: bool,
+  }
+
+  enum page-rotation {
+    degrees0,
+    degrees90,
+    degrees180,
+    degrees270,
+  }
+
+  record page-metadata-snapshot {
+    document: document-handle,
+    page: page-handle,
+    revision: snapshot-revision,
+    index: page-index,
+    label: option<string>,
+    width-points: f32,
+    height-points: f32,
+    rotation: page-rotation,
+  }
+
+  record outline-entry-id {
+    value: u64,
+  }
+
+  record outline-entry {
+    id: outline-entry-id,
+    parent: option<outline-entry-id>,
+    depth: u16,
+    title: string,
+    destination: document-destination,
+  }
+
+  record outline-snapshot {
+    document: document-handle,
+    revision: snapshot-revision,
+    entries: list<outline-entry>,
+    truncated: bool,
+  }
+
+  record link-id {
+    value: u64,
+  }
+
+  variant link-target {
+    internal(document-destination),
+    external(string),
+  }
+
+  record link-entry {
+    id: link-id,
+    regions: list<normalized-rect>,
+    source-range: option<text-selection-range>,
+    target: link-target,
+  }
+
+  record page-links-snapshot {
+    page: page-handle,
+    index: page-index,
+    revision: snapshot-revision,
+    links: list<link-entry>,
+    truncated: bool,
+  }
+
+  record page-text-request {
+    page: page-handle,
+    start: u32,
+    maximum-characters: u32,
+  }
+
+  record text-character {
+    scalar: u32,
+    bounds: option<normalized-rect>,
+  }
+
+  record page-text-snapshot {
+    page: page-handle,
+    index: page-index,
+    revision: snapshot-revision,
+    start: u32,
+    total-characters: u32,
+    characters: list<text-character>,
+    complete: bool,
+  }
+
+  record selection-page-snapshot {
+    page: page-handle,
+    index: page-index,
+    regions: list<normalized-rect>,
+  }
+
+  record selection-snapshot {
+    document: document-handle,
+    revision: snapshot-revision,
+    range: option<text-selection-range>,
+    text: option<string>,
+    pages: list<selection-page-snapshot>,
+  }
+
+  record viewport-anchor {
+    page: page-index,
+    point: normalized-point,
+  }
+
+  record visible-page-snapshot {
+    page: page-handle,
+    index: page-index,
+    visible-area: normalized-rect,
+  }
+
+  record viewport-snapshot {
+    document: document-handle,
+    revision: snapshot-revision,
+    zoom-ratio: f32,
+    anchor: option<viewport-anchor>,
+    visible-pages: list<visible-page-snapshot>,
+  }
+
+  record navigation-placement {
+    viewport-anchor-y: f32,
+    center-horizontal: bool,
+  }
+
+  enum navigation-focus-tone {
+    accent,
+    search-match,
+  }
+
+  enum navigation-focus-motion {
+    sweep,
+    pulse,
+  }
+
+  record navigation-focus-request {
+    tone: navigation-focus-tone,
+    motion: navigation-focus-motion,
+    regions: list<normalized-rect>,
+  }
+
+  record navigation-request {
+    document: document-handle,
+    destination: document-destination,
+    placement: navigation-placement,
+    focus: option<navigation-focus-request>,
+  }
+
+  record navigation-receipt {
+    document: document-handle,
+    viewport-revision: snapshot-revision,
+    destination: document-destination,
+    focus-scheduled: bool,
+  }
+
+  enum overlay-shape {
+    highlight,
+    outline,
+    underline,
+    marker,
+  }
+
+  enum overlay-tone {
+    accent,
+    search-match,
+    positive,
+    caution,
+    critical,
+    neutral,
+  }
+
+  enum overlay-emphasis {
+    subtle,
+    regular,
+    strong,
+  }
+
+  enum overlay-motion {
+    none,
+    pulse-once,
+    sweep-once,
+  }
+
+  record overlay-appearance {
+    shape: overlay-shape,
+    tone: overlay-tone,
+    emphasis: overlay-emphasis,
+    motion: overlay-motion,
+  }
+
+  record document-overlay {
+    id: string,
+    page: page-index,
+    regions: list<normalized-rect>,
+    appearance: overlay-appearance,
+    label: option<string>,
+    command: option<string>,
+  }
+
+  record overlay-batch {
+    document: document-handle,
+    revision: snapshot-revision,
+    overlays: list<document-overlay>,
+  }
+
+  record overlay-receipt {
+    handle: overlay-set-handle,
+    revision: snapshot-revision,
+    overlay-count: u32,
+  }
+}
+
+/// Capability ID: `key:pdf/document-metadata`.
+interface document-metadata {
+  use types.{document-handle, document-metadata-snapshot, pdf-error};
+  active-document: func() -> result<option<document-handle>, pdf-error>;
+  metadata: func(document: document-handle) -> result<document-metadata-snapshot, pdf-error>;
+}
+
+/// Capability ID: `key:pdf/page-metadata`.
+interface page-metadata {
+  use types.{document-handle, page-index, page-metadata-snapshot, pdf-error};
+  metadata: func(document: document-handle, page: page-index) -> result<page-metadata-snapshot, pdf-error>;
+}
+
+/// Capability ID: `key:pdf/outline`.
+interface outline {
+  use types.{document-handle, outline-snapshot, pdf-error};
+  read: func(document: document-handle) -> result<outline-snapshot, pdf-error>;
+}
+
+/// Capability ID: `key:pdf/links`.
+interface links {
+  use types.{page-handle, page-links-snapshot, pdf-error};
+  read: func(page: page-handle) -> result<page-links-snapshot, pdf-error>;
+}
+
+/// Capability ID: `key:pdf/text`.
+interface text {
+  use types.{page-text-request, page-text-snapshot, pdf-error};
+  read-page: func(request: page-text-request) -> result<page-text-snapshot, pdf-error>;
+}
+
+/// Capability ID: `key:pdf/selection`.
+interface selection {
+  use types.{document-handle, selection-snapshot, pdf-error};
+  read: func(document: document-handle) -> result<selection-snapshot, pdf-error>;
+}
+
+/// Capability ID: `key:pdf/viewport`.
+interface viewport {
+  use types.{document-handle, viewport-snapshot, pdf-error};
+  read: func(document: document-handle) -> result<viewport-snapshot, pdf-error>;
+}
+
+/// Capability ID: `key:pdf/navigation`.
+interface navigation {
+  use types.{navigation-receipt, navigation-request, pdf-error};
+  navigate: func(request: navigation-request) -> result<navigation-receipt, pdf-error>;
+}
+
+/// Capability ID: `key:pdf/overlays`.
+interface overlays {
+  use types.{overlay-batch, overlay-receipt, pdf-error};
+  replace: func(batch: overlay-batch) -> result<overlay-receipt, pdf-error>;
+}
+
+/// Conformance world containing the complete 0.1 read-only host surface.
+/// Production adapters link only the independently granted imports above.
+world full-read-only-host {
+  import document-metadata;
+  import page-metadata;
+  import outline;
+  import links;
+  import text;
+  import selection;
+  import viewport;
+  import navigation;
+  import overlays;
+}
+

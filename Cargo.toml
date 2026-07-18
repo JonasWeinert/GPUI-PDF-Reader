@@ -9,8 +9,11 @@ members = [
     "crates/key-extension-package",
     "crates/key-extension-wasm",
     "crates/key-pdf-core",
+    "crates/key-pdf-extension-api",
+    "crates/key-pdf-gpui",
     "crates/key-pdf-runtime",
     "crates/key-pdfium",
+    "crates/key-safe-http",
     "crates/key-sidecar-store",
     "crates/key-ui-gpui",
 ]
