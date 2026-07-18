@@ -112,7 +112,7 @@ mod annotation_io;
 mod comments;
 mod extensions;
 #[cfg(debug_assertions)]
-mod qa;
+pub(crate) mod qa;
 mod references;
 mod render;
 mod search;
@@ -175,24 +175,44 @@ const LINK_HOVER_HANDOFF_DELAY: Duration = Duration::from_millis(180);
 const LINK_HOVER_CLOSE_DELAY: Duration = Duration::from_millis(320);
 const LINK_HOVER_STABILITY_RADIUS: f32 = 3.0;
 
-fn resource_cache_limits(amount: ResourceAmount) -> (usize, usize, usize) {
-    if amount.gpu_memory_bytes == 0 && amount.cpu_memory_bytes == 0 {
+fn resource_cache_limits(activity: ActivityLevel, amount: ResourceAmount) -> (usize, usize, usize) {
+    if activity == ActivityLevel::Suspended
+        || activity == ActivityLevel::BackgroundCold
+        || (amount.gpu_memory_bytes == 0 && amount.cpu_memory_bytes == 0)
+    {
         return (0, 0, 0);
     }
-    let cache_bytes = usize::try_from(amount.gpu_memory_bytes)
+
+    // Every RenderImage retains its BGRA frame after GPUI uploads the same
+    // pixels into the window's GPU atlas. Charge both resident copies instead
+    // of treating the raw frame as the complete tile cost.
+    let raw_tile_budget = amount.gpu_memory_bytes / 2;
+    let activity_cap = match activity {
+        ActivityLevel::ForegroundInteractive => 96 * RESOURCE_MIB as usize,
+        ActivityLevel::ForegroundIdle => 48 * RESOURCE_MIB as usize,
+        ActivityLevel::BackgroundWarm => 32 * RESOURCE_MIB as usize,
+        ActivityLevel::BackgroundCold | ActivityLevel::Suspended => 0,
+    };
+    let cache_bytes = usize::try_from(raw_tile_budget)
         .unwrap_or(usize::MAX)
-        .min(512 * 1024 * 1024);
+        .min(activity_cap);
     let tiles = if cache_bytes == 0 {
         0
     } else {
         (cache_bytes / (4 * 1024 * 1024)).clamp(2, 128)
     };
-    let text_pages = if amount.cpu_memory_bytes == 0 {
+    let text_page_cap = match activity {
+        ActivityLevel::ForegroundInteractive => 48,
+        ActivityLevel::ForegroundIdle => 24,
+        ActivityLevel::BackgroundWarm => 8,
+        ActivityLevel::BackgroundCold | ActivityLevel::Suspended => 0,
+    };
+    let text_pages = if amount.cpu_memory_bytes == 0 || text_page_cap == 0 {
         0
     } else {
         usize::try_from(amount.cpu_memory_bytes / (4 * RESOURCE_MIB))
             .unwrap_or(128)
-            .clamp(2, 128)
+            .clamp(2, text_page_cap)
     };
     (cache_bytes, tiles, text_pages)
 }
@@ -954,7 +974,7 @@ impl PdfReader {
         }
         self.resource_allocation = allocation;
         let (max_cache_bytes, max_cached_tiles, max_cached_text_pages) =
-            resource_cache_limits(allocation.amount);
+            resource_cache_limits(allocation.activity, allocation.amount);
         self.max_cache_bytes = max_cache_bytes;
         self.max_cached_tiles = max_cached_tiles;
         self.max_cached_text_pages = max_cached_text_pages;
@@ -963,7 +983,10 @@ impl PdfReader {
             ActivityLevel::ForegroundIdle | ActivityLevel::ForegroundInteractive
         ) && allocation.amount.worker_slots > 0;
 
-        if allocation.activity == ActivityLevel::Suspended {
+        if matches!(
+            allocation.activity,
+            ActivityLevel::Suspended | ActivityLevel::BackgroundCold
+        ) {
             if matches!(self.status, ReaderStatus::Ready) {
                 let _ = self.worker.render_viewport(
                     self.generation,
@@ -982,12 +1005,9 @@ impl PdfReader {
         } else {
             self.evict_distant_tiles(window, cx);
             self.evict_distant_text();
-            if matches!(
-                allocation.activity,
-                ActivityLevel::ForegroundIdle | ActivityLevel::ForegroundInteractive
-            ) {
-                self.request_visible_tiles(window);
-            }
+            // This also replaces foreground prefetch demand with a visible-only
+            // demand when the document becomes BackgroundWarm.
+            self.request_visible_tiles(window);
         }
         cx.notify();
     }

@@ -1,8 +1,8 @@
 //! GPUI window shell shared by document and host-owned workspace views.
 
 use crate::application_host::{
-    ApplicationHost, activate_workspace_view, open_pdf_from_window, open_settings_window,
-    set_resource_mode,
+    ApplicationHost, activate_workspace_view, idle_workspace_view, open_pdf_from_window,
+    open_settings_window, set_resource_mode,
 };
 use crate::reader::PdfReader;
 use crate::{OpenDocument, OpenSettings};
@@ -112,6 +112,7 @@ impl WorkspaceWindow {
 
     fn activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !window.is_window_active() {
+            idle_workspace_view(self.host.clone(), self.view.id, cx);
             return;
         }
         let view = self.view.id;

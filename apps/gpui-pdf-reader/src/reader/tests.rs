@@ -8,21 +8,42 @@ use gpui_component::{ThemeColor, ThemeMode};
 
 #[test]
 fn resource_cache_limits_scale_and_suspend_without_hidden_minimums() {
-    assert_eq!(resource_cache_limits(ResourceAmount::default()), (0, 0, 0));
-    let saver = resource_cache_limits(ResourceAmount {
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::Suspended, ResourceAmount::default()),
+        (0, 0, 0)
+    );
+    let saver_amount = ResourceAmount {
         cpu_memory_bytes: 24 * RESOURCE_MIB,
         gpu_memory_bytes: 16 * RESOURCE_MIB,
         worker_slots: 0,
         network_slots: 0,
-    });
-    let performance = resource_cache_limits(ResourceAmount {
+    };
+    let performance_amount = ResourceAmount {
         cpu_memory_bytes: 192 * RESOURCE_MIB,
         gpu_memory_bytes: 128 * RESOURCE_MIB,
         worker_slots: 2,
         network_slots: 2,
-    });
-    assert_eq!(saver, (16 * 1024 * 1024, 4, 6));
-    assert_eq!(performance, (128 * 1024 * 1024, 32, 48));
+    };
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::ForegroundInteractive, saver_amount),
+        (8 * RESOURCE_MIB as usize, 2, 6)
+    );
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::ForegroundInteractive, performance_amount),
+        (64 * RESOURCE_MIB as usize, 16, 48)
+    );
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::ForegroundIdle, performance_amount),
+        (48 * RESOURCE_MIB as usize, 12, 24)
+    );
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::BackgroundWarm, performance_amount),
+        (32 * RESOURCE_MIB as usize, 8, 8)
+    );
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::BackgroundCold, performance_amount),
+        (0, 0, 0)
+    );
 }
 
 #[test]

@@ -353,15 +353,23 @@ fn resource_profile(kind: &ItemKind) -> ResourceProfile {
 }
 
 fn apply_resource_targets(targets: Vec<(AnyWindowHandle, ResourceAllocation)>, cx: &mut App) {
-    for (handle, allocation) in targets {
-        if let Some(handle) = handle.downcast::<WorkspaceWindow>() {
-            handle
-                .update(cx, |workspace, window, cx| {
-                    workspace.apply_resource_allocation(allocation, window, cx)
-                })
-                .ok();
-        }
+    if targets.is_empty() {
+        return;
     }
+    // Activation callbacks run while their source window is on GPUI's update
+    // stack. Defer all handles together so the current window is addressable
+    // again and every participant actually receives its new allocation.
+    cx.defer(move |cx| {
+        for (handle, allocation) in targets {
+            if let Some(handle) = handle.downcast::<WorkspaceWindow>() {
+                handle
+                    .update(cx, |workspace, window, cx| {
+                        workspace.apply_resource_allocation(allocation, window, cx)
+                    })
+                    .ok();
+            }
+        }
+    });
 }
 
 pub(crate) fn activate_workspace_view(
@@ -375,6 +383,17 @@ pub(crate) fn activate_workspace_view(
     });
     apply_resource_targets(targets, cx);
     changed
+}
+
+pub(crate) fn idle_workspace_view(host: Entity<ApplicationHost>, view: ViewId, cx: &mut App) {
+    let targets = host.update(cx, |host, _| {
+        if host.active_view == Some(view) {
+            host.resource_registry
+                .set_activity(participant_for(view), ActivityLevel::ForegroundIdle);
+        }
+        host.reconcile_resource_targets()
+    });
+    apply_resource_targets(targets, cx);
 }
 
 pub(crate) fn set_resource_mode(host: Entity<ApplicationHost>, mode: ResourceMode, cx: &mut App) {
