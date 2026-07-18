@@ -266,11 +266,6 @@ fn render_appearance_from_theme(theme: &Theme, pdf_dark_mode_enabled: bool) -> R
     }
 }
 
-#[cfg(target_os = "macos")]
-const TITLEBAR_CONTROL_INSET: f32 = 76.0;
-#[cfg(not(target_os = "macos"))]
-const TITLEBAR_CONTROL_INSET: f32 = 0.0;
-
 type Offset = ScrollOffset;
 
 #[derive(Clone, Copy, Debug)]
@@ -1321,6 +1316,13 @@ impl PdfReader {
                         }
                         let window_height = f32::from(window.viewport_size().height);
                         weak.update(cx, |reader, cx| {
+                            if !reader
+                                ._application_host
+                                .read(cx)
+                                .is_active_view(reader.workspace_view_id)
+                            {
+                                return;
+                            }
                             let position = point(px(pinch.x), px(window_height - pinch.cocoa_y));
                             reader.zoom_at(reader.zoom * (1.0 + pinch.delta), position, window, cx);
                         })
@@ -1450,11 +1452,6 @@ impl PdfReader {
                 self.viewport.fit_width();
                 self.sync_viewport_snapshot();
                 self.publish_pdf_selection();
-                let title = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("PDF");
-                window.set_window_title(&format!("{title} — GPUI PDF Reader"));
                 self.request_visible_tiles(window);
             }
             WorkerEvent::TileRendered {
@@ -2677,8 +2674,9 @@ impl PdfReader {
         let size = window.viewport_size();
         let full_width = f32::from(size.width).max(1.0);
         let width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
-        let error_height = self.content_top() - TOOLBAR_HEIGHT;
-        let height = (f32::from(size.height) - TOOLBAR_HEIGHT - error_height).max(1.0);
+        let toolbar_height = self.reader_toolbar_height();
+        let error_height = self.content_top() - toolbar_height;
+        let height = (f32::from(size.height) - toolbar_height - error_height).max(1.0);
         let right_occlusion = if self.view_mode == ReaderView::Fluid {
             fluid_sidebar_extent(width, self.sidebar.progress)
                 + reference_panel_extent(width, self.reference_panel.value())
@@ -3324,13 +3322,48 @@ impl PdfReader {
         false
     }
 
+    pub(crate) fn tab_close_requires_confirmation(&self) -> bool {
+        self.comment_draft_needs_confirmation()
+    }
+
+    pub(crate) fn prepare_tab_close(&mut self) {
+        self.close_pdf_capability_generation();
+    }
+
+    pub(crate) fn tab_detail(&self) -> SharedString {
+        let status = self.status_text();
+        if !matches!(status.as_ref(), "Ready" | "Open a PDF to begin") {
+            return status;
+        }
+        let page_count = self
+            .document
+            .as_ref()
+            .map(|document| document.pages.len())
+            .unwrap_or(0);
+        if page_count == 0 {
+            return status;
+        }
+        let current_page = self
+            .layout()
+            .map(|layout| layout.current_page(self.scroll.y, self.viewport_height) + 1)
+            .unwrap_or(1);
+        format!("Page {current_page} of {page_count}").into()
+    }
+
     fn content_top(&self) -> f32 {
-        TOOLBAR_HEIGHT
+        self.reader_toolbar_height()
             + if matches!(self.status, ReaderStatus::Error(_)) {
                 ERROR_BAR_HEIGHT
             } else {
                 0.0
             }
+    }
+
+    fn reader_toolbar_height(&self) -> f32 {
+        match self.view_mode {
+            ReaderView::Classic => TOOLBAR_HEIGHT,
+            ReaderView::Fluid => 0.0,
+        }
     }
 
     fn request_visible_tiles(&mut self, _window: &Window) {

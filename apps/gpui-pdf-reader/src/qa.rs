@@ -41,6 +41,7 @@ struct QaConfig {
     reference_details: bool,
     extension_scenario: Option<String>,
     expected_window_count: Option<usize>,
+    expected_tab_count: Option<usize>,
     resource_trace: bool,
     resource_sample_interval: Duration,
     resource_stress: bool,
@@ -93,6 +94,7 @@ impl QaConfig {
             reference_details: flag("GPUI_PDF_READER_QA_REFERENCE_DETAILS"),
             extension_scenario: std::env::var("GPUI_PDF_READER_QA_EXTENSION_SCENARIO").ok(),
             expected_window_count: optional_value("GPUI_PDF_READER_QA_WINDOW_COUNT"),
+            expected_tab_count: optional_value("GPUI_PDF_READER_QA_TAB_COUNT"),
             resource_trace: flag("GPUI_PDF_READER_QA_RESOURCE_TRACE"),
             resource_sample_interval: Duration::from_millis(
                 optional_value::<u64>("GPUI_PDF_READER_QA_RESOURCE_SAMPLE_MS")
@@ -130,6 +132,7 @@ impl QaConfig {
             || self.reference_details
             || self.extension_scenario.is_some()
             || self.expected_window_count.is_some()
+            || self.expected_tab_count.is_some()
             || self.resource_trace
             || self.resource_stress
             || self.progressive_open
@@ -290,6 +293,71 @@ pub fn install(
                             }
                             cx.background_executor().timer(POLL_INTERVAL).await;
                         }
+                    }
+
+                    if let Some(expected) = config.expected_tab_count {
+                        let actual = cx
+                            .update(|window, cx| {
+                                window
+                                    .root::<WorkspaceWindow>()
+                                    .flatten()
+                                    .map_or(0, |workspace| workspace.read(cx).qa_tab_count())
+                            })
+                            .unwrap_or(0);
+                        if actual != expected {
+                            fail_and_quit(
+                                cx,
+                                &format!("expected {expected} workspace tabs, found {actual}"),
+                            );
+                            return;
+                        }
+                        let mut settled = 0;
+                        for index in 0..expected {
+                            let activated = cx
+                                .update(|window, cx| {
+                                    let Some(workspace) = window
+                                        .root::<WorkspaceWindow>()
+                                        .flatten()
+                                    else {
+                                        return false;
+                                    };
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.qa_activate_tab(index, window, cx)
+                                    });
+                                    true
+                                })
+                                .unwrap_or(false);
+                            if !activated {
+                                fail_and_quit(cx, "tab QA could not access the workspace root");
+                                return;
+                            }
+                            let deadline = Instant::now() + config.timeout;
+                            loop {
+                                let ready = cx
+                                    .update(|window, cx| {
+                                        reader_entity(window, cx).is_some_and(|reader| {
+                                            reader.read(cx).qa_viewport_is_settled()
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                if ready {
+                                    settled += 1;
+                                    break;
+                                }
+                                if Instant::now() >= deadline {
+                                    fail_and_quit(
+                                        cx,
+                                        &format!("tab {index} did not settle after activation"),
+                                    );
+                                    return;
+                                }
+                                cx.background_executor().timer(POLL_INTERVAL).await;
+                            }
+                        }
+                        let windows = cx.update(|_, cx| cx.windows().len()).unwrap_or(0);
+                        eprintln!(
+                            "GPUI_PDF_READER_QA_TABS tabs={actual} switched={expected} settled={settled} windows={windows}"
+                        );
                     }
 
                     if config.resource_stress {
@@ -787,11 +855,13 @@ fn workspace_window_counts(current: &Window, cx: &App) -> (usize, usize, usize) 
     let mut settled = 0;
     for handle in &windows {
         if *handle == current_handle {
-            let Some(reader) = reader_entity(current, cx) else {
+            let Some(workspace) = current.root::<WorkspaceWindow>().flatten() else {
                 continue;
             };
-            pdf_views += 1;
-            settled += usize::from(reader.read(cx).qa_resource_is_settled());
+            for reader in workspace.read(cx).readers() {
+                pdf_views += 1;
+                settled += usize::from(reader.read(cx).qa_resource_is_settled());
+            }
             continue;
         }
         let Some(handle) = handle.downcast::<WorkspaceWindow>() else {
@@ -800,11 +870,10 @@ fn workspace_window_counts(current: &Window, cx: &App) -> (usize, usize, usize) 
         let Ok(workspace) = handle.read(cx) else {
             continue;
         };
-        let Some(reader) = workspace.reader() else {
-            continue;
-        };
-        pdf_views += 1;
-        settled += usize::from(reader.read(cx).qa_resource_is_settled());
+        for reader in workspace.readers() {
+            pdf_views += 1;
+            settled += usize::from(reader.read(cx).qa_resource_is_settled());
+        }
     }
     (windows.len(), pdf_views, settled)
 }
@@ -1123,6 +1192,7 @@ mod tests {
             reference_details: false,
             extension_scenario: None,
             expected_window_count: None,
+            expected_tab_count: None,
             resource_trace: false,
             resource_sample_interval: Duration::from_millis(DEFAULT_RESOURCE_SAMPLE_MS),
             resource_stress: false,

@@ -26,7 +26,7 @@ use std::{cell::RefCell, rc::Rc};
 
 struct WindowRecord {
     descriptor: WorkspaceWindowDescriptor,
-    item: Option<WorkspaceItemDescriptor>,
+    views: BTreeMap<ViewId, Option<WorkspaceItemDescriptor>>,
     handle: AnyWindowHandle,
 }
 
@@ -40,8 +40,8 @@ pub(crate) struct ApplicationHost {
     reference_executor: ReferenceExecutor,
     ids: IdGenerator,
     windows: BTreeMap<WindowId, WindowRecord>,
-    paths: HashMap<PathBuf, WindowId>,
-    settings_window: Option<WindowId>,
+    paths: HashMap<PathBuf, (WindowId, ViewId)>,
+    settings_view: Option<(WindowId, ViewId)>,
     active_view: Option<ViewId>,
     view_mru: VecDeque<ViewId>,
     resources: ResourceCoordinator,
@@ -62,7 +62,7 @@ impl ApplicationHost {
             ids: IdGenerator::new(1),
             windows: BTreeMap::new(),
             paths: HashMap::new(),
-            settings_window: None,
+            settings_view: None,
             active_view: None,
             view_mru: VecDeque::new(),
             resources: ResourceCoordinator::new(ResourceMode::Auto, system_resources::detect()),
@@ -128,7 +128,7 @@ impl ApplicationHost {
             .windows
             .values()
             .filter(|record| !open.contains(&record.handle))
-            .filter_map(|record| record.descriptor.active_view)
+            .flat_map(|record| record.views.keys().copied())
             .collect::<Vec<_>>();
         self.windows
             .retain(|_, record| open.contains(&record.handle));
@@ -137,18 +137,20 @@ impl ApplicationHost {
         }
         self.view_mru.retain(|view| !removed_views.contains(view));
         self.paths
-            .retain(|_, window| self.windows.contains_key(window));
-        if self
-            .settings_window
-            .is_some_and(|window| !self.windows.contains_key(&window))
-        {
-            self.settings_window = None;
+            .retain(|_, (window, _)| self.windows.contains_key(window));
+        if self.settings_view.is_some_and(|(window, view)| {
+            !self
+                .windows
+                .get(&window)
+                .is_some_and(|record| record.views.contains_key(&view))
+        }) {
+            self.settings_view = None;
         }
         if self.active_view.is_some_and(|view| {
             !self
                 .windows
                 .values()
-                .any(|record| record.descriptor.active_view == Some(view))
+                .any(|record| record.views.contains_key(&view))
         }) {
             self.active_view = None;
         }
@@ -179,9 +181,9 @@ impl ApplicationHost {
             .filter_map(|change| {
                 self.windows.values().find_map(|record| {
                     (record
-                        .descriptor
-                        .active_view
-                        .is_some_and(|view| participant_for(view) == change.current.id))
+                        .views
+                        .keys()
+                        .any(|view| participant_for(*view) == change.current.id))
                     .then_some((record.handle, change.current))
                 })
             })
@@ -197,6 +199,20 @@ impl ApplicationHost {
         WorkspaceViewDescriptor,
     ) {
         let window_id = self.ids.window();
+        let (item, view) = self.allocate_pdf_view(path);
+        let title = view.title.clone();
+        let window = WorkspaceWindowDescriptor {
+            id: window_id,
+            title,
+            active_view: Some(view.id),
+        };
+        (window, item, view)
+    }
+
+    fn allocate_pdf_view(
+        &self,
+        path: Option<&Path>,
+    ) -> (Option<WorkspaceItemDescriptor>, WorkspaceViewDescriptor) {
         let view_id = self.ids.view();
         let item = path.map(|path| WorkspaceItemDescriptor {
             id: self.ids.item(),
@@ -224,32 +240,31 @@ impl ApplicationHost {
                 .as_ref()
                 .map_or_else(BTreeSet::new, |item| item.capabilities.clone()),
         };
-        let window = WorkspaceWindowDescriptor {
-            id: window_id,
-            title,
-            active_view: Some(view_id),
-        };
-        (window, item, view)
+        (item, view)
     }
 
     fn allocate_settings(&self) -> (WorkspaceWindowDescriptor, WorkspaceViewDescriptor) {
         let window_id = self.ids.window();
-        let view_id = self.ids.view();
+        let view = self.allocate_settings_view();
         (
             WorkspaceWindowDescriptor {
                 id: window_id,
                 title: "Settings".into(),
-                active_view: Some(view_id),
+                active_view: Some(view.id),
             },
-            WorkspaceViewDescriptor {
-                id: view_id,
-                generation: Generation::INITIAL,
-                item_id: None,
-                kind: ItemKind::Settings,
-                title: "Settings".into(),
-                capabilities: BTreeSet::from([Capability::Settings]),
-            },
+            view,
         )
+    }
+
+    fn allocate_settings_view(&self) -> WorkspaceViewDescriptor {
+        WorkspaceViewDescriptor {
+            id: self.ids.view(),
+            generation: Generation::INITIAL,
+            item_id: None,
+            kind: ItemKind::Settings,
+            title: "Settings".into(),
+            capabilities: BTreeSet::from([Capability::Settings]),
+        }
     }
 
     fn insert_window(
@@ -259,19 +274,50 @@ impl ApplicationHost {
         view: &WorkspaceViewDescriptor,
         handle: AnyWindowHandle,
     ) {
-        if let Some(item) = &item
-            && let ItemSource::File(path) = &item.source
-        {
-            self.paths.insert(normalize_path(path), descriptor.id);
-        }
+        let window_id = descriptor.id;
+        let mut views = BTreeMap::new();
+        views.insert(view.id, item.clone());
         self.windows.insert(
             descriptor.id,
             WindowRecord {
                 descriptor,
-                item,
+                views,
                 handle,
             },
         );
+        self.register_view_path(item.as_ref(), window_id, view.id);
+        self.register_participant(view);
+    }
+
+    fn register_view(
+        &mut self,
+        window: WindowId,
+        item: Option<WorkspaceItemDescriptor>,
+        view: &WorkspaceViewDescriptor,
+    ) {
+        if let Some(record) = self.windows.get_mut(&window) {
+            record.views.insert(view.id, item.clone());
+            record.descriptor.active_view = Some(view.id);
+            record.descriptor.title = view.title.clone();
+        }
+        self.register_view_path(item.as_ref(), window, view.id);
+        self.register_participant(view);
+    }
+
+    fn register_view_path(
+        &mut self,
+        item: Option<&WorkspaceItemDescriptor>,
+        window: WindowId,
+        view: ViewId,
+    ) {
+        if let Some(item) = item
+            && let ItemSource::File(path) = &item.source
+        {
+            self.paths.insert(normalize_path(path), (window, view));
+        }
+    }
+
+    fn register_participant(&mut self, view: &WorkspaceViewDescriptor) {
         self.resource_registry.upsert(ParticipantSnapshot {
             id: participant_for(view.id),
             activity: ActivityLevel::BackgroundWarm,
@@ -279,19 +325,20 @@ impl ApplicationHost {
         });
         self.view_mru.retain(|candidate| *candidate != view.id);
         self.view_mru.push_back(view.id);
+        self.refresh_activity_levels();
     }
 
-    fn existing_pdf_window(&self, path: &Path) -> Option<AnyWindowHandle> {
+    fn existing_pdf_view(&self, path: &Path) -> Option<(AnyWindowHandle, ViewId)> {
         self.paths
             .get(&normalize_path(path))
-            .and_then(|id| self.windows.get(id))
-            .map(|record| record.handle)
+            .and_then(|(id, view)| self.windows.get(id).map(|record| (record.handle, *view)))
     }
 
     fn empty_pdf_window(&self, id: WindowId) -> bool {
         self.windows
             .get(&id)
-            .is_some_and(|record| record.item.is_none())
+            .and_then(|record| record.descriptor.active_view.map(|view| (record, view)))
+            .is_some_and(|(record, view)| record.views.get(&view).is_some_and(Option::is_none))
     }
 }
 
@@ -385,6 +432,55 @@ pub(crate) fn activate_workspace_view(
     changed
 }
 
+pub(crate) fn select_workspace_tab(
+    host: Entity<ApplicationHost>,
+    window: WindowId,
+    view: ViewId,
+    title: String,
+    cx: &mut App,
+) -> bool {
+    host.update(cx, |host, _| {
+        if let Some(record) = host.windows.get_mut(&window) {
+            record.descriptor.active_view = Some(view);
+            record.descriptor.title = title;
+        }
+    });
+    activate_workspace_view(host, view, cx)
+}
+
+pub(crate) fn remove_workspace_view(
+    host: Entity<ApplicationHost>,
+    window: WindowId,
+    view: ViewId,
+    next_active: Option<(ViewId, String)>,
+    cx: &mut App,
+) {
+    let targets = host.update(cx, |host, _| {
+        if let Some(record) = host.windows.get_mut(&window) {
+            record.views.remove(&view);
+            record.descriptor.active_view = next_active.as_ref().map(|(view, _)| *view);
+            if let Some((_, title)) = next_active.as_ref() {
+                record.descriptor.title = title.clone();
+            }
+        }
+        host.paths.retain(|_, (_, candidate)| *candidate != view);
+        if host
+            .settings_view
+            .is_some_and(|(_, candidate)| candidate == view)
+        {
+            host.settings_view = None;
+        }
+        host.resource_registry.remove(participant_for(view));
+        host.view_mru.retain(|candidate| *candidate != view);
+        if host.active_view == Some(view) {
+            host.active_view = next_active.as_ref().map(|(view, _)| *view);
+        }
+        host.refresh_activity_levels();
+        host.reconcile_resource_targets()
+    });
+    apply_resource_targets(targets, cx);
+}
+
 pub(crate) fn idle_workspace_view(host: Entity<ApplicationHost>, view: ViewId, cx: &mut App) {
     let targets = host.update(cx, |host, _| {
         if host.active_view == Some(view) {
@@ -422,11 +518,14 @@ pub(crate) fn open_pdf_window(
     cx: &mut App,
 ) -> Result<WindowHandle<WorkspaceWindow>, String> {
     if let Some(path) = path.as_deref()
-        && let Some(existing) = host.read(cx).existing_pdf_window(path)
+        && let Some((existing, view)) = host.read(cx).existing_pdf_view(path)
         && let Some(existing) = existing.downcast::<WorkspaceWindow>()
     {
         existing
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |workspace, window, cx| {
+                workspace.activate_tab(view, window, cx);
+                window.activate_window();
+            })
             .map_err(|error| error.to_string())?;
         return Ok(existing);
     }
@@ -495,8 +594,9 @@ fn open_pdf_from_workspace(
     cx: &mut Context<WorkspaceWindow>,
 ) -> Result<(), String> {
     let path = normalize_path(&path);
-    if let Some(existing_id) = host.read(cx).paths.get(&path).copied() {
+    if let Some((existing_id, existing_view)) = host.read(cx).paths.get(&path).copied() {
         if existing_id == source {
+            workspace.activate_tab(existing_view, window, cx);
             window.activate_window();
             return Ok(());
         }
@@ -510,7 +610,10 @@ fn open_pdf_from_workspace(
             return Err("existing PDF window has an unexpected root type".to_owned());
         };
         existing
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |workspace, window, cx| {
+                workspace.activate_tab(existing_view, window, cx);
+                window.activate_window();
+            })
             .map_err(|error| error.to_string())?;
         return Ok(());
     }
@@ -522,25 +625,14 @@ fn open_pdf_from_workspace(
                 .windows
                 .get(&source)
                 .ok_or_else(|| "source window is no longer open".to_owned())?;
-            let item = WorkspaceItemDescriptor {
-                id: host_ref.ids.item(),
-                generation: Generation::INITIAL,
-                kind: ItemKind::Pdf,
-                title: file_title(&path, "PDF"),
-                source: ItemSource::File(path.clone()),
-                capabilities: BTreeSet::from([
-                    Capability::Read,
-                    Capability::Search,
-                    Capability::Annotate,
-                    Capability::NavigateOutline,
-                ]),
-            };
+            let (item, view) = host_ref.allocate_pdf_view(Some(&path));
+            let item = item.expect("a path-backed PDF allocation includes an item");
             let view = WorkspaceViewDescriptor {
                 id: record
                     .descriptor
                     .active_view
                     .expect("PDF windows own a view"),
-                generation: Generation::INITIAL,
+                generation: view.generation,
                 item_id: Some(item.id),
                 kind: ItemKind::Pdf,
                 title: item.title.clone(),
@@ -548,31 +640,78 @@ fn open_pdf_from_workspace(
             };
             (item, view)
         };
+        let view_id = view.id;
         workspace.open_pdf(path.clone(), item.clone(), view, window, cx);
         host.update(cx, |host, _| {
             if let Some(record) = host.windows.get_mut(&source) {
                 record.descriptor.title = item.title.clone();
-                record.item = Some(item);
+                if let Some(view) = record.descriptor.active_view {
+                    record.views.insert(view, Some(item));
+                }
             }
-            host.paths.insert(path, source);
+            host.paths.insert(path, (source, view_id));
         });
         return Ok(());
     }
 
-    open_pdf_window(host, Some(path), cx).map(|_| ())
+    let (item, view) = host.read(cx).allocate_pdf_view(Some(&path));
+    workspace.add_pdf_tab(item.clone(), view.clone(), path, window, cx);
+    host.update(cx, |host, _| host.register_view(source, item, &view));
+    activate_workspace_view(host, view.id, cx);
+    Ok(())
+}
+
+pub(crate) fn open_pdf_tab(
+    host: Entity<ApplicationHost>,
+    handle: WindowHandle<WorkspaceWindow>,
+    path: PathBuf,
+    cx: &mut App,
+) -> Result<(), String> {
+    handle
+        .update(cx, |workspace, window, cx| {
+            open_pdf_from_workspace(host, workspace.window_id(), path, workspace, window, cx)
+        })
+        .map_err(|error| error.to_string())?
 }
 
 pub(crate) fn open_settings_window(
     host: Entity<ApplicationHost>,
     cx: &mut App,
 ) -> Result<WindowHandle<WorkspaceWindow>, String> {
-    if let Some(id) = host.read(cx).settings_window
+    if let Some((id, view)) = host.read(cx).settings_view
         && let Some(record) = host.read(cx).windows.get(&id)
         && let Some(handle) = record.handle.downcast::<WorkspaceWindow>()
     {
         handle
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |workspace, window, cx| {
+                workspace.activate_tab(view, window, cx);
+                window.activate_window();
+            })
             .map_err(|error| error.to_string())?;
+        return Ok(handle);
+    }
+
+    if let Some((window_id, record_handle)) = host.read(cx).active_view.and_then(|active| {
+        host.read(cx).windows.iter().find_map(|(id, record)| {
+            record
+                .views
+                .contains_key(&active)
+                .then_some((*id, record.handle))
+        })
+    }) && let Some(handle) = record_handle.downcast::<WorkspaceWindow>()
+    {
+        let view = host.read(cx).allocate_settings_view();
+        handle
+            .update(cx, |workspace, window, cx| {
+                workspace.add_settings_tab(view.clone(), window, cx);
+                window.activate_window();
+            })
+            .map_err(|error| error.to_string())?;
+        host.update(cx, |host, _| {
+            host.settings_view = Some((window_id, view.id));
+            host.register_view(window_id, None, &view);
+        });
+        activate_workspace_view(host, view.id, cx);
         return Ok(handle);
     }
 
@@ -595,7 +734,7 @@ pub(crate) fn open_settings_window(
         )
         .map_err(|error| error.to_string())?;
     host.update(cx, |host, _| {
-        host.settings_window = Some(window_descriptor.id);
+        host.settings_view = Some((window_descriptor.id, view_descriptor.id));
         host.insert_window(window_descriptor, None, &view_descriptor, handle.into());
     });
     activate_workspace_view(host, view_descriptor.id, cx);

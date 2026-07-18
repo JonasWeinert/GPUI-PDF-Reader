@@ -2069,7 +2069,9 @@ impl PdfReader {
                 .id("reference-details-panel")
                 .block_mouse_except_scroll()
                 .absolute()
-                .top(px(TOOLBAR_HEIGHT + FLUID_PANEL_VERTICAL_MARGIN))
+                .top(px(
+                    self.reader_toolbar_height() + FLUID_PANEL_VERTICAL_MARGIN
+                ))
                 .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
                 .right(px(right))
                 .w(px(panel_width))

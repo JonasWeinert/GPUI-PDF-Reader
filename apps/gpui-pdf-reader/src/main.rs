@@ -125,6 +125,8 @@ fn main() {
         let application_host = cx.new(|_| application_host::ApplicationHost::new(extensions));
         let progressive_qa = cfg!(debug_assertions)
             && std::env::var_os("GPUI_PDF_READER_QA_PROGRESSIVE_OPEN").is_some();
+        let separate_window_qa = cfg!(debug_assertions)
+            && std::env::var_os("GPUI_PDF_READER_QA_SEPARATE_WINDOWS").is_some();
         let mut initial_paths = initial_paths.into_iter();
         let window =
             application_host::open_pdf_window(application_host.clone(), initial_paths.next(), cx)
@@ -133,9 +135,12 @@ fn main() {
         for path in initial_paths {
             if progressive_qa {
                 deferred_paths.push(path);
-            } else {
+            } else if separate_window_qa {
                 application_host::open_pdf_window(application_host.clone(), Some(path), cx)
                     .expect("failed to open an additional GPUI PDF Reader window");
+            } else {
+                application_host::open_pdf_tab(application_host.clone(), window, path, cx)
+                    .expect("failed to open an additional GPUI PDF Reader tab");
             }
         }
 

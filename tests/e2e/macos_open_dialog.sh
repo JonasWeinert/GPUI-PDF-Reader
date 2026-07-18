@@ -42,24 +42,27 @@ app_pid=$!
 
 ready=0
 for _ in $(jot 100); do
-  if osascript -e 'tell application "System Events" to return exists process "gpui-pdf-reader"' 2>/dev/null | grep -q true; then
+  if osascript \
+    -e 'tell application "System Events" to tell process "gpui-pdf-reader" to return exists window 1' \
+    2>/dev/null | grep -q true; then
     ready=1
     break
   fi
   sleep 0.1
 done
-[ "$ready" -eq 1 ] || fail "app process did not become available to System Events"
+[ "$ready" -eq 1 ] || fail "app window did not become available to System Events"
 
 osascript \
   -e 'tell application "System Events" to tell process "gpui-pdf-reader"' \
   -e 'set frontmost to true' \
+  -e 'delay 0.6' \
   -e 'keystroke "o" using command down' \
   -e 'delay 1' \
   -e 'keystroke "g" using {command down, shift down}' \
   -e 'delay 0.4' \
   -e "keystroke \"$fixture\"" \
   -e 'key code 36' \
-  -e 'delay 0.6' \
+  -e 'delay 1.6' \
   -e 'key code 36' \
   -e 'end tell'
 
