@@ -28,8 +28,9 @@ pub use controls::{ChromeButtonStyle, chrome_button, close_button, icon_button, 
 pub use panel::{PanelHeader, PanelShell, PanelShellStyle};
 #[cfg(target_os = "macos")]
 pub use tabs::{
-    TAB_BAR_HEIGHT, TabBarAction, TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover,
-    TabStrip,
+    TAB_BAR_HEIGHT, TAB_HOVER_CARD_WIDTH, TAB_SEARCH_POPOVER_WIDTH, TabBarAction, TabHoverAction,
+    TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover, TabStrip, tab_hover_card_x,
+    tab_search_popover_x,
 };
 #[cfg(target_os = "macos")]
 pub use theme::{ActionTokens, ContentTokens, StatusTokens, SurfaceTokens, ThemeTokens};

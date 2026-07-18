@@ -13,8 +13,9 @@ use gpui::{
 };
 use gpui_component::{Icon, IconName, Theme};
 use key_ui_gpui::{
-    TAB_BAR_HEIGHT, TabBarAction, TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover,
-    TabStrip, ThemeTokens,
+    TAB_BAR_HEIGHT, TAB_HOVER_CARD_WIDTH, TabBarAction, TabHoverCard, TabIndexAction,
+    TabPresentation, TabSearchPopover, TabStrip, ThemeTokens, tab_hover_card_x,
+    tab_search_popover_x,
 };
 use key_workspace_core::{
     DockPanel, ItemKind, ResourceAllocation, ResourceMode, ViewId, WorkspaceItemDescriptor,
@@ -44,14 +45,10 @@ impl WorkspaceTab {
         }
     }
 
-    fn hover_detail(&self, cx: &App) -> SharedString {
+    fn state_detail(&self, cx: &App) -> SharedString {
         match &self.content {
-            WorkspaceContent::Pdf(reader) => {
-                let source = self.source_detail();
-                let state = reader.read(cx).tab_detail();
-                format!("{state}  ·  {source}").into()
-            }
-            WorkspaceContent::Settings => self.source_detail(),
+            WorkspaceContent::Pdf(reader) => reader.read(cx).tab_detail(),
+            WorkspaceContent::Settings => "Application settings".into(),
         }
     }
 }
@@ -506,7 +503,7 @@ impl WorkspaceWindow {
         let tabs = self
             .tabs
             .iter()
-            .map(|tab| TabPresentation::new(tab.view.title.clone(), tab.hover_detail(cx)))
+            .map(|tab| TabPresentation::new(tab.view.title.clone(), tab.state_detail(cx)))
             .collect();
         let weak = cx.weak_entity();
         let activate_weak = weak.clone();
@@ -569,26 +566,32 @@ impl WorkspaceWindow {
     fn render_tab_search(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let tokens = ThemeTokens::from_theme(Theme::global(cx));
         let weak = cx.weak_entity();
-        let rows = self
-            .filtered_tab_indices()
+        let filtered_indices = self.filtered_tab_indices();
+        let row_count = filtered_indices.len();
+        let rows = filtered_indices
             .into_iter()
-            .map(|index| {
+            .enumerate()
+            .map(|(row_index, index)| {
                 let tab = &self.tabs[index];
                 let active = index == self.active_tab;
+                let is_last = row_index + 1 == row_count;
                 let title: SharedString = tab.view.title.clone().into();
                 let detail = tab.source_detail();
                 let weak = weak.clone();
                 div()
                     .id(("tab-search-result", index))
-                    .p_3()
-                    .rounded_lg()
+                    .relative()
+                    .min_h(px(58.0))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
                     .cursor_pointer()
                     .bg(if active {
                         tokens.action.accent_soft
                     } else {
-                        tokens.surface.overlay
+                        tokens.surface.background
                     })
-                    .hover(move |row| row.bg(tokens.action.control_hover))
+                    .hover(move |row| row.bg(tokens.surface.muted))
                     .on_click(move |_, window, cx| {
                         weak.update(cx, |workspace, cx| {
                             workspace.activate_tab_index(index, window, cx)
@@ -633,6 +636,26 @@ impl WorkspaceWindow {
                                     .child(detail),
                             ),
                     )
+                    .when(active, |row| {
+                        row.child(
+                            div()
+                                .size(px(6.0))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(tokens.action.accent),
+                        )
+                    })
+                    .when(!is_last, |row| {
+                        row.child(
+                            div()
+                                .absolute()
+                                .bottom_0()
+                                .left(px(42.0))
+                                .right_2()
+                                .h(px(1.0))
+                                .bg(tokens.surface.border.opacity(0.58)),
+                        )
+                    })
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -643,22 +666,27 @@ impl WorkspaceWindow {
         let index = self.hovered_tab.filter(|index| *index != self.active_tab)?;
         let tab = self.tabs.get(index)?;
         let width = f32::from(window.viewport_size().width);
-        let x = self
-            .tab_scroll
-            .bounds_for_item(index)
-            .map_or(112.0, |bounds| f32::from(bounds.origin.x))
-            .clamp(8.0, (width - 258.0).max(8.0));
+        let x = self.tab_scroll.bounds_for_item(index).map_or_else(
+            || tab_hover_card_x(112.0, 180.0, width, TAB_HOVER_CARD_WIDTH),
+            |bounds| {
+                tab_hover_card_x(
+                    f32::from(bounds.origin.x),
+                    f32::from(bounds.size.width),
+                    width,
+                    TAB_HOVER_CARD_WIDTH,
+                )
+            },
+        );
         let tokens = ThemeTokens::from_theme(Theme::global(cx));
         Some(
             div()
                 .absolute()
-                .top(px(TAB_BAR_HEIGHT + 6.0))
+                .top(px(TAB_BAR_HEIGHT + 8.0))
                 .left(px(x))
-                .child(TabHoverCard::new(
-                    tokens,
-                    tab.view.title.clone(),
-                    tab.hover_detail(cx),
-                ))
+                .child(
+                    TabHoverCard::new(tokens, tab.view.title.clone(), tab.source_detail())
+                        .status(tab.state_detail(cx)),
+                )
                 .into_any_element(),
         )
     }
@@ -840,6 +868,73 @@ fn active_index_after_close(tab_count: usize, active: usize, closed: usize) -> O
     })
 }
 
+impl Focusable for WorkspaceWindow {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.active_tab().content {
+            WorkspaceContent::Pdf(reader) => reader.read(cx).focus_handle(cx),
+            WorkspaceContent::Settings => self.focus_handle.clone(),
+        }
+    }
+}
+
+impl Render for WorkspaceWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = match &self.active_tab().content {
+            WorkspaceContent::Pdf(reader) => reader.clone().into_any_element(),
+            WorkspaceContent::Settings => self.render_settings(cx),
+        };
+        let left_dock = (self.active_tab().layout.docks.left.open
+            && self.active_view().kind == ItemKind::Settings)
+            .then(|| self.render_settings_dock(cx));
+        let tokens = ThemeTokens::from_theme(Theme::global(cx));
+        let viewport_width = f32::from(window.viewport_size().width);
+        let search_x = tab_search_popover_x(viewport_width);
+        div()
+            .key_context("WorkspaceWindow")
+            .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(Self::open_dialog))
+            .on_action(cx.listener(Self::open_settings))
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(tokens.surface.background)
+            .child(self.render_tab_bar(cx))
+            .child(
+                div()
+                    .min_h_0()
+                    .flex_1()
+                    .flex()
+                    .children(left_dock)
+                    .child(div().h_full().flex_1().overflow_hidden().child(content)),
+            )
+            .when(self.tab_search_open, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(px(TAB_BAR_HEIGHT + 8.0))
+                        .left(px(search_x))
+                        .child(self.render_tab_search(cx)),
+                )
+            })
+            .children(self.render_tab_hover_card(window, cx))
+            .when_some(self.warning.clone(), |root, warning| {
+                root.child(
+                    div()
+                        .absolute()
+                        .bottom_4()
+                        .left_4()
+                        .right_4()
+                        .p_3()
+                        .rounded_lg()
+                        .bg(tokens.status.danger_soft)
+                        .text_color(tokens.status.danger)
+                        .child(warning),
+                )
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{active_index_after_close, tab_matches_query};
@@ -867,70 +962,5 @@ mod tests {
         assert_eq!(active_index_after_close(4, 3, 3), Some(2));
         assert_eq!(active_index_after_close(1, 0, 0), None);
         assert_eq!(active_index_after_close(3, 4, 0), None);
-    }
-}
-
-impl Focusable for WorkspaceWindow {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match &self.active_tab().content {
-            WorkspaceContent::Pdf(reader) => reader.read(cx).focus_handle(cx),
-            WorkspaceContent::Settings => self.focus_handle.clone(),
-        }
-    }
-}
-
-impl Render for WorkspaceWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = match &self.active_tab().content {
-            WorkspaceContent::Pdf(reader) => reader.clone().into_any_element(),
-            WorkspaceContent::Settings => self.render_settings(cx),
-        };
-        let left_dock = (self.active_tab().layout.docks.left.open
-            && self.active_view().kind == ItemKind::Settings)
-            .then(|| self.render_settings_dock(cx));
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
-        div()
-            .key_context("WorkspaceWindow")
-            .track_focus(&self.focus_handle(cx))
-            .on_action(cx.listener(Self::open_dialog))
-            .on_action(cx.listener(Self::open_settings))
-            .relative()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(tokens.surface.background)
-            .child(self.render_tab_bar(cx))
-            .child(
-                div()
-                    .min_h_0()
-                    .flex_1()
-                    .flex()
-                    .children(left_dock)
-                    .child(div().h_full().flex_1().overflow_hidden().child(content)),
-            )
-            .when(self.tab_search_open, |root| {
-                root.child(
-                    div()
-                        .absolute()
-                        .top(px(TAB_BAR_HEIGHT + 6.0))
-                        .right(px(48.0))
-                        .child(self.render_tab_search(cx)),
-                )
-            })
-            .children(self.render_tab_hover_card(window, cx))
-            .when_some(self.warning.clone(), |root, warning| {
-                root.child(
-                    div()
-                        .absolute()
-                        .bottom_4()
-                        .left_4()
-                        .right_4()
-                        .p_3()
-                        .rounded_lg()
-                        .bg(tokens.status.danger_soft)
-                        .text_color(tokens.status.danger)
-                        .child(warning),
-                )
-            })
     }
 }
