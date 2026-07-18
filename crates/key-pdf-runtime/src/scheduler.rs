@@ -1,4 +1,4 @@
-use crate::DemandPriority;
+use crate::{CancellationSource, CancellationToken, DemandPriority};
 use std::{collections::HashMap, fmt, hash::Hash};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -10,12 +10,13 @@ impl DemandRevision {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ScheduledDemand<K, V> {
     key: K,
     revision: DemandRevision,
     priority: DemandPriority,
     value: V,
+    cancellation: CancellationSource,
 }
 
 impl<K, V> ScheduledDemand<K, V> {
@@ -38,7 +39,40 @@ impl<K, V> ScheduledDemand<K, V> {
     pub fn into_value(self) -> V {
         self.value
     }
+
+    /// Read-only cancellation capability for the engine operation represented
+    /// by this scheduled demand.
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.token()
+    }
+
+    /// Cloneable owner capability for controllers that must cancel work from
+    /// another thread while an engine call is in progress.
+    pub fn cancellation_source(&self) -> CancellationSource {
+        self.cancellation.clone()
+    }
+
+    /// Cancels this individual operation without cancelling its document
+    /// session. All clones observe the same state.
+    pub fn cancel(&self) -> bool {
+        self.cancellation.cancel()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
 }
+
+impl<K: PartialEq, V: PartialEq> PartialEq for ScheduledDemand<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.revision == other.revision
+            && self.priority == other.priority
+            && self.value == other.value
+    }
+}
+
+impl<K: Eq, V: Eq> Eq for ScheduledDemand<K, V> {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScheduleOutcome<K, V> {
@@ -92,6 +126,13 @@ struct Queued<V> {
     revision: DemandRevision,
     priority: DemandPriority,
     value: V,
+    cancellation: CancellationSource,
+}
+
+#[derive(Clone, Debug)]
+struct InFlight {
+    revision: DemandRevision,
+    cancellation: CancellationSource,
 }
 
 /// A bounded de-duplicating scheduler. New work replaces pending work with the
@@ -104,7 +145,7 @@ pub struct LatestWinsQueue<K, V> {
     max_in_flight: usize,
     next_revision: u128,
     queued: HashMap<K, Queued<V>>,
-    in_flight: HashMap<K, DemandRevision>,
+    in_flight: HashMap<K, InFlight>,
     latest: HashMap<K, DemandRevision>,
 }
 
@@ -164,15 +205,19 @@ where
         }
 
         if let Some(previous) = self.queued.remove(&key) {
+            previous.cancellation.cancel();
             let revision = self.allocate_revision();
+            let cancellation = CancellationSource::new();
             self.queued.insert(
                 key.clone(),
                 Queued {
                     revision,
                     priority,
                     value,
+                    cancellation,
                 },
             );
+            self.cancel_in_flight(&key);
             self.latest.insert(key, revision);
             return ScheduleOutcome::Replaced {
                 revision,
@@ -192,6 +237,7 @@ where
                 return ScheduleOutcome::Rejected { value };
             }
             let queued = self.queued.remove(&eviction_key).unwrap();
+            queued.cancellation.cancel();
             if self.latest.get(&eviction_key) == Some(&queued.revision) {
                 self.latest.remove(&eviction_key);
             }
@@ -200,20 +246,24 @@ where
                 revision: queued.revision,
                 priority: queued.priority,
                 value: queued.value,
+                cancellation: queued.cancellation,
             })
         } else {
             None
         };
 
         let revision = self.allocate_revision();
+        let cancellation = CancellationSource::new();
         self.queued.insert(
             key.clone(),
             Queued {
                 revision,
                 priority,
                 value,
+                cancellation,
             },
         );
+        self.cancel_in_flight(&key);
         self.latest.insert(key, revision);
         match evicted {
             Some(evicted) => ScheduleOutcome::Evicted { revision, evicted },
@@ -234,19 +284,31 @@ where
             .max_by_key(|(_, queued)| (queued.priority, queued.revision))
             .map(|(key, _)| key.clone())?;
         let queued = self.queued.remove(&key).unwrap();
-        self.in_flight.insert(key.clone(), queued.revision);
+        self.in_flight.insert(
+            key.clone(),
+            InFlight {
+                revision: queued.revision,
+                cancellation: queued.cancellation.clone(),
+            },
+        );
         Some(ScheduledDemand {
             key,
             revision: queued.revision,
             priority: queued.priority,
             value: queued.value,
+            cancellation: queued.cancellation,
         })
     }
 
     /// Completes an in-flight item and decides whether its output still
     /// represents the latest accepted demand for that key.
     pub fn finish(&mut self, demand: &ScheduledDemand<K, V>) -> CompletionDisposition {
-        if self.in_flight.get(&demand.key) != Some(&demand.revision) {
+        if self
+            .in_flight
+            .get(&demand.key)
+            .map(|in_flight| in_flight.revision)
+            != Some(demand.revision)
+        {
             return CompletionDisposition::Unknown;
         }
         self.in_flight.remove(&demand.key);
@@ -258,20 +320,31 @@ where
         }
     }
 
-    /// Cancels pending work and invalidates an in-flight completion with this
-    /// key. The engine still owns cooperative cancellation of the operation.
+    /// Cancels pending work and cooperatively cancels any in-flight operation
+    /// with this key.
     pub fn cancel(&mut self, key: &K) -> Option<V> {
         self.latest.remove(key);
-        self.queued.remove(key).map(|queued| queued.value)
+        self.cancel_in_flight(key);
+        self.queued.remove(key).map(|queued| {
+            queued.cancellation.cancel();
+            queued.value
+        })
     }
 
-    /// Replaces an entire pending demand set. In-flight work becomes stale;
-    /// callers can then schedule the new viewport in priority order.
+    /// Replaces an entire pending demand set. In-flight work is cooperatively
+    /// cancelled and becomes stale; callers can then schedule the new viewport
+    /// in priority order.
     pub fn clear_pending(&mut self) -> Vec<V> {
         self.latest.clear();
+        for in_flight in self.in_flight.values() {
+            in_flight.cancellation.cancel();
+        }
         self.queued
             .drain()
-            .map(|(_, queued)| queued.value)
+            .map(|(_, queued)| {
+                queued.cancellation.cancel();
+                queued.value
+            })
             .collect()
     }
 
@@ -286,6 +359,12 @@ where
             .checked_add(1)
             .expect("u128 demand revision space exhausted");
         revision
+    }
+
+    fn cancel_in_flight(&self, key: &K) {
+        if let Some(in_flight) = self.in_flight.get(key) {
+            in_flight.cancellation.cancel();
+        }
     }
 }
 
@@ -332,7 +411,9 @@ mod tests {
         queue.schedule("tile", DemandPriority::VISIBLE, "old");
         let old = queue.pop_next().unwrap();
         assert!(queue.is_latest(&old));
+        assert!(!old.is_cancelled());
         queue.schedule("tile", DemandPriority::VISIBLE, "new");
+        assert!(old.is_cancelled());
         assert!(!queue.is_latest(&old));
         assert_eq!(queue.finish(&old), CompletionDisposition::Stale);
 
@@ -349,7 +430,20 @@ mod tests {
         let latest = queue.pop_next().unwrap();
         assert_eq!(latest.value(), &"latest");
         queue.clear_pending();
+        assert!(latest.is_cancelled());
         assert_eq!(queue.finish(&latest), CompletionDisposition::Stale);
+    }
+
+    #[test]
+    fn explicit_cancel_reaches_in_flight_operation_token() {
+        let mut queue = LatestWinsQueue::new(2);
+        queue.schedule("tile", DemandPriority::VISIBLE, "render");
+        let in_flight = queue.pop_next().unwrap();
+        let worker_token = in_flight.cancellation();
+
+        assert_eq!(queue.cancel(&"tile"), None);
+        assert!(worker_token.is_cancelled());
+        assert_eq!(queue.finish(&in_flight), CompletionDisposition::Stale);
     }
 
     #[test]

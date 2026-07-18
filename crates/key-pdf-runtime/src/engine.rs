@@ -1,7 +1,7 @@
 use crate::{
     AllocationError, CachePolicy, CancellationToken, DemandError, DemandStamp, DocumentGeneration,
     DocumentSession, DocumentSessionManager, PreviewDemand, RenderDemand, ResourceHandle,
-    SessionError, TextDemand,
+    ScheduledDemand, SessionError, TextDemand,
 };
 use key_pdf_core::{PageSize, PdfLink, TextLayer, TocEntry};
 use std::{fmt, sync::Arc};
@@ -459,16 +459,46 @@ impl<E: PdfEngine> PdfRuntime<E> {
     }
 
     pub fn render(&mut self, demand: RenderDemand) -> RenderEvent<E::Error> {
+        self.render_inner(demand, None)
+    }
+
+    /// Executes a render with an operation-specific cancellation token. The
+    /// engine receives a token composed with the owning document session, so
+    /// either source cooperatively cancels the work.
+    pub fn render_with_cancellation(
+        &mut self,
+        demand: RenderDemand,
+        operation_cancellation: &CancellationToken,
+    ) -> RenderEvent<E::Error> {
+        self.render_inner(demand, Some(operation_cancellation))
+    }
+
+    /// Convenience bridge from the bounded latest-wins scheduler.
+    pub fn render_scheduled<K>(
+        &mut self,
+        scheduled: &ScheduledDemand<K, RenderDemand>,
+    ) -> RenderEvent<E::Error> {
+        self.render_with_cancellation(scheduled.value().clone(), &scheduled.cancellation())
+    }
+
+    fn render_inner(
+        &mut self,
+        demand: RenderDemand,
+        operation_cancellation: Option<&CancellationToken>,
+    ) -> RenderEvent<E::Error> {
         let stamp = demand.stamp();
         let session = match self.session_for(stamp) {
             SessionState::Current(session) => session,
             SessionState::Cancelled => return RenderEvent::Cancelled { stamp },
             SessionState::Stale => return RenderEvent::Discarded { stamp },
         };
+        let cancellation = composed_cancellation(&session, operation_cancellation);
+        if cancellation.is_cancelled() {
+            return RenderEvent::Cancelled { stamp };
+        }
         if let Err(error) = self.validate_page(demand.page()) {
             return RenderEvent::Failed { stamp, error };
         }
-        let cancellation = session.cancellation();
         let result = match self.document.as_mut() {
             Some(document) => document.render(&demand, &cancellation),
             None => {
@@ -516,16 +546,44 @@ impl<E: PdfEngine> PdfRuntime<E> {
     }
 
     pub fn extract_text(&mut self, demand: TextDemand) -> TextEvent<E::Error> {
+        self.extract_text_inner(demand, None)
+    }
+
+    /// Executes text extraction with operation and session cancellation
+    /// composed into the token observed by the engine.
+    pub fn extract_text_with_cancellation(
+        &mut self,
+        demand: TextDemand,
+        operation_cancellation: &CancellationToken,
+    ) -> TextEvent<E::Error> {
+        self.extract_text_inner(demand, Some(operation_cancellation))
+    }
+
+    pub fn extract_text_scheduled<K>(
+        &mut self,
+        scheduled: &ScheduledDemand<K, TextDemand>,
+    ) -> TextEvent<E::Error> {
+        self.extract_text_with_cancellation(scheduled.value().clone(), &scheduled.cancellation())
+    }
+
+    fn extract_text_inner(
+        &mut self,
+        demand: TextDemand,
+        operation_cancellation: Option<&CancellationToken>,
+    ) -> TextEvent<E::Error> {
         let stamp = demand.stamp();
         let session = match self.session_for(stamp) {
             SessionState::Current(session) => session,
             SessionState::Cancelled => return TextEvent::Cancelled { stamp },
             SessionState::Stale => return TextEvent::Discarded { stamp },
         };
+        let cancellation = composed_cancellation(&session, operation_cancellation);
+        if cancellation.is_cancelled() {
+            return TextEvent::Cancelled { stamp };
+        }
         if let Err(error) = self.validate_page(demand.page()) {
             return TextEvent::Failed { stamp, error };
         }
-        let cancellation = session.cancellation();
         let result = match self.document.as_mut() {
             Some(document) => document.extract_text(&demand, &cancellation),
             None => {
@@ -561,16 +619,44 @@ impl<E: PdfEngine> PdfRuntime<E> {
     }
 
     pub fn render_preview(&mut self, demand: PreviewDemand) -> PreviewEvent<E::Error> {
+        self.render_preview_inner(demand, None)
+    }
+
+    /// Executes preview rendering with operation and session cancellation
+    /// composed into the token observed by the engine.
+    pub fn render_preview_with_cancellation(
+        &mut self,
+        demand: PreviewDemand,
+        operation_cancellation: &CancellationToken,
+    ) -> PreviewEvent<E::Error> {
+        self.render_preview_inner(demand, Some(operation_cancellation))
+    }
+
+    pub fn render_preview_scheduled<K>(
+        &mut self,
+        scheduled: &ScheduledDemand<K, PreviewDemand>,
+    ) -> PreviewEvent<E::Error> {
+        self.render_preview_with_cancellation(scheduled.value().clone(), &scheduled.cancellation())
+    }
+
+    fn render_preview_inner(
+        &mut self,
+        demand: PreviewDemand,
+        operation_cancellation: Option<&CancellationToken>,
+    ) -> PreviewEvent<E::Error> {
         let stamp = demand.stamp();
         let session = match self.session_for(stamp) {
             SessionState::Current(session) => session,
             SessionState::Cancelled => return PreviewEvent::Cancelled { stamp },
             SessionState::Stale => return PreviewEvent::Discarded { stamp },
         };
+        let cancellation = composed_cancellation(&session, operation_cancellation);
+        if cancellation.is_cancelled() {
+            return PreviewEvent::Cancelled { stamp };
+        }
         if let Err(error) = self.validate_page(demand.page()) {
             return PreviewEvent::Failed { stamp, error };
         }
-        let cancellation = session.cancellation();
         let result = match self.document.as_mut() {
             Some(document) => document.render_preview(&demand, &cancellation),
             None => {
@@ -649,6 +735,14 @@ impl<E: PdfEngine> PdfRuntime<E> {
     }
 }
 
+fn composed_cancellation(
+    session: &DocumentSession,
+    operation: Option<&CancellationToken>,
+) -> CancellationToken {
+    let session = session.cancellation();
+    operation.map_or(session.clone(), |operation| session.combined(operation))
+}
+
 enum SessionState {
     Current(DocumentSession),
     Cancelled,
@@ -658,7 +752,10 @@ enum SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ColorMode, DemandIntent, DemandPriority, TextDemandPurpose};
+    use crate::{
+        ColorMode, CompletionDisposition, DemandIntent, DemandPriority, LatestWinsQueue,
+        TextDemandPurpose,
+    };
     use key_pdf_core::{PixelRect, RasterSize, TextBounds, TextChar, TileKey};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -916,6 +1013,76 @@ mod tests {
         session.cancel();
         assert!(matches!(
             runtime.extract_text(demand),
+            TextEvent::Cancelled { .. }
+        ));
+        assert_eq!(runtime.document.as_ref().unwrap().text_extractions, 0);
+    }
+
+    #[test]
+    fn latest_wins_replacement_cancels_engine_work_not_only_publication() {
+        let mut runtime = PdfRuntime::new(MockEngine::default(), CachePolicy::default());
+        let session = opened(&mut runtime);
+        let old_demand = session
+            .text_demand(
+                0,
+                TextDemandPurpose::VisibleLayer,
+                DemandPriority::VISIBLE,
+                DemandIntent::Visible,
+            )
+            .unwrap();
+        let new_demand = session
+            .text_demand(
+                0,
+                TextDemandPurpose::VisibleLayer,
+                DemandPriority::VISIBLE,
+                DemandIntent::Visible,
+            )
+            .unwrap();
+        let mut queue = LatestWinsQueue::new(2);
+        queue.schedule(0, DemandPriority::VISIBLE, old_demand);
+        let old = queue.pop_next().unwrap();
+
+        queue.schedule(0, DemandPriority::VISIBLE, new_demand);
+        assert!(old.is_cancelled());
+        assert!(matches!(
+            runtime.extract_text_scheduled(&old),
+            TextEvent::Cancelled { .. }
+        ));
+        assert_eq!(runtime.document.as_ref().unwrap().text_extractions, 0);
+        assert_eq!(queue.finish(&old), CompletionDisposition::Stale);
+
+        let new = queue.pop_next().unwrap();
+        assert!(!new.is_cancelled());
+        assert!(matches!(
+            runtime.extract_text_scheduled(&new),
+            TextEvent::Ready { .. }
+        ));
+        assert_eq!(queue.finish(&new), CompletionDisposition::Publish);
+        assert_eq!(runtime.document.as_ref().unwrap().text_extractions, 1);
+    }
+
+    #[test]
+    fn scheduled_operation_token_is_also_cancelled_by_its_document_session() {
+        let mut runtime = PdfRuntime::new(MockEngine::default(), CachePolicy::default());
+        let session = opened(&mut runtime);
+        let demand = session
+            .text_demand(
+                0,
+                TextDemandPurpose::Search,
+                DemandPriority::BACKGROUND,
+                DemandIntent::Background,
+            )
+            .unwrap();
+        let mut queue = LatestWinsQueue::new(1);
+        queue.schedule(0, DemandPriority::BACKGROUND, demand);
+        let scheduled = queue.pop_next().unwrap();
+        let composed = session.cancellation().combined(&scheduled.cancellation());
+
+        session.cancel();
+        assert!(composed.is_cancelled());
+        assert!(!scheduled.is_cancelled());
+        assert!(matches!(
+            runtime.extract_text_scheduled(&scheduled),
             TextEvent::Cancelled { .. }
         ));
         assert_eq!(runtime.document.as_ref().unwrap().text_extractions, 0);

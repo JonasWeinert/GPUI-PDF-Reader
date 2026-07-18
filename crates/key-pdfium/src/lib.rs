@@ -332,8 +332,15 @@ impl EngineDocument for PdfiumEngineDocument {
             core_rect: demand.core_rect(),
             render_rect: demand.render_rect(),
         };
-        let (width, height, pixels) = ops::render_tile(&self.document, tile, demand.color_mode())
-            .map_err(PdfiumEngineError::Operation)?;
+        let (width, height, pixels) =
+            match ops::render_tile(&self.document, tile, demand.color_mode(), || {
+                cancellation.is_cancelled()
+            })
+            .map_err(PdfiumEngineError::Operation)?
+            {
+                ops::RenderExtraction::Complete(output) => output,
+                ops::RenderExtraction::Cancelled => return Err(PdfiumEngineError::Cancelled),
+            };
         cancellation
             .checkpoint()
             .map_err(|_| PdfiumEngineError::Cancelled)?;
@@ -380,8 +387,15 @@ impl EngineDocument for PdfiumEngineDocument {
             core_rect: region,
             render_rect: region,
         };
-        let (width, height, pixels) = ops::render_tile(&self.document, tile, demand.color_mode())
-            .map_err(PdfiumEngineError::Operation)?;
+        let (width, height, pixels) =
+            match ops::render_tile(&self.document, tile, demand.color_mode(), || {
+                cancellation.is_cancelled()
+            })
+            .map_err(PdfiumEngineError::Operation)?
+            {
+                ops::RenderExtraction::Complete(output) => output,
+                ops::RenderExtraction::Cancelled => return Err(PdfiumEngineError::Cancelled),
+            };
         cancellation
             .checkpoint()
             .map_err(|_| PdfiumEngineError::Cancelled)?;

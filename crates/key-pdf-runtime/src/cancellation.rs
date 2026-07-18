@@ -20,7 +20,7 @@ pub struct CancellationSource {
 /// Read-only cancellation capability passed into engine work.
 #[derive(Clone, Debug)]
 pub struct CancellationToken {
-    state: Arc<CancellationState>,
+    states: Arc<[Arc<CancellationState>]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,7 +37,7 @@ impl CancellationSource {
 
     pub fn token(&self) -> CancellationToken {
         CancellationToken {
-            state: self.state.clone(),
+            states: Arc::from([self.state.clone()]),
         }
     }
 
@@ -59,8 +59,27 @@ impl Default for CancellationSource {
 }
 
 impl CancellationToken {
+    /// Returns a token that is cancelled when either input token is cancelled.
+    ///
+    /// Composition is intentionally engine-neutral: a document session and an
+    /// individual scheduled operation can each retain their own cancellation
+    /// owner while engine work receives a single read-only token.
+    pub fn combined(&self, other: &Self) -> Self {
+        let mut states = Vec::with_capacity(self.states.len() + other.states.len());
+        for state in self.states.iter().chain(other.states.iter()) {
+            if !states.iter().any(|existing| Arc::ptr_eq(existing, state)) {
+                states.push(state.clone());
+            }
+        }
+        Self {
+            states: states.into(),
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
-        self.state.cancelled.load(Ordering::Acquire)
+        self.states
+            .iter()
+            .any(|state| state.cancelled.load(Ordering::Acquire))
     }
 
     pub fn checkpoint(&self) -> Result<(), Cancelled> {
@@ -94,5 +113,33 @@ mod tests {
         assert!(!source.cancel());
         assert_eq!(first.checkpoint(), Err(Cancelled));
         assert!(second.is_cancelled());
+    }
+
+    #[test]
+    fn combined_token_is_cancelled_by_either_independent_source() {
+        let session = CancellationSource::new();
+        let operation = CancellationSource::new();
+        let combined = session.token().combined(&operation.token());
+
+        operation.cancel();
+        assert!(combined.is_cancelled());
+        assert!(!session.is_cancelled());
+
+        let session = CancellationSource::new();
+        let operation = CancellationSource::new();
+        let combined = session.token().combined(&operation.token());
+        session.cancel();
+        assert!(combined.is_cancelled());
+        assert!(!operation.is_cancelled());
+    }
+
+    #[test]
+    fn combining_a_token_with_itself_preserves_one_cancellation_state() {
+        let source = CancellationSource::new();
+        let token = source.token();
+        let combined = token.combined(&token);
+        assert_eq!(combined.states.len(), 1);
+        source.cancel();
+        assert_eq!(combined.checkpoint(), Err(Cancelled));
     }
 }

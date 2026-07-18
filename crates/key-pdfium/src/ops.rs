@@ -288,6 +288,11 @@ pub(crate) fn validated_link_url(uri: &str) -> Option<String> {
 
 pub(crate) type RenderOutput = (u32, u32, Vec<u8>);
 
+pub(crate) enum RenderExtraction {
+    Complete(RenderOutput),
+    Cancelled,
+}
+
 fn pdfium_color(color: PixelColor) -> PdfColor {
     // pdfium-render's PdfColor encoder stores colors in Pdfium's native ABGR integer order. Swap
     // the semantic red/blue inputs so PDFium's forced-color and bitmap-clear APIs receive RGB.
@@ -298,13 +303,20 @@ pub(crate) fn render_tile(
     document: &PdfDocument<'static>,
     tile: TileRequest,
     appearance: ColorMode,
-) -> Result<RenderOutput, String> {
+    mut should_cancel: impl FnMut() -> bool,
+) -> Result<RenderExtraction, String> {
+    if should_cancel() {
+        return Ok(RenderExtraction::Cancelled);
+    }
     validate_tile_request(tile)?;
     let page_index = i32::try_from(tile.key.page).map_err(|_| "page index is too large")?;
     let page = document
         .pages()
         .get(page_index)
         .map_err(|error| error.to_string())?;
+    if should_cancel() {
+        return Ok(RenderExtraction::Cancelled);
+    }
 
     let full_width =
         i32::try_from(tile.key.raster.width).map_err(|_| "page raster width is too large")?;
@@ -338,6 +350,14 @@ pub(crate) fn render_tile(
             ))
             .render_fills_as_strokes(true);
     }
+    if should_cancel() {
+        return Ok(RenderExtraction::Cancelled);
+    }
+
+    // PDFium's tile render call is synchronous and cannot safely be
+    // interrupted from Rust. Tile dimensions are strictly bounded above; poll
+    // immediately on both sides so cancellation skips all remaining buffer
+    // validation/copy work as soon as PDFium returns.
     let bitmap = page
         .render_tile_with_config(
             &config,
@@ -347,12 +367,18 @@ pub(crate) fn render_tile(
             render_height,
         )
         .map_err(|error| error.to_string())?;
+    if should_cancel() {
+        return Ok(RenderExtraction::Cancelled);
+    }
     let rendered_width = u32::try_from(bitmap.width()).map_err(|_| "invalid tile width")?;
     let rendered_height = u32::try_from(bitmap.height()).map_err(|_| "invalid tile height")?;
     if rendered_width != tile.render_rect.width || rendered_height != tile.render_rect.height {
         return Err("PDFium returned an unexpected tile size".into());
     }
     let bgra = bitmap.as_raw_bytes();
+    if should_cancel() {
+        return Ok(RenderExtraction::Cancelled);
+    }
     let expected_len = rendered_width
         .checked_mul(rendered_height)
         .and_then(|pixels| pixels.checked_mul(4))
@@ -362,7 +388,11 @@ pub(crate) fn render_tile(
         return Err("PDFium returned an invalid tile buffer".into());
     }
 
-    Ok((rendered_width, rendered_height, bgra))
+    Ok(RenderExtraction::Complete((
+        rendered_width,
+        rendered_height,
+        bgra,
+    )))
 }
 
 pub(crate) fn precision_text_raster(page_width: f32, page_height: f32) -> (i32, i32) {
