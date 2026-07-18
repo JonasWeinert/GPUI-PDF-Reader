@@ -11,7 +11,9 @@ mod json;
 mod memory;
 mod store;
 
-pub use extension::{JsonExtensionStorage, extension_document_namespace};
+pub use extension::{
+    JsonExtensionStorage, JsonExtensionStorageScope, extension_document_namespace,
+};
 pub use json::{JsonSidecarStore, MAX_SIDECAR_BYTES, SIDECAR_SCHEMA_VERSION, sidecar_path};
 pub use memory::MemoryAnnotationStore;
 pub use store::{
