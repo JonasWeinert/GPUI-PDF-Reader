@@ -118,7 +118,7 @@ mod ui;
 use annotation_io::{AnnotationIo, AnnotationIoEvent, AnnotationIoOperation};
 use key_ui_gpui::UnitTransition;
 #[cfg(debug_assertions)]
-use qa::{QaFeaturePhase, QaFluidPhase};
+use qa::{QaExtensionPhase, QaFeaturePhase, QaFluidPhase};
 use references::reference_panel_extent;
 #[cfg(debug_assertions)]
 use references::union_text_bounds;
@@ -619,6 +619,12 @@ pub struct PdfReader {
     #[cfg(debug_assertions)]
     qa_fluid_phase: QaFluidPhase,
     #[cfg(debug_assertions)]
+    qa_extension_phase: QaExtensionPhase,
+    #[cfg(debug_assertions)]
+    qa_extension_checks: usize,
+    #[cfg(debug_assertions)]
+    qa_extension_native_rejected: bool,
+    #[cfg(debug_assertions)]
     qa_sidebar_anchor_reference: Option<PageAnchor>,
     #[cfg(debug_assertions)]
     qa_sidebar_transitions: usize,
@@ -784,6 +790,12 @@ impl PdfReader {
                 qa_feature_phase: QaFeaturePhase::Seed,
                 #[cfg(debug_assertions)]
                 qa_fluid_phase: QaFluidPhase::Seed,
+                #[cfg(debug_assertions)]
+                qa_extension_phase: QaExtensionPhase::Seed,
+                #[cfg(debug_assertions)]
+                qa_extension_checks: 0,
+                #[cfg(debug_assertions)]
+                qa_extension_native_rejected: false,
                 #[cfg(debug_assertions)]
                 qa_sidebar_anchor_reference: None,
                 #[cfg(debug_assertions)]
@@ -2064,6 +2076,9 @@ impl PdfReader {
         {
             self.qa_feature_phase = QaFeaturePhase::Seed;
             self.qa_fluid_phase = QaFluidPhase::Seed;
+            self.qa_extension_phase = QaExtensionPhase::Seed;
+            self.qa_extension_checks = 0;
+            self.qa_extension_native_rejected = false;
             self.qa_sidebar_anchor_reference = None;
             self.qa_sidebar_transitions = 0;
             self.qa_max_sidebar_anchor_error = 0.0;
@@ -2577,6 +2592,11 @@ impl PdfReader {
             }
         };
         self.execute_extension_effects(effects, window, cx);
+        if self.extensions.has_pending_service_work()
+            || self.extensions.has_pending_extension_work()
+        {
+            self.schedule_extension_snapshot_sync(window, cx);
+        }
         #[cfg(feature = "installable-extensions")]
         self.refresh_extension_manager_state();
         crate::rebuild_application_menus(&mut self.extensions, cx);

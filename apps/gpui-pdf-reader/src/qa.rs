@@ -32,6 +32,7 @@ struct QaConfig {
     scientific_reference_hover: Option<usize>,
     toc_callout_hold: bool,
     reference_details: bool,
+    extension_scenario: Option<String>,
 }
 
 impl QaConfig {
@@ -73,6 +74,7 @@ impl QaConfig {
             ),
             toc_callout_hold: flag("GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD"),
             reference_details: flag("GPUI_PDF_READER_QA_REFERENCE_DETAILS"),
+            extension_scenario: std::env::var("GPUI_PDF_READER_QA_EXTENSION_SCENARIO").ok(),
         }
     }
 
@@ -91,6 +93,7 @@ impl QaConfig {
             || self.scientific_reference_hover.is_some()
             || self.toc_callout_hold
             || self.reference_details
+            || self.extension_scenario.is_some()
     }
 
     fn has_navigation_setup(&self) -> bool {
@@ -283,6 +286,56 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         }
                     }
 
+                    if let Some(extension_scenario) = config.extension_scenario.as_deref() {
+                        let deadline = Instant::now() + config.timeout;
+                        loop {
+                            let outcome = cx
+                                .update(|window, cx| {
+                                    let Some(Some(reader)) = window.root::<PdfReader>() else {
+                                        return Ok(false);
+                                    };
+                                    reader.update(cx, |reader, cx| {
+                                        reader.qa_drive_extension_scenario(
+                                            extension_scenario,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                })
+                                .unwrap_or_else(|error| {
+                                    Err(format!(
+                                        "extension scenario window update failed: {error}"
+                                    ))
+                                });
+                            match outcome {
+                                Ok(true) => break,
+                                Ok(false) => {}
+                                Err(message) => {
+                                    fail_and_quit(cx, &message);
+                                    return;
+                                }
+                            }
+                            if Instant::now() >= deadline {
+                                let _ = cx.update(|window, cx| {
+                                    if let Some(Some(reader)) = window.root::<PdfReader>() {
+                                        eprintln!(
+                                            "GPUI_PDF_READER_QA_EXTENSION_TIMEOUT {}",
+                                            reader.read(cx).qa_report()
+                                        );
+                                    }
+                                });
+                                fail_and_quit(
+                                    cx,
+                                    &format!(
+                                        "extension scenario {extension_scenario:?} did not settle"
+                                    ),
+                                );
+                                return;
+                            }
+                            cx.background_executor().timer(POLL_INTERVAL).await;
+                        }
+                    }
+
                     for keystroke in config.keystrokes {
                         let _ = cx.update(|window, cx| {
                             window.dispatch_keystroke(keystroke, cx);
@@ -406,6 +459,7 @@ mod tests {
             scientific_reference_hover: None,
             toc_callout_hold: false,
             reference_details: false,
+            extension_scenario: None,
         };
 
         assert!(!config.requested());

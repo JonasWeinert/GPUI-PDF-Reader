@@ -36,6 +36,19 @@ pub(super) enum QaFluidPhase {
     Complete,
 }
 
+#[cfg(debug_assertions)]
+#[cfg_attr(not(feature = "installable-extensions"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum QaExtensionPhase {
+    Seed,
+    WaitReference,
+    WaitReferencePanel,
+    WaitRestore,
+    WaitRestorePanel,
+    WaitAdversarial,
+    Complete,
+}
+
 impl PdfReader {
     #[cfg(debug_assertions)]
     pub fn qa_report(&self) -> String {
@@ -139,8 +152,14 @@ impl PdfReader {
             .filter(|source| !source.is_empty())
             .map(|source| source.split_whitespace().collect::<Vec<_>>().join("_"))
             .unwrap_or_else(|| "none".to_owned());
+        let (extension_packages, extension_active, extension_suspended, extension_failed) =
+            self.qa_extension_package_counts();
+        let extension_panel = self
+            .extension_contribution
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |pane| pane.owner.to_string());
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} reference_preview={} reference_group={} citation_source={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} reference_panel={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
+            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} reference_preview={} reference_group={} citation_source={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} reference_panel={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} extension_packages={} extension_active={} extension_suspended={} extension_failed={} extension_panel={} extension_checks={} extension_native_rejected={} status={:?}",
             self.view_mode,
             theme_name,
             if matches!(
@@ -215,8 +234,36 @@ impl PdfReader {
             active_search,
             self.qa_search_focuses,
             u8::from(self.search.complete),
+            extension_packages,
+            extension_active,
+            extension_suspended,
+            extension_failed,
+            extension_panel,
+            self.qa_extension_checks,
+            u8::from(self.qa_extension_native_rejected),
             self.status,
         )
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn qa_extension_package_counts(&self) -> (usize, usize, usize, usize) {
+        let count = |state| {
+            self.extension_packages
+                .iter()
+                .filter(|package| package.state == state)
+                .count()
+        };
+        (
+            self.extension_packages.len(),
+            count(LifecycleState::Active),
+            count(LifecycleState::Suspended),
+            count(LifecycleState::Failed),
+        )
+    }
+
+    #[cfg(not(feature = "installable-extensions"))]
+    fn qa_extension_package_counts(&self) -> (usize, usize, usize, usize) {
+        (0, 0, 0, 0)
     }
 
     #[cfg(debug_assertions)]
@@ -462,6 +509,377 @@ impl PdfReader {
         true
     }
 
+    #[cfg(all(debug_assertions, feature = "installable-extensions"))]
+    pub fn qa_drive_extension_scenario(
+        &mut self,
+        scenario: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        match scenario {
+            "reference" => self.qa_drive_reference_extensions(window, cx),
+            "restore" => self.qa_drive_restored_extensions(window, cx),
+            "adversarial" => self.qa_drive_adversarial_extension(window, cx),
+            _ => Err(format!("unknown extension QA scenario {scenario:?}")),
+        }
+    }
+
+    #[cfg(all(debug_assertions, not(feature = "installable-extensions")))]
+    pub fn qa_drive_extension_scenario(
+        &mut self,
+        _scenario: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        Err("extension QA requires the installable-extensions feature".into())
+    }
+
+    #[cfg(all(debug_assertions, feature = "installable-extensions"))]
+    fn qa_drive_reference_extensions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        const THEME: &str = "org.key.reference.theme-pack";
+        const THEME_COMMAND: &str = "org.key.reference.theme-pack/apply-preset";
+        const STATISTICS: &str = "org.key.reference.document-statistics";
+        const STATISTICS_COMMAND: &str = "org.key.reference.document-statistics/open";
+
+        match self.qa_extension_phase {
+            QaExtensionPhase::Seed => {
+                let theme_path = qa_extension_package_path("reference-theme-pack");
+                let preview = self
+                    .extensions
+                    .preview_package(&theme_path)
+                    .map_err(|error| format!("theme package preview failed: {error}"))?;
+                let report = self
+                    .extensions
+                    .install_reviewed_package(&theme_path, &preview)
+                    .map_err(|error| format!("theme package install failed: {error}"))?;
+                if report.activation != PackageActivation::Active {
+                    return Err(format!(
+                        "theme package did not activate immediately: {:?}",
+                        report.activation
+                    ));
+                }
+                self.qa_extension_checks += 1;
+                self.invoke_extension_command(
+                    &InvokeExtensionCommand {
+                        command: key_extension_api::CommandId::parse(THEME_COMMAND)
+                            .expect("static QA command ID"),
+                        payload: Some(DataValue::String("graphite".into())),
+                    },
+                    window,
+                    cx,
+                );
+
+                let statistics_path = qa_extension_package_path("reference-document-statistics");
+                let preview = self
+                    .extensions
+                    .preview_package(&statistics_path)
+                    .map_err(|error| format!("statistics package preview failed: {error}"))?;
+                let report = self
+                    .extensions
+                    .install_reviewed_package(&statistics_path, &preview)
+                    .map_err(|error| format!("statistics package install failed: {error}"))?;
+                if !matches!(report.activation, PackageActivation::AwaitingPermissions(_)) {
+                    return Err(format!(
+                        "statistics package bypassed permission review: {:?}",
+                        report.activation
+                    ));
+                }
+                self.qa_extension_checks += 1;
+                let statistics = ExtensionId::parse(STATISTICS).expect("static QA extension ID");
+                let report = self
+                    .extensions
+                    .approve_package(&statistics)
+                    .map_err(|error| format!("statistics package approval failed: {error}"))?;
+                if !matches!(
+                    report.activation,
+                    PackageActivation::Active | PackageActivation::Activating
+                ) {
+                    return Err(format!(
+                        "approved statistics package did not activate: {:?}",
+                        report.activation
+                    ));
+                }
+                self.qa_extension_checks += 1;
+                self.refresh_extension_manager_state();
+                self.schedule_extension_snapshot_sync(window, cx);
+                self.qa_extension_phase = QaExtensionPhase::WaitReference;
+                Ok(false)
+            }
+            QaExtensionPhase::WaitReference => {
+                self.refresh_extension_manager_state();
+                qa_reject_failed_packages(&self.extension_packages)?;
+                if !qa_packages_are_active(&self.extension_packages, &[THEME, STATISTICS]) {
+                    return Ok(false);
+                }
+
+                let theme_view = self
+                    .extensions
+                    .contribution_view(
+                        &ContributionId::parse("org.key.reference.theme-pack/settings")
+                            .expect("static QA contribution ID"),
+                    )
+                    .ok_or_else(|| "active theme settings view is missing".to_owned())?;
+                if qa_nested_state(&theme_view.state, &["settings", "theme-preset"])
+                    != Some(&DataValue::String("graphite".into()))
+                {
+                    return Ok(false);
+                }
+
+                let statistics_view = self.extensions.contribution_view(
+                    &ContributionId::parse("org.key.reference.document-statistics/panel")
+                        .expect("static QA contribution ID"),
+                );
+                let Some(statistics_view) = statistics_view else {
+                    return Ok(false);
+                };
+                let runtime_ready =
+                    statistics_view.state.get("runtime-ready") == Some(&DataValue::Boolean(true));
+                let pages = qa_nested_integer(
+                    &statistics_view.state,
+                    &["document", "statistics", "page-count"],
+                );
+                let known_text_pages = qa_nested_integer(
+                    &statistics_view.state,
+                    &["document", "statistics", "text-pages-known"],
+                );
+                if !runtime_ready || pages <= 0 || known_text_pages <= 0 {
+                    self.schedule_extension_snapshot_sync(window, cx);
+                    return Ok(false);
+                }
+                if self.extension_commands.len() != 2 {
+                    return Err(format!(
+                        "expected two external commands, found {}",
+                        self.extension_commands.len()
+                    ));
+                }
+                self.qa_extension_checks += 3;
+                self.invoke_extension_command(
+                    &InvokeExtensionCommand {
+                        command: key_extension_api::CommandId::parse(STATISTICS_COMMAND)
+                            .expect("static QA command ID"),
+                        payload: None,
+                    },
+                    window,
+                    cx,
+                );
+                self.qa_extension_phase = QaExtensionPhase::WaitReferencePanel;
+                Ok(false)
+            }
+            QaExtensionPhase::WaitReferencePanel => {
+                if !self.qa_viewport_is_settled() {
+                    return Ok(false);
+                }
+                let expected = ExtensionId::parse(STATISTICS).expect("static QA extension ID");
+                if self
+                    .extension_contribution
+                    .as_ref()
+                    .is_none_or(|pane| pane.owner != expected)
+                    || self.sidebar.panel != SidePanel::Contribution
+                    || self.sidebar.progress < 0.999
+                {
+                    return Ok(false);
+                }
+                self.qa_extension_checks += 1;
+                self.qa_extension_phase = QaExtensionPhase::Complete;
+                Ok(true)
+            }
+            QaExtensionPhase::Complete => Ok(true),
+            _ => Err("reference extension scenario entered an invalid phase".into()),
+        }
+    }
+
+    #[cfg(all(debug_assertions, feature = "installable-extensions"))]
+    fn qa_drive_restored_extensions(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        const THEME: &str = "org.key.reference.theme-pack";
+        const STATISTICS: &str = "org.key.reference.document-statistics";
+        match self.qa_extension_phase {
+            QaExtensionPhase::Seed => {
+                self.refresh_extension_manager_state();
+                self.schedule_extension_snapshot_sync(window, cx);
+                self.qa_extension_phase = QaExtensionPhase::WaitRestore;
+                Ok(false)
+            }
+            QaExtensionPhase::WaitRestore => {
+                self.refresh_extension_manager_state();
+                qa_reject_failed_packages(&self.extension_packages)?;
+                if !qa_packages_are_active(&self.extension_packages, &[THEME, STATISTICS]) {
+                    return Ok(false);
+                }
+                let panel_id = ContributionId::parse("org.key.reference.document-statistics/panel")
+                    .expect("static QA contribution ID");
+                let Some(view) = self.extensions.contribution_view(&panel_id) else {
+                    return Ok(false);
+                };
+                if view.state.get("runtime-ready") != Some(&DataValue::Boolean(true))
+                    || qa_nested_integer(&view.state, &["document", "statistics", "page-count"])
+                        <= 0
+                {
+                    self.schedule_extension_snapshot_sync(window, cx);
+                    return Ok(false);
+                }
+                self.qa_extension_checks += 3;
+                self.invoke_extension_command(
+                    &InvokeExtensionCommand {
+                        command: key_extension_api::CommandId::parse(
+                            "org.key.reference.document-statistics/open",
+                        )
+                        .expect("static QA command ID"),
+                        payload: None,
+                    },
+                    window,
+                    cx,
+                );
+                self.qa_extension_phase = QaExtensionPhase::WaitRestorePanel;
+                Ok(false)
+            }
+            QaExtensionPhase::WaitRestorePanel => {
+                if !self.qa_viewport_is_settled() {
+                    return Ok(false);
+                }
+                let expected = ExtensionId::parse(STATISTICS).expect("static QA extension ID");
+                if self
+                    .extension_contribution
+                    .as_ref()
+                    .is_none_or(|pane| pane.owner != expected)
+                    || self.sidebar.progress < 0.999
+                {
+                    return Ok(false);
+                }
+                self.qa_extension_checks += 1;
+                self.qa_extension_phase = QaExtensionPhase::Complete;
+                Ok(true)
+            }
+            QaExtensionPhase::Complete => Ok(true),
+            _ => Err("restored extension scenario entered an invalid phase".into()),
+        }
+    }
+
+    #[cfg(all(debug_assertions, feature = "installable-extensions"))]
+    fn qa_drive_adversarial_extension(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<bool, String> {
+        const HOSTILE: &str = "org.key.reference.adversarial-loop";
+        match self.qa_extension_phase {
+            QaExtensionPhase::Seed => {
+                let native_path = qa_extension_package_path("reference-native-escape");
+                match self.extensions.preview_package(&native_path) {
+                    Err(
+                        crate::extension_packages::ExtensionPackageError::ExternalNativeEntrypoint(
+                            extension,
+                        ),
+                    ) if extension.as_str() == "org.key.reference.native-escape" => {
+                        self.qa_extension_native_rejected = true;
+                        self.qa_extension_checks += 1;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "native escape was rejected for the wrong reason: {error}"
+                        ));
+                    }
+                    Ok(_) => return Err("native escape package passed preview".into()),
+                }
+
+                let path = qa_extension_package_path("reference-adversarial-loop");
+                let preview = self
+                    .extensions
+                    .preview_package(&path)
+                    .map_err(|error| format!("hostile package preview failed: {error}"))?;
+                let report = self
+                    .extensions
+                    .install_reviewed_package(&path, &preview)
+                    .map_err(|error| format!("hostile package install failed: {error}"))?;
+                if !matches!(report.activation, PackageActivation::AwaitingPermissions(_)) {
+                    return Err(format!(
+                        "hostile package bypassed permission review: {:?}",
+                        report.activation
+                    ));
+                }
+                let hostile = ExtensionId::parse(HOSTILE).expect("static QA extension ID");
+                let report = self
+                    .extensions
+                    .approve_package(&hostile)
+                    .map_err(|error| format!("hostile package approval failed: {error}"))?;
+                if !matches!(
+                    report.activation,
+                    PackageActivation::Active | PackageActivation::Activating
+                ) {
+                    return Err(format!(
+                        "hostile package did not enter the runtime: {:?}",
+                        report.activation
+                    ));
+                }
+                self.qa_extension_checks += 2;
+                let probe =
+                    key_extension_api::CommandId::parse("org.key.reference.adversarial-loop/probe")
+                        .expect("static QA command ID");
+                for _ in 0..4 {
+                    let effects = self
+                        .extensions
+                        .invoke_command(&probe, None)
+                        .map_err(|error| format!("hostile probe could not be queued: {error}"))?;
+                    if !effects.is_empty() {
+                        return Err("hostile probe unexpectedly received host authority".into());
+                    }
+                    self.qa_extension_checks += 1;
+                }
+                self.refresh_extension_manager_state();
+                self.schedule_extension_snapshot_sync(window, cx);
+                self.qa_extension_phase = QaExtensionPhase::WaitAdversarial;
+                Ok(false)
+            }
+            QaExtensionPhase::WaitAdversarial => {
+                self.refresh_extension_manager_state();
+                let Some(summary) = self
+                    .extension_packages
+                    .iter()
+                    .find(|package| package.extension.as_str() == HOSTILE)
+                else {
+                    return Err("hostile package disappeared from the manager".into());
+                };
+                match summary.state {
+                    LifecycleState::Suspended => {
+                        if self
+                            .extension_commands
+                            .iter()
+                            .any(|command| command.owner == summary.extension)
+                            || self
+                                .extension_contribution
+                                .as_ref()
+                                .is_some_and(|pane| pane.owner == summary.extension)
+                        {
+                            return Err("suspended hostile package retained UI authority".into());
+                        }
+                        self.qa_extension_checks += 1;
+                        self.qa_extension_phase = QaExtensionPhase::Complete;
+                        Ok(true)
+                    }
+                    LifecycleState::Failed => Err(format!(
+                        "hostile event loop failed the package instead of suspending it: {}",
+                        self.extensions
+                            .latest_diagnostic_message()
+                            .unwrap_or_else(|| "no diagnostic".into())
+                    )),
+                    _ => {
+                        self.schedule_extension_snapshot_sync(window, cx);
+                        Ok(false)
+                    }
+                }
+            }
+            QaExtensionPhase::Complete => Ok(true),
+            _ => Err("adversarial extension scenario entered an invalid phase".into()),
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub fn qa_viewport_is_settled(&self) -> bool {
         if !matches!(self.status, ReaderStatus::Ready)
@@ -506,6 +924,9 @@ impl PdfReader {
                 .is_some_and(|state| matches!(state, ScholarlyMetadataState::Loading))
             || self.navigation_focus.is_busy(Instant::now())
             || self.comment_autosave_task.is_some()
+            || self.extension_snapshot_task.is_some()
+            || self.extensions.has_pending_service_work()
+            || self.extensions.has_pending_extension_work()
         {
             return false;
         }
@@ -1277,5 +1698,65 @@ impl PdfReader {
             QaFluidPhase::Complete => return Ok(true),
         }
         Ok(false)
+    }
+}
+
+#[cfg(all(debug_assertions, feature = "installable-extensions"))]
+fn qa_extension_package_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("extensions")
+        .join(name)
+        .join("package")
+}
+
+#[cfg(all(debug_assertions, feature = "installable-extensions"))]
+fn qa_packages_are_active(packages: &[InstalledPackageSummary], expected: &[&str]) -> bool {
+    expected.iter().all(|expected| {
+        packages.iter().any(|package| {
+            package.extension.as_str() == *expected && package.state == LifecycleState::Active
+        })
+    })
+}
+
+#[cfg(all(debug_assertions, feature = "installable-extensions"))]
+fn qa_reject_failed_packages(packages: &[InstalledPackageSummary]) -> Result<(), String> {
+    if let Some(package) = packages.iter().find(|package| {
+        matches!(
+            package.state,
+            LifecycleState::Failed | LifecycleState::Suspended
+        )
+    }) {
+        return Err(format!(
+            "extension {} entered {:?}: {}",
+            package.extension,
+            package.state,
+            package.restoration_error.as_deref().unwrap_or("no detail")
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(debug_assertions, feature = "installable-extensions"))]
+fn qa_nested_state<'a>(
+    state: &'a BTreeMap<String, DataValue>,
+    path: &[&str],
+) -> Option<&'a DataValue> {
+    let (first, rest) = path.split_first()?;
+    let mut value = state.get(*first)?;
+    for segment in rest {
+        let DataValue::Record(record) = value else {
+            return None;
+        };
+        value = record.get(*segment)?;
+    }
+    Some(value)
+}
+
+#[cfg(all(debug_assertions, feature = "installable-extensions"))]
+fn qa_nested_integer(state: &BTreeMap<String, DataValue>, path: &[&str]) -> i64 {
+    match qa_nested_state(state, path) {
+        Some(DataValue::Integer(value)) => *value,
+        _ => 0,
     }
 }

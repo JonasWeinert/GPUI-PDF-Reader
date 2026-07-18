@@ -290,10 +290,18 @@ sidecar:
 sh tests/e2e/macos_fluid.sh
 ```
 
+The extension scenario installs and uses both reference packages, relaunches
+to prove durable restoration, rejects a package that requests native code, and
+contains a fuel-exhausting Component Model guest without taking down the app:
+
+```sh
+sh tests/e2e/macos_extensions.sh
+```
+
 Each E2E case has a hard watchdog and requires a quiet Ready state, all exact
 visible tiles, bounded tile memory, and no panic or GPU/Metal fault in the app
 or macOS logs. The feature scenario also measures document-anchor drift during
-sidebar transitions. Both scripts need a logged-in macOS GUI session but do
+sidebar transitions. These scripts need a logged-in macOS GUI session but do
 not require Accessibility permission.
 
 The root integration fixture is `tests/fixtures/interaction.pdf`.
