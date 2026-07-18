@@ -3,7 +3,7 @@ use gpui::{App, Hsla, Menu, MenuItem, Rgba, SharedString, Window};
 use gpui_component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry, ThemeSet};
 use std::{rc::Rc, sync::LazyLock};
 
-const BUNDLED_THEMES_JSON: &str = include_str!("../assets/themes/gpui-component.json");
+const BUNDLED_THEMES_JSON: &str = include_str!("../../../assets/themes/gpui-component.json");
 
 static BUNDLED_THEMES: LazyLock<ThemeSet> = LazyLock::new(|| {
     serde_json::from_str(BUNDLED_THEMES_JSON).expect("bundled gpui-component themes must be valid")

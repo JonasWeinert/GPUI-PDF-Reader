@@ -7,7 +7,7 @@ description = "A fast native PDF reader built with GPUI and PDFium"
 
 [[bin]]
 name = "gpui-pdf-reader"
-path = "../../src/main.rs"
+path = "src/main.rs"
 
 [dependencies]
 image.workspace = true
