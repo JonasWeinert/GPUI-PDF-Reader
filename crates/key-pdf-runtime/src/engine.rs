@@ -260,6 +260,7 @@ impl std::error::Error for EngineOutputError {}
 #[derive(Debug)]
 pub enum RuntimeFailure<E> {
     Engine(E),
+    Session(SessionError),
     Demand(DemandError),
     Allocation(AllocationError),
     NoDocument,
@@ -272,6 +273,7 @@ impl<E: fmt::Display> fmt::Display for RuntimeFailure<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Engine(error) => error.fmt(formatter),
+            Self::Session(error) => error.fmt(formatter),
             Self::Demand(error) => error.fmt(formatter),
             Self::Allocation(error) => error.fmt(formatter),
             Self::NoDocument => formatter.write_str("no PDF document is open"),
