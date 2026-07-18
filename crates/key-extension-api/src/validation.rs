@@ -524,6 +524,7 @@ impl<'a> ManifestValidator<'a> {
                 MenuItemKind::Command {
                     label,
                     command,
+                    payload,
                     icon,
                     enabled,
                     checked,
@@ -531,6 +532,9 @@ impl<'a> ManifestValidator<'a> {
                     self.nonempty_string(&format!("{item_path}.label"), label);
                     self.command_reference(&format!("{item_path}.command"), command.as_str());
                     self.validate_binding_source(&format!("{item_path}.enabled"), enabled);
+                    if let Some(payload) = payload {
+                        self.validate_value(&format!("{item_path}.payload"), payload);
+                    }
                     if let Some(checked) = checked {
                         self.validate_binding_source(&format!("{item_path}.checked"), checked);
                     }

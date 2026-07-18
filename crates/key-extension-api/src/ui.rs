@@ -97,6 +97,8 @@ pub enum MenuItemKind {
     Command {
         label: String,
         command: CommandId,
+        #[serde(default)]
+        payload: Option<DataValue>,
         icon: Option<IconRef>,
         #[serde(default)]
         enabled: BooleanSource,

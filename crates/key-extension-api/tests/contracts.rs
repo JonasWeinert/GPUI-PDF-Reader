@@ -61,6 +61,7 @@ fn command_item(id: &str, command: &str) -> MenuItem {
         kind: MenuItemKind::Command {
             label: "Show statistics".into(),
             command: command_id(command),
+            payload: None,
             icon: Some(IconRef::Host("chart".into())),
             enabled: BooleanSource::Constant(true),
             checked: None,

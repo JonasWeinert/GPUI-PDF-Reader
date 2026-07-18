@@ -2408,6 +2408,7 @@ mod tests {
             kind: MenuItemKind::Command {
                 label: "First".into(),
                 command: command.clone(),
+                payload: None,
                 icon: None,
                 enabled: BooleanSource::Constant(true),
                 checked: None,
@@ -2420,6 +2421,7 @@ mod tests {
             kind: MenuItemKind::Command {
                 label: "Second".into(),
                 command,
+                payload: None,
                 icon: None,
                 enabled: BooleanSource::Constant(true),
                 checked: None,
