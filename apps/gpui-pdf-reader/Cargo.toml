@@ -1,0 +1,29 @@
+[package]
+name = "gpui-pdf-reader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A fast native PDF reader built with GPUI and PDFium"
+
+[[bin]]
+name = "gpui-pdf-reader"
+path = "../../src/main.rs"
+
+[dependencies]
+image.workspace = true
+key-editor-core = { path = "../../crates/key-editor-core" }
+key-pdf-core = { path = "../../crates/key-pdf-core" }
+open.workspace = true
+pdfium-render.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+url.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6.2", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSEvent"] }
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
+gpui-component = "=0.5.1"
+gpui-component-assets = "=0.5.1"

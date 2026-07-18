@@ -1641,7 +1641,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let pdfium = initialize_pdfium().expect("the pinned PDFium binary should load");
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/interaction.pdf");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("tests/fixtures/interaction.pdf");
         let (document, pages) = open_document(pdfium, &path).expect("fixture should open");
         assert_eq!(
             pages,
@@ -1973,8 +1975,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let pdfium = initialize_pdfium().expect("the pinned PDFium binary should load");
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scientific-unlinked.pdf");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("tests/fixtures/scientific-unlinked.pdf");
         let (document, pages) = open_document(pdfium, &fixture).expect("fixture should open");
         let links = extract_document_links(&document, &pages);
         assert!(
@@ -2217,7 +2220,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let pdfium = initialize_pdfium().expect("the pinned PDFium binary should load");
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/interaction.pdf");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("tests/fixtures/interaction.pdf");
         let (document, pages) = open_document(pdfium, &fixture).expect("fixture should open");
         let mut state = WorkerState {
             document: Some(document),

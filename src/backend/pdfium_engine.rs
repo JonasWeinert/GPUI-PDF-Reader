@@ -50,6 +50,7 @@ pub(super) fn initialize_pdfium() -> Result<&'static Pdfium, String> {
 
     candidates.push(
         Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
             .join("vendor/pdfium/lib")
             .join(&library_name),
     );
