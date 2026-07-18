@@ -74,7 +74,7 @@ contribution = "org.key.reference.document-statistics/panel"
 
 [[contributions.menus]]
 id = "org.key.reference.document-statistics/tools-menu"
-slot = "tools.analysis"
+slot = "tools.extensions"
 
 [contributions.menus.order]
 priority = 0

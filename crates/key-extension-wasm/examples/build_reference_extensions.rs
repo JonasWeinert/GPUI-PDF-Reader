@@ -233,22 +233,43 @@ fn theme_manifest() -> ExtensionManifest {
         },
         settings: SettingsSchema {
             version: 1,
-            fields: vec![SettingDefinition {
-                key: "theme-preset".into(),
-                label: "Theme preset".into(),
-                description: "Host-rendered semantic palette preset.".into(),
-                value_type: SettingType::Choice {
-                    options: select_options
-                        .into_iter()
-                        .map(|option| key_extension_api::SettingChoice {
-                            label: option.label,
-                            value: option.value,
-                        })
-                        .collect(),
+            fields: vec![
+                SettingDefinition {
+                    key: "theme-preset".into(),
+                    label: "Theme preset".into(),
+                    description: "Host-rendered semantic palette preset.".into(),
+                    value_type: SettingType::Choice {
+                        options: select_options
+                            .into_iter()
+                            .map(|option| key_extension_api::SettingChoice {
+                                label: option.label,
+                                value: option.value,
+                            })
+                            .collect(),
+                    },
+                    default: DataValue::String("warm-paper".into()),
+                    sensitive: false,
                 },
-                default: DataValue::String("warm-paper".into()),
-                sensitive: false,
-            }],
+                SettingDefinition {
+                    key: "display-name".into(),
+                    label: "Preset label".into(),
+                    description: "A short local label shown with this preset.".into(),
+                    value_type: SettingType::String {
+                        maximum_bytes: Some(80),
+                    },
+                    default: DataValue::String("Reading palette".into()),
+                    sensitive: false,
+                },
+                SettingDefinition {
+                    key: "follow-document".into(),
+                    label: "Follow document appearance".into(),
+                    description: "Allow the preset to respond to document appearance changes."
+                        .into(),
+                    value_type: SettingType::Boolean,
+                    default: DataValue::Boolean(true),
+                    sensitive: false,
+                },
+            ],
         },
         storage: StorageRequirements {
             settings_bytes: 4 * 1024,
@@ -324,7 +345,7 @@ fn statistics_manifest() -> ExtensionManifest {
             }],
             menus: vec![MenuContribution {
                 id: contribution("org.key.reference.document-statistics/tools-menu"),
-                slot: MenuSlotId::parse("tools.analysis").expect("static menu slot"),
+                slot: MenuSlotId::parse("tools.extensions").expect("static menu slot"),
                 order: ContributionOrder::default(),
                 items: vec![MenuItem {
                     id: local("show-statistics"),

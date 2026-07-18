@@ -23,6 +23,10 @@ use key_extension_api::{
     MenuItemOrder, MenuSlotId, NativeAdapterId, Permission, Publisher, SettingsSchema,
     SnapshotKind, StorageRequirements,
 };
+#[cfg(feature = "installable-extensions")]
+use key_extension_gpui::{
+    BoundedStateMap, InvokeExtensionCommand, ResolvedMenuItem, resolve_menu_contribution_items,
+};
 use key_extension_gpui::{native_menu_slots, resolve_menu_slots};
 #[cfg(feature = "installable-extensions")]
 use key_extension_host::OwnedCommand;
@@ -85,6 +89,14 @@ pub struct ReaderExtensions {
 #[cfg(feature = "installable-extensions")]
 pub struct PackageActivationUpdate {
     pub message: String,
+}
+
+#[cfg(feature = "installable-extensions")]
+pub struct ExtensionToolEntry {
+    pub extension: ExtensionId,
+    pub name: String,
+    /// `None` means the host should open this extension's detail/settings page.
+    pub action: Option<InvokeExtensionCommand>,
 }
 
 #[cfg(feature = "installable-extensions")]
@@ -580,25 +592,6 @@ impl ReaderExtensions {
     }
 
     #[cfg(feature = "installable-extensions")]
-    pub fn deny_package_permissions(
-        &mut self,
-        extension: &ExtensionId,
-    ) -> Result<(), ExtensionPackageError> {
-        let packages = self.packages.as_mut().ok_or_else(|| {
-            ExtensionPackageError::Host(HostError::EventRejected(
-                "the installable extension runtime is unavailable".into(),
-            ))
-        })?;
-        packages.deny_permissions(&mut self.host, extension)?;
-        let source = self.pending_sources.remove(extension);
-        if packages.is_managed(extension) && source.is_none() {
-            self.persist_managed_package(extension, None, false)?;
-        }
-        self.sync_extension_assets(extension, false)?;
-        Ok(())
-    }
-
-    #[cfg(feature = "installable-extensions")]
     pub fn disable_package(
         &mut self,
         extension: &ExtensionId,
@@ -686,6 +679,43 @@ impl ReaderExtensions {
     }
 
     #[cfg(feature = "installable-extensions")]
+    pub fn set_package_setting(
+        &mut self,
+        extension: &ExtensionId,
+        key: &str,
+        value: DataValue,
+    ) -> Result<Vec<ArbitratedEffect>, ExtensionPackageError> {
+        let packages = self.packages.as_ref().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the installable extension runtime is unavailable".into(),
+            ))
+        })?;
+        if !packages.is_managed(extension) {
+            return Err(ExtensionPackageError::NotManaged(extension.clone()));
+        }
+        let previous = self.host.extension_settings(extension);
+        let next = self
+            .host
+            .extension_settings_with_update(extension, key, value.clone())
+            .map_err(ExtensionPackageError::Host)?;
+        let registry = self.registry.as_mut().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the durable extension registry is unavailable".into(),
+            ))
+        })?;
+        registry
+            .replace_settings(extension, Some(next))
+            .map_err(extension_registry_error)?;
+        if let Err(error) = self.host.update_extension_setting(extension, key, value) {
+            if let Err(rollback) = registry.replace_settings(extension, previous) {
+                return Err(extension_registry_error(rollback));
+            }
+            return Err(ExtensionPackageError::Host(error));
+        }
+        Ok(self.host.process_tick().effects)
+    }
+
+    #[cfg(feature = "installable-extensions")]
     pub fn installed_packages(&self) -> Vec<InstalledPackageSummary> {
         let mut summaries = self
             .packages
@@ -695,6 +725,7 @@ impl ReaderExtensions {
             InstalledPackageSummary {
                 extension: failure.entry.extension.clone(),
                 name: failure.entry.extension.to_string(),
+                description: "This extension could not be restored from its saved package.".into(),
                 version: "Unavailable".into(),
                 license: "Unknown".into(),
                 source: if failure.entry.source_path.is_dir() {
@@ -706,6 +737,8 @@ impl ReaderExtensions {
                 state: key_extension_api::LifecycleState::Failed,
                 ui_kind: None,
                 permissions: Vec::new(),
+                settings_schema: SettingsSchema::default(),
+                settings: failure.entry.settings.clone(),
                 restoration_error: Some(failure.reason.clone()),
             }
         }));
@@ -734,6 +767,49 @@ impl ReaderExtensions {
             .commands
             .into_iter()
             .filter(|command| installed.contains(&command.owner))
+            .collect()
+    }
+
+    /// One stable Tools → Extensions entry per active local package. A package
+    /// may contribute one direct command to the reserved `tools.extensions`
+    /// slot; without one, the application opens its host-rendered details.
+    #[cfg(feature = "installable-extensions")]
+    pub fn extension_tool_entries(&mut self) -> Vec<ExtensionToolEntry> {
+        let active = self
+            .installed_packages()
+            .into_iter()
+            .filter(|package| package.state == key_extension_api::LifecycleState::Active)
+            .collect::<Vec<_>>();
+        let menus = self.host.collect_contributions().menus;
+        active
+            .into_iter()
+            .map(|package| {
+                let action = menus
+                    .iter()
+                    .filter(|menu| {
+                        menu.owner == package.extension
+                            && menu.menu.slot.as_str() == "tools.extensions"
+                    })
+                    .find_map(|menu| {
+                        let state =
+                            BoundedStateMap::new(menu.state.clone(), Default::default()).ok()?;
+                        resolve_menu_contribution_items(&menu.menu.items, &state)
+                            .into_iter()
+                            .find_map(|item| match item {
+                                ResolvedMenuItem::Command {
+                                    action,
+                                    enabled: true,
+                                    ..
+                                } => Some(action),
+                                _ => None,
+                            })
+                    });
+                ExtensionToolEntry {
+                    extension: package.extension,
+                    name: package.name,
+                    action,
+                }
+            })
             .collect()
     }
 
@@ -1195,7 +1271,12 @@ fn compatible(value: &str) -> CompatibleVersion {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "installable-extensions")]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+    #[cfg(feature = "installable-extensions")]
+    use crate::extension_packages::PackageActivation;
 
     fn test_theme(name: &str, mode: ThemeMode) -> ThemeConfig {
         ThemeConfig {
@@ -1321,5 +1402,98 @@ mod tests {
             extensions.host.state(&probe),
             Some(key_extension_api::LifecycleState::Active)
         );
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    #[test]
+    fn installed_extension_settings_persist_and_tools_entries_use_declared_fallbacks() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("gpui-pdf-extension-tools-{nonce}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let theme_path = workspace.join("extensions/reference-theme-pack/package");
+        let statistics_path = workspace.join("extensions/reference-document-statistics/package");
+
+        let mut extensions = ReaderExtensions::new(&[], false).expect("host starts");
+        extensions.registry = Some(
+            ExtensionRegistry::load(root.join("extensions-v1.json")).expect("test registry loads"),
+        );
+
+        let theme_preview = extensions.preview_package(&theme_path).unwrap();
+        let theme = theme_preview.extension.clone();
+        assert_eq!(
+            extensions
+                .install_reviewed_package(&theme_path, &theme_preview)
+                .unwrap()
+                .activation,
+            PackageActivation::Active
+        );
+        extensions
+            .set_package_setting(
+                &theme,
+                "display-name",
+                DataValue::String("My paper palette".into()),
+            )
+            .unwrap();
+        let persisted = extensions
+            .registry
+            .as_ref()
+            .unwrap()
+            .get(&theme)
+            .unwrap()
+            .settings
+            .clone()
+            .unwrap();
+        let DataValue::Record(settings) = persisted else {
+            panic!("settings must remain a record");
+        };
+        assert_eq!(
+            settings.get("display-name"),
+            Some(&DataValue::String("My paper palette".into()))
+        );
+
+        let statistics_preview = extensions.preview_package(&statistics_path).unwrap();
+        let statistics = statistics_preview.extension.clone();
+        assert!(matches!(
+            extensions
+                .install_reviewed_package(&statistics_path, &statistics_preview)
+                .unwrap()
+                .activation,
+            PackageActivation::AwaitingPermissions(_)
+        ));
+        assert_eq!(
+            extensions.approve_package(&statistics).unwrap().activation,
+            PackageActivation::Active
+        );
+
+        let entries = extensions.extension_tool_entries();
+        assert_eq!(entries.len(), 2);
+        let theme_entry = entries
+            .iter()
+            .find(|entry| entry.extension == theme)
+            .expect("theme entry exists");
+        assert!(
+            theme_entry.action.is_none(),
+            "extensions without a trigger open their details page"
+        );
+        let statistics_entry = entries
+            .iter()
+            .find(|entry| entry.extension == statistics)
+            .expect("statistics entry exists");
+        assert_eq!(
+            statistics_entry
+                .action
+                .as_ref()
+                .map(|action| action.command.as_str()),
+            Some("org.key.reference.document-statistics/open")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

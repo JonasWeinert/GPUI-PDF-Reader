@@ -15,8 +15,8 @@ use std::{
 
 use key_extension_api::{
     DataValue, EventSubscription, ExtensionEntrypoint, ExtensionId, IconRef, LifecycleState,
-    MenuItem, MenuItemKind, PackagePath, Permission, PermissionRequest, SnapshotKind, UiNode,
-    UiNodeKind,
+    MenuItem, MenuItemKind, PackagePath, Permission, PermissionRequest, SettingsSchema,
+    SnapshotKind, UiNode, UiNodeKind,
 };
 use key_extension_host::{
     ExtensionHost, HostError, PackageMetadata, PackageOrigin, PermissionDecision,
@@ -60,6 +60,7 @@ pub struct PackageInstallReport {
 pub struct PackageInstallPreview {
     pub extension: ExtensionId,
     pub name: String,
+    pub description: String,
     pub version: String,
     pub license: String,
     pub source: PackageSourceKind,
@@ -95,10 +96,11 @@ impl PackageInstallPreview {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InstalledPackageSummary {
     pub extension: ExtensionId,
     pub name: String,
+    pub description: String,
     pub version: String,
     pub license: String,
     pub source: PackageSourceKind,
@@ -108,6 +110,8 @@ pub struct InstalledPackageSummary {
     /// The host still renders only the bounded contributions in the manifest.
     pub ui_kind: Option<String>,
     pub permissions: Vec<(PermissionRequest, PermissionDecision)>,
+    pub settings_schema: SettingsSchema,
+    pub settings: Option<DataValue>,
     pub restoration_error: Option<String>,
 }
 
@@ -489,6 +493,7 @@ impl InstallableExtensionManager {
         Ok(self.activation_report(host, extension.clone())?.report)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn deny_permissions(
         &mut self,
         host: &mut ExtensionHost,
@@ -664,6 +669,7 @@ impl InstallableExtensionManager {
             .map(|(extension, managed)| InstalledPackageSummary {
                 extension: extension.clone(),
                 name: managed.manifest().name.clone(),
+                description: managed.manifest().description.clone(),
                 version: managed.manifest().version.to_string(),
                 license: managed.manifest().license.clone(),
                 source: managed.package.source(),
@@ -680,6 +686,8 @@ impl InstallableExtensionManager {
                         (request, decision)
                     })
                     .collect(),
+                settings_schema: managed.manifest().settings.clone(),
+                settings: host.extension_settings(extension),
                 restoration_error: None,
             })
             .collect()
@@ -1093,6 +1101,7 @@ impl InstallableExtensionManager {
         Ok(PackageInstallPreview {
             extension: manifest.id.clone(),
             name: manifest.name.clone(),
+            description: manifest.description.clone(),
             version: manifest.version.to_string(),
             license: manifest.license.clone(),
             source: managed.package.source(),

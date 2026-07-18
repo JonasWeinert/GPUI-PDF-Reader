@@ -10,9 +10,9 @@ use key_extension_api::{
     ContributionOrder, ContributionSlot, DataValue, EffectId, EffectRequest, EffectResult,
     EventEnvelope, EventSource, EventSubscription, ExtensionEffect, ExtensionEntrypoint,
     ExtensionError, ExtensionErrorCode, ExtensionEvent, ExtensionId, ExtensionManifest,
-    ExtensionVersion, GenerationId, LifecycleState, MenuContribution, MenuItem, MenuItemKind,
-    Permission, PermissionRequest, ProvidedCapability, SnapshotKind, StateBinding, StorageArea,
-    UiContribution, ValidationLimits,
+    ExtensionVersion, GenerationId, LifecycleEvent, LifecycleState, MenuContribution, MenuItem,
+    MenuItemKind, Permission, PermissionRequest, ProvidedCapability, SnapshotKind, StateBinding,
+    StorageArea, UiContribution, ValidationLimits,
 };
 
 use crate::{
@@ -617,6 +617,83 @@ impl ExtensionHost {
             runtime.state.insert("settings".into(), settings);
         }
         Ok(())
+    }
+
+    /// Updates one non-sensitive manifest setting through the trusted host.
+    ///
+    /// Apps use this for host-rendered settings forms. The manifest remains the
+    /// source of type/range limits, extensions never receive a mutable state
+    /// handle, and active runtimes observe only a bounded lifecycle event.
+    pub fn update_extension_setting(
+        &mut self,
+        extension: &ExtensionId,
+        key: &str,
+        value: DataValue,
+    ) -> Result<(), HostError> {
+        let previous = self.extension_settings(extension);
+        let settings = self.extension_settings_with_update(extension, key, value)?;
+        if previous.as_ref() == Some(&settings) {
+            return Ok(());
+        }
+        if self.state(extension) == Some(LifecycleState::Active) {
+            self.enqueue_host_event(
+                extension,
+                ExtensionEvent::Lifecycle {
+                    event: LifecycleEvent::SettingsChanged {
+                        keys: vec![key.to_owned()],
+                    },
+                },
+            )?;
+        }
+        self.restore_extension_settings(extension, settings)?;
+        Ok(())
+    }
+
+    /// Validates and materializes a setting update without mutating the host.
+    /// Applications can durably commit this snapshot before notifying a live
+    /// runtime, avoiding a split-brain state if their registry write fails.
+    pub fn extension_settings_with_update(
+        &self,
+        extension: &ExtensionId,
+        key: &str,
+        value: DataValue,
+    ) -> Result<DataValue, HostError> {
+        let manifest = self
+            .registry
+            .get(extension)
+            .ok_or_else(|| HostError::NotInstalled(extension.clone()))?
+            .manifest();
+        let definition = manifest
+            .settings
+            .fields
+            .iter()
+            .find(|setting| setting.key == key)
+            .ok_or_else(|| HostError::EventRejected(format!("unknown setting '{key}'")))?;
+        if definition.sensitive {
+            return Err(HostError::EventRejected(format!(
+                "sensitive setting '{key}' requires a host secret provider"
+            )));
+        }
+        if !definition.value_type.accepts(&value) {
+            return Err(HostError::EventRejected(format!(
+                "setting '{key}' has the wrong type or is outside its declared range"
+            )));
+        }
+
+        let mut settings = match self.extension_settings(extension) {
+            Some(DataValue::Record(settings)) => settings,
+            Some(_) => {
+                return Err(HostError::EventRejected(
+                    "persisted extension settings are not a record".into(),
+                ));
+            }
+            None => BTreeMap::new(),
+        };
+        let path = key.split('.').collect::<Vec<_>>();
+        if get_data_path(&settings, &path) != Some(&value) {
+            set_data_path(&mut settings, &path, value)?;
+        }
+        Ok(DataValue::Record(settings))
     }
 
     #[must_use]
@@ -2695,6 +2772,45 @@ fn set_state_binding(
     set_path(state, &binding.0, value);
 }
 
+fn get_data_path<'a>(
+    record: &'a BTreeMap<String, DataValue>,
+    path: &[&str],
+) -> Option<&'a DataValue> {
+    let (head, tail) = path.split_first()?;
+    let value = record.get(*head)?;
+    if tail.is_empty() {
+        Some(value)
+    } else if let DataValue::Record(record) = value {
+        get_data_path(record, tail)
+    } else {
+        None
+    }
+}
+
+fn set_data_path(
+    record: &mut BTreeMap<String, DataValue>,
+    path: &[&str],
+    value: DataValue,
+) -> Result<(), HostError> {
+    let (head, tail) = path
+        .split_first()
+        .ok_or_else(|| HostError::EventRejected("setting key cannot be empty".into()))?;
+    if tail.is_empty() {
+        record.insert((*head).to_owned(), value);
+        return Ok(());
+    }
+    let child = record
+        .entry((*head).to_owned())
+        .or_insert_with(|| DataValue::Record(BTreeMap::new()));
+    let DataValue::Record(child) = child else {
+        return Err(HostError::EventRejected(format!(
+            "setting path '{}' crosses a non-record value",
+            path.join(".")
+        )));
+    };
+    set_data_path(child, tail, value)
+}
+
 fn order_owned_menus(menus: &mut Vec<OwnedMenu>) -> bool {
     stable_order(
         menus,
@@ -3227,6 +3343,64 @@ mod tests {
             !settings.contains_key("api-token"),
             "sensitive settings must remain outside extension-visible UI state"
         );
+
+        let preview = host
+            .extension_settings_with_update(
+                &extension,
+                "theme-preset",
+                DataValue::String("slate".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            preview,
+            DataValue::Record(settings)
+                if settings.get("theme-preset")
+                    == Some(&DataValue::String("slate".into()))
+        ));
+        assert!(matches!(
+            host.extension_settings(&extension),
+            Some(DataValue::Record(settings))
+                if settings.get("theme-preset")
+                    == Some(&DataValue::String("graphite".into()))
+        ));
+
+        host.update_extension_setting(
+            &extension,
+            "theme-preset",
+            DataValue::String("slate".into()),
+        )
+        .unwrap();
+        assert_eq!(host.pending_event_count(), 1);
+        host.process_tick();
+        assert!(matches!(
+            host.extension_settings(&extension),
+            Some(DataValue::Record(settings))
+                if settings.get("theme-preset")
+                    == Some(&DataValue::String("slate".into()))
+        ));
+        assert!(
+            host.update_extension_setting(&extension, "missing", DataValue::Boolean(true))
+                .is_err()
+        );
+        assert!(
+            host.update_extension_setting(&extension, "theme-preset", DataValue::Integer(7),)
+                .is_err()
+        );
+        assert!(
+            host.update_extension_setting(
+                &extension,
+                "api-token",
+                DataValue::String("secret".into()),
+            )
+            .is_err()
+        );
+        host.update_extension_setting(
+            &extension,
+            "theme-preset",
+            DataValue::String("graphite".into()),
+        )
+        .unwrap();
+        host.process_tick();
 
         host.invoke_command(&command_for(&extension), DataValue::Integer(7))
             .unwrap();

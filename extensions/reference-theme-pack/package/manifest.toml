@@ -248,6 +248,33 @@ value = "high-contrast"
 type = "string"
 value = "warm-paper"
 
+[[settings.fields]]
+key = "display-name"
+label = "Preset label"
+description = "A short local label shown with this preset."
+sensitive = false
+
+[settings.fields.value_type]
+kind = "string"
+maximum_bytes = 80
+
+[settings.fields.default]
+type = "string"
+value = "Reading palette"
+
+[[settings.fields]]
+key = "follow-document"
+label = "Follow document appearance"
+description = "Allow the preset to respond to document appearance changes."
+sensitive = false
+
+[settings.fields.value_type]
+kind = "boolean"
+
+[settings.fields.default]
+type = "boolean"
+value = true
+
 [storage]
 settings_bytes = 4096
 document_bytes = 0

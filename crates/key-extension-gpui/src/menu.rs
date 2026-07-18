@@ -48,7 +48,7 @@ pub fn resolve_menu_slots(contributions: &CollectedContributions) -> Vec<Resolve
         let state = BoundedStateMap::new(owned.state.clone(), Default::default())
             .expect("host-owned extension menu state is bounded");
         let target = slots.entry(owned.menu.slot.clone()).or_default();
-        target.extend(resolve_menu_items(&owned.menu.items, &state));
+        target.extend(resolve_menu_contribution_items(&owned.menu.items, &state));
         normalize_separators(target);
     }
     slots
@@ -60,7 +60,14 @@ pub fn resolve_menu_slots(contributions: &CollectedContributions) -> Vec<Resolve
         .collect()
 }
 
-fn resolve_menu_items(items: &[MenuItem], state: &BoundedStateMap) -> Vec<ResolvedMenuItem> {
+/// Resolves one host-owned menu contribution against its immutable state.
+/// Applications use this when a reserved slot needs to preserve contribution
+/// ownership instead of flattening every extension into one native menu.
+#[must_use]
+pub fn resolve_menu_contribution_items(
+    items: &[MenuItem],
+    state: &BoundedStateMap,
+) -> Vec<ResolvedMenuItem> {
     let mut resolved = Vec::new();
     for item in items {
         if !state.resolve_boolean(&item.visible) {
@@ -89,7 +96,7 @@ fn resolve_menu_items(items: &[MenuItem], state: &BoundedStateMap) -> Vec<Resolv
                 icon,
                 children,
             } => {
-                let mut children = resolve_menu_items(children, state);
+                let mut children = resolve_menu_contribution_items(children, state);
                 normalize_separators(&mut children);
                 if !children.is_empty() {
                     resolved.push(ResolvedMenuItem::Submenu {

@@ -132,7 +132,6 @@ pub enum ExtensionRegistryError {
     DuplicatePermission,
     InvalidPermission(String),
     InvalidSettings(String),
-    #[cfg(test)]
     ExtensionNotFound(ExtensionId),
     AtomicRollbackFailed {
         path: PathBuf,
@@ -191,7 +190,6 @@ impl fmt::Display for ExtensionRegistryError {
             Self::InvalidSettings(reason) => {
                 write!(formatter, "invalid persisted extension settings: {reason}")
             }
-            #[cfg(test)]
             Self::ExtensionNotFound(extension) => {
                 write!(formatter, "extension {extension} is not in the registry")
             }
@@ -379,7 +377,6 @@ impl ExtensionRegistry {
         self.commit(next)
     }
 
-    #[cfg(test)]
     pub fn replace_settings(
         &mut self,
         extension: &ExtensionId,
