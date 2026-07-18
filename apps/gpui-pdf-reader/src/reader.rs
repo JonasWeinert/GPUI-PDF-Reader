@@ -4,6 +4,7 @@ use crate::annotations::{
     TextRange,
 };
 use crate::app_extensions::ReaderExtensions;
+use crate::application_host::ApplicationHost;
 use crate::backend::{
     PdfWorker, PreviewSpec, RenderAppearance, RenderColor, TileRequest, WorkerEvent,
 };
@@ -99,8 +100,10 @@ use key_pdf_gpui::{
     inflate_tile_rect as viewport_inflate_tile_rect,
     plan_visible_tiles as viewport_plan_visible_tiles,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -515,7 +518,9 @@ enum ReaderStatus {
 }
 
 pub struct PdfReader {
-    extensions: ReaderExtensions,
+    _application_host: Entity<ApplicationHost>,
+    extensions: Rc<RefCell<ReaderExtensions>>,
+    pdf_capabilities: Arc<PdfCapabilityBridge>,
     extension_contribution: Option<ExtensionContributionPane>,
     extension_ui_panel: RevealState,
     #[cfg(feature = "installable-extensions")]
@@ -664,7 +669,7 @@ pub struct PdfReader {
 impl PdfReader {
     pub fn new(
         initial_path: Option<PathBuf>,
-        extensions: ReaderExtensions,
+        application_host: Entity<ApplicationHost>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -672,9 +677,12 @@ impl PdfReader {
         let (annotation_io, annotation_events) = AnnotationIo::start();
         let (link_preview_fetcher, link_preview_events) = LinkPreviewFetcher::new();
         let (scholarly_fetcher, scholarly_events) = ScholarlyFetcher::new();
+        let extensions = application_host.read(cx).extensions();
         let extension_warning = extensions
+            .borrow()
             .startup_error()
             .map(|message| SharedString::from(message.to_owned()));
+        let pdf_capabilities = Arc::new(PdfCapabilityBridge::default());
         let search_field =
             cx.new(|cx| TextField::new(cx, "Search document", MAX_SEARCH_QUERY_BYTES));
         let search_field_for_reader = search_field.clone();
@@ -694,7 +702,9 @@ impl PdfReader {
             )
             .detach();
             Self {
+                _application_host: application_host,
                 extensions,
+                pdf_capabilities,
                 extension_contribution: None,
                 extension_ui_panel: RevealState::default(),
                 #[cfg(feature = "installable-extensions")]
@@ -1068,6 +1078,7 @@ impl PdfReader {
                 }
                 if let Err(error) = self
                     .extensions
+                    .borrow()
                     .begin_document_storage(path.clone(), pages.len())
                 {
                     self.warning =
@@ -1618,7 +1629,7 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let preview = match self.extensions.preview_package(&path) {
+        let preview = match self.extensions.borrow().preview_package(&path) {
             Ok(preview) => preview,
             Err(error) => {
                 self.warning = Some(format!("Could not review extension: {error}").into());
@@ -1649,7 +1660,11 @@ impl PdfReader {
         } else {
             "Installed"
         };
-        let mut report = match self.extensions.install_reviewed_package(&path, &preview) {
+        let mut report = match self
+            .extensions
+            .borrow_mut()
+            .install_reviewed_package(&path, &preview)
+        {
             Ok(report) => report,
             Err(error) => {
                 self.warning = Some(format!("Could not install extension: {error}").into());
@@ -1658,13 +1673,17 @@ impl PdfReader {
             }
         };
         if matches!(report.activation, PackageActivation::AwaitingPermissions(_)) {
-            report = match self.extensions.approve_package(&report.extension) {
+            let approval = self
+                .extensions
+                .borrow_mut()
+                .approve_package(&report.extension);
+            report = match approval {
                 Ok(report) => report,
                 Err(error) => {
                     self.warning =
                         Some(format!("Could not enable {}: {error}", preview.name).into());
                     self.refresh_extension_manager_state();
-                    crate::rebuild_application_menus(&mut self.extensions, cx);
+                    crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
                     cx.notify();
                     return;
                 }
@@ -1685,7 +1704,7 @@ impl PdfReader {
             PackageActivation::Active => {
                 self.warning = Some(format!("{verb} {} {}", report.name, report.version).into());
                 self.refresh_extension_manager_state();
-                crate::rebuild_application_menus(&mut self.extensions, cx);
+                crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
                 self.schedule_extension_snapshot_sync(window, cx);
             }
             PackageActivation::Activating => {
@@ -1708,7 +1727,7 @@ impl PdfReader {
                     .into(),
                 );
                 self.refresh_extension_manager_state();
-                crate::rebuild_application_menus(&mut self.extensions, cx);
+                crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
             }
             PackageActivation::AwaitingPermissions(permissions) => {
                 self.warning = Some(
@@ -1950,11 +1969,15 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.extensions.set_package_setting(&extension, &key, value) {
+        let setting_result = self
+            .extensions
+            .borrow_mut()
+            .set_package_setting(&extension, &key, value);
+        match setting_result {
             Ok(effects) => {
                 self.execute_extension_effects(effects, window, cx);
                 self.refresh_extension_manager_state();
-                if self.extensions.has_pending_extension_work() {
+                if self.extensions.borrow().has_pending_extension_work() {
                     self.schedule_extension_snapshot_sync(window, cx);
                 }
                 self.warning = Some("Extension setting saved".into());
@@ -1973,7 +1996,8 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.extensions.enable_package(&extension) {
+        let enable_result = self.extensions.borrow_mut().enable_package(&extension);
+        match enable_result {
             Ok(report) => self.handle_package_report(report, "Enabled", window, cx),
             Err(error) => {
                 self.warning = Some(format!("Could not enable extension: {error}").into());
@@ -1990,7 +2014,8 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.extensions.disable_package(&extension) {
+        let disable_result = self.extensions.borrow_mut().disable_package(&extension);
+        match disable_result {
             Ok(()) => {
                 if self
                     .extension_contribution
@@ -2002,7 +2027,7 @@ impl PdfReader {
                 }
                 self.warning = Some("Extension disabled".into());
                 self.refresh_extension_manager_state();
-                crate::rebuild_application_menus(&mut self.extensions, cx);
+                crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
             }
             Err(error) => {
                 self.warning = Some(format!("Could not disable extension: {error}").into());
@@ -2026,10 +2051,11 @@ impl PdfReader {
         } else {
             PermissionDecision::Denied
         };
-        match self
-            .extensions
-            .set_package_permission(&extension, &permission, decision)
-        {
+        let permission_result =
+            self.extensions
+                .borrow_mut()
+                .set_package_permission(&extension, &permission, decision);
+        match permission_result {
             Ok(()) => {
                 self.warning = Some(
                     if grant {
@@ -2040,7 +2066,7 @@ impl PdfReader {
                     .into(),
                 );
                 self.refresh_extension_manager_state();
-                crate::rebuild_application_menus(&mut self.extensions, cx);
+                crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
                 self.refresh_active_extension_view(window, cx);
                 self.schedule_extension_snapshot_sync(window, cx);
             }
@@ -2076,7 +2102,9 @@ impl PdfReader {
                 }
                 let _ = cx.update(|window, cx| {
                     weak.update(cx, |reader, cx| {
-                        match reader.extensions.remove_package(&extension) {
+                        let remove_result =
+                            reader.extensions.borrow_mut().remove_package(&extension);
+                        match remove_result {
                             Ok(()) => {
                                 if reader
                                     .extension_contribution
@@ -2095,7 +2123,10 @@ impl PdfReader {
                                 ) {
                                     reader.show_extension_manager_overview(window, cx);
                                 }
-                                crate::rebuild_application_menus(&mut reader.extensions, cx);
+                                crate::rebuild_application_menus(
+                                    &mut reader.extensions.borrow_mut(),
+                                    cx,
+                                );
                             }
                             Err(error) => {
                                 reader.warning =
@@ -2158,7 +2189,7 @@ impl PdfReader {
 
     fn begin_open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_open = None;
-        self.extensions.invalidate_document_scope();
+        self.extensions.borrow_mut().invalidate_document_scope();
         self.generation = self.generation.wrapping_add(1);
         self.close_pdf_capability_generation();
         self.link_preview_fetcher.begin_document(self.generation);
@@ -2279,7 +2310,7 @@ impl PdfReader {
     }
 
     fn pdf_capabilities(&self) -> Arc<PdfCapabilityBridge> {
-        self.extensions.pdf_capabilities()
+        self.pdf_capabilities.clone()
     }
 
     fn close_pdf_capability_generation(&mut self) {
@@ -2487,8 +2518,9 @@ impl PdfReader {
 
     #[cfg(feature = "installable-extensions")]
     fn refresh_extension_manager_state(&mut self) {
-        self.extension_packages = self.extensions.installed_packages();
-        self.extension_commands = self.extensions.installed_commands();
+        let mut extensions = self.extensions.borrow_mut();
+        self.extension_packages = extensions.installed_packages();
+        self.extension_commands = extensions.installed_commands();
     }
 
     fn refresh_active_extension_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2499,7 +2531,7 @@ impl PdfReader {
         else {
             return;
         };
-        let Some(owned) = self.extensions.contribution_view(&id) else {
+        let Some(owned) = self.extensions.borrow_mut().contribution_view(&id) else {
             self.extension_ui_panel.set_target(0.0);
             self.start_animation(window, cx);
             return;
@@ -2521,7 +2553,7 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> EffectResult {
-        let Some(owned) = self.extensions.contribution_view(contribution) else {
+        let Some(owned) = self.extensions.borrow_mut().contribution_view(contribution) else {
             return Err(ExtensionError {
                 code: ExtensionErrorCode::NotFound,
                 message: "the contribution is no longer active".into(),
@@ -2668,12 +2700,13 @@ impl PdfReader {
     /// Executes bounded host ticks from event/animation callbacks, never from
     /// `Render`. High-frequency navigation is coalesced by snapshot equality.
     fn flush_extension_snapshots(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let completions = self.extensions.poll_service_completions(32);
+        let completions = self.extensions.borrow_mut().poll_service_completions(32);
         for completion in completions {
-            match self
+            let completion_result = self
                 .extensions
-                .complete_effect(&completion.effect, completion.result)
-            {
+                .borrow_mut()
+                .complete_effect(&completion.effect, completion.result);
+            match completion_result {
                 Ok(report) if !report.effects.is_empty() => {
                     self.execute_extension_effects(report.effects, window, cx);
                 }
@@ -2684,10 +2717,9 @@ impl PdfReader {
                 }
             }
         }
-        let report = match self
-            .extensions
-            .publish_snapshots(self.extension_snapshot_values())
-        {
+        let snapshots = self.extension_snapshot_values();
+        let snapshot_result = self.extensions.borrow_mut().publish_snapshots(snapshots);
+        let report = match snapshot_result {
             Ok(report) => report,
             Err(error) => {
                 self.warning = Some(format!("Extension snapshot failed: {error}").into());
@@ -2696,11 +2728,11 @@ impl PdfReader {
         };
         #[cfg(feature = "installable-extensions")]
         {
-            let activation_updates = self.extensions.settle_package_activations();
+            let activation_updates = self.extensions.borrow_mut().settle_package_activations();
             if let Some(update) = activation_updates.last() {
                 self.warning = Some(update.message.clone().into());
                 self.refresh_extension_manager_state();
-                crate::rebuild_application_menus(&mut self.extensions, cx);
+                crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
             }
         }
         self.refresh_active_extension_view(window, cx);
@@ -2708,8 +2740,8 @@ impl PdfReader {
             self.execute_extension_effects(report.effects, window, cx);
         }
         if report.deferred_events > 0
-            || self.extensions.has_pending_service_work()
-            || self.extensions.has_pending_extension_work()
+            || self.extensions.borrow().has_pending_service_work()
+            || self.extensions.borrow().has_pending_extension_work()
         {
             self.schedule_extension_snapshot_sync(window, cx);
         }
@@ -2751,14 +2783,16 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let effects = match self
+        let command_result = self
             .extensions
-            .invoke_command(&action.command, action.payload.clone())
-        {
+            .borrow_mut()
+            .invoke_command(&action.command, action.payload.clone());
+        let effects = match command_result {
             Ok(effects) => effects,
             Err(error) => {
                 let detail = self
                     .extensions
+                    .borrow()
                     .latest_diagnostic_message()
                     .unwrap_or_else(|| error.to_string());
                 self.warning = Some(format!("Extension command failed: {detail}").into());
@@ -2767,14 +2801,14 @@ impl PdfReader {
             }
         };
         self.execute_extension_effects(effects, window, cx);
-        if self.extensions.has_pending_service_work()
-            || self.extensions.has_pending_extension_work()
+        if self.extensions.borrow().has_pending_service_work()
+            || self.extensions.borrow().has_pending_extension_work()
         {
             self.schedule_extension_snapshot_sync(window, cx);
         }
         #[cfg(feature = "installable-extensions")]
         self.refresh_extension_manager_state();
-        crate::rebuild_application_menus(&mut self.extensions, cx);
+        crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
     }
 
     fn execute_extension_effects(
@@ -2793,7 +2827,11 @@ impl PdfReader {
                 break;
             }
             completed += 1;
-            let result = match self.extensions.dispatch_service_effect(&effect) {
+            let dispatch = self
+                .extensions
+                .borrow_mut()
+                .dispatch_service_effect(&effect);
+            let result = match dispatch {
                 ServiceDispatch::Immediate(result) => result,
                 ServiceDispatch::Deferred => {
                     self.schedule_extension_snapshot_sync(window, cx);
@@ -2801,7 +2839,11 @@ impl PdfReader {
                 }
                 ServiceDispatch::Unsupported => self.execute_extension_effect(&effect, window, cx),
             };
-            match self.extensions.complete_effect(&effect, result) {
+            let completion = self
+                .extensions
+                .borrow_mut()
+                .complete_effect(&effect, result);
+            match completion {
                 Ok(report) => {
                     pending.extend(report.effects);
                     self.refresh_active_extension_view(window, cx);

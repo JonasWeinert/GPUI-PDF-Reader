@@ -47,7 +47,6 @@ use crate::extension_registry::{
     ExtensionRegistry, ExtensionRegistryEntry, ExtensionRegistryEntryInput,
     RequiredPermissionDecision, StoredPermissionDecision, default_app_data_root,
 };
-use crate::pdf_capability_bridge::PdfCapabilityBridge;
 
 #[cfg(feature = "installable-extensions")]
 use crate::extension_packages::{
@@ -68,7 +67,6 @@ pub struct ReaderExtensions {
     services: HostServiceRouter,
     extension_storage: Option<Arc<JsonExtensionStorage>>,
     theme_command: CommandId,
-    pdf_capabilities: Arc<PdfCapabilityBridge>,
     extension_assets: Arc<ExtensionAssetStore>,
     startup_error: Option<String>,
     /// Last host snapshot by kind. Equality coalescing keeps high-frequency
@@ -145,7 +143,6 @@ impl ReaderExtensions {
         let mut host = ExtensionHost::new(config);
         host.register_host_capability(capability.clone(), version("1.0.0"));
         register_pdf_capabilities(&mut host);
-        let pdf_capabilities = Arc::new(PdfCapabilityBridge::default());
         let command_for_adapter = theme_command.clone();
         host.register_native_adapter(NativeExtensionAdapter::new(adapter, move || {
             Box::new(ThemeExtension {
@@ -198,7 +195,6 @@ impl ReaderExtensions {
             services,
             extension_storage,
             theme_command,
-            pdf_capabilities,
             extension_assets,
             startup_error,
             last_snapshots: Vec::new(),
@@ -238,7 +234,6 @@ impl ReaderExtensions {
             services,
             extension_storage,
             theme_command: theme_command_id(),
-            pdf_capabilities: Arc::new(PdfCapabilityBridge::default()),
             extension_assets,
             startup_error: Some(error.into()),
             last_snapshots: Vec::new(),
@@ -255,11 +250,6 @@ impl ReaderExtensions {
 
     pub fn startup_error(&self) -> Option<&str> {
         self.startup_error.as_deref()
-    }
-
-    /// Returns the app-owned implementation of the PDF capability boundary.
-    pub fn pdf_capabilities(&self) -> Arc<PdfCapabilityBridge> {
-        self.pdf_capabilities.clone()
     }
 
     /// Cancels old-document extension work before the reader increments its

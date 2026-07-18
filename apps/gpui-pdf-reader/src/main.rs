@@ -1,5 +1,6 @@
 mod annotations;
 mod app_extensions;
+mod application_host;
 mod backend;
 mod document_jump;
 mod extension_assets;
@@ -35,8 +36,8 @@ mod theme;
 #[cfg(target_os = "macos")]
 use gpui::TitlebarOptions;
 use gpui::{
-    App, Application, Bounds, KeyBinding, Menu, MenuItem, Point, WindowBounds, WindowOptions,
-    actions, px, size,
+    App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, Point, WindowBounds,
+    WindowOptions, actions, px, size,
 };
 use markdown_editor::{
     CommentBackspace, CommentCancel, CommentDelete, CommentDown, CommentEnd, CommentHome,
@@ -118,6 +119,7 @@ fn main() {
             )
         });
         rebuild_application_menus(&mut extensions, cx);
+        let application_host = cx.new(|_| application_host::ApplicationHost::new(extensions));
         let bounds = Bounds {
             origin: Point::new(px(120.0), px(80.0)),
             size: size(px(1180.0), px(820.0)),
@@ -143,9 +145,10 @@ fn main() {
             }),
             ..window_options
         };
+        let host_for_window = application_host.clone();
         let window = cx
             .open_window(window_options, move |window, cx| {
-                reader::PdfReader::new(initial_path.clone(), extensions, window, cx)
+                reader::PdfReader::new(initial_path.clone(), host_for_window, window, cx)
             })
             .expect("failed to open the GPUI PDF Reader window");
 

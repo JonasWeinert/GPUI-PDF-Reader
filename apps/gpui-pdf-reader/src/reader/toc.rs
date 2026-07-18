@@ -408,6 +408,7 @@ impl PdfReader {
     ) -> bool {
         let Ok(effects) = self
             .extensions
+            .borrow_mut()
             .invoke_toc_navigation(title.to_owned(), page)
         else {
             return false;

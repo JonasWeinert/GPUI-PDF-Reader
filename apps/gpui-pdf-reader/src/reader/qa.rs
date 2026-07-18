@@ -496,7 +496,7 @@ impl PdfReader {
         {
             return false;
         }
-        let command = self.extensions.theme_command().clone();
+        let command = self.extensions.borrow().theme_command().clone();
         let selected = if name == "system" { "" } else { name };
         self.invoke_extension_command(
             &InvokeExtensionCommand {
@@ -617,10 +617,12 @@ impl PdfReader {
                 let theme_path = qa_extension_package_path("reference-theme-pack");
                 let preview = self
                     .extensions
+                    .borrow()
                     .preview_package(&theme_path)
                     .map_err(|error| format!("theme package preview failed: {error}"))?;
                 let report = self
                     .extensions
+                    .borrow_mut()
                     .install_reviewed_package(&theme_path, &preview)
                     .map_err(|error| format!("theme package install failed: {error}"))?;
                 if report.activation != PackageActivation::Active {
@@ -643,10 +645,12 @@ impl PdfReader {
                 let statistics_path = qa_extension_package_path("reference-document-statistics");
                 let preview = self
                     .extensions
+                    .borrow()
                     .preview_package(&statistics_path)
                     .map_err(|error| format!("statistics package preview failed: {error}"))?;
                 let report = self
                     .extensions
+                    .borrow_mut()
                     .install_reviewed_package(&statistics_path, &preview)
                     .map_err(|error| format!("statistics package install failed: {error}"))?;
                 if !matches!(report.activation, PackageActivation::AwaitingPermissions(_)) {
@@ -659,6 +663,7 @@ impl PdfReader {
                 let statistics = ExtensionId::parse(STATISTICS).expect("static QA extension ID");
                 let report = self
                     .extensions
+                    .borrow_mut()
                     .approve_package(&statistics)
                     .map_err(|error| format!("statistics package approval failed: {error}"))?;
                 if !matches!(
@@ -685,6 +690,7 @@ impl PdfReader {
 
                 let theme_view = self
                     .extensions
+                    .borrow_mut()
                     .contribution_view(
                         &ContributionId::parse("org.key.reference.theme-pack/settings")
                             .expect("static QA contribution ID"),
@@ -696,7 +702,7 @@ impl PdfReader {
                     return Ok(false);
                 }
 
-                let statistics_view = self.extensions.contribution_view(
+                let statistics_view = self.extensions.borrow_mut().contribution_view(
                     &ContributionId::parse("org.key.reference.document-statistics/panel")
                         .expect("static QA contribution ID"),
                 );
@@ -723,7 +729,7 @@ impl PdfReader {
                         self.extension_commands.len()
                     ));
                 }
-                let tool_entries = self.extensions.extension_tool_entries();
+                let tool_entries = self.extensions.borrow_mut().extension_tool_entries();
                 let theme = ExtensionId::parse(THEME).expect("static QA extension ID");
                 let statistics = ExtensionId::parse(STATISTICS).expect("static QA extension ID");
                 if tool_entries.len() != 2
@@ -743,6 +749,7 @@ impl PdfReader {
                     );
                 }
                 self.extensions
+                    .borrow_mut()
                     .set_package_setting(
                         &theme,
                         "display-name",
@@ -750,6 +757,7 @@ impl PdfReader {
                     )
                     .map_err(|error| format!("string setting update failed: {error}"))?;
                 self.extensions
+                    .borrow_mut()
                     .set_package_setting(&theme, "follow-document", DataValue::Boolean(false))
                     .map_err(|error| format!("boolean setting update failed: {error}"))?;
                 self.refresh_extension_manager_state();
@@ -837,7 +845,7 @@ impl PdfReader {
                 }
                 let panel_id = ContributionId::parse("org.key.reference.document-statistics/panel")
                     .expect("static QA contribution ID");
-                let Some(view) = self.extensions.contribution_view(&panel_id) else {
+                let Some(view) = self.extensions.borrow_mut().contribution_view(&panel_id) else {
                     return Ok(false);
                 };
                 if view.state.get("runtime-ready") != Some(&DataValue::Boolean(true))
@@ -894,7 +902,7 @@ impl PdfReader {
         match self.qa_extension_phase {
             QaExtensionPhase::Seed => {
                 let native_path = qa_extension_package_path("reference-native-escape");
-                match self.extensions.preview_package(&native_path) {
+                match self.extensions.borrow().preview_package(&native_path) {
                     Err(
                         crate::extension_packages::ExtensionPackageError::ExternalNativeEntrypoint(
                             extension,
@@ -914,10 +922,12 @@ impl PdfReader {
                 let path = qa_extension_package_path("reference-adversarial-loop");
                 let preview = self
                     .extensions
+                    .borrow()
                     .preview_package(&path)
                     .map_err(|error| format!("hostile package preview failed: {error}"))?;
                 let report = self
                     .extensions
+                    .borrow_mut()
                     .install_reviewed_package(&path, &preview)
                     .map_err(|error| format!("hostile package install failed: {error}"))?;
                 if !matches!(report.activation, PackageActivation::AwaitingPermissions(_)) {
@@ -929,6 +939,7 @@ impl PdfReader {
                 let hostile = ExtensionId::parse(HOSTILE).expect("static QA extension ID");
                 let report = self
                     .extensions
+                    .borrow_mut()
                     .approve_package(&hostile)
                     .map_err(|error| format!("hostile package approval failed: {error}"))?;
                 if !matches!(
@@ -947,6 +958,7 @@ impl PdfReader {
                 for _ in 0..4 {
                     let effects = self
                         .extensions
+                        .borrow_mut()
                         .invoke_command(&probe, None)
                         .map_err(|error| format!("hostile probe could not be queued: {error}"))?;
                     if !effects.is_empty() {
@@ -988,6 +1000,7 @@ impl PdfReader {
                     LifecycleState::Failed => Err(format!(
                         "hostile event loop failed the package instead of suspending it: {}",
                         self.extensions
+                            .borrow()
                             .latest_diagnostic_message()
                             .unwrap_or_else(|| "no diagnostic".into())
                     )),
@@ -1058,8 +1071,8 @@ impl PdfReader {
             || self.navigation_focus.is_busy(Instant::now())
             || self.comment_autosave_task.is_some()
             || self.extension_snapshot_task.is_some()
-            || self.extensions.has_pending_service_work()
-            || self.extensions.has_pending_extension_work()
+            || self.extensions.borrow().has_pending_service_work()
+            || self.extensions.borrow().has_pending_extension_work()
         {
             return false;
         }
