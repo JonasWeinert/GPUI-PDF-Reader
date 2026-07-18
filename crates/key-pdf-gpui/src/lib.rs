@@ -1,16 +1,28 @@
-//! Embeddable, engine-independent PDF viewport behavior for GPUI applications.
+//! Embeddable, engine-independent PDF viewport behavior and rendering for GPUI
+//! applications.
 //!
-//! The controller in this crate owns document layout, bounded navigation, and
-//! tile-demand planning. It deliberately has no dependency on a PDF engine,
-//! filesystem, network client, sidecar store, application menu, or product UI.
+//! The controller owns document layout, bounded navigation, and tile-demand
+//! planning. The rendered canvas owns paper, shadows, decoded-tile clipping,
+//! scrollbars, and a bounded page-overlay hook. The crate deliberately has no
+//! dependency on a PDF engine, filesystem, network client, sidecar store,
+//! application menu, or product UI.
 
 #![forbid(unsafe_code)]
 
+mod canvas_model;
 mod controller;
 mod planning;
 
 #[cfg(target_os = "macos")]
+mod canvas;
+#[cfg(target_os = "macos")]
 mod gpui_adapter;
+
+pub use canvas_model::{
+    DEFAULT_MAX_CANVAS_PAGES, DEFAULT_MAX_CANVAS_TILES, PdfCanvasFramePlan, PdfCanvasLimits,
+    PdfCanvasMetrics, PdfCanvasPageGeometry, PdfCanvasScrollbars, PlannedCanvasPage,
+    page_viewport_rect, pdf_canvas_scrollbars, plan_pdf_canvas_frame,
+};
 
 pub use controller::{
     DEFAULT_MAX_CACHE_BYTES, DEFAULT_MAX_CACHED_TEXT_PAGES, DEFAULT_MAX_CACHED_TILES,
@@ -26,5 +38,10 @@ pub use planning::{
     desired_raster_size, inflate_tile_rect, plan_visible_tiles, tile_core_rect, tile_logical_rect,
 };
 
+#[cfg(target_os = "macos")]
+pub use canvas::{
+    PdfCanvasPage, PdfCanvasPagePaintContext, PdfCanvasSnapshot, PdfCanvasStyle, PdfCanvasTile,
+    content_rect_to_bounds, pdf_canvas,
+};
 #[cfg(target_os = "macos")]
 pub use gpui_adapter::{PdfViewport, appearance_from_theme};

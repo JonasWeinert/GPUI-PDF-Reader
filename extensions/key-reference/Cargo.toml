@@ -1,0 +1,18 @@
+[package]
+name = "key-reference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reusable, bounded website-preview and scholarly-reference services for Key applications"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+image = { workspace = true, features = ["avif", "jpeg", "png", "webp"] }
+key-safe-http = { path = "../../crates/key-safe-http" }
+serde_json.workspace = true
+url.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

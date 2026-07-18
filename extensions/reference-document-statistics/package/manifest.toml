@@ -67,6 +67,11 @@ title = "Show document statistics"
 description = "Open the sandboxed document statistics side panel."
 category = "Document"
 
+[[contributions.command_behaviors]]
+command = "org.key.reference.document-statistics/open"
+kind = "open_contribution"
+contribution = "org.key.reference.document-statistics/panel"
+
 [[contributions.menus]]
 id = "org.key.reference.document-statistics/tools-menu"
 slot = "tools.analysis"
@@ -142,6 +147,51 @@ value = true
 [[contributions.views.root.children]]
 id = "divider"
 kind = "divider"
+
+[contributions.views.root.children.visible]
+source = "constant"
+value = true
+
+[[contributions.views.root.children]]
+id = "pages"
+kind = "metric"
+label = "Pages"
+value = [
+    "document",
+    "statistics",
+    "page-count",
+]
+format = "integer"
+
+[contributions.views.root.children.visible]
+source = "constant"
+value = true
+
+[[contributions.views.root.children]]
+id = "words"
+kind = "metric"
+label = "Known words"
+value = [
+    "document",
+    "statistics",
+    "word-count",
+]
+format = "integer"
+
+[contributions.views.root.children.visible]
+source = "constant"
+value = true
+
+[[contributions.views.root.children]]
+id = "characters"
+kind = "metric"
+label = "Known characters"
+value = [
+    "document",
+    "statistics",
+    "character-count",
+]
+format = "integer"
 
 [contributions.views.root.children.visible]
 source = "constant"

@@ -15,6 +15,11 @@ pub struct WasmRuntimeLimits {
     pub maximum_input_bytes: usize,
     pub maximum_output_bytes: usize,
     pub maximum_effects_per_event: usize,
+    /// Immutable calls waiting for one component worker. Snapshot and
+    /// capability events are latest-wins coalesced before this bound applies.
+    pub maximum_pending_events: usize,
+    /// Completed guest updates retained until the semantic host polls them.
+    pub maximum_pending_results: usize,
     pub fuel_per_invocation: u64,
     pub epoch_ticks_per_invocation: u64,
     pub epoch_tick_interval: Duration,
@@ -25,19 +30,25 @@ impl Default for WasmRuntimeLimits {
     fn default() -> Self {
         Self {
             maximum_component_bytes: 16 * 1024 * 1024,
-            maximum_memory_bytes: 64 * 1024 * 1024,
+            maximum_memory_bytes: 32 * 1024 * 1024,
             maximum_table_elements: 10_000,
             maximum_instances: 16,
             maximum_memories: 4,
             maximum_tables: 4,
             maximum_host_resources: 1_024,
             maximum_host_calls_per_invocation: 256,
-            maximum_input_bytes: 1024 * 1024,
-            maximum_output_bytes: 4 * 1024 * 1024,
-            maximum_effects_per_event: 64,
-            fuel_per_invocation: 10_000_000,
-            epoch_ticks_per_invocation: 50,
-            epoch_tick_interval: Duration::from_millis(10),
+            maximum_input_bytes: 256 * 1024,
+            maximum_output_bytes: 512 * 1024,
+            maximum_effects_per_event: 32,
+            maximum_pending_events: 128,
+            maximum_pending_results: 128,
+            // Fuel is the normal deterministic ceiling. The short epoch
+            // deadline is an independent wall-clock backstop for instructions
+            // whose cost varies across hardware; an extension event must not
+            // be able to monopolize an older laptop for half a second.
+            fuel_per_invocation: 2_000_000,
+            epoch_ticks_per_invocation: 5,
+            epoch_tick_interval: Duration::from_millis(2),
             maximum_wasm_stack_bytes: 512 * 1024,
         }
     }
@@ -56,6 +67,8 @@ impl WasmRuntimeLimits {
             ("maximum_input_bytes", self.maximum_input_bytes),
             ("maximum_output_bytes", self.maximum_output_bytes),
             ("maximum_effects_per_event", self.maximum_effects_per_event),
+            ("maximum_pending_events", self.maximum_pending_events),
+            ("maximum_pending_results", self.maximum_pending_results),
             ("maximum_wasm_stack_bytes", self.maximum_wasm_stack_bytes),
         ];
         if let Some((name, _)) = positive.into_iter().find(|(_, value)| *value == 0) {
@@ -109,7 +122,8 @@ mod tests {
     fn defaults_are_bounded_and_coherent() {
         let limits = WasmRuntimeLimits::default();
         limits.validate().unwrap();
-        assert_eq!(limits.approximate_deadline(), Duration::from_millis(500));
+        assert_eq!(limits.approximate_deadline(), Duration::from_millis(10));
+        assert!(limits.maximum_output_bytes < limits.maximum_memory_bytes);
     }
 
     #[test]

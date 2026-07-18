@@ -15,12 +15,14 @@ use gpui_component::{
     v_flex,
 };
 use key_extension_api::{
-    CommandId, DataValue, ExtensionId, IconRef, LocalId, PackagePath, StateBinding, TextEmphasis,
-    UiContribution, UiNode, UiNodeKind, UiTone,
+    CommandId, DataValue, ExtensionId, IconRef, LocalId, MetricFormat, PackagePath, StateBinding,
+    TextEmphasis, UiContribution, UiNode, UiNodeKind, UiTone,
 };
 use key_extension_host::OwnedView;
 
-use crate::{BoundedStateMap, InvokeExtensionCommand, resolve_host_icon};
+use crate::{
+    BoundedStateMap, InvokeExtensionCommand, resolve_host_icon, safe_markdown::safe_markdown_html,
+};
 
 /// Purely resolved UI state used by both the renderer and non-GPUI tests.
 /// Only the selected tab's content is part of the visible tree.
@@ -83,11 +85,7 @@ impl DeclarativeView {
     /// Build a retained renderer. The supplied contribution must already have
     /// passed `key-extension-api` and `key-extension-host` validation.
     #[must_use]
-    pub fn new(
-        owned: OwnedView,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(owned: OwnedView, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // `ExtensionHost` validates every state update against limits no looser
         // than the renderer's defaults before attaching it to `OwnedView`.
         let state = BoundedStateMap::new(owned.state.clone(), Default::default())
@@ -258,12 +256,36 @@ impl DeclarativeView {
                         .selectable(*selectable)
                         .into_any_element()
                 }
+                UiNodeKind::Metric {
+                    label,
+                    value,
+                    format,
+                } => h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(format_metric_value(self.state.resolve(value), *format)),
+                    )
+                    .into_any_element(),
                 UiNodeKind::Markdown {
                     markdown,
                     selectable,
-                } => TextView::markdown(
+                } => TextView::html(
                     self.element_key(&node.id, "markdown"),
-                    markdown.clone(),
+                    safe_markdown_html(markdown),
                     window,
                     cx,
                 )
@@ -493,6 +515,47 @@ impl Render for DeclarativeView {
     }
 }
 
+fn format_metric_value(value: Option<&DataValue>, format: MetricFormat) -> String {
+    match (value, format) {
+        (Some(DataValue::Integer(value)), MetricFormat::Integer) => value.to_string(),
+        (Some(DataValue::Number(value)), MetricFormat::Integer) if value.is_finite() => {
+            format!("{value:.0}")
+        }
+        (Some(DataValue::Integer(value)), MetricFormat::Decimal) => format!("{value}.00"),
+        (Some(DataValue::Number(value)), MetricFormat::Decimal) if value.is_finite() => {
+            format!("{value:.2}")
+        }
+        (Some(DataValue::Integer(value)), MetricFormat::Percentage) => format!("{value}%"),
+        (Some(DataValue::Number(value)), MetricFormat::Percentage) if value.is_finite() => {
+            format!("{value:.1}%")
+        }
+        (Some(DataValue::Integer(value)), MetricFormat::Bytes) if *value >= 0 => {
+            format_bytes(*value as u64)
+        }
+        (Some(DataValue::Number(value)), MetricFormat::Bytes)
+            if value.is_finite() && *value >= 0.0 =>
+        {
+            format_bytes(*value as u64)
+        }
+        _ => "—".into(),
+    }
+}
+
+fn format_bytes(value: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut amount = value as f64;
+    let mut unit = 0usize;
+    while amount >= 1_024.0 && unit + 1 < UNITS.len() {
+        amount /= 1_024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value} {}", UNITS[unit])
+    } else {
+        format!("{amount:.1} {}", UNITS[unit])
+    }
+}
+
 fn collect_text_fields(
     node: &UiNode,
     fields: &mut Vec<(LocalId, String, StateBinding, CommandId, u32)>,
@@ -684,5 +747,29 @@ mod tests {
             plain_text_html("<one> &\n\"two\""),
             "&lt;one&gt; &amp;<br>&quot;two&quot;"
         );
+    }
+
+    #[test]
+    fn metric_formatting_is_host_owned_and_type_mismatches_are_safe() {
+        assert_eq!(
+            format_metric_value(Some(&DataValue::Integer(42)), MetricFormat::Integer),
+            "42"
+        );
+        assert_eq!(
+            format_metric_value(Some(&DataValue::Number(12.5)), MetricFormat::Percentage),
+            "12.5%"
+        );
+        assert_eq!(
+            format_metric_value(Some(&DataValue::Integer(2048)), MetricFormat::Bytes),
+            "2.0 KB"
+        );
+        assert_eq!(
+            format_metric_value(
+                Some(&DataValue::String("not a number".into())),
+                MetricFormat::Integer
+            ),
+            "—"
+        );
+        assert_eq!(format_metric_value(None, MetricFormat::Decimal), "—");
     }
 }

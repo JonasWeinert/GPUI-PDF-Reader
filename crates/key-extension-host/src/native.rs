@@ -16,6 +16,41 @@ pub struct ActivationContext {
 /// Compatibility name for the runtime-neutral update used by every adapter.
 pub type NativeUpdate = ExtensionUpdate;
 
+/// Describes how an adapter delivers the result of a lifecycle or event call.
+///
+/// Trusted, inexpensive built-ins normally return an update inline. Sandboxed
+/// runtimes use `Deferred`: the call only places immutable input in a bounded
+/// worker mailbox and the host later obtains the result through
+/// [`NativeExtension::drain_deferred_updates`]. This distinction lets the
+/// semantic host preserve one arbitration path without ever waiting for guest
+/// code on a platform UI thread.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UpdateDelivery {
+    #[default]
+    Immediate,
+    Deferred,
+}
+
+/// The original authority context for an update completed by a background
+/// adapter. The host, rather than the adapter, still owns command behavior,
+/// state replacement, effect validation, and permission arbitration.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeferredCall {
+    Activation { cause: CauseContext },
+    Event(EventEnvelope),
+    Resume { cause: CauseContext },
+}
+
+/// One immutable background result. `generation` is copied from the host's
+/// activation context and prevents a result from a replaced runtime being
+/// applied to its successor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeferredNativeUpdate {
+    pub generation: GenerationId,
+    pub call: DeferredCall,
+    pub result: Result<NativeUpdate, ExtensionError>,
+}
+
 /// Trusted built-in implementation of the same semantic protocol used by
 /// sandbox adapters. Calls are always made outside platform paint callbacks.
 pub trait NativeExtension: Send {
@@ -28,6 +63,29 @@ pub trait NativeExtension: Send {
     }
 
     fn handle_event(&mut self, event: &EventEnvelope) -> Result<NativeUpdate, ExtensionError>;
+
+    /// Whether successful callback returns are placeholders whose real update
+    /// will be delivered by [`Self::drain_deferred_updates`]. Errors returned
+    /// directly still mean the mailbox rejected the call.
+    fn update_delivery(&self) -> UpdateDelivery {
+        UpdateDelivery::Immediate
+    }
+
+    /// Drain at most `maximum` completed background calls without blocking.
+    /// Implementations must retain any additional results for a future tick.
+    fn drain_deferred_updates(&mut self, _maximum: usize) -> Vec<DeferredNativeUpdate> {
+        Vec::new()
+    }
+
+    /// Total queued, executing, and completed calls retained by the adapter.
+    /// The host uses this only to schedule another bounded tick.
+    fn pending_deferred_work(&self) -> usize {
+        0
+    }
+
+    /// Cancel event work tied to the previous document generation while
+    /// retaining the extension instance and lifecycle operations.
+    fn cancel_deferred_events(&mut self) {}
 
     fn suspend(&mut self, _reason: &str) -> Result<(), ExtensionError> {
         Ok(())

@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use key_extension_api::{
-    EventEnvelope, EventSubscription, ExtensionEntrypoint, ExtensionError, ExtensionErrorCode,
-    ExtensionId, PackagePath,
+    EventSubscription, ExtensionEntrypoint, ExtensionError, ExtensionErrorCode, ExtensionId,
+    PackagePath,
 };
-use key_extension_host::{ActivationContext, NativeExtension, NativeUpdate, WasmExtensionAdapter};
+use key_extension_host::{NativeExtension, WasmExtensionAdapter};
 
+use crate::worker::WasmWorkerExtension;
 use crate::{WasmDiagnostic, WasmDiagnosticCode, WasmRuntime};
 
 /// Immutable package identity and event contract bound to verified component
@@ -19,26 +20,42 @@ pub struct WasmHostAdapterConfig {
     pub subscriptions: Vec<EventSubscription>,
 }
 
-/// Compiles verified bytes once and creates a package-scoped host adapter.
-/// No WASI or host imports are linked by this transport runtime.
+/// Creates a package-scoped adapter over verified immutable bytes.
+///
+/// Despite the compatibility-preserving name, component compilation is
+/// intentionally deferred to the adapter's dedicated worker. Constructing and
+/// activating this adapter from a GPUI callback therefore never compiles,
+/// instantiates, or calls untrusted code. No WASI or host imports are linked by
+/// this transport runtime.
 pub fn compile_host_adapter(
     runtime: &WasmRuntime,
     config: WasmHostAdapterConfig,
     component_bytes: &[u8],
 ) -> Result<WasmExtensionAdapter, WasmDiagnostic> {
-    let compiled = Arc::new(runtime.compile(component_bytes)?);
+    if component_bytes.len() > runtime.limits().maximum_component_bytes {
+        return Err(WasmDiagnostic::new(
+            WasmDiagnosticCode::ComponentTooLarge,
+            crate::WasmStage::Validation,
+            format!(
+                "component is {} bytes; limit is {} bytes",
+                component_bytes.len(),
+                runtime.limits().maximum_component_bytes
+            ),
+        ));
+    }
+    let component_bytes: Arc<[u8]> = Arc::from(component_bytes);
+    let runtime = runtime.clone();
     let extension = config.extension.clone();
     Ok(WasmExtensionAdapter::new(
         extension,
         move |entrypoint: &ExtensionEntrypoint| {
             validate_entrypoint(entrypoint, &config)?;
-            let instance = compiled
-                .instantiate()
-                .map_err(extension_error_from_diagnostic)?;
-            Ok(Box::new(WasmHostExtension {
-                instance,
-                subscriptions: config.subscriptions.clone(),
-            }) as Box<dyn NativeExtension>)
+            let instance = WasmWorkerExtension::spawn(
+                runtime.clone(),
+                Arc::clone(&component_bytes),
+                config.subscriptions.clone(),
+            )?;
+            Ok(Box::new(instance) as Box<dyn NativeExtension>)
         },
     ))
 }
@@ -64,48 +81,7 @@ fn validate_entrypoint(
     }
 }
 
-struct WasmHostExtension {
-    instance: crate::WasmExtensionInstance,
-    subscriptions: Vec<EventSubscription>,
-}
-
-impl NativeExtension for WasmHostExtension {
-    fn subscriptions(&self) -> Vec<EventSubscription> {
-        self.subscriptions.clone()
-    }
-
-    fn activate(&mut self, _context: &ActivationContext) -> Result<NativeUpdate, ExtensionError> {
-        self.instance
-            .activate()
-            .map_err(extension_error_from_diagnostic)?;
-        Ok(NativeUpdate::default())
-    }
-
-    fn handle_event(&mut self, event: &EventEnvelope) -> Result<NativeUpdate, ExtensionError> {
-        self.instance
-            .dispatch(event)
-            .map_err(extension_error_from_diagnostic)
-    }
-
-    fn suspend(&mut self, _reason: &str) -> Result<(), ExtensionError> {
-        self.instance
-            .suspend()
-            .map_err(extension_error_from_diagnostic)
-    }
-
-    fn resume(&mut self, _context: &ActivationContext) -> Result<NativeUpdate, ExtensionError> {
-        self.instance
-            .resume()
-            .map_err(extension_error_from_diagnostic)?;
-        Ok(NativeUpdate::default())
-    }
-
-    fn unload(&mut self) {
-        let _ = self.instance.unload();
-    }
-}
-
-fn extension_error_from_diagnostic(diagnostic: WasmDiagnostic) -> ExtensionError {
+pub(crate) fn extension_error_from_diagnostic(diagnostic: WasmDiagnostic) -> ExtensionError {
     let (code, retryable) = match diagnostic.code {
         WasmDiagnosticCode::FuelExhausted
         | WasmDiagnosticCode::MemoryLimitExceeded

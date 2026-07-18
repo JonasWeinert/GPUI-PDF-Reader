@@ -59,6 +59,16 @@ are macOS-specific today.
   hierarchy rail follows reading position, reveals section detail on hover,
   and smoothly moves to explicit destinations or matched page headings when
   clicked.
+- Clickable PDF links for URLs and in-document destinations. Internal jumps
+  refine rough page destinations against nearby text and use the same centered,
+  transient focus animation as search and outline navigation.
+- Hover previews for links and scientific citations, including grouped
+  references, OpenAlex/Semantic Scholar metadata, selectable citation details,
+  abstract/TLDR tabs, DOI copy, open-access links, and bounded website images.
+- A capability-based extension host with declarative and sandboxed WebAssembly
+  packages, permission previews, lifecycle management, nested host-owned menu
+  slots, and bounded host-rendered panels. Installable packages cannot load
+  arbitrary native Rust or receive GPUI/PDFium handles.
 - Latest-wins rendering and bounded caches to keep rapid scrolling and zooming
   responsive.
 
@@ -96,6 +106,15 @@ For an optimized build:
 ```sh
 cargo build --release --locked
 ./target/release/gpui-pdf-reader /path/to/document.pdf
+```
+
+The default `standard` bundle includes local installable extensions and bounded
+scholarly networking. A smaller reader omits Wasmtime and all scholarly/network
+providers while retaining the core PDF, text, search, comment, and annotation
+experience:
+
+```sh
+cargo build --release --locked --no-default-features
 ```
 
 The fetch script downloads Chromium PDFium build 7763, selects `mac-arm64` or
@@ -140,6 +159,8 @@ been implemented yet.
 | Search document | Toolbar or `Command-F` |
 | Next / previous search result | `Command-G` / `Command-Shift-G` |
 | Show / hide comments | Comments control in the toolbar |
+| Install or update an extension | File → Install or Update Extension |
+| Manage installed extensions | Tools → Extensions → Manage |
 
 The comment editor displays formatted content directly while storing Markdown.
 Its hovering formatting pill provides bold, italic, inline code, bulleted-list,
@@ -154,11 +175,14 @@ and zoom gestures preserve the document position beneath the pointer.
 
 - Only macOS is currently implemented and supported.
 - Encrypted PDFs do not have a password prompt.
-- Outlines, thumbnails, PDF-embedded annotation editing, and interactive form
+- Thumbnail navigation, PDF-embedded annotation editing, and interactive form
   filling are not implemented yet.
 - Highlights and comments use a companion sidecar; they are not written into
   the PDF and are not interoperable with PDF annotation tools yet.
 - There is no packaged, signed, or notarized application release.
+- The extension API and local package format are pre-stable. Local packages are
+  explicitly marked unverified; a signed registry and revocation service have
+  not been implemented.
 - Zoom is limited to 20–500%.
 - PDFium's initial text-page loading call is synchronous. Later character
   extraction is cancellable and scheduled behind visible rendering.
@@ -167,6 +191,18 @@ and zoom gestures preserve the document position beneath the pointer.
   pages on screen simultaneously.
 
 ## Development
+
+The repository is a virtual Cargo workspace. The standalone app lives in
+`apps/gpui-pdf-reader`; reusable editor, PDF domain/runtime/PDFium, shared UI,
+storage, safe-network, and extension layers live in `crates/`. Reference and
+first-party feature packages live in `extensions/`. No reusable crate imports
+the standalone app shell.
+
+Core crates contain no GPUI, PDFium, Wasmtime, network, or app-shell types.
+`key-pdf-gpui` provides an embeddable viewport controller/entity adapter;
+applications inject the PDF engine, annotation store, product chrome, and
+optional capabilities. The semantic extension APIs likewise contain no GPUI,
+PDFium, Wasmtime, filesystem-path, or socket types.
 
 GPUI owns the window, input, layout, and GPU painting. PDFium rasterizes pages
 and supplies character data for the text layer. All PDFium calls run on one
@@ -196,6 +232,8 @@ texture from an already submitted frame during rapid multi-page zoom.
 Short investigation notes are kept in [`notes/`](notes/). The focused PDFium
 tile extension is documented in
 [`vendor/pdfium-render-tile/TILE_PATCH.md`](vendor/pdfium-render-tile/TILE_PATCH.md).
+The workspace map is in [`notes/architecture.md`](notes/architecture.md), and
+the installable package guide is in [`extensions/README.md`](extensions/README.md).
 
 ## Testing
 
@@ -205,7 +243,8 @@ Run the deterministic development suite with:
 sh scripts/test.sh
 ```
 
-It checks formatting, all root tests, Clippy with warnings denied, the
+It checks formatting, all workspace targets, Clippy with warnings denied, the
+minimal bundle, architectural dependency boundaries, the explicit
 permissive-license policy, and the focused tiled-versus-full PDFium pixel
 regression. The PDFium regression covers portrait pages, intrinsic rotation,
 CropBox geometry, annotations, and AcroForm appearances.
@@ -250,18 +289,20 @@ The root integration fixture is `tests/fixtures/interaction.pdf`.
 Likely development areas include:
 
 - Linux and Windows platform support
-- Outlines and thumbnail navigation
+- Thumbnail navigation
 - Password handling for encrypted PDFs
 - Interactive forms
+- A signed extension registry and stable extension API
 - Packaged and signed application releases
 
 The roadmap is directional rather than a release commitment.
 
 ## License
 
-GPUI PDF Reader source is MIT licensed. Its supported dependency graph is restricted
-to MIT, Apache-2.0, and more-permissive licenses; GPL, LGPL, AGPL, MPL, and
-similar reciprocal dependencies are excluded by project policy.
+GPUI PDF Reader source is MIT licensed. Its supported dependency graph is
+restricted to MIT, Apache-2.0, and more-permissive license choices; GPL, LGPL,
+AGPL, MPL, and similar reciprocal-only dependencies are excluded by project
+policy.
 
 See [`LICENSE`](LICENSE) and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). PDFium's complete binary

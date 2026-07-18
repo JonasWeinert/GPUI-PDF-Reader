@@ -3,7 +3,7 @@ name = "key-pdf-gpui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Embeddable GPUI PDF viewport state, input, and render-demand planning"
+description = "Embeddable GPUI PDF viewport state, input, rendering, and demand planning"
 
 [dependencies]
 key-pdf-core = { path = "../key-pdf-core" }

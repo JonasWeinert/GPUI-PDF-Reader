@@ -42,14 +42,13 @@ pub enum ResolvedMenuItem {
 /// Resolve visibility and state bindings, retaining the deterministic order
 /// already arbitrated by `key-extension-host`.
 #[must_use]
-pub fn resolve_menu_slots(
-    contributions: &CollectedContributions,
-    state: &BoundedStateMap,
-) -> Vec<ResolvedMenuSlot> {
+pub fn resolve_menu_slots(contributions: &CollectedContributions) -> Vec<ResolvedMenuSlot> {
     let mut slots = BTreeMap::<MenuSlotId, Vec<ResolvedMenuItem>>::new();
     for owned in &contributions.menus {
+        let state = BoundedStateMap::new(owned.state.clone(), Default::default())
+            .expect("host-owned extension menu state is bounded");
         let target = slots.entry(owned.menu.slot.clone()).or_default();
-        target.extend(resolve_menu_items(&owned.menu.items, state));
+        target.extend(resolve_menu_items(&owned.menu.items, &state));
         normalize_separators(target);
     }
     slots
@@ -231,6 +230,7 @@ mod tests {
         CollectedContributions {
             menus: vec![OwnedMenu {
                 owner: id("org.example.menu"),
+                state: BTreeMap::new(),
                 menu: MenuContribution {
                     id: ContributionId::parse("org.example.menu/themes").unwrap(),
                     slot: MenuSlotId::parse("view.appearance").unwrap(),
@@ -253,7 +253,7 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        let input = contributions(vec![
+        let mut input = contributions(vec![
             MenuItem {
                 id: local("folder"),
                 order: MenuItemOrder::default(),
@@ -282,7 +282,8 @@ mod tests {
                 BooleanSource::Constant(true),
             ),
         ]);
-        let slots = resolve_menu_slots(&input, &state);
+        input.menus[0].state = state.values().clone();
+        let slots = resolve_menu_slots(&input);
         assert_eq!(slots.len(), 1);
         let ResolvedMenuItem::Submenu { children, .. } = &slots[0].items[0] else {
             panic!("expected submenu")
@@ -304,14 +305,11 @@ mod tests {
 
     #[test]
     fn native_menu_action_preserves_typed_payload() {
-        let slots = resolve_menu_slots(
-            &contributions(vec![command_item(
-                "Dark",
-                BooleanSource::Constant(true),
-                BooleanSource::Constant(true),
-            )]),
-            &BoundedStateMap::default(),
-        );
+        let slots = resolve_menu_slots(&contributions(vec![command_item(
+            "Dark",
+            BooleanSource::Constant(true),
+            BooleanSource::Constant(true),
+        )]));
         let native = native_menu_slots(&slots);
         let GpuiMenuItem::Action { action, .. } = &native[0].items[0] else {
             panic!("expected action")

@@ -96,8 +96,14 @@ fn a_nested_host_menu_and_ui_tree_validate() {
             },
         }],
     });
+    let panel = contribution_id("org.example.stats/side-panel");
+    manifest.permissions.push(PermissionRequest {
+        permission: Permission::AddSidePanel,
+        reason: "Open the statistics panel".into(),
+        required: true,
+    });
     manifest.contributions.views.push(UiContribution {
-        id: contribution_id("org.example.stats/side-panel"),
+        id: panel.clone(),
         slot: ContributionSlot::SidePanel,
         order: ContributionOrder::default(),
         root: UiNode {
@@ -115,6 +121,15 @@ fn a_nested_host_menu_and_ui_tree_validate() {
             },
         },
     });
+    manifest
+        .contributions
+        .command_behaviors
+        .push(CommandBehavior {
+            command: command_id(command),
+            action: CommandBehaviorAction::OpenContribution {
+                contribution: panel,
+            },
+        });
 
     manifest.validate().unwrap();
 
@@ -125,6 +140,53 @@ fn a_nested_host_menu_and_ui_tree_validate() {
     let encoded_toml = toml::to_string(&manifest).unwrap();
     let decoded: ExtensionManifest = toml::from_str(&encoded_toml).unwrap();
     assert_eq!(decoded, manifest);
+}
+
+#[test]
+fn declarative_commands_require_exactly_one_behavior() {
+    let mut manifest = valid_manifest("org.example.inert-command");
+    manifest.contributions.commands.push(CommandDefinition {
+        id: command_id("org.example.inert-command/run"),
+        title: "Run".into(),
+        description: String::new(),
+        category: String::new(),
+    });
+
+    let errors = manifest.validate().unwrap_err();
+    assert!(errors.as_slice().iter().any(|error| {
+        error.code == ValidationCode::InvalidField && error.path == "contributions.commands[0].id"
+    }));
+}
+
+#[test]
+fn bound_metrics_are_typed_bounded_and_default_to_integer_format() {
+    let decoded: UiNode = serde_json::from_value(serde_json::json!({
+        "id": "pages",
+        "kind": "metric",
+        "label": "Pages",
+        "value": ["document", "statistics", "page-count"]
+    }))
+    .unwrap();
+    assert!(matches!(
+        decoded.kind,
+        UiNodeKind::Metric {
+            format: MetricFormat::Integer,
+            ..
+        }
+    ));
+
+    let mut manifest = valid_manifest("org.example.metrics");
+    manifest.contributions.views.push(UiContribution {
+        id: contribution_id("org.example.metrics/panel"),
+        slot: ContributionSlot::SidePanel,
+        order: ContributionOrder::default(),
+        root: decoded,
+    });
+    manifest.validate().unwrap();
+    assert_eq!(
+        toml::from_str::<ExtensionManifest>(&toml::to_string(&manifest).unwrap()).unwrap(),
+        manifest
+    );
 }
 
 #[test]
@@ -252,7 +314,7 @@ fn ui_values_and_stable_node_ids_are_bounded() {
 }
 
 #[test]
-fn setting_defaults_must_satisfy_the_schema() {
+fn setting_defaults_and_nested_keys_must_satisfy_the_schema() {
     let mut manifest = valid_manifest("org.example.stats");
     manifest.settings.fields.push(SettingDefinition {
         key: "maximum-pages".into(),
@@ -265,9 +327,25 @@ fn setting_defaults_must_satisfy_the_schema() {
         default: DataValue::Integer(20),
         sensitive: false,
     });
+    manifest.settings.fields.push(SettingDefinition {
+        key: "appearance..preset".into(),
+        label: "Preset".into(),
+        description: String::new(),
+        value_type: SettingType::String {
+            maximum_bytes: Some(32),
+        },
+        default: DataValue::String("paper".into()),
+        sensitive: false,
+    });
 
     let errors = manifest.validate().unwrap_err();
     assert!(errors.contains_code(ValidationCode::InvalidSetting));
+    assert!(
+        errors
+            .as_slice()
+            .iter()
+            .any(|error| error.path == "settings.fields[1].key")
+    );
 }
 
 #[test]
@@ -326,4 +404,167 @@ fn native_and_wasm_adapters_share_one_state_and_effect_update_shape() {
     let encoded = serde_json::to_vec(&update).unwrap();
     let decoded: ExtensionUpdate = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(decoded, update);
+}
+
+#[test]
+fn declarative_command_behaviors_validate_and_round_trip() {
+    let mut manifest = valid_manifest("org.example.behaviors");
+    let set = command_id("org.example.behaviors/set");
+    let open = command_id("org.example.behaviors/open");
+    let close = command_id("org.example.behaviors/close");
+    let panel = contribution_id("org.example.behaviors/panel");
+    for command in [&set, &open, &close] {
+        manifest.contributions.commands.push(CommandDefinition {
+            id: command.clone(),
+            title: "Behavior".into(),
+            description: String::new(),
+            category: String::new(),
+        });
+    }
+    manifest.settings.fields.push(SettingDefinition {
+        key: "preset".into(),
+        label: "Preset".into(),
+        description: String::new(),
+        value_type: SettingType::String {
+            maximum_bytes: Some(64),
+        },
+        default: DataValue::String("paper".into()),
+        sensitive: false,
+    });
+    manifest.permissions.push(PermissionRequest {
+        permission: Permission::AddSidePanel,
+        reason: "Open the declared panel".into(),
+        required: true,
+    });
+    manifest.contributions.views.push(UiContribution {
+        id: panel.clone(),
+        slot: ContributionSlot::SidePanel,
+        order: ContributionOrder::default(),
+        root: UiNode {
+            id: local_id("root"),
+            visible: BooleanSource::Constant(true),
+            kind: UiNodeKind::Text {
+                text: "Panel".into(),
+                selectable: true,
+            },
+        },
+    });
+    manifest.contributions.command_behaviors = vec![
+        CommandBehavior {
+            command: set,
+            action: CommandBehaviorAction::SetState {
+                binding: StateBinding::new(["settings", "preset"]),
+            },
+        },
+        CommandBehavior {
+            command: open,
+            action: CommandBehaviorAction::OpenContribution {
+                contribution: panel.clone(),
+            },
+        },
+        CommandBehavior {
+            command: close,
+            action: CommandBehaviorAction::CloseContribution {
+                contribution: panel,
+            },
+        },
+    ];
+    manifest.validate().unwrap();
+    assert_eq!(
+        toml::from_str::<ExtensionManifest>(&toml::to_string(&manifest).unwrap()).unwrap(),
+        manifest
+    );
+}
+
+#[test]
+fn command_behaviors_reject_unknown_commands_contributions_and_sensitive_settings() {
+    let mut manifest = valid_manifest("org.example.invalid-behaviors");
+    let declared = command_id("org.example.invalid-behaviors/run");
+    let reserved = command_id("org.example.invalid-behaviors/overwrite-document");
+    for command in [&declared, &reserved] {
+        manifest.contributions.commands.push(CommandDefinition {
+            id: command.clone(),
+            title: "Run".into(),
+            description: String::new(),
+            category: String::new(),
+        });
+    }
+    manifest.settings.fields.push(SettingDefinition {
+        key: "token".into(),
+        label: "Token".into(),
+        description: String::new(),
+        value_type: SettingType::String {
+            maximum_bytes: Some(64),
+        },
+        default: DataValue::String("secret".into()),
+        sensitive: true,
+    });
+    manifest.contributions.command_behaviors = vec![
+        CommandBehavior {
+            command: command_id("org.example.invalid-behaviors/missing"),
+            action: CommandBehaviorAction::OpenContribution {
+                contribution: contribution_id("org.example.invalid-behaviors/missing-panel"),
+            },
+        },
+        CommandBehavior {
+            command: declared,
+            action: CommandBehaviorAction::SetState {
+                binding: StateBinding::new(["settings", "token"]),
+            },
+        },
+        CommandBehavior {
+            command: reserved,
+            action: CommandBehaviorAction::SetState {
+                binding: StateBinding::new(["document", "statistics"]),
+            },
+        },
+    ];
+    let errors = manifest.validate().unwrap_err();
+    assert!(errors.contains_code(ValidationCode::UnknownCommand));
+    assert!(errors.contains_code(ValidationCode::UnknownContribution));
+    assert!(errors.contains_code(ValidationCode::InvalidSetting));
+    assert!(errors.contains_code(ValidationCode::InvalidField));
+}
+
+#[test]
+fn command_behaviors_reject_multiple_actions_for_one_command() {
+    let mut manifest = valid_manifest("org.example.composed-behaviors");
+    let command = command_id("org.example.composed-behaviors/run");
+    let panel = contribution_id("org.example.composed-behaviors/panel");
+    manifest.contributions.commands.push(CommandDefinition {
+        id: command.clone(),
+        title: "Run".into(),
+        description: String::new(),
+        category: String::new(),
+    });
+    manifest.contributions.views.push(UiContribution {
+        id: panel.clone(),
+        slot: ContributionSlot::HoverCard,
+        order: ContributionOrder::default(),
+        root: UiNode {
+            id: local_id("root"),
+            visible: BooleanSource::Constant(true),
+            kind: UiNodeKind::Text {
+                text: "Panel".into(),
+                selectable: true,
+            },
+        },
+    });
+    manifest.contributions.command_behaviors = vec![
+        CommandBehavior {
+            command: command.clone(),
+            action: CommandBehaviorAction::OpenContribution {
+                contribution: panel.clone(),
+            },
+        },
+        CommandBehavior {
+            command,
+            action: CommandBehaviorAction::CloseContribution {
+                contribution: panel,
+            },
+        },
+    ];
+
+    let errors = manifest.validate().unwrap_err();
+    assert!(errors.contains_code(ValidationCode::Duplicate));
 }

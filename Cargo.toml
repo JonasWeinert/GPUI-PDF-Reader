@@ -16,6 +16,7 @@ members = [
     "crates/key-safe-http",
     "crates/key-sidecar-store",
     "crates/key-ui-gpui",
+    "extensions/key-reference",
 ]
 default-members = ["apps/gpui-pdf-reader"]
 exclude = []

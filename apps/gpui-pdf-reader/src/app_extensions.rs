@@ -4,7 +4,14 @@
 //! reader shell remains responsible for executing approved effects against
 //! GPUI, PDF sessions, storage, and operating-system services.
 
-use std::str::FromStr;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+    sync::Arc,
+};
+
+#[cfg(feature = "installable-extensions")]
+use std::path::Path;
 
 use gpui::MenuItem as GpuiMenuItem;
 use gpui_component::{ThemeConfig, ThemeMode};
@@ -15,12 +22,34 @@ use key_extension_api::{
     EffectResult, EventEnvelope, EventSubscription, ExtensionEffect, ExtensionEntrypoint,
     ExtensionError, ExtensionErrorCode, ExtensionEvent, ExtensionId, ExtensionManifest,
     ExtensionVersion, HostCompatibility, LocalId, MenuContribution, MenuItem, MenuItemKind,
-    MenuItemOrder, MenuSlotId, NativeAdapterId, Publisher, SettingsSchema, StorageRequirements,
+    MenuItemOrder, MenuSlotId, NativeAdapterId, Permission, Publisher, SettingsSchema,
+    SnapshotKind, StorageRequirements,
 };
-use key_extension_gpui::{BoundedStateMap, native_menu_slots, resolve_menu_slots};
+use key_extension_gpui::{native_menu_slots, resolve_menu_slots};
+#[cfg(feature = "installable-extensions")]
+use key_extension_host::OwnedCommand;
+#[cfg(feature = "installable-extensions")]
+use key_extension_host::PermissionDecision;
 use key_extension_host::{
     ArbitratedEffect, CollectedContributions, ExtensionHost, HostConfig, HostError,
-    NativeExtension, NativeExtensionAdapter, NativeUpdate, PackageMetadata, TickReport,
+    NativeExtension, NativeExtensionAdapter, NativeUpdate, OwnedView, PackageMetadata, TickReport,
+};
+#[cfg(feature = "installable-extensions")]
+use key_extension_package::PackageSourceKind;
+use key_pdf_extension_api::{PDF_EXTENSION_API_VERSION, PdfCapability};
+
+use crate::extension_assets::ExtensionAssetStore;
+#[cfg(feature = "installable-extensions")]
+use crate::extension_registry::{
+    ExtensionRegistry, ExtensionRegistryEntry, ExtensionRegistryEntryInput,
+    RequiredPermissionDecision, StoredPermissionDecision, default_app_data_root,
+};
+use crate::pdf_capability_bridge::PdfCapabilityBridge;
+
+#[cfg(feature = "installable-extensions")]
+use crate::extension_packages::{
+    ExtensionPackageError, InstallableExtensionManager, InstalledPackageSummary,
+    PackageInstallPreview, PackageInstallReport,
 };
 
 const THEME_EXTENSION: &str = "com.jonasweinert.gpuipdf.theme";
@@ -34,11 +63,39 @@ const THEME_MENU: &str = "com.jonasweinert.gpuipdf.theme/view-theme-menu";
 pub struct ReaderExtensions {
     host: ExtensionHost,
     theme_command: CommandId,
+    pdf_capabilities: Arc<PdfCapabilityBridge>,
+    extension_assets: Arc<ExtensionAssetStore>,
     startup_error: Option<String>,
+    /// Last host snapshot by kind. Equality coalescing keeps high-frequency
+    /// viewport input from turning into needless guest invocations.
+    last_snapshots: Vec<(SnapshotKind, DataValue)>,
+    #[cfg(feature = "installable-extensions")]
+    packages: Option<InstallableExtensionManager>,
+    #[cfg(feature = "installable-extensions")]
+    registry: Option<ExtensionRegistry>,
+    #[cfg(feature = "installable-extensions")]
+    restoration_failures: BTreeMap<ExtensionId, ExtensionRestoreFailure>,
+    #[cfg(feature = "installable-extensions")]
+    pending_sources: BTreeMap<ExtensionId, std::path::PathBuf>,
+}
+
+#[cfg(feature = "installable-extensions")]
+#[derive(Clone)]
+struct ExtensionRestoreFailure {
+    entry: ExtensionRegistryEntry,
+    reason: String,
 }
 
 impl ReaderExtensions {
     pub fn new(themes: &[ThemeConfig], safe_mode: bool) -> Result<Self, HostError> {
+        Self::new_with_assets(themes, safe_mode, Arc::new(ExtensionAssetStore::default()))
+    }
+
+    pub fn new_with_assets(
+        themes: &[ThemeConfig],
+        safe_mode: bool,
+        extension_assets: Arc<ExtensionAssetStore>,
+    ) -> Result<Self, HostError> {
         let extension = extension_id();
         let adapter = native_adapter_id();
         let theme_command = theme_command_id();
@@ -50,6 +107,8 @@ impl ReaderExtensions {
         };
         let mut host = ExtensionHost::new(config);
         host.register_host_capability(capability.clone(), version("1.0.0"));
+        register_pdf_capabilities(&mut host);
+        let pdf_capabilities = Arc::new(PdfCapabilityBridge::default());
         let command_for_adapter = theme_command.clone();
         host.register_native_adapter(NativeExtensionAdapter::new(adapter, move || {
             Box::new(ThemeExtension {
@@ -60,10 +119,28 @@ impl ReaderExtensions {
         host.install(theme_manifest(themes), PackageMetadata::bundled())?;
         host.activate(&extension)?;
 
+        #[cfg(feature = "installable-extensions")]
+        let (packages, registry, restoration_failures, startup_error) =
+            restore_installable_extensions(&mut host, &extension_assets, safe_mode);
+
         Ok(Self {
             host,
             theme_command,
+            pdf_capabilities,
+            extension_assets,
+            #[cfg(not(feature = "installable-extensions"))]
             startup_error: None,
+            #[cfg(feature = "installable-extensions")]
+            startup_error,
+            last_snapshots: Vec::new(),
+            #[cfg(feature = "installable-extensions")]
+            packages,
+            #[cfg(feature = "installable-extensions")]
+            registry,
+            #[cfg(feature = "installable-extensions")]
+            restoration_failures,
+            #[cfg(feature = "installable-extensions")]
+            pending_sources: BTreeMap::new(),
         })
     }
 
@@ -71,19 +148,60 @@ impl ReaderExtensions {
     /// incompatible. The failed feature contributes no UI and the reason is
     /// surfaced by the reader instead of aborting application startup.
     pub fn disabled(safe_mode: bool, error: impl Into<String>) -> Self {
+        Self::disabled_with_assets(safe_mode, error, Arc::new(ExtensionAssetStore::default()))
+    }
+
+    pub fn disabled_with_assets(
+        safe_mode: bool,
+        error: impl Into<String>,
+        extension_assets: Arc<ExtensionAssetStore>,
+    ) -> Self {
         let config = HostConfig {
             safe_mode,
             ..HostConfig::default()
         };
+        let mut host = ExtensionHost::new(config);
+        register_pdf_capabilities(&mut host);
         Self {
-            host: ExtensionHost::new(config),
+            host,
             theme_command: theme_command_id(),
+            pdf_capabilities: Arc::new(PdfCapabilityBridge::default()),
+            extension_assets,
             startup_error: Some(error.into()),
+            last_snapshots: Vec::new(),
+            #[cfg(feature = "installable-extensions")]
+            packages: None,
+            #[cfg(feature = "installable-extensions")]
+            registry: None,
+            #[cfg(feature = "installable-extensions")]
+            restoration_failures: BTreeMap::new(),
+            #[cfg(feature = "installable-extensions")]
+            pending_sources: BTreeMap::new(),
         }
     }
 
     pub fn startup_error(&self) -> Option<&str> {
         self.startup_error.as_deref()
+    }
+
+    /// Returns the app-owned implementation of the PDF capability boundary.
+    pub fn pdf_capabilities(&self) -> Arc<PdfCapabilityBridge> {
+        self.pdf_capabilities.clone()
+    }
+
+    /// Cancels old-document extension work before the reader increments its
+    /// document generation. New snapshots are therefore always republished
+    /// and cannot be confused with a cached prior-document value.
+    pub fn invalidate_document_scope(&mut self) {
+        const DOCUMENT_SNAPSHOTS: [SnapshotKind; 4] = [
+            SnapshotKind::Document,
+            SnapshotKind::Viewport,
+            SnapshotKind::Selection,
+            SnapshotKind::Annotation,
+        ];
+        self.last_snapshots
+            .retain(|(kind, _)| !DOCUMENT_SNAPSHOTS.contains(kind));
+        self.host.invalidate_document_scope(DOCUMENT_SNAPSHOTS);
     }
 
     pub fn contributions(&mut self) -> CollectedContributions {
@@ -98,7 +216,7 @@ impl ReaderExtensions {
             return Vec::new();
         };
         let contributions = self.contributions();
-        let resolved = resolve_menu_slots(&contributions, &BoundedStateMap::default());
+        let resolved = resolve_menu_slots(&contributions);
         native_menu_slots(&resolved)
             .into_iter()
             .find(|candidate| candidate.slot == slot)
@@ -126,6 +244,57 @@ impl ReaderExtensions {
         Ok(self.host.process_tick())
     }
 
+    /// Publish small, host-authored state summaries to active extensions.
+    ///
+    /// Targets are derived from active, host-owned contributions rather than
+    /// guest callbacks. Payloads are constructed by the reader and remain far
+    /// below the protocol bounds; full PDF text stays behind capability calls.
+    pub fn publish_snapshots(
+        &mut self,
+        snapshots: impl IntoIterator<Item = (SnapshotKind, DataValue)>,
+    ) -> Result<TickReport, HostError> {
+        let changed = snapshots
+            .into_iter()
+            .filter(|(kind, value)| {
+                !self
+                    .last_snapshots
+                    .iter()
+                    .any(|(current_kind, current)| current_kind == kind && current == value)
+            })
+            .collect::<Vec<_>>();
+        if changed.is_empty() && self.host.pending_event_count() == 0 {
+            return Ok(TickReport::default());
+        }
+
+        for (snapshot, value) in &changed {
+            for target in self.host.snapshot_targets(*snapshot) {
+                self.host.enqueue_host_event(
+                    &target,
+                    ExtensionEvent::SnapshotChanged {
+                        snapshot: *snapshot,
+                        value: value.clone(),
+                    },
+                )?;
+            }
+            // Cache only after every intended recipient accepted the event.
+            // A queue-capacity failure therefore remains retryable.
+            self.last_snapshots
+                .retain(|(current_kind, _)| current_kind != snapshot);
+            self.last_snapshots.push((*snapshot, value.clone()));
+        }
+        Ok(self.host.process_tick())
+    }
+
+    /// Fetch one immutable, validated contribution snapshot for the trusted
+    /// GPUI renderer. No extension code runs while GPUI paints the result.
+    pub fn contribution_view(&mut self, contribution: &ContributionId) -> Option<OwnedView> {
+        self.host
+            .collect_contributions()
+            .views
+            .into_iter()
+            .find(|owned| owned.view.id == *contribution)
+    }
+
     pub fn theme_command(&self) -> &CommandId {
         &self.theme_command
     }
@@ -136,6 +305,429 @@ impl ReaderExtensions {
             .last()
             .map(|diagnostic| diagnostic.message.clone())
     }
+
+    #[cfg(feature = "installable-extensions")]
+    pub fn preview_package(
+        &self,
+        path: &Path,
+    ) -> Result<PackageInstallPreview, ExtensionPackageError> {
+        let packages = self.packages.as_ref().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the installable extension runtime is unavailable".into(),
+            ))
+        })?;
+        packages.preview(&self.host, path)
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    pub fn install_reviewed_package(
+        &mut self,
+        path: &Path,
+        reviewed: &PackageInstallPreview,
+    ) -> Result<PackageInstallReport, ExtensionPackageError> {
+        // Decode and validate every referenced image before changing the
+        // runtime. The temporary namespace proves the candidate is renderable
+        // without replacing assets belonging to an active prior version.
+        ExtensionAssetStore::default()
+            .replace_extension(
+                &reviewed.extension,
+                reviewed.referenced_assets().iter().cloned(),
+            )
+            .map_err(extension_asset_error)?;
+        let packages = self.packages.as_mut().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the installable extension runtime is unavailable".into(),
+            ))
+        })?;
+        let report = packages.install_reviewed(&mut self.host, path, reviewed)?;
+        self.pending_sources
+            .insert(reviewed.extension.clone(), path.to_path_buf());
+        let committed = packages
+            .content_sha256(&reviewed.extension)
+            .is_ok_and(|hash| hash == reviewed.content_sha256_hex());
+        if committed {
+            let enabled = report.activation == crate::extension_packages::PackageActivation::Active;
+            self.persist_managed_package(&reviewed.extension, Some(path), enabled)?;
+            self.sync_extension_assets(&reviewed.extension, enabled)?;
+            self.pending_sources.remove(&reviewed.extension);
+        } else if !reviewed.is_upgrade {
+            self.persist_managed_package(&reviewed.extension, Some(path), false)?;
+        }
+        self.restoration_failures.remove(&reviewed.extension);
+        self.last_snapshots.clear();
+        Ok(report)
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    pub fn approve_package(
+        &mut self,
+        extension: &ExtensionId,
+    ) -> Result<PackageInstallReport, ExtensionPackageError> {
+        let packages = self.packages.as_mut().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the installable extension runtime is unavailable".into(),
+            ))
+        })?;
+        let report = packages.grant_permissions_and_activate(&mut self.host, extension)?;
+        let source = self.pending_sources.remove(extension);
+        let enabled = report.activation == crate::extension_packages::PackageActivation::Active;
+        self.persist_managed_package(extension, source.as_deref(), enabled)?;
+        self.sync_extension_assets(extension, enabled)?;
+        self.last_snapshots.clear();
+        Ok(report)
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    pub fn deny_package_permissions(
+        &mut self,
+        extension: &ExtensionId,
+    ) -> Result<(), ExtensionPackageError> {
+        let packages = self.packages.as_mut().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the installable extension runtime is unavailable".into(),
+            ))
+        })?;
+        packages.deny_permissions(&mut self.host, extension)?;
+        let source = self.pending_sources.remove(extension);
+        if packages.is_managed(extension) && source.is_none() {
+            self.persist_managed_package(extension, None, false)?;
+        }
+        self.sync_extension_assets(extension, false)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    pub fn disable_package(
+        &mut self,
+        extension: &ExtensionId,
+    ) -> Result<(), ExtensionPackageError> {
+        let packages = self.packages.as_mut().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the installable extension runtime is unavailable".into(),
+            ))
+        })?;
+        packages.disable(&mut self.host, extension)?;
+        self.persist_managed_package(extension, None, false)?;
+        self.sync_extension_assets(extension, false)?;
+        self.last_snapshots.clear();
+        Ok(())
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    pub fn enable_package(
+        &mut self,
+        extension: &ExtensionId,
+    ) -> Result<PackageInstallReport, ExtensionPackageError> {
+        let packages = self.packages.as_mut().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the installable extension runtime is unavailable".into(),
+            ))
+        })?;
+        let report = packages.enable(&mut self.host, extension)?;
+        let enabled = report.activation == crate::extension_packages::PackageActivation::Active;
+        self.persist_managed_package(extension, None, enabled)?;
+        self.sync_extension_assets(extension, enabled)?;
+        self.last_snapshots.clear();
+        Ok(report)
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    pub fn remove_package(&mut self, extension: &ExtensionId) -> Result<(), ExtensionPackageError> {
+        let packages = self.packages.as_mut().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the installable extension runtime is unavailable".into(),
+            ))
+        })?;
+        if packages.is_managed(extension) {
+            packages.remove(&mut self.host, extension)?;
+        } else if !self.restoration_failures.contains_key(extension) {
+            return Err(ExtensionPackageError::NotManaged(extension.clone()));
+        }
+        if let Some(registry) = self.registry.as_mut() {
+            registry
+                .remove(extension)
+                .map_err(extension_registry_error)?;
+        }
+        self.restoration_failures.remove(extension);
+        self.pending_sources.remove(extension);
+        self.extension_assets.remove_extension(extension);
+        self.last_snapshots.clear();
+        Ok(())
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    pub fn set_package_permission(
+        &mut self,
+        extension: &ExtensionId,
+        permission: &Permission,
+        decision: PermissionDecision,
+    ) -> Result<(), ExtensionPackageError> {
+        let packages = self.packages.as_mut().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the installable extension runtime is unavailable".into(),
+            ))
+        })?;
+        packages.set_permission_decision(&mut self.host, extension, permission, decision)?;
+        self.persist_managed_package(
+            extension,
+            None,
+            self.host.state(extension) == Some(key_extension_api::LifecycleState::Active),
+        )?;
+        if self.host.state(extension) != Some(key_extension_api::LifecycleState::Active) {
+            self.extension_assets.remove_extension(extension);
+        }
+        self.last_snapshots.clear();
+        Ok(())
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    pub fn installed_packages(&self) -> Vec<InstalledPackageSummary> {
+        let mut summaries = self
+            .packages
+            .as_ref()
+            .map_or_else(Vec::new, |packages| packages.summaries(&self.host));
+        summaries.extend(self.restoration_failures.values().map(|failure| {
+            InstalledPackageSummary {
+                extension: failure.entry.extension.clone(),
+                name: failure.entry.extension.to_string(),
+                version: "Unavailable".into(),
+                license: "Unknown".into(),
+                source: if failure.entry.source_path.is_dir() {
+                    PackageSourceKind::DevelopmentDirectory
+                } else {
+                    PackageSourceKind::KeyextArchive
+                },
+                publisher_verified: false,
+                state: key_extension_api::LifecycleState::Failed,
+                ui_kind: None,
+                permissions: Vec::new(),
+                restoration_error: Some(failure.reason.clone()),
+            }
+        }));
+        summaries.sort_by(|left, right| left.extension.cmp(&right.extension));
+        summaries
+    }
+
+    /// Commands from active installable packages are exposed from the trusted
+    /// manager panel. GPUI's native menubar is built once during application
+    /// startup, so rebuilding it for untrusted runtime packages would be both
+    /// platform-fragile and prone to stale action objects.
+    #[cfg(feature = "installable-extensions")]
+    pub fn installed_commands(&mut self) -> Vec<OwnedCommand> {
+        let installed = self
+            .packages
+            .as_ref()
+            .map_or_else(BTreeSet::new, |packages| {
+                packages
+                    .summaries(&self.host)
+                    .into_iter()
+                    .map(|summary| summary.extension)
+                    .collect()
+            });
+        self.host
+            .collect_contributions()
+            .commands
+            .into_iter()
+            .filter(|command| installed.contains(&command.owner))
+            .collect()
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn persist_managed_package(
+        &mut self,
+        extension: &ExtensionId,
+        source: Option<&Path>,
+        enabled: bool,
+    ) -> Result<(), ExtensionPackageError> {
+        let registry = self.registry.as_ref().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the durable extension registry is unavailable".into(),
+            ))
+        })?;
+        let source_path = source
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                registry
+                    .get(extension)
+                    .map(|entry| entry.source_path.clone())
+            })
+            .ok_or_else(|| {
+                ExtensionPackageError::Host(HostError::EventRejected(format!(
+                    "extension {extension} has no durable package source"
+                )))
+            })?;
+        let packages = self.packages.as_ref().ok_or_else(|| {
+            ExtensionPackageError::Host(HostError::EventRejected(
+                "the installable extension runtime is unavailable".into(),
+            ))
+        })?;
+        let expected_content_sha256 = packages.content_sha256(extension)?;
+        let required_permissions = packages
+            .permission_decisions(&self.host, extension)?
+            .into_iter()
+            .filter_map(|(permission, decision)| match decision {
+                PermissionDecision::Granted => Some(StoredPermissionDecision {
+                    permission,
+                    decision: RequiredPermissionDecision::Granted,
+                }),
+                PermissionDecision::Denied => Some(StoredPermissionDecision {
+                    permission,
+                    decision: RequiredPermissionDecision::Denied,
+                }),
+                PermissionDecision::Undecided => None,
+            })
+            .collect();
+        let settings = self.host.extension_settings(extension);
+        let registry = self.registry.as_mut().expect("registry was checked");
+        registry
+            .upsert(ExtensionRegistryEntryInput {
+                extension: extension.clone(),
+                source_path,
+                expected_content_sha256,
+                enabled,
+                required_permissions,
+                settings,
+            })
+            .map_err(extension_registry_error)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn sync_extension_assets(
+        &self,
+        extension: &ExtensionId,
+        enabled: bool,
+    ) -> Result<(), ExtensionPackageError> {
+        if !enabled {
+            self.extension_assets.remove_extension(extension);
+            return Ok(());
+        }
+        let assets = self
+            .packages
+            .as_ref()
+            .ok_or_else(|| {
+                ExtensionPackageError::Host(HostError::EventRejected(
+                    "the installable extension runtime is unavailable".into(),
+                ))
+            })?
+            .referenced_assets(extension)?;
+        self.extension_assets
+            .replace_extension(extension, assets)
+            .map_err(extension_asset_error)
+    }
+}
+
+#[cfg(feature = "installable-extensions")]
+fn extension_registry_error(
+    error: crate::extension_registry::ExtensionRegistryError,
+) -> ExtensionPackageError {
+    ExtensionPackageError::Host(HostError::EventRejected(format!(
+        "could not persist extension state: {error}"
+    )))
+}
+
+#[cfg(feature = "installable-extensions")]
+fn extension_asset_error(
+    error: crate::extension_assets::ExtensionAssetError,
+) -> ExtensionPackageError {
+    ExtensionPackageError::Host(HostError::EventRejected(format!(
+        "extension assets were rejected: {error}"
+    )))
+}
+
+#[cfg(feature = "installable-extensions")]
+fn restore_installable_extensions(
+    host: &mut ExtensionHost,
+    assets: &Arc<ExtensionAssetStore>,
+    safe_mode: bool,
+) -> (
+    Option<InstallableExtensionManager>,
+    Option<ExtensionRegistry>,
+    BTreeMap<ExtensionId, ExtensionRestoreFailure>,
+    Option<String>,
+) {
+    let mut errors = Vec::new();
+    let mut failures = BTreeMap::new();
+    let mut packages = match InstallableExtensionManager::new() {
+        Ok(packages) => packages,
+        Err(error) => {
+            return (
+                None,
+                None,
+                failures,
+                Some(format!("Installable extensions are unavailable: {error}")),
+            );
+        }
+    };
+    let mut registry = match default_app_data_root().and_then(ExtensionRegistry::load_from_root) {
+        Ok(registry) => registry,
+        Err(error) => {
+            return (
+                Some(packages),
+                None,
+                failures,
+                Some(format!("Extension registry is unavailable: {error}")),
+            );
+        }
+    };
+
+    for entry in registry.list() {
+        let decisions = entry
+            .required_permissions
+            .iter()
+            .map(|stored| {
+                (
+                    stored.permission.clone(),
+                    match stored.decision {
+                        RequiredPermissionDecision::Granted => PermissionDecision::Granted,
+                        RequiredPermissionDecision::Denied => PermissionDecision::Denied,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let restored = packages.restore_registered(
+            host,
+            &entry.source_path,
+            &entry.extension,
+            &entry.expected_content_sha256,
+            &decisions,
+            entry.settings.clone(),
+            entry.enabled && !safe_mode,
+        );
+        let result = restored.and_then(|report| {
+            if report.activation == crate::extension_packages::PackageActivation::Active {
+                assets
+                    .replace_extension(
+                        &entry.extension,
+                        packages.referenced_assets(&entry.extension)?,
+                    )
+                    .map_err(|error| {
+                        ExtensionPackageError::Host(HostError::EventRejected(format!(
+                            "extension assets were rejected: {error}"
+                        )))
+                    })?;
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            let _ = packages.remove(host, &entry.extension);
+            assets.remove_extension(&entry.extension);
+            let reason = error.to_string();
+            errors.push(format!("{}: {reason}", entry.extension));
+            failures.insert(
+                entry.extension.clone(),
+                ExtensionRestoreFailure { entry, reason },
+            );
+        }
+    }
+
+    let startup_error = (!errors.is_empty()).then(|| {
+        format!(
+            "Some extensions could not be restored and remain disabled: {}",
+            errors.join("; ")
+        )
+    });
+    (Some(packages), Some(registry), failures, startup_error)
 }
 
 struct ThemeExtension {
@@ -233,6 +825,7 @@ fn theme_manifest(themes: &[ThemeConfig]) -> ExtensionManifest {
                 description: "Apply a bundled reader theme or follow the system appearance".into(),
                 category: "Appearance".into(),
             }],
+            command_behaviors: Vec::new(),
             menus: vec![MenuContribution {
                 id: ContributionId::parse(THEME_MENU).expect("static contribution ID is valid"),
                 slot: MenuSlotId::parse("view.appearance").expect("static menu slot is valid"),
@@ -323,6 +916,25 @@ fn theme_capability_id() -> CapabilityId {
     CapabilityId::parse(THEME_CAPABILITY).expect("static capability ID is valid")
 }
 
+fn register_pdf_capabilities(host: &mut ExtensionHost) {
+    let version = version(PDF_EXTENSION_API_VERSION);
+    for capability in PdfCapability::ALL {
+        let id = capability.capability_id();
+        host.register_host_capability(id.clone(), version.clone());
+        host.require_capability_permission(id, capability.required_permission());
+    }
+    host.require_snapshot_permissions(
+        SnapshotKind::Document,
+        [
+            Permission::ReadDocumentMetadata,
+            Permission::ReadDocumentText(key_extension_api::DocumentAccess::ActiveDocument),
+        ],
+    );
+    host.require_snapshot_permissions(SnapshotKind::Viewport, [Permission::ReadDocumentMetadata]);
+    host.require_snapshot_permissions(SnapshotKind::Selection, [Permission::ReadSelection]);
+    host.require_snapshot_permissions(SnapshotKind::Annotation, [Permission::ReadAnnotations]);
+}
+
 fn version(value: &str) -> ExtensionVersion {
     ExtensionVersion::from_str(value).expect("static extension version is valid")
 }
@@ -397,5 +1009,44 @@ mod tests {
         let mut extensions = ReaderExtensions::disabled(true, "broken package");
         assert_eq!(extensions.startup_error(), Some("broken package"));
         assert!(extensions.native_menu_items("view.appearance").is_empty());
+    }
+
+    #[test]
+    fn all_pdf_contract_capabilities_are_registered_at_the_exact_api_version() {
+        let mut extensions = ReaderExtensions::new(&[], false).expect("host starts");
+        let probe = ExtensionId::parse("org.example.pdf-contract-probe").expect("valid probe ID");
+        let mut manifest = theme_manifest(&[]);
+        manifest.id = probe.clone();
+        manifest.name = "PDF capability probe".into();
+        manifest.entrypoint = ExtensionEntrypoint::Declarative {
+            ui: key_extension_api::PackagePath::parse("ui.json").expect("valid package path"),
+        };
+        manifest.capabilities = CapabilityRequirements {
+            required: PdfCapability::ALL
+                .into_iter()
+                .map(|capability| CapabilityRequest {
+                    id: capability.capability_id(),
+                    version: compatible(&format!("={PDF_EXTENSION_API_VERSION}")),
+                    scope: CapabilityScope::ActiveDocument,
+                })
+                .collect(),
+            optional: Vec::new(),
+            provided: Vec::new(),
+        };
+        manifest.contributions = ContributionSet::default();
+        manifest.validate().expect("probe manifest validates");
+
+        extensions
+            .host
+            .install(manifest, PackageMetadata::bundled())
+            .expect("probe installs");
+        extensions
+            .host
+            .activate(&probe)
+            .expect("all exact-version capabilities negotiate");
+        assert_eq!(
+            extensions.host.state(&probe),
+            Some(key_extension_api::LifecycleState::Active)
+        );
     }
 }

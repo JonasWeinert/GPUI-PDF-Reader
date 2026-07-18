@@ -1,10 +1,15 @@
 #![cfg(feature = "wasmtime-runtime")]
 
-use std::{path::PathBuf, str::FromStr};
+use std::{
+    path::PathBuf,
+    str::FromStr,
+    thread,
+    time::{Duration, Instant},
+};
 
 use key_extension_api::{
-    DataValue, EventSubscription, ExtensionEntrypoint, ExtensionEvent, ExtensionVersion,
-    HostCompatibility, LifecycleState, SnapshotKind,
+    DataValue, EventSubscription, ExtensionEffect, ExtensionEntrypoint, ExtensionEvent,
+    ExtensionVersion, HostCompatibility, LifecycleState, SnapshotKind,
 };
 use key_extension_host::{ExtensionHost, HostError, PackageMetadata, PermissionDecision};
 use key_extension_package::{
@@ -37,6 +42,22 @@ fn load(name: &str) -> LoadedPackage {
     package_loader(PackageLimits::default())
         .load_development_directory(package_root(name), &DenyAllSignatureVerifier)
         .expect("checked-in reference package must load")
+}
+
+fn wait_for_host(
+    host: &mut ExtensionHost,
+    mut ready: impl FnMut(&ExtensionHost) -> bool,
+) -> Vec<key_extension_host::ArbitratedEffect> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut effects = Vec::new();
+    loop {
+        let report = host.process_tick();
+        effects.extend(report.effects);
+        if ready(host) || Instant::now() >= deadline {
+            return effects;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 #[test]
@@ -74,6 +95,16 @@ fn declarative_theme_pack_loads_and_uses_host_owned_contributions() {
     let contributions = host.collect_contributions();
     assert_eq!(contributions.menus.len(), 1);
     assert_eq!(contributions.views.len(), 1);
+    let apply = &manifest.contributions.commands[0].id;
+    host.invoke_command(apply, DataValue::String("graphite".into()))
+        .expect("reference command queues");
+    assert_eq!(host.process_tick().processed_events, 1);
+    assert!(matches!(
+        host.extension_state(&extension)
+            .and_then(|state| state.get("settings")),
+        Some(DataValue::Record(settings))
+            if settings.get("theme-preset") == Some(&DataValue::String("graphite".into()))
+    ));
     host.unload(&extension)
         .expect("declarative package unloads");
     assert_eq!(host.state(&extension), Some(LifecycleState::Disabled));
@@ -143,6 +174,19 @@ fn statistics_component_runs_through_permissioned_shared_lifecycle() {
     let initial = host.collect_contributions();
     assert_eq!(initial.views.len(), 1);
     assert!(initial.views[0].state.is_empty());
+    wait_for_host(&mut host, |host| host.pending_event_count() == 0);
+
+    let open = &manifest.contributions.commands[0].id;
+    host.invoke_command(open, DataValue::Null)
+        .expect("statistics panel command queues");
+    let command_effects = wait_for_host(&mut host, |host| host.pending_event_count() == 0);
+    assert_eq!(command_effects.len(), 1);
+    assert_eq!(
+        command_effects[0].request.effect,
+        ExtensionEffect::OpenContribution {
+            contribution: manifest.contributions.views[0].id.clone(),
+        }
+    );
 
     host.enqueue_host_event(
         &manifest.id,
@@ -152,10 +196,13 @@ fn statistics_component_runs_through_permissioned_shared_lifecycle() {
         },
     )
     .expect("bounded document snapshot queues");
-    let tick = host.process_tick();
-    assert_eq!(tick.processed_events, 1);
+    let snapshot_effects = wait_for_host(&mut host, |host| {
+        host.extension_state(&manifest.id)
+            .and_then(|state| state.get("runtime-ready"))
+            == Some(&DataValue::Boolean(true))
+    });
     assert!(
-        tick.effects.is_empty(),
+        snapshot_effects.is_empty(),
         "transport pilot has no direct authority"
     );
     let published = host.collect_contributions();

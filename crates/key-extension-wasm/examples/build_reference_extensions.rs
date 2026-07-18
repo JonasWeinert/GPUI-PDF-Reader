@@ -11,13 +11,14 @@ use std::{
 
 use key_extension_api::{
     BooleanSource, CURRENT_MANIFEST_SCHEMA, CapabilityRequest, CapabilityRequirements,
-    CapabilityScope, CommandDefinition, CommandId, CompatibleVersion, ContributionId,
-    ContributionOrder, ContributionSet, ContributionSlot, DataValue, DocumentAccess,
-    ExtensionEntrypoint, ExtensionId, ExtensionManifest, ExtensionVersion, HostCompatibility,
-    IconRef, LocalId, MenuContribution, MenuItem, MenuItemKind, MenuItemOrder, MenuSlotId,
-    PackagePath, Permission, PermissionRequest, Publisher, SelectOption, SettingDefinition,
-    SettingType, SettingsSchema, StateBinding, StorageRequirements, TextEmphasis, TextSpan,
-    UiContribution, UiNode, UiNodeKind, UiTone,
+    CapabilityScope, CommandBehavior, CommandBehaviorAction, CommandDefinition, CommandId,
+    CompatibleVersion, ContributionId, ContributionOrder, ContributionSet, ContributionSlot,
+    DataValue, DocumentAccess, ExtensionEntrypoint, ExtensionId, ExtensionManifest,
+    ExtensionVersion, HostCompatibility, IconRef, LocalId, MenuContribution, MenuItem,
+    MenuItemKind, MenuItemOrder, MenuSlotId, MetricFormat, PackagePath, Permission,
+    PermissionRequest, Publisher, SelectOption, SettingDefinition, SettingType, SettingsSchema,
+    StateBinding, StorageRequirements, TextEmphasis, TextSpan, UiContribution, UiNode, UiNodeKind,
+    UiTone,
 };
 use serde_json::json;
 
@@ -157,6 +158,12 @@ fn theme_manifest() -> ExtensionManifest {
                 description: "Select a host-rendered semantic theme preset.".into(),
                 category: "Appearance".into(),
             }],
+            command_behaviors: vec![CommandBehavior {
+                command: apply.clone(),
+                action: CommandBehaviorAction::SetState {
+                    binding: StateBinding::new(["settings", "theme-preset"]),
+                },
+            }],
             menus: vec![MenuContribution {
                 id: contribution("org.key.reference.theme-pack/appearance-menu"),
                 slot: MenuSlotId::parse("view.appearance").expect("static menu slot"),
@@ -232,6 +239,7 @@ fn theme_manifest() -> ExtensionManifest {
 
 fn statistics_manifest() -> ExtensionManifest {
     let open = command("org.key.reference.document-statistics/open");
+    let panel = contribution("org.key.reference.document-statistics/panel");
     ExtensionManifest {
         schema_version: CURRENT_MANIFEST_SCHEMA,
         id: extension("org.key.reference.document-statistics"),
@@ -288,6 +296,12 @@ fn statistics_manifest() -> ExtensionManifest {
                 description: "Open the sandboxed document statistics side panel.".into(),
                 category: "Document".into(),
             }],
+            command_behaviors: vec![CommandBehavior {
+                command: open.clone(),
+                action: CommandBehaviorAction::OpenContribution {
+                    contribution: panel.clone(),
+                },
+            }],
             menus: vec![MenuContribution {
                 id: contribution("org.key.reference.document-statistics/tools-menu"),
                 slot: MenuSlotId::parse("tools.analysis").expect("static menu slot"),
@@ -307,7 +321,7 @@ fn statistics_manifest() -> ExtensionManifest {
                 }],
             }],
             views: vec![UiContribution {
-                id: contribution("org.key.reference.document-statistics/panel"),
+                id: panel,
                 slot: ContributionSlot::SidePanel,
                 order: ContributionOrder::default(),
                 root: UiNode {
@@ -339,6 +353,9 @@ fn statistics_manifest() -> ExtensionManifest {
                                 visible: visible(),
                                 kind: UiNodeKind::Divider,
                             },
+                            statistic_metric("pages", "Pages", "page-count"),
+                            statistic_metric("words", "Known words", "word-count"),
+                            statistic_metric("characters", "Known characters", "character-count"),
                             UiNode {
                                 id: local("status"),
                                 visible: BooleanSource::Binding(StateBinding::new([
@@ -358,6 +375,18 @@ fn statistics_manifest() -> ExtensionManifest {
         storage: StorageRequirements {
             ephemeral_cache_bytes: 64 * 1024,
             ..StorageRequirements::default()
+        },
+    }
+}
+
+fn statistic_metric(id: &str, label: &str, statistic: &str) -> UiNode {
+    UiNode {
+        id: local(id),
+        visible: visible(),
+        kind: UiNodeKind::Metric {
+            label: label.into(),
+            value: StateBinding::new(["document", "statistics", statistic]),
+            format: MetricFormat::Integer,
         },
     }
 }

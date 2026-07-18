@@ -2,16 +2,30 @@ mod annotations;
 mod app_extensions;
 mod backend;
 mod document_jump;
+mod extension_assets;
+#[cfg(feature = "installable-extensions")]
+mod extension_packages;
+#[cfg(feature = "installable-extensions")]
+mod extension_registry;
 mod floating_panel;
+#[cfg(feature = "scholarly-network")]
+mod link_preview;
+#[cfg(not(feature = "scholarly-network"))]
+#[path = "link_preview_disabled.rs"]
 mod link_preview;
 mod link_resolution;
 mod markdown_editor;
 mod model;
 mod native_gestures;
 mod navigation_focus;
+mod pdf_capability_bridge;
 #[cfg(debug_assertions)]
 mod qa;
 mod reader;
+#[cfg(feature = "scholarly-network")]
+mod scholarly;
+#[cfg(not(feature = "scholarly-network"))]
+#[path = "scholarly_disabled.rs"]
 mod scholarly;
 mod scientific;
 mod search;
@@ -30,7 +44,7 @@ use markdown_editor::{
     CommentSelectRight, CommentSelectUp, CommentToggleBold, CommentToggleBulletedList,
     CommentToggleCode, CommentToggleItalic, CommentToggleNumberedList, CommentUp,
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use text_field::{
     FieldBackspace, FieldCancel, FieldDelete, FieldEnd, FieldHome, FieldLeft, FieldRight,
     FieldSelectLeft, FieldSelectRight, FieldSubmit,
@@ -47,6 +61,8 @@ actions!(
     gpui_pdf_reader,
     [
         OpenDocument,
+        InstallExtension,
+        ManageExtensions,
         ZoomIn,
         ZoomOut,
         ActualSize,
@@ -75,64 +91,27 @@ actions!(
 fn main() {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
 
-    let application = Application::new().with_assets(gpui_component_assets::Assets);
+    let extension_assets = Arc::new(extension_assets::ExtensionAssetStore::default());
+    let application = Application::new().with_assets(extension_assets::ReaderAssetSource::new(
+        extension_assets.clone(),
+    ));
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
         bind_keys(cx);
         let safe_mode = std::env::var_os("GPUI_PDF_READER_SAFE_MODE").is_some();
-        let mut extensions =
-            app_extensions::ReaderExtensions::new(theme::bundled_themes(), safe_mode)
-                .unwrap_or_else(|error| {
-                    app_extensions::ReaderExtensions::disabled(
-                        safe_mode,
-                        format!("Reader themes could not start: {error}"),
-                    )
-                });
-        let theme_menu_items = extensions.native_menu_items("view.appearance");
-        let mut view_items = vec![
-            MenuItem::action("Classic View", ClassicView),
-            MenuItem::action("Fluid View", FluidView),
-            MenuItem::separator(),
-        ];
-        view_items.extend(theme_menu_items);
-        view_items.extend([
-            MenuItem::separator(),
-            MenuItem::action("Zoom In", ZoomIn),
-            MenuItem::action("Zoom Out", ZoomOut),
-            MenuItem::action("Actual Size", ActualSize),
-            MenuItem::action("Fit Width", FitWidth),
-            MenuItem::separator(),
-            MenuItem::action("Comments", ToggleComments),
-        ]);
-        cx.set_menus(vec![
-            Menu {
-                name: "File".into(),
-                items: vec![
-                    MenuItem::action("Open…", OpenDocument),
-                    MenuItem::separator(),
-                    MenuItem::action("Quit GPUI PDF Reader", Quit),
-                ],
-            },
-            Menu {
-                name: "Edit".into(),
-                items: vec![
-                    MenuItem::action("Cut", EditCut),
-                    MenuItem::action("Copy", EditCopy),
-                    MenuItem::action("Paste", EditPaste),
-                    MenuItem::action("Select All", EditSelectAll),
-                    MenuItem::separator(),
-                    MenuItem::action("Find…", Find),
-                    MenuItem::action("Find Next", NextSearchResult),
-                    MenuItem::action("Find Previous", PreviousSearchResult),
-                    MenuItem::separator(),
-                    MenuItem::action("Add Comment", AddComment),
-                ],
-            },
-            Menu {
-                name: "View".into(),
-                items: view_items,
-            },
-        ]);
+        let mut extensions = app_extensions::ReaderExtensions::new_with_assets(
+            theme::bundled_themes(),
+            safe_mode,
+            extension_assets.clone(),
+        )
+        .unwrap_or_else(|error| {
+            app_extensions::ReaderExtensions::disabled_with_assets(
+                safe_mode,
+                format!("Reader themes could not start: {error}"),
+                extension_assets.clone(),
+            )
+        });
+        rebuild_application_menus(&mut extensions, cx);
         let bounds = Bounds {
             origin: Point::new(px(120.0), px(80.0)),
             size: size(px(1180.0), px(820.0)),
@@ -176,6 +155,93 @@ fn main() {
         cx.on_window_closed(|cx| cx.quit()).detach();
         cx.activate(true);
     });
+}
+
+/// Rebuild native host-owned slots after extension lifecycle changes. Nested
+/// extension submenus are already converted to native GPUI menus by the
+/// trusted bridge; packages never receive `App` or platform menu handles.
+pub(crate) fn rebuild_application_menus(
+    extensions: &mut app_extensions::ReaderExtensions,
+    cx: &mut App,
+) {
+    let theme_menu_items = extensions.native_menu_items("view.appearance");
+    let analysis_menu_items = extensions.native_menu_items("tools.analysis");
+    let mut view_items = vec![
+        MenuItem::action("Classic View", ClassicView),
+        MenuItem::action("Fluid View", FluidView),
+        MenuItem::separator(),
+    ];
+    view_items.extend(theme_menu_items);
+    view_items.extend([
+        MenuItem::separator(),
+        MenuItem::action("Zoom In", ZoomIn),
+        MenuItem::action("Zoom Out", ZoomOut),
+        MenuItem::action("Actual Size", ActualSize),
+        MenuItem::action("Fit Width", FitWidth),
+        MenuItem::separator(),
+        MenuItem::action("Comments", ToggleComments),
+    ]);
+    let mut file_items = vec![MenuItem::action("Open…", OpenDocument)];
+    #[cfg(feature = "installable-extensions")]
+    file_items.extend([
+        MenuItem::separator(),
+        MenuItem::action("Install or Update Extension…", InstallExtension),
+        MenuItem::action("Manage Extensions…", ManageExtensions),
+    ]);
+    #[cfg(not(feature = "installable-extensions"))]
+    file_items.extend([
+        MenuItem::separator(),
+        MenuItem::action("Manage Extensions…", ManageExtensions),
+    ]);
+    file_items.extend([
+        MenuItem::separator(),
+        MenuItem::action("Quit GPUI PDF Reader", Quit),
+    ]);
+    let mut tools_items = analysis_menu_items;
+    if !tools_items.is_empty() {
+        tools_items.push(MenuItem::separator());
+    }
+    let extension_tools = {
+        let mut items = Vec::new();
+        #[cfg(feature = "installable-extensions")]
+        items.push(MenuItem::action("Install or Update…", InstallExtension));
+        items.push(MenuItem::action("Manage…", ManageExtensions));
+        MenuItem::submenu(Menu {
+            name: "Extensions".into(),
+            items,
+        })
+    };
+    tools_items.push(extension_tools);
+
+    cx.set_menus(vec![
+        Menu {
+            name: "File".into(),
+            items: file_items,
+        },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::action("Cut", EditCut),
+                MenuItem::action("Copy", EditCopy),
+                MenuItem::action("Paste", EditPaste),
+                MenuItem::action("Select All", EditSelectAll),
+                MenuItem::separator(),
+                MenuItem::action("Find…", Find),
+                MenuItem::action("Find Next", NextSearchResult),
+                MenuItem::action("Find Previous", PreviousSearchResult),
+                MenuItem::separator(),
+                MenuItem::action("Add Comment", AddComment),
+            ],
+        },
+        Menu {
+            name: "View".into(),
+            items: view_items,
+        },
+        Menu {
+            name: "Tools".into(),
+            items: tools_items,
+        },
+    ]);
 }
 
 fn bind_keys(cx: &mut App) {

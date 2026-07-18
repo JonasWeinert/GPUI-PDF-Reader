@@ -31,6 +31,14 @@ title = "Apply reference theme preset"
 description = "Select a host-rendered semantic theme preset."
 category = "Appearance"
 
+[[contributions.command_behaviors]]
+command = "org.key.reference.theme-pack/apply-preset"
+kind = "set_state"
+binding = [
+    "settings",
+    "theme-preset",
+]
+
 [[contributions.menus]]
 id = "org.key.reference.theme-pack/appearance-menu"
 slot = "view.appearance"

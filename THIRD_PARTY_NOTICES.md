@@ -6,17 +6,19 @@ Keep them with redistributed source and binary bundles.
 
 ## Rust dependency graph
 
-The supported `aarch64-apple-darwin` normal/build graph currently contains 511
-unique packages. Every active package declares MIT, Apache-2.0, or a
-more-permissive option: BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0,
-CC0-1.0, MIT-0, Unlicense, BSL-1.0, or Apache-2.0 with LLVM exception. No active
-package declares GPL, LGPL, AGPL, MPL, EPL, CDDL, or SSPL, and none lacks
-license metadata.
+The default standard `aarch64-apple-darwin` normal/build graph currently
+contains 752 unique package records; the minimal `--no-default-features` graph
+contains 675. The repository guard currently checks 787 unique host and
+cross-target normal/build/dev records across the workspace. Every selected
+record has an MIT, Apache-2.0, or more-permissive license choice:
+BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, CC0-1.0, MIT-0, Unlicense,
+BSL-1.0, NCSA, or Apache-2.0 with LLVM exception. None lacks license metadata.
 
-The full lock also contains target-inactive `r-efi` packages whose expression
-is `MIT OR Apache-2.0 OR LGPL-2.1-or-later`; GPUI PDF Reader uses the
-MIT/Apache option, and those packages are not selected by the supported macOS
-build.
+Some multi-license declarations include a reciprocal alternative, including
+`Apache-2.0 OR GPL-2.0-only` and
+`MIT OR Apache-2.0 OR LGPL-2.1-or-later`. GPUI PDF Reader elects the explicit
+Apache/MIT branch; no GPL/LGPL branch is used. Expressions that require a
+reciprocal license with `AND` are rejected by the guard.
 
 Key direct components include:
 
@@ -26,6 +28,9 @@ Key direct components include:
 | `gpui-component` and its icon assets 0.5.1 | Apache-2.0 |
 | `pdfium-render` 0.9.2 plus GPUI PDF Reader tile patch | MIT (upstream also offers Apache-2.0) |
 | `image` 0.25 | MIT OR Apache-2.0 |
+| `wasmtime` 45 (standard bundle only) | Apache-2.0 WITH LLVM-exception |
+| `zed-reqwest`/`reqwest` (standard scholarly bundle only) | MIT OR Apache-2.0 |
+| `zip` 8 (installable package loader only) | MIT |
 | `block2` | MIT |
 | `objc2-app-kit` and Objective-C support crates | MIT OR Apache-2.0 OR Zlib |
 

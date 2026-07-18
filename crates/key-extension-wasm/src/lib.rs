@@ -12,6 +12,8 @@ mod diagnostic;
 mod host_adapter;
 #[cfg(feature = "wasmtime-runtime")]
 mod runtime;
+#[cfg(feature = "wasmtime-runtime")]
+mod worker;
 
 pub use config::*;
 pub use diagnostic::*;

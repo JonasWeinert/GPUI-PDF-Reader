@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 /// Thin GPUI entity adapter around [`ViewportController`].
 ///
-/// Painting remains host-owned because image resources, text layers, and
-/// annotations have different lifetimes in different applications. Mutations
-/// made through [`update_controller`](Self::update_controller) emit every
-/// typed controller event through GPUI's subscription system.
+/// Pair this state adapter with [`crate::pdf_canvas`] for base rendering. Image
+/// resources and feature overlays remain caller-supplied because their
+/// lifetimes differ between applications. Mutations made through
+/// [`update_controller`](Self::update_controller) emit every typed controller
+/// event through GPUI's subscription system.
 pub struct PdfViewport {
     controller: ViewportController,
 }

@@ -1,4 +1,4 @@
-use key_extension_api::CapabilityId;
+use key_extension_api::{CapabilityId, DocumentAccess, Permission};
 use serde::{Deserialize, Serialize};
 
 /// Semantic version of the pre-stable PDF extension contract.
@@ -90,11 +90,56 @@ impl PdfCapability {
             .expect("built-in PDF capability identifiers are canonical")
     }
 
+    /// Returns the user-sensitive authority required to invoke this
+    /// capability. Capability negotiation only proves protocol availability;
+    /// the host must independently require this permission for every call.
+    #[must_use]
+    pub const fn required_permission(self) -> Permission {
+        match self {
+            Self::DocumentMetadata
+            | Self::PageMetadata
+            | Self::Outline
+            | Self::Links
+            | Self::Viewport => Permission::ReadDocumentMetadata,
+            Self::Text => Permission::ReadDocumentText(DocumentAccess::ActiveDocument),
+            Self::Selection => Permission::ReadSelection,
+            Self::Navigation => Permission::NavigateDocument,
+            Self::Overlays => Permission::AddDocumentOverlays,
+        }
+    }
+
     /// Finds a PDF capability by its canonical semantic identifier.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|capability| capability.as_str() == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_pdf_capability_has_explicit_user_authority() {
+        let permissions = PdfCapability::ALL
+            .into_iter()
+            .map(PdfCapability::required_permission)
+            .collect::<Vec<_>>();
+
+        assert_eq!(permissions.len(), PdfCapability::ALL.len());
+        assert_eq!(
+            PdfCapability::Text.required_permission(),
+            Permission::ReadDocumentText(DocumentAccess::ActiveDocument)
+        );
+        assert_eq!(
+            PdfCapability::Navigation.required_permission(),
+            Permission::NavigateDocument
+        );
+        assert_eq!(
+            PdfCapability::Overlays.required_permission(),
+            Permission::AddDocumentOverlays
+        );
     }
 }

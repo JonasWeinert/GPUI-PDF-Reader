@@ -6,18 +6,20 @@ use std::{
 
 use key_extension_api::{
     CapabilityGrant, CapabilityId, CapabilityRequest, CapabilitySnapshot, CauseContext, CauseId,
-    CommandDefinition, CommandId, ContributionId, ContributionOrder, ContributionSlot, DataValue,
-    EffectId, EffectRequest, EffectResult, EventEnvelope, EventSource, EventSubscription,
-    ExtensionEffect, ExtensionEntrypoint, ExtensionError, ExtensionErrorCode, ExtensionEvent,
-    ExtensionId, ExtensionManifest, ExtensionVersion, GenerationId, LifecycleState,
-    MenuContribution, MenuItem, MenuItemKind, Permission, PermissionRequest, ProvidedCapability,
-    StorageArea, UiContribution, ValidationLimits,
+    CommandBehavior, CommandBehaviorAction, CommandDefinition, CommandId, ContributionId,
+    ContributionOrder, ContributionSlot, DataValue, EffectId, EffectRequest, EffectResult,
+    EventEnvelope, EventSource, EventSubscription, ExtensionEffect, ExtensionEntrypoint,
+    ExtensionError, ExtensionErrorCode, ExtensionEvent, ExtensionId, ExtensionManifest,
+    ExtensionVersion, GenerationId, LifecycleState, MenuContribution, MenuItem, MenuItemKind,
+    Permission, PermissionRequest, ProvidedCapability, SnapshotKind, StateBinding, StorageArea,
+    UiContribution, ValidationLimits,
 };
 
 use crate::{
-    ActivationContext, DiagnosticCode, DiagnosticLog, DiagnosticSeverity, HostDiagnostic,
-    NativeExtension, NativeExtensionAdapter, NativeUpdate, PackageMetadata, PackageRecord,
-    PackageRegistry, RegistryError, WasmExtensionAdapter,
+    ActivationContext, DeferredCall, DeferredNativeUpdate, DiagnosticCode, DiagnosticLog,
+    DiagnosticSeverity, HostDiagnostic, NativeExtension, NativeExtensionAdapter, NativeUpdate,
+    PackageMetadata, PackageRecord, PackageRegistry, RegistryError, UpdateDelivery,
+    WasmExtensionAdapter,
 };
 
 #[derive(Clone, Debug)]
@@ -236,6 +238,8 @@ pub struct OwnedCommand {
 pub struct OwnedMenu {
     pub owner: ExtensionId,
     pub menu: MenuContribution,
+    /// Immutable state snapshot resolved in the owning extension's namespace.
+    pub state: BTreeMap<String, DataValue>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -291,7 +295,10 @@ pub struct ExtensionHost {
     wasm_adapters: BTreeMap<ExtensionId, WasmExtensionAdapter>,
     runtimes: BTreeMap<ExtensionId, ActiveRuntime>,
     host_capabilities: BTreeMap<CapabilityId, ExtensionVersion>,
+    capability_permissions: BTreeMap<CapabilityId, Permission>,
+    snapshot_permissions: Vec<(SnapshotKind, Vec<Permission>)>,
     permission_decisions: BTreeMap<ExtensionId, Vec<PermissionEntry>>,
+    persisted_settings: BTreeMap<ExtensionId, DataValue>,
     queue: VecDeque<QueuedEvent>,
     pending_effects: BTreeMap<(ExtensionId, EffectId), PendingEffect>,
     diagnostics: DiagnosticLog,
@@ -313,7 +320,10 @@ impl ExtensionHost {
             wasm_adapters: BTreeMap::new(),
             runtimes: BTreeMap::new(),
             host_capabilities: BTreeMap::new(),
+            capability_permissions: BTreeMap::new(),
+            snapshot_permissions: Vec::new(),
             permission_decisions: BTreeMap::new(),
+            persisted_settings: BTreeMap::new(),
             queue: VecDeque::new(),
             pending_effects: BTreeMap::new(),
             diagnostics,
@@ -416,8 +426,37 @@ impl ExtensionHost {
         self.broadcast_capability_changes();
     }
 
+    /// Binds a semantic capability to the user-sensitive authority required
+    /// for every invocation. Protocol availability and permission grants are
+    /// deliberately separate, so registering a capability never grants data
+    /// access by itself.
+    pub fn require_capability_permission(&mut self, id: CapabilityId, permission: Permission) {
+        self.capability_permissions.insert(id, permission);
+    }
+
+    /// Binds a host-authored snapshot to all permissions required before it
+    /// may be delivered or retained in extension state. Delivery additionally
+    /// requires an explicit runtime subscription.
+    pub fn require_snapshot_permissions(
+        &mut self,
+        snapshot: SnapshotKind,
+        permissions: impl IntoIterator<Item = Permission>,
+    ) {
+        let permissions = permissions.into_iter().collect::<Vec<_>>();
+        if let Some((_, current)) = self
+            .snapshot_permissions
+            .iter_mut()
+            .find(|(kind, _)| *kind == snapshot)
+        {
+            *current = permissions;
+        } else {
+            self.snapshot_permissions.push((snapshot, permissions));
+        }
+    }
+
     pub fn remove_host_capability(&mut self, id: &CapabilityId) {
         self.host_capabilities.remove(id);
+        self.capability_permissions.remove(id);
         self.reconcile_active_capabilities();
         self.broadcast_capability_changes();
     }
@@ -428,7 +467,10 @@ impl ExtensionHost {
         permission: Permission,
         decision: PermissionDecision,
     ) {
-        let entries = self.permission_decisions.entry(extension).or_default();
+        let entries = self
+            .permission_decisions
+            .entry(extension.clone())
+            .or_default();
         if let Some(entry) = entries
             .iter_mut()
             .find(|entry| entry.permission == permission)
@@ -436,9 +478,28 @@ impl ExtensionHost {
             entry.decision = decision;
         } else {
             entries.push(PermissionEntry {
-                permission,
+                permission: permission.clone(),
                 decision,
             });
+        }
+        if decision != PermissionDecision::Granted {
+            self.purge_snapshot_namespaces_for_permission(&extension, &permission);
+        }
+    }
+
+    /// Clears all remembered authority for an extension. Installers use this
+    /// when an unverified upgrade crosses a trust boundary and must be reviewed
+    /// as a new principal rather than inheriting grants by self-declared ID.
+    pub fn clear_permission_decisions(&mut self, extension: &ExtensionId) {
+        let permissions = self
+            .permission_decisions
+            .remove(extension)
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.permission)
+            .collect::<Vec<_>>();
+        for permission in permissions {
+            self.purge_snapshot_namespaces_for_permission(extension, &permission);
         }
     }
 
@@ -459,11 +520,92 @@ impl ExtensionHost {
         self.registry.get(extension).map(PackageRecord::state)
     }
 
+    /// Returns active extension IDs that explicitly subscribe to and are
+    /// authorized for one host snapshot. The lightweight ID list avoids
+    /// cloning complete contribution trees merely to discover recipients.
+    #[must_use]
+    pub fn snapshot_targets(&self, snapshot: SnapshotKind) -> Vec<ExtensionId> {
+        self.runtimes
+            .keys()
+            .filter(|extension| self.snapshot_is_authorized(extension, snapshot))
+            .cloned()
+            .collect()
+    }
+
+    /// Number of bounded dispatcher events waiting for a later host tick.
+    #[must_use]
+    pub fn pending_event_count(&self) -> usize {
+        self.queue.len().saturating_add(
+            self.runtimes
+                .values()
+                .filter_map(|runtime| runtime.instance.as_ref())
+                .map(|instance| instance.pending_deferred_work())
+                .sum::<usize>(),
+        )
+    }
+
+    /// Establishes a document-state barrier. Host snapshots from the prior
+    /// document are removed, queued work is discarded, and outstanding effect
+    /// tokens are invalidated so an old completion cannot gain authority over
+    /// a newly opened document.
+    pub fn invalidate_document_scope(&mut self, snapshots: impl IntoIterator<Item = SnapshotKind>) {
+        let namespaces = snapshots
+            .into_iter()
+            .map(snapshot_namespace)
+            .collect::<BTreeSet<_>>();
+        self.queue.clear();
+        self.pending_effects.clear();
+        for runtime in self.runtimes.values_mut() {
+            if let Some(instance) = runtime.instance.as_mut() {
+                instance.cancel_deferred_events();
+            }
+            for namespace in &namespaces {
+                runtime.state.remove(*namespace);
+            }
+        }
+    }
+
     /// Returns the current immutable extension-owned UI state snapshot. State
     /// only exists while an extension runtime is active or suspended.
     #[must_use]
     pub fn extension_state(&self, extension: &ExtensionId) -> Option<&BTreeMap<String, DataValue>> {
         self.runtimes.get(extension).map(|runtime| &runtime.state)
+    }
+
+    /// Returns the non-sensitive settings snapshot retained across runtime
+    /// disable/enable cycles. Sensitive settings never enter extension-visible
+    /// state and are therefore never returned here.
+    #[must_use]
+    pub fn extension_settings(&self, extension: &ExtensionId) -> Option<DataValue> {
+        self.runtimes
+            .get(extension)
+            .and_then(|runtime| runtime.state.get("settings"))
+            .cloned()
+            .or_else(|| self.persisted_settings.get(extension).cloned())
+    }
+
+    /// Restores a bounded settings snapshot after package installation and
+    /// before activation. Unknown, sensitive, or wrongly typed keys are
+    /// rejected instead of being exposed to the extension runtime.
+    pub fn restore_extension_settings(
+        &mut self,
+        extension: &ExtensionId,
+        settings: DataValue,
+    ) -> Result<(), HostError> {
+        let manifest = self
+            .registry
+            .get(extension)
+            .ok_or_else(|| HostError::NotInstalled(extension.clone()))?
+            .manifest();
+        let settings =
+            normalize_persisted_settings(manifest, settings, &self.config.validation_limits)
+                .map_err(HostError::EventRejected)?;
+        self.persisted_settings
+            .insert(extension.clone(), settings.clone());
+        if let Some(runtime) = self.runtimes.get_mut(extension) {
+            runtime.state.insert("settings".into(), settings);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -588,6 +730,20 @@ impl ExtensionHost {
             .get_mut(extension)
             .expect("record exists")
             .transition(LifecycleState::Active)?;
+        let mut state = initial_extension_state(&manifest);
+        if let Some(settings) = self.persisted_settings.get(extension).cloned() {
+            match normalize_persisted_settings(&manifest, settings, &self.config.validation_limits)
+            {
+                Ok(settings) => {
+                    self.persisted_settings
+                        .insert(extension.clone(), settings.clone());
+                    state.insert("settings".into(), settings);
+                }
+                Err(_) => {
+                    self.persisted_settings.remove(extension);
+                }
+            }
+        }
         self.runtimes.insert(
             extension.clone(),
             ActiveRuntime {
@@ -595,12 +751,7 @@ impl ExtensionHost {
                 capabilities: capabilities.clone(),
                 subscriptions,
                 instance,
-                state: manifest
-                    .settings
-                    .fields
-                    .iter()
-                    .map(|setting| (setting.key.clone(), setting.default.clone()))
-                    .collect(),
+                state,
                 violations: 0,
             },
         );
@@ -957,6 +1108,11 @@ impl ExtensionHost {
                 "command {command} is not declared"
             )));
         }
+        if !value_is_bounded(&payload, &self.config.validation_limits) {
+            return Err(HostError::EventRejected(
+                "command payload exceeds host limits or contains invalid state keys".into(),
+            ));
+        }
         self.enqueue_host_event(
             &owner,
             ExtensionEvent::CommandInvoked {
@@ -972,6 +1128,16 @@ impl ExtensionHost {
             tick: self.tick,
             ..TickReport::default()
         };
+
+        // Background adapters only exchange owned protocol values with this
+        // single-threaded host. Pull a bounded batch before dispatching new
+        // work, then run the exact same state/effect arbitration used by an
+        // inline adapter. No guest callback occurs in this method.
+        let completed = self.drain_deferred_adapter_updates();
+        for (extension, update) in completed {
+            self.apply_deferred_adapter_update(&extension, update, &mut report);
+        }
+
         let mut selected = Vec::new();
         let initial_len = self.queue.len();
         for _ in 0..initial_len {
@@ -998,8 +1164,6 @@ impl ExtensionHost {
                 "event batch limit reached; remaining events deferred",
             );
         }
-        report.deferred_events = self.queue.len();
-
         let mut cause_counts = BTreeMap::<(ExtensionId, CauseId), usize>::new();
         for queued in selected {
             let key = (queued.target.clone(), queued.root_cause);
@@ -1025,42 +1189,65 @@ impl ExtensionHost {
                 );
                 continue;
             }
-            let deliver = self.runtimes.get(&queued.target).is_some_and(|runtime| {
+            if let ExtensionEvent::SnapshotChanged { snapshot, .. } = &queued.envelope.event
+                && !self.snapshot_is_authorized(&queued.target, *snapshot)
+            {
+                report.dropped_events += 1;
+                self.diagnostic(
+                    Some(queued.target),
+                    DiagnosticSeverity::Info,
+                    DiagnosticCode::EventDropped,
+                    format!(
+                        "{snapshot:?} snapshot ignored without both an explicit subscription and its required permissions"
+                    ),
+                );
+                continue;
+            }
+            let command_behaviors =
+                self.command_behaviors_for_event(&queued.target, &queued.envelope);
+            let deliver_to_adapter = self.runtimes.get(&queued.target).is_some_and(|runtime| {
                 event_is_mandatory(&queued.envelope.event)
                     || runtime.subscriptions.iter().any(|subscription| {
                         subscription_matches(subscription, &queued.envelope.event)
                     })
             });
-            if !deliver {
+            let snapshot_state = snapshot_state_update(&queued.envelope);
+            if !deliver_to_adapter && command_behaviors.is_empty() {
+                if let Some((namespace, value)) = snapshot_state {
+                    self.replace_snapshot_state(&queued.target, namespace, value);
+                }
                 continue;
             }
-            let outcome = {
+            let generation = self
+                .runtimes
+                .get(&queued.target)
+                .expect("active extension has runtime")
+                .generation;
+            let (outcome, delivery) = if deliver_to_adapter {
                 let runtime = self
                     .runtimes
                     .get_mut(&queued.target)
                     .expect("active extension has runtime");
-                runtime
-                    .instance
-                    .as_mut()
-                    .map(|instance| instance.handle_event(&queued.envelope))
+                match runtime.instance.as_mut() {
+                    Some(instance) => {
+                        let delivery = instance.update_delivery();
+                        (Some(instance.handle_event(&queued.envelope)), delivery)
+                    }
+                    None => (None, UpdateDelivery::Immediate),
+                }
+            } else {
+                (None, UpdateDelivery::Immediate)
             };
             report.processed_events += 1;
-            match outcome {
-                None => {}
-                Some(Ok(update)) => {
-                    let generation = self
-                        .runtimes
-                        .get(&queued.target)
-                        .expect("runtime remains active")
-                        .generation;
-                    self.arbitrate_update(
-                        &queued.target,
-                        generation,
-                        queued.envelope.cause,
-                        update,
-                        &mut report.effects,
-                    );
-                }
+            if delivery == UpdateDelivery::Deferred && matches!(outcome, Some(Ok(_))) {
+                // Command behavior and snapshot replacement must wait for the
+                // guest update so their deterministic merge order stays
+                // identical to the inline path.
+                continue;
+            }
+            let adapter_update = match outcome {
+                None => NativeUpdate::default(),
+                Some(Ok(update)) => update,
                 Some(Err(error)) => {
                     self.diagnostic(
                         Some(queued.target.clone()),
@@ -1073,10 +1260,348 @@ impl ExtensionHost {
                         DiagnosticCode::ExtensionFault,
                         "extension event handler returned an error",
                     );
+                    NativeUpdate::default()
+                }
+            };
+            let update = self.merge_command_behaviors(
+                &queued.target,
+                &queued.envelope,
+                &command_behaviors,
+                adapter_update,
+            );
+            self.arbitrate_update_internal(
+                &queued.target,
+                generation,
+                queued.envelope.cause,
+                update,
+                &mut report.effects,
+                matches!(queued.envelope.event, ExtensionEvent::CommandInvoked { .. }),
+            );
+            if let Some((namespace, value)) = snapshot_state {
+                self.replace_snapshot_state(&queued.target, namespace, value);
+            }
+        }
+        report.deferred_events = self.pending_event_count();
+        report
+    }
+
+    fn drain_deferred_adapter_updates(&mut self) -> Vec<(ExtensionId, DeferredNativeUpdate)> {
+        let mut remaining = self.config.maximum_events_per_tick;
+        let mut completed = Vec::new();
+        if remaining == 0 {
+            return completed;
+        }
+        for (extension, runtime) in &mut self.runtimes {
+            let Some(instance) = runtime.instance.as_mut() else {
+                continue;
+            };
+            if instance.update_delivery() != UpdateDelivery::Deferred {
+                continue;
+            }
+            let updates = instance.drain_deferred_updates(remaining);
+            remaining = remaining.saturating_sub(updates.len());
+            completed.extend(
+                updates
+                    .into_iter()
+                    .map(|update| (extension.clone(), update)),
+            );
+            if remaining == 0 {
+                break;
+            }
+        }
+        completed
+    }
+
+    fn apply_deferred_adapter_update(
+        &mut self,
+        extension: &ExtensionId,
+        completed: DeferredNativeUpdate,
+        report: &mut TickReport,
+    ) {
+        let Some(runtime) = self.runtimes.get(extension) else {
+            return;
+        };
+        if runtime.generation != completed.generation
+            || self.state(extension) != Some(LifecycleState::Active)
+        {
+            return;
+        }
+        let generation = runtime.generation;
+        match completed.call {
+            DeferredCall::Activation { cause } | DeferredCall::Resume { cause } => {
+                match completed.result {
+                    Ok(update) => {
+                        self.arbitrate_update(
+                            extension,
+                            generation,
+                            cause,
+                            update,
+                            &mut report.effects,
+                        );
+                    }
+                    Err(error) => {
+                        self.fail_deferred_runtime(extension, error);
+                        report.dropped_events = report.dropped_events.saturating_add(1);
+                    }
+                }
+            }
+            DeferredCall::Event(envelope) => {
+                let command_behaviors = self.command_behaviors_for_event(extension, &envelope);
+                let snapshot_state = snapshot_state_update(&envelope);
+                let adapter_update = match completed.result {
+                    Ok(update) => update,
+                    Err(error) => {
+                        self.diagnostic(
+                            Some(extension.clone()),
+                            DiagnosticSeverity::Error,
+                            DiagnosticCode::ExtensionFault,
+                            error.message,
+                        );
+                        self.record_violation(
+                            extension,
+                            DiagnosticCode::ExtensionFault,
+                            "deferred extension event handler returned an error",
+                        );
+                        NativeUpdate::default()
+                    }
+                };
+                // A repeated violation may suspend and remove authority while
+                // the result is being diagnosed. Never apply it afterward.
+                if self.state(extension) != Some(LifecycleState::Active) {
+                    return;
+                }
+                let update = self.merge_command_behaviors(
+                    extension,
+                    &envelope,
+                    &command_behaviors,
+                    adapter_update,
+                );
+                self.arbitrate_update_internal(
+                    extension,
+                    generation,
+                    envelope.cause,
+                    update,
+                    &mut report.effects,
+                    matches!(envelope.event, ExtensionEvent::CommandInvoked { .. }),
+                );
+                if let Some((namespace, value)) = snapshot_state {
+                    self.replace_snapshot_state(extension, namespace, value);
                 }
             }
         }
-        report
+    }
+
+    fn fail_deferred_runtime(&mut self, extension: &ExtensionId, error: ExtensionError) {
+        self.queue.retain(|event| event.target != *extension);
+        self.pending_effects
+            .retain(|(owner, _), _| owner != extension);
+        if let Some(mut runtime) = self.runtimes.remove(extension)
+            && let Some(instance) = runtime.instance.as_mut()
+        {
+            instance.unload();
+        }
+        if let Some(record) = self.registry.get_mut(extension) {
+            let _ = record.transition(LifecycleState::Failed);
+        }
+        self.diagnostic(
+            Some(extension.clone()),
+            DiagnosticSeverity::Error,
+            DiagnosticCode::ExtensionFault,
+            error.message,
+        );
+        self.reconcile_active_capabilities();
+        self.broadcast_capability_changes();
+    }
+
+    fn command_behaviors_for_event(
+        &self,
+        extension: &ExtensionId,
+        envelope: &EventEnvelope,
+    ) -> Vec<CommandBehavior> {
+        if envelope.source != EventSource::Host {
+            return Vec::new();
+        }
+        let ExtensionEvent::CommandInvoked { command, .. } = &envelope.event else {
+            return Vec::new();
+        };
+        self.registry
+            .get(extension)
+            .map(|record| {
+                record
+                    .manifest()
+                    .contributions
+                    .command_behaviors
+                    .iter()
+                    .filter(|behavior| behavior.command == *command)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn replace_snapshot_state(
+        &mut self,
+        extension: &ExtensionId,
+        namespace: &str,
+        value: DataValue,
+    ) {
+        if !value_is_bounded(&value, &self.config.validation_limits) {
+            self.record_violation(
+                extension,
+                DiagnosticCode::EffectRejected,
+                "snapshot state exceeded host bounds",
+            );
+            return;
+        }
+        let Some(runtime) = self.runtimes.get_mut(extension) else {
+            return;
+        };
+        let previous = runtime.state.insert(namespace.to_owned(), value);
+        if !state_is_bounded(&runtime.state, &self.config.validation_limits) {
+            match previous {
+                Some(previous) => {
+                    runtime.state.insert(namespace.to_owned(), previous);
+                }
+                None => {
+                    runtime.state.remove(namespace);
+                }
+            }
+            self.record_violation(
+                extension,
+                DiagnosticCode::EffectRejected,
+                "snapshot state exceeded host bounds",
+            );
+        }
+    }
+
+    /// Merge host-declared no-code behavior with one adapter update. Manifest
+    /// behavior is applied in declaration order after adapter state, so a
+    /// control's command payload deterministically wins at its bound path.
+    /// Generated effects precede adapter effects and pass through the same
+    /// bounded arbitration and permission checks.
+    fn merge_command_behaviors(
+        &mut self,
+        extension: &ExtensionId,
+        envelope: &EventEnvelope,
+        behaviors: &[CommandBehavior],
+        mut update: NativeUpdate,
+    ) -> NativeUpdate {
+        let ExtensionEvent::CommandInvoked { payload, .. } = &envelope.event else {
+            return update;
+        };
+        let has_state_behavior = behaviors
+            .iter()
+            .any(|behavior| matches!(behavior.action, CommandBehaviorAction::SetState { .. }));
+        if has_state_behavior {
+            let current = self
+                .runtimes
+                .get(extension)
+                .map(|runtime| runtime.state.clone())
+                .unwrap_or_default();
+            let mut state = match update.state.take() {
+                Some(mut state) if state_is_bounded(&state, &self.config.validation_limits) => {
+                    // Host snapshots and settings are reserved. Guest/native
+                    // state may replace its own snapshot but cannot forge or
+                    // discard these host-owned channels.
+                    preserve_host_state_namespaces(&current, &mut state);
+                    state
+                }
+                Some(_) => {
+                    self.record_violation(
+                        extension,
+                        DiagnosticCode::EffectRejected,
+                        "extension state update exceeded host limits or used an invalid key",
+                    );
+                    current
+                }
+                None => current,
+            };
+            for behavior in behaviors {
+                if let CommandBehaviorAction::SetState { binding } = &behavior.action {
+                    let setting_accepts = if binding
+                        .0
+                        .first()
+                        .is_some_and(|segment| segment == "settings")
+                    {
+                        let key = binding
+                            .0
+                            .iter()
+                            .skip(1)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        self.registry
+                            .get(extension)
+                            .and_then(|record| {
+                                record
+                                    .manifest()
+                                    .settings
+                                    .fields
+                                    .iter()
+                                    .find(|setting| setting.key == key && !setting.sensitive)
+                            })
+                            .is_some_and(|setting| setting.value_type.accepts(payload))
+                    } else {
+                        true
+                    };
+                    if setting_accepts {
+                        set_state_binding(&mut state, binding, payload.clone());
+                    } else {
+                        self.record_violation(
+                            extension,
+                            DiagnosticCode::EffectRejected,
+                            "command payload does not satisfy the bound setting type",
+                        );
+                    }
+                }
+            }
+            update.state = Some(state);
+        } else if let Some(state) = update.state.as_mut() {
+            // A command adapter update without SetState still cannot replace
+            // or discard host-owned state namespaces.
+            let current = self
+                .runtimes
+                .get(extension)
+                .map(|runtime| runtime.state.clone())
+                .unwrap_or_default();
+            preserve_host_state_namespaces(&current, state);
+        }
+
+        let mut behavior_effects = Vec::new();
+        for (index, behavior) in behaviors.iter().enumerate() {
+            let effect = match &behavior.action {
+                CommandBehaviorAction::SetState { .. } => continue,
+                CommandBehaviorAction::OpenContribution { contribution } => {
+                    ExtensionEffect::OpenContribution {
+                        contribution: contribution.clone(),
+                    }
+                }
+                CommandBehaviorAction::CloseContribution { contribution } => {
+                    ExtensionEffect::CloseContribution {
+                        contribution: contribution.clone(),
+                    }
+                }
+            };
+            let Ok(id) = EffectId::parse(format!(
+                "{extension}/behavior-{}-{index}",
+                envelope.sequence
+            )) else {
+                self.record_violation(
+                    extension,
+                    DiagnosticCode::EffectRejected,
+                    "host could not allocate a bounded declarative effect ID",
+                );
+                continue;
+            };
+            behavior_effects.push(EffectRequest {
+                id,
+                cause: envelope.cause,
+                effect,
+            });
+        }
+        behavior_effects.append(&mut update.effects);
+        update.effects = behavior_effects;
+        update
     }
 
     fn arbitrate_update(
@@ -1084,15 +1609,42 @@ impl ExtensionHost {
         extension: &ExtensionId,
         generation: GenerationId,
         cause: CauseContext,
-        mut update: NativeUpdate,
+        update: NativeUpdate,
         accepted: &mut Vec<ArbitratedEffect>,
     ) {
+        self.arbitrate_update_internal(extension, generation, cause, update, accepted, false);
+    }
+
+    fn arbitrate_update_internal(
+        &mut self,
+        extension: &ExtensionId,
+        generation: GenerationId,
+        cause: CauseContext,
+        mut update: NativeUpdate,
+        accepted: &mut Vec<ArbitratedEffect>,
+        allow_host_settings_update: bool,
+    ) {
         if let Some(state) = update.state.take() {
+            let mut state = state;
+            if !allow_host_settings_update {
+                let current = self
+                    .runtimes
+                    .get(extension)
+                    .map(|runtime| runtime.state.clone())
+                    .unwrap_or_default();
+                preserve_host_state_namespaces(&current, &mut state);
+            }
             if state_is_bounded(&state, &self.config.validation_limits) {
-                if let Some(runtime) = self.runtimes.get_mut(extension)
+                let settings = if let Some(runtime) = self.runtimes.get_mut(extension)
                     && runtime.generation == generation
                 {
                     runtime.state = state;
+                    runtime.state.get("settings").cloned()
+                } else {
+                    None
+                };
+                if let Some(settings) = settings {
+                    self.persisted_settings.insert(extension.clone(), settings);
                 }
             } else {
                 self.record_violation(
@@ -1220,9 +1772,11 @@ impl ExtensionHost {
                         retryable: false,
                     });
                 }
+                if let Some(permission) = self.capability_permissions.get(capability) {
+                    self.require_permission(extension, permission)?;
+                }
             }
-            ExtensionEffect::OpenContribution { contribution }
-            | ExtensionEffect::CloseContribution { contribution } => {
+            ExtensionEffect::OpenContribution { contribution } => {
                 if contribution.owner() != *extension
                     || !self.contribution_exists(extension, contribution)
                 {
@@ -1235,6 +1789,17 @@ impl ExtensionHost {
                 {
                     return Err(permission_error(permission));
                 }
+            }
+            ExtensionEffect::CloseContribution { contribution } => {
+                if contribution.owner() != *extension
+                    || !self.contribution_exists(extension, contribution)
+                {
+                    return Err(invalid(
+                        "contribution is not owned and declared by extension",
+                    ));
+                }
+                // Closing host UI must remain possible after a permission is
+                // revoked; it reduces authority and visible surface.
             }
             ExtensionEffect::StorageGet { area, .. }
             | ExtensionEffect::StoragePut { area, .. }
@@ -1289,6 +1854,42 @@ impl ExtensionHost {
         }) && self.permission_decision(extension, permission) == PermissionDecision::Granted
     }
 
+    fn purge_snapshot_namespaces_for_permission(
+        &mut self,
+        extension: &ExtensionId,
+        permission: &Permission,
+    ) {
+        let namespaces = self
+            .snapshot_permissions
+            .iter()
+            .filter(|(_, required)| required.contains(permission))
+            .map(|(snapshot, _)| snapshot_namespace(*snapshot))
+            .collect::<Vec<_>>();
+        if let Some(runtime) = self.runtimes.get_mut(extension) {
+            for namespace in namespaces {
+                runtime.state.remove(namespace);
+            }
+        }
+    }
+
+    fn snapshot_is_authorized(&self, extension: &ExtensionId, snapshot: SnapshotKind) -> bool {
+        let subscribed = self.runtimes.get(extension).is_some_and(|runtime| {
+            runtime.subscriptions.iter().any(
+                |subscription| matches!(subscription, EventSubscription::Snapshot(kind) if *kind == snapshot),
+            )
+        });
+        subscribed
+            && self
+                .snapshot_permissions
+                .iter()
+                .find(|(kind, _)| *kind == snapshot)
+                .is_none_or(|(_, permissions)| {
+                    permissions
+                        .iter()
+                        .all(|permission| self.permission_is_granted(extension, permission))
+                })
+    }
+
     fn storage_permission_is_granted(&self, extension: &ExtensionId, area: StorageArea) -> bool {
         self.registry.get(extension).is_some_and(|record| {
             record.manifest().permissions.iter().any(|request| {
@@ -1336,7 +1937,9 @@ impl ExtensionHost {
             .iter()
             .find(|view| view.id == *contribution)?;
         match view.slot {
-            ContributionSlot::SidePanel => Some(Permission::AddSidePanel),
+            ContributionSlot::SidePanel | ContributionSlot::SettingsPanel => {
+                Some(Permission::AddSidePanel)
+            }
             ContributionSlot::DocumentOverlay => Some(Permission::AddDocumentOverlays),
             _ => None,
         }
@@ -1575,10 +2178,13 @@ impl ExtensionHost {
                     .get_mut(extension)
                     .expect("record exists")
                     .transition(LifecycleState::Unloading)?;
-                if let Some(mut runtime) = self.runtimes.remove(extension)
-                    && let Some(instance) = runtime.instance.as_mut()
-                {
-                    instance.unload();
+                if let Some(mut runtime) = self.runtimes.remove(extension) {
+                    if let Some(settings) = runtime.state.get("settings").cloned() {
+                        self.persisted_settings.insert(extension.clone(), settings);
+                    }
+                    if let Some(instance) = runtime.instance.as_mut() {
+                        instance.unload();
+                    }
                 }
                 self.registry
                     .get_mut(extension)
@@ -1620,6 +2226,7 @@ impl ExtensionHost {
             .expect("record exists")
             .transition(LifecycleState::Removed)?;
         self.permission_decisions.remove(extension);
+        self.persisted_settings.remove(extension);
         let record = self
             .registry
             .remove_record(extension)
@@ -1673,9 +2280,15 @@ impl ExtensionHost {
                 );
             result
                 .menus
-                .extend(contributions.menus.into_iter().map(|menu| OwnedMenu {
-                    owner: owner.clone(),
-                    menu,
+                .extend(contributions.menus.into_iter().map(|menu| {
+                    OwnedMenu {
+                        owner: owner.clone(),
+                        menu,
+                        state: self
+                            .runtimes
+                            .get(&owner)
+                            .map_or_else(BTreeMap::new, |runtime| runtime.state.clone()),
+                    }
                 }));
             result
                 .views
@@ -1890,8 +2503,7 @@ fn value_is_bounded(value: &DataValue, limits: &ValidationLimits) -> bool {
             DataValue::Record(values) => {
                 values.len() <= limits.maximum_list_items
                     && values.iter().all(|(key, value)| {
-                        key.len() <= limits.maximum_string_bytes
-                            && visit(value, limits, depth + 1, nodes)
+                        state_key_is_safe(key, limits) && visit(value, limits, depth + 1, nodes)
                     })
             }
             DataValue::Null | DataValue::Boolean(_) | DataValue::Integer(_) => true,
@@ -1902,14 +2514,165 @@ fn value_is_bounded(value: &DataValue, limits: &ValidationLimits) -> bool {
 
 fn state_is_bounded(state: &BTreeMap<String, DataValue>, limits: &ValidationLimits) -> bool {
     state.len() <= limits.maximum_list_items
-        && state.keys().all(|key| {
-            !key.is_empty()
-                && key.len() <= limits.maximum_string_bytes
-                && key
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        })
+        && state.keys().all(|key| state_key_is_safe(key, limits))
         && value_is_bounded(&DataValue::Record(state.clone()), limits)
+}
+
+fn state_key_is_safe(key: &str, limits: &ValidationLimits) -> bool {
+    !key.is_empty()
+        && key.len() <= limits.maximum_string_bytes
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+const HOST_STATE_NAMESPACES: [&str; 8] = [
+    "settings",
+    "application",
+    "document",
+    "viewport",
+    "selection",
+    "annotation",
+    "theme",
+    "capabilities",
+];
+
+fn preserve_host_state_namespaces(
+    current: &BTreeMap<String, DataValue>,
+    incoming: &mut BTreeMap<String, DataValue>,
+) {
+    for namespace in HOST_STATE_NAMESPACES {
+        incoming.remove(namespace);
+        if let Some(value) = current.get(namespace) {
+            incoming.insert(namespace.to_owned(), value.clone());
+        }
+    }
+}
+
+fn snapshot_state_update(envelope: &EventEnvelope) -> Option<(&'static str, DataValue)> {
+    if envelope.source != EventSource::Host {
+        return None;
+    }
+    let ExtensionEvent::SnapshotChanged { snapshot, value } = &envelope.event else {
+        return None;
+    };
+    Some((snapshot_namespace(*snapshot), value.clone()))
+}
+
+const fn snapshot_namespace(snapshot: SnapshotKind) -> &'static str {
+    match snapshot {
+        key_extension_api::SnapshotKind::Application => "application",
+        key_extension_api::SnapshotKind::Document => "document",
+        key_extension_api::SnapshotKind::Viewport => "viewport",
+        key_extension_api::SnapshotKind::Selection => "selection",
+        key_extension_api::SnapshotKind::Annotation => "annotation",
+        key_extension_api::SnapshotKind::Theme => "theme",
+        key_extension_api::SnapshotKind::Capabilities => "capabilities",
+    }
+}
+
+fn initial_extension_state(manifest: &ExtensionManifest) -> BTreeMap<String, DataValue> {
+    let mut state = BTreeMap::new();
+    for setting in manifest
+        .settings
+        .fields
+        .iter()
+        .filter(|setting| !setting.sensitive)
+    {
+        let binding = StateBinding::new(std::iter::once("settings").chain(setting.key.split('.')));
+        set_state_binding(&mut state, &binding, setting.default.clone());
+    }
+    state
+}
+
+fn normalize_persisted_settings(
+    manifest: &ExtensionManifest,
+    settings: DataValue,
+    limits: &ValidationLimits,
+) -> Result<DataValue, String> {
+    let DataValue::Record(incoming) = settings else {
+        return Err("persisted extension settings must be a record".into());
+    };
+    if !value_is_bounded(&DataValue::Record(incoming.clone()), limits) {
+        return Err("persisted extension settings exceed host bounds".into());
+    }
+
+    fn get_path<'a>(
+        record: &'a BTreeMap<String, DataValue>,
+        path: &[&str],
+    ) -> Option<&'a DataValue> {
+        let (head, tail) = path.split_first()?;
+        let value = record.get(*head)?;
+        if tail.is_empty() {
+            Some(value)
+        } else if let DataValue::Record(record) = value {
+            get_path(record, tail)
+        } else {
+            None
+        }
+    }
+
+    let mut normalized = initial_extension_state(manifest);
+    let mut observed = BTreeMap::new();
+    for setting in manifest
+        .settings
+        .fields
+        .iter()
+        .filter(|setting| !setting.sensitive)
+    {
+        let path = setting.key.split('.').collect::<Vec<_>>();
+        let Some(value) = get_path(&incoming, &path).cloned() else {
+            continue;
+        };
+        if !setting.value_type.accepts(&value) {
+            return Err(format!(
+                "persisted value for setting '{}' has the wrong type or range",
+                setting.key
+            ));
+        }
+        let binding = StateBinding::new(std::iter::once("settings").chain(path.iter().copied()));
+        set_state_binding(&mut normalized, &binding, value.clone());
+        set_state_binding(&mut observed, &binding, value);
+    }
+    let observed = match observed.remove("settings") {
+        Some(DataValue::Record(observed)) => observed,
+        None => BTreeMap::new(),
+        Some(_) => unreachable!("settings bindings always build records"),
+    };
+    if observed != incoming {
+        return Err("persisted extension settings contain unknown or sensitive keys".into());
+    }
+    Ok(normalized
+        .remove("settings")
+        .unwrap_or_else(|| DataValue::Record(BTreeMap::new())))
+}
+
+fn set_state_binding(
+    state: &mut BTreeMap<String, DataValue>,
+    binding: &StateBinding,
+    value: DataValue,
+) {
+    fn set_path(record: &mut BTreeMap<String, DataValue>, path: &[String], value: DataValue) {
+        let Some((head, tail)) = path.split_first() else {
+            return;
+        };
+        if tail.is_empty() {
+            record.insert(head.clone(), value);
+            return;
+        }
+        let child = record
+            .entry(head.clone())
+            .or_insert_with(|| DataValue::Record(BTreeMap::new()));
+        if !matches!(child, DataValue::Record(_)) {
+            *child = DataValue::Record(BTreeMap::new());
+        }
+        let DataValue::Record(child) = child else {
+            unreachable!("record was initialized above")
+        };
+        set_path(child, tail, value);
+    }
+
+    set_path(state, &binding.0, value);
 }
 
 fn order_owned_menus(menus: &mut Vec<OwnedMenu>) -> bool {
@@ -2068,7 +2831,8 @@ mod tests {
         BooleanSource, CURRENT_MANIFEST_SCHEMA, CapabilityRequirements, CapabilityScope,
         CompatibleVersion, ContributionSet, ExtensionDependency, HostCompatibility, LifecycleEvent,
         LocalId, MenuItemOrder, MenuSlotId, NativeAdapterId, NotificationTone, PermissionRequest,
-        Platform, Publisher, SettingsSchema, StorageRequirements,
+        Platform, Publisher, SettingDefinition, SettingType, SettingsSchema, StorageRequirements,
+        UiNode, UiNodeKind,
     };
 
     use crate::PackageOrigin;
@@ -2165,6 +2929,7 @@ mod tests {
             vec![
                 EventSubscription::Commands,
                 EventSubscription::Capabilities,
+                EventSubscription::Snapshot(SnapshotKind::Document),
                 EventSubscription::EffectResults,
             ]
         }
@@ -2302,6 +3067,478 @@ mod tests {
     }
 
     #[test]
+    fn declarative_set_state_runs_without_adapter_subscriptions() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.declarative-state");
+        let mut package = declarative_manifest(extension.as_str());
+        add_command(&mut package);
+        package.settings.fields.push(SettingDefinition {
+            key: "theme-preset".into(),
+            label: "Theme preset".into(),
+            description: String::new(),
+            value_type: SettingType::String {
+                maximum_bytes: Some(64),
+            },
+            default: DataValue::String("paper".into()),
+            sensitive: false,
+        });
+        package.settings.fields.push(SettingDefinition {
+            key: "api-token".into(),
+            label: "API token".into(),
+            description: String::new(),
+            value_type: SettingType::String {
+                maximum_bytes: Some(64),
+            },
+            default: DataValue::String("must-not-enter-ui-state".into()),
+            sensitive: true,
+        });
+        package
+            .contributions
+            .command_behaviors
+            .push(CommandBehavior {
+                command: command_for(&extension),
+                action: CommandBehaviorAction::SetState {
+                    binding: StateBinding::new(["settings", "theme-preset"]),
+                },
+            });
+        host.install(package, PackageMetadata::bundled()).unwrap();
+        host.activate(&extension).unwrap();
+
+        host.invoke_command(
+            &command_for(&extension),
+            DataValue::String("graphite".into()),
+        )
+        .unwrap();
+        assert_eq!(host.process_tick().processed_events, 1);
+        let settings = host
+            .extension_state(&extension)
+            .and_then(|state| state.get("settings"))
+            .and_then(|value| match value {
+                DataValue::Record(settings) => Some(settings),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            settings.get("theme-preset"),
+            Some(&DataValue::String("graphite".into()))
+        );
+        assert!(
+            !settings.contains_key("api-token"),
+            "sensitive settings must remain outside extension-visible UI state"
+        );
+
+        host.invoke_command(&command_for(&extension), DataValue::Integer(7))
+            .unwrap();
+        host.process_tick();
+        let settings = host
+            .extension_state(&extension)
+            .and_then(|state| state.get("settings"))
+            .and_then(|value| match value {
+                DataValue::Record(settings) => Some(settings),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            settings.get("theme-preset"),
+            Some(&DataValue::String("graphite".into())),
+            "wrongly typed command payload must not mutate settings"
+        );
+
+        let root = host
+            .enqueue_host_event(
+                &extension,
+                ExtensionEvent::Lifecycle {
+                    event: LifecycleEvent::ApplicationReady,
+                },
+            )
+            .unwrap();
+        host.enqueue_extension_event(
+            &extension,
+            &extension,
+            root,
+            ExtensionEvent::CommandInvoked {
+                command: command_for(&extension),
+                payload: DataValue::String("forged".into()),
+            },
+        )
+        .unwrap();
+        host.process_tick();
+        let settings = host
+            .extension_state(&extension)
+            .and_then(|state| state.get("settings"))
+            .and_then(|value| match value {
+                DataValue::Record(settings) => Some(settings),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            settings.get("theme-preset"),
+            Some(&DataValue::String("graphite".into())),
+            "extension-sourced command events must not execute host behaviors"
+        );
+
+        let persisted = host.extension_settings(&extension).unwrap();
+        host.unload(&extension).unwrap();
+        assert_eq!(host.extension_settings(&extension), Some(persisted));
+        host.activate(&extension).unwrap();
+        assert!(matches!(
+            host.extension_settings(&extension),
+            Some(DataValue::Record(settings))
+                if settings.get("theme-preset")
+                    == Some(&DataValue::String("graphite".into()))
+        ));
+
+        assert!(
+            host.restore_extension_settings(
+                &extension,
+                DataValue::Record(BTreeMap::from([(
+                    "api-token".into(),
+                    DataValue::String("must stay private".into()),
+                )])),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn host_snapshots_atomically_replace_their_stable_namespace() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.document-snapshot");
+        install_native(
+            &mut host,
+            native_manifest(extension.as_str()),
+            Behavior::None,
+            Arc::default(),
+            Arc::default(),
+        );
+        host.activate(&extension).unwrap();
+
+        host.enqueue_host_event(
+            &extension,
+            ExtensionEvent::SnapshotChanged {
+                snapshot: key_extension_api::SnapshotKind::Document,
+                value: DataValue::Record(BTreeMap::from([(
+                    "statistics".into(),
+                    DataValue::Record(BTreeMap::from([(
+                        "page-count".into(),
+                        DataValue::Integer(12),
+                    )])),
+                )])),
+            },
+        )
+        .unwrap();
+        host.process_tick();
+        host.enqueue_host_event(
+            &extension,
+            ExtensionEvent::SnapshotChanged {
+                snapshot: key_extension_api::SnapshotKind::Document,
+                value: DataValue::Record(BTreeMap::from([(
+                    "statistics".into(),
+                    DataValue::Record(BTreeMap::from([(
+                        "word-count".into(),
+                        DataValue::Integer(1_024),
+                    )])),
+                )])),
+            },
+        )
+        .unwrap();
+        host.process_tick();
+
+        let statistics = host
+            .extension_state(&extension)
+            .and_then(|state| state.get("document"))
+            .and_then(|value| match value {
+                DataValue::Record(document) => document.get("statistics"),
+                _ => None,
+            })
+            .and_then(|value| match value {
+                DataValue::Record(statistics) => Some(statistics),
+                _ => None,
+            })
+            .expect("document statistics snapshot");
+        assert_eq!(statistics.get("page-count"), None);
+        assert_eq!(
+            statistics.get("word-count"),
+            Some(&DataValue::Integer(1_024))
+        );
+    }
+
+    #[test]
+    fn snapshots_require_both_subscription_and_explicit_permission() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.permissioned-snapshot");
+        let permission = Permission::ReadDocumentMetadata;
+        host.require_snapshot_permissions(SnapshotKind::Document, [permission.clone()]);
+        let mut package = native_manifest(extension.as_str());
+        package.permissions.push(PermissionRequest {
+            permission: permission.clone(),
+            reason: "Read the active document summary".into(),
+            required: false,
+        });
+        install_native(
+            &mut host,
+            package,
+            Behavior::None,
+            Arc::default(),
+            Arc::default(),
+        );
+        host.activate(&extension).unwrap();
+
+        let event = ExtensionEvent::SnapshotChanged {
+            snapshot: SnapshotKind::Document,
+            value: DataValue::Record(BTreeMap::from([(
+                "title".into(),
+                DataValue::String("Sensitive title".into()),
+            )])),
+        };
+        host.enqueue_host_event(&extension, event.clone()).unwrap();
+        let denied = host.process_tick();
+        assert_eq!(denied.dropped_events, 1);
+        assert!(
+            host.extension_state(&extension)
+                .is_some_and(|state| !state.contains_key("document"))
+        );
+
+        host.set_permission_decision(
+            extension.clone(),
+            permission.clone(),
+            PermissionDecision::Granted,
+        );
+        host.enqueue_host_event(&extension, event).unwrap();
+        assert_eq!(host.process_tick().processed_events, 1);
+        assert!(
+            host.extension_state(&extension)
+                .is_some_and(|state| state.contains_key("document"))
+        );
+
+        host.set_permission_decision(extension.clone(), permission, PermissionDecision::Denied);
+        assert!(
+            host.extension_state(&extension)
+                .is_some_and(|state| !state.contains_key("document")),
+            "revocation must purge the host-owned snapshot namespace"
+        );
+    }
+
+    #[test]
+    fn capability_calls_require_the_registered_permission() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.permissioned-capability");
+        let capability = CapabilityId::parse("key:test/document-metadata").unwrap();
+        let permission = Permission::ReadDocumentMetadata;
+        host.register_host_capability(capability.clone(), version("1.0.0"));
+        host.require_capability_permission(capability.clone(), permission.clone());
+
+        let mut package = declarative_manifest(extension.as_str());
+        package.capabilities.required.push(CapabilityRequest {
+            id: capability.clone(),
+            version: requirement("^1"),
+            scope: CapabilityScope::ActiveDocument,
+        });
+        package.permissions.push(PermissionRequest {
+            permission: permission.clone(),
+            reason: "Read document metadata".into(),
+            required: false,
+        });
+        host.install(package, PackageMetadata::bundled()).unwrap();
+        let activation = host.activate(&extension).unwrap();
+        let cause = host.root_cause();
+        let request = EffectRequest {
+            id: EffectId::parse(format!("{extension}/read")).unwrap(),
+            cause,
+            effect: ExtensionEffect::CapabilityCall {
+                capability,
+                operation: "read".into(),
+                input: DataValue::Null,
+            },
+        };
+
+        let denied = host
+            .validate_effect(&extension, activation.generation, cause, &request)
+            .unwrap_err();
+        assert_eq!(denied.code, ExtensionErrorCode::PermissionDenied);
+
+        host.set_permission_decision(extension.clone(), permission, PermissionDecision::Granted);
+        host.validate_effect(&extension, activation.generation, cause, &request)
+            .unwrap();
+    }
+
+    #[test]
+    fn native_adapter_state_and_manifest_behavior_merge_deterministically() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.merged-state");
+        let mut package = native_manifest(extension.as_str());
+        add_command(&mut package);
+        package.settings.fields.push(SettingDefinition {
+            key: "preset".into(),
+            label: "Preset".into(),
+            description: String::new(),
+            value_type: SettingType::String {
+                maximum_bytes: Some(64),
+            },
+            default: DataValue::String("paper".into()),
+            sensitive: false,
+        });
+        package
+            .contributions
+            .command_behaviors
+            .push(CommandBehavior {
+                command: command_for(&extension),
+                action: CommandBehaviorAction::SetState {
+                    binding: StateBinding::new(["settings", "preset"]),
+                },
+            });
+        install_native(
+            &mut host,
+            package,
+            Behavior::State,
+            Arc::default(),
+            Arc::default(),
+        );
+        host.activate(&extension).unwrap();
+        host.enqueue_host_event(
+            &extension,
+            ExtensionEvent::SnapshotChanged {
+                snapshot: key_extension_api::SnapshotKind::Document,
+                value: DataValue::Record(BTreeMap::from([(
+                    "statistics".into(),
+                    DataValue::Record(BTreeMap::from([(
+                        "page-count".into(),
+                        DataValue::Integer(12),
+                    )])),
+                )])),
+            },
+        )
+        .unwrap();
+        host.process_tick();
+        host.invoke_command(
+            &command_for(&extension),
+            DataValue::String("graphite".into()),
+        )
+        .unwrap();
+        host.process_tick();
+        let state = host.extension_state(&extension).unwrap();
+        assert_eq!(
+            state.get("status"),
+            Some(&DataValue::String("ready".into()))
+        );
+        assert!(matches!(
+            state.get("document"),
+            Some(DataValue::Record(document))
+                if matches!(
+                    document.get("statistics"),
+                    Some(DataValue::Record(statistics))
+                        if statistics.get("page-count") == Some(&DataValue::Integer(12))
+                )
+        ));
+        assert!(matches!(
+            state.get("settings"),
+            Some(DataValue::Record(settings))
+                if settings.get("preset") == Some(&DataValue::String("graphite".into()))
+        ));
+    }
+
+    #[test]
+    fn open_is_permission_checked_but_close_remains_available_after_revocation() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.panel-behavior");
+        let open = CommandId::parse(format!("{extension}/open")).unwrap();
+        let close = CommandId::parse(format!("{extension}/close")).unwrap();
+        let panel = ContributionId::parse(format!("{extension}/panel")).unwrap();
+        let mut package = declarative_manifest(extension.as_str());
+        for command in [&open, &close] {
+            package.contributions.commands.push(CommandDefinition {
+                id: command.clone(),
+                title: "Panel".into(),
+                description: String::new(),
+                category: String::new(),
+            });
+        }
+        package.permissions.push(PermissionRequest {
+            permission: Permission::AddSidePanel,
+            reason: "Open the panel".into(),
+            required: true,
+        });
+        package.contributions.views.push(UiContribution {
+            id: panel.clone(),
+            slot: ContributionSlot::SidePanel,
+            order: ContributionOrder::default(),
+            root: UiNode {
+                id: LocalId::parse("root").unwrap(),
+                visible: BooleanSource::Constant(true),
+                kind: UiNodeKind::Text {
+                    text: "Panel".into(),
+                    selectable: true,
+                },
+            },
+        });
+        package.contributions.command_behaviors = vec![
+            CommandBehavior {
+                command: open.clone(),
+                action: CommandBehaviorAction::OpenContribution {
+                    contribution: panel.clone(),
+                },
+            },
+            CommandBehavior {
+                command: close.clone(),
+                action: CommandBehaviorAction::CloseContribution {
+                    contribution: panel.clone(),
+                },
+            },
+        ];
+        host.install(package, PackageMetadata::bundled()).unwrap();
+        host.set_permission_decision(
+            extension.clone(),
+            Permission::AddSidePanel,
+            PermissionDecision::Granted,
+        );
+        host.activate(&extension).unwrap();
+        host.set_permission_decision(
+            extension.clone(),
+            Permission::AddSidePanel,
+            PermissionDecision::Denied,
+        );
+
+        host.invoke_command(&open, DataValue::Null).unwrap();
+        assert!(host.process_tick().effects.is_empty());
+        host.invoke_command(&close, DataValue::Null).unwrap();
+        let effects = host.process_tick().effects;
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0].request.effect,
+            ExtensionEffect::CloseContribution {
+                contribution: panel
+            }
+        );
+    }
+
+    #[test]
+    fn command_payload_rejects_unsafe_nested_state_keys_before_queueing() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.payload-bounds");
+        let mut package = declarative_manifest(extension.as_str());
+        add_command(&mut package);
+        package
+            .contributions
+            .command_behaviors
+            .push(CommandBehavior {
+                command: command_for(&extension),
+                action: CommandBehaviorAction::SetState {
+                    binding: StateBinding::new(["payload"]),
+                },
+            });
+        host.install(package, PackageMetadata::bundled()).unwrap();
+        host.activate(&extension).unwrap();
+        let payload = DataValue::Record(BTreeMap::from([(
+            "unsafe.key".into(),
+            DataValue::Boolean(true),
+        )]));
+        assert!(matches!(
+            host.invoke_command(&command_for(&extension), payload),
+            Err(HostError::EventRejected(_))
+        ));
+    }
+
+    #[test]
     fn activation_negotiates_capabilities_and_permissions_before_native_code() {
         let mut host = ExtensionHost::new(HostConfig::default());
         let extension = id("org.example.activation");
@@ -2347,7 +3584,27 @@ mod tests {
     fn wasm_packages_require_an_explicit_package_scoped_adapter() {
         let mut host = ExtensionHost::new(HostConfig::default());
         let extension = id("org.example.wasm");
-        let package = wasm_manifest(extension.as_str());
+        let mut package = wasm_manifest(extension.as_str());
+        add_command(&mut package);
+        package.settings.fields.push(SettingDefinition {
+            key: "mode".into(),
+            label: "Mode".into(),
+            description: String::new(),
+            value_type: SettingType::String {
+                maximum_bytes: Some(32),
+            },
+            default: DataValue::String("default".into()),
+            sensitive: false,
+        });
+        package
+            .contributions
+            .command_behaviors
+            .push(CommandBehavior {
+                command: command_for(&extension),
+                action: CommandBehaviorAction::SetState {
+                    binding: StateBinding::new(["settings", "mode"]),
+                },
+            });
         host.install(package, PackageMetadata::bundled()).unwrap();
         assert_eq!(
             host.activate(&extension),
@@ -2374,6 +3631,18 @@ mod tests {
         ));
         host.activate(&extension).unwrap();
         assert_eq!(host.state(&extension), Some(LifecycleState::Active));
+        host.invoke_command(
+            &command_for(&extension),
+            DataValue::String("sandboxed".into()),
+        )
+        .unwrap();
+        host.process_tick();
+        assert!(matches!(
+            host.extension_state(&extension)
+                .and_then(|state| state.get("settings")),
+            Some(DataValue::Record(settings))
+                if settings.get("mode") == Some(&DataValue::String("sandboxed".into()))
+        ));
     }
 
     #[test]
@@ -2564,6 +3833,23 @@ mod tests {
         let extension = id("org.example.menu");
         let mut package = declarative_manifest(extension.as_str());
         add_command(&mut package);
+        package
+            .contributions
+            .command_behaviors
+            .push(CommandBehavior {
+                command: command_for(&extension),
+                action: CommandBehaviorAction::SetState {
+                    binding: StateBinding::new(["menu-action"]),
+                },
+            });
+        package.settings.fields.push(SettingDefinition {
+            key: "menu.compact".into(),
+            label: "Compact menu".into(),
+            description: String::new(),
+            value_type: SettingType::Boolean,
+            default: DataValue::Boolean(true),
+            sensitive: false,
+        });
         let command = command_for(&extension);
         let first = MenuItem {
             id: LocalId::parse("first").unwrap(),
@@ -2613,6 +3899,15 @@ mod tests {
         host.install(package, PackageMetadata::bundled()).unwrap();
         host.activate(&extension).unwrap();
         let contributions = host.collect_contributions();
+        assert!(matches!(
+            contributions.menus[0].state.get("settings"),
+            Some(DataValue::Record(settings))
+                if matches!(
+                    settings.get("menu"),
+                    Some(DataValue::Record(menu))
+                        if menu.get("compact") == Some(&DataValue::Boolean(true))
+                )
+        ));
         let MenuItemKind::Submenu { children, .. } = &contributions.menus[0].menu.items[0].kind
         else {
             panic!("submenu preserved");

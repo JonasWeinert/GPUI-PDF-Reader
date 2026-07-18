@@ -7,9 +7,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CURRENT_MANIFEST_SCHEMA, CapabilityScope, ContributionId, DataValue, ExtensionEntrypoint,
-    ExtensionManifest, MenuItem, MenuItemKind, NetworkScope, Permission, SettingType, StateBinding,
-    UiNode, UiNodeKind,
+    CURRENT_MANIFEST_SCHEMA, CapabilityScope, CommandBehaviorAction, ContributionId, DataValue,
+    ExtensionEntrypoint, ExtensionManifest, MenuItem, MenuItemKind, NetworkScope, Permission,
+    SettingType, StateBinding, UiNode, UiNodeKind,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -25,6 +25,7 @@ pub enum ValidationCode {
     Duplicate,
     ForeignNamespace,
     UnknownCommand,
+    UnknownContribution,
     MissingDependency,
     IncompatibleDependency,
     DependencyCycle,
@@ -391,6 +392,11 @@ impl<'a> ManifestValidator<'a> {
             contributions.commands.len(),
             self.limits.maximum_commands,
         );
+        self.check_count(
+            "contributions.command_behaviors",
+            contributions.command_behaviors.len(),
+            self.limits.maximum_commands,
+        );
         for (index, command) in contributions.commands.iter().enumerate() {
             let path = format!("contributions.commands[{index}]");
             if command.id.owner() != self.manifest.id {
@@ -429,9 +435,11 @@ impl<'a> ManifestValidator<'a> {
                 &mut item_ids,
             );
         }
+        let mut view_ids = BTreeSet::new();
         for (index, view) in contributions.views.iter().enumerate() {
             let path = format!("contributions.views[{index}]");
             self.contribution_id(&path, &view.id, &mut ids);
+            view_ids.insert(view.id.as_str().to_owned());
             let mut node_ids = BTreeSet::new();
             let mut count = 0;
             self.validate_ui_node(
@@ -441,6 +449,119 @@ impl<'a> ManifestValidator<'a> {
                 &mut count,
                 &mut node_ids,
             );
+        }
+        let mut behavior_commands = BTreeSet::new();
+        for (index, behavior) in contributions.command_behaviors.iter().enumerate() {
+            let path = format!("contributions.command_behaviors[{index}]");
+            self.command_reference(&format!("{path}.command"), behavior.command.as_str());
+            if !behavior_commands.insert(behavior.command.as_str().to_owned()) {
+                self.error(
+                    ValidationCode::Duplicate,
+                    format!("{path}.command"),
+                    "schema v1 permits at most one declarative behavior per command",
+                );
+            }
+            match &behavior.action {
+                CommandBehaviorAction::SetState { binding } => {
+                    self.validate_binding(&format!("{path}.binding"), binding);
+                    let root = binding.0.first().map(String::as_str);
+                    if root == Some("settings") {
+                        let key = binding
+                            .0
+                            .iter()
+                            .skip(1)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        match self
+                            .manifest
+                            .settings
+                            .fields
+                            .iter()
+                            .find(|setting| setting.key == key)
+                        {
+                            None => self.error(
+                                ValidationCode::InvalidSetting,
+                                format!("{path}.binding"),
+                                "SetState binding names an unknown setting",
+                            ),
+                            Some(setting) if setting.sensitive => self.error(
+                                ValidationCode::InvalidSetting,
+                                format!("{path}.binding"),
+                                "sensitive settings cannot be exposed through declarative state",
+                            ),
+                            Some(_) => {}
+                        }
+                    } else if root.is_some_and(host_state_namespace_is_reserved) {
+                        self.error(
+                            ValidationCode::InvalidField,
+                            format!("{path}.binding"),
+                            "SetState cannot write a host-owned snapshot namespace",
+                        );
+                    }
+                }
+                CommandBehaviorAction::OpenContribution { contribution }
+                | CommandBehaviorAction::CloseContribution { contribution } => {
+                    if contribution.owner() != self.manifest.id {
+                        self.error(
+                            ValidationCode::ForeignNamespace,
+                            format!("{path}.contribution"),
+                            "command behavior contribution must be owned by the extension",
+                        );
+                    } else if !view_ids.contains(contribution.as_str()) {
+                        self.error(
+                            ValidationCode::UnknownContribution,
+                            format!("{path}.contribution"),
+                            "command behavior target is not a declared view contribution",
+                        );
+                    } else if matches!(
+                        behavior.action,
+                        CommandBehaviorAction::OpenContribution { .. }
+                    ) {
+                        let permission = contributions
+                            .views
+                            .iter()
+                            .find(|view| view.id == *contribution)
+                            .and_then(|view| match view.slot {
+                                crate::ContributionSlot::SidePanel
+                                | crate::ContributionSlot::SettingsPanel => {
+                                    Some(Permission::AddSidePanel)
+                                }
+                                crate::ContributionSlot::DocumentOverlay => {
+                                    Some(Permission::AddDocumentOverlays)
+                                }
+                                _ => None,
+                            });
+                        if let Some(permission) = permission
+                            && !self
+                                .manifest
+                                .permissions
+                                .iter()
+                                .any(|request| request.required && request.permission == permission)
+                        {
+                            self.error(
+                                ValidationCode::InvalidField,
+                                &path,
+                                "opening this contribution requires a matching required permission",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(
+            self.manifest.entrypoint,
+            ExtensionEntrypoint::Declarative { .. }
+        ) {
+            for (index, command) in contributions.commands.iter().enumerate() {
+                if !behavior_commands.contains(command.id.as_str()) {
+                    self.error(
+                        ValidationCode::InvalidField,
+                        format!("contributions.commands[{index}].id"),
+                        "declarative commands require exactly one host-executed behavior",
+                    );
+                }
+            }
         }
     }
 
@@ -625,6 +746,10 @@ impl<'a> ManifestValidator<'a> {
                 for (index, span) in spans.iter().enumerate() {
                     self.string(&format!("{path}.spans[{index}].text"), &span.text);
                 }
+            }
+            UiNodeKind::Metric { label, value, .. } => {
+                self.nonempty_string(&format!("{path}.label"), label);
+                self.validate_binding(&format!("{path}.value"), value);
             }
             UiNodeKind::Markdown { markdown, .. } => {
                 self.string(&format!("{path}.markdown"), markdown)
@@ -820,11 +945,16 @@ impl<'a> ManifestValidator<'a> {
         let mut keys = BTreeSet::new();
         for (index, setting) in self.manifest.settings.fields.iter().enumerate() {
             let path = format!("settings.fields[{index}]");
+            let segments = setting.key.split('.').collect::<Vec<_>>();
             if setting.key.is_empty()
-                || !setting.key.bytes().all(|byte| {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'-' | b'.')
+                || setting.key.len() > self.limits.maximum_string_bytes
+                || segments.len().saturating_add(1) > self.limits.maximum_binding_segments
+                || segments.iter().any(|segment| {
+                    segment.is_empty()
+                        || segment.len() > self.limits.maximum_string_bytes
+                        || !segment.bytes().all(|byte| {
+                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                        })
                 })
             {
                 self.error(
@@ -917,6 +1047,19 @@ impl<'a> ManifestValidator<'a> {
     fn error(&mut self, code: ValidationCode, path: impl Into<String>, message: impl Into<String>) {
         self.errors.push(ValidationError::new(code, path, message));
     }
+}
+
+fn host_state_namespace_is_reserved(namespace: &str) -> bool {
+    matches!(
+        namespace,
+        "application"
+            | "document"
+            | "viewport"
+            | "selection"
+            | "annotation"
+            | "theme"
+            | "capabilities"
+    )
 }
 
 /// Validate installed-manifest dependency presence, compatibility, and cycles.

@@ -14,6 +14,8 @@ pub use state::*;
 mod icon;
 #[cfg(target_os = "macos")]
 mod menu;
+#[cfg(any(target_os = "macos", test))]
+mod safe_markdown;
 #[cfg(target_os = "macos")]
 mod view;
 

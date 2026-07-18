@@ -9,10 +9,37 @@ use crate::{
 pub struct ContributionSet {
     #[serde(default)]
     pub commands: Vec<CommandDefinition>,
+    /// Host-executed, no-code behaviors attached to declared commands. The
+    /// list is separate from command presentation metadata, while validation
+    /// deliberately permits at most one behavior per command in schema v1.
+    #[serde(default)]
+    pub command_behaviors: Vec<CommandBehavior>,
     #[serde(default)]
     pub menus: Vec<MenuContribution>,
     #[serde(default)]
     pub views: Vec<UiContribution>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CommandBehavior {
+    pub command: CommandId,
+    #[serde(flatten)]
+    pub action: CommandBehaviorAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandBehaviorAction {
+    /// Assign the command payload to this extension-owned state path.
+    SetState {
+        binding: StateBinding,
+    },
+    OpenContribution {
+        contribution: ContributionId,
+    },
+    CloseContribution {
+        contribution: ContributionId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -148,6 +175,15 @@ pub enum UiNodeKind {
         spans: Vec<TextSpan>,
         selectable: bool,
     },
+    /// A host-formatted scalar read from the owning extension's bounded state.
+    /// Missing or type-mismatched values render as unavailable rather than
+    /// executing package-provided formatting code.
+    Metric {
+        label: String,
+        value: StateBinding,
+        #[serde(default)]
+        format: MetricFormat,
+    },
     Markdown {
         markdown: String,
         selectable: bool,
@@ -231,6 +267,16 @@ pub enum TextEmphasis {
     Muted,
     Strong,
     Code,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricFormat {
+    #[default]
+    Integer,
+    Decimal,
+    Percentage,
+    Bytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -1,12 +1,16 @@
 use crate::annotations::{
-    AnnotationId, AnnotationSet, AnnotationStore, DocumentIdentity, DocumentKey, HighlightColor,
-    JsonSidecarStore, MAX_TEXT_CHARACTER_INDEX, TextRange,
+    AnnotationId, AnnotationSet, DocumentIdentity, HighlightColor, MAX_TEXT_CHARACTER_INDEX,
+    TextRange,
 };
 use crate::app_extensions::ReaderExtensions;
 use crate::backend::{
     PdfWorker, PreviewSpec, RenderAppearance, RenderColor, TileRequest, WorkerEvent,
 };
 use crate::document_jump::DocumentJump;
+#[cfg(feature = "installable-extensions")]
+use crate::extension_packages::{
+    InstalledPackageSummary, PackageActivation, PackageInstallPreview,
+};
 use crate::floating_panel::FloatingPanel;
 use crate::link_preview::{
     LinkPreviewEvent, LinkPreviewFetcher, LinkPreviewSession, WebsitePreviewState,
@@ -25,6 +29,7 @@ use crate::model::{
 use crate::navigation_focus::{
     NavigationFocusEffect, NavigationFocusFrame, NavigationFocusMotion, NavigationFocusTone,
 };
+use crate::pdf_capability_bridge::PdfCapabilityBridge;
 use crate::scholarly::{
     ScholarlyEvent, ScholarlyFetcher, ScholarlyMetadata, ScholarlyMetadataState, ScholarlySession,
     ScholarlySource,
@@ -39,17 +44,17 @@ use crate::text_field::{TextField, TextFieldEvent};
 use crate::theme::{self, ReaderPalette, ThemePreference};
 use crate::{
     ActualSize, AddComment, ClassicView, CopySelection, EditCopy, EditCut, EditPaste,
-    EditSelectAll, Find, FirstPage, FitWidth, FluidView, LastPage, NextSearchResult, OpenDocument,
-    PageDown, PageUp, PreviousSearchResult, Quit, ScrollDown, ScrollLeft, ScrollRight, ScrollUp,
-    SelectAll, ToggleComments, ZoomIn, ZoomOut,
+    EditSelectAll, Find, FirstPage, FitWidth, FluidView, InstallExtension, LastPage,
+    ManageExtensions, NextSearchResult, OpenDocument, PageDown, PageUp, PreviousSearchResult, Quit,
+    ScrollDown, ScrollLeft, ScrollRight, ScrollUp, SelectAll, ToggleComments, ZoomIn, ZoomOut,
 };
 use gpui::{
-    Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corners,
+    Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context,
     CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, ListAlignment,
     ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
     Pixels, Point, PromptButton, PromptLevel, Render, RenderImage, ScrollWheelEvent, SharedString,
     StyledText, Task, TextRun, Transformation, UniformListScrollHandle, Window, WindowControlArea,
-    canvas, div, ease_in_out, font, img, list, percentage, point, prelude::*, px, quad, rems, size,
+    div, ease_in_out, font, img, list, percentage, point, prelude::*, px, quad, rems, size,
     uniform_list,
 };
 #[cfg(debug_assertions)]
@@ -59,45 +64,94 @@ use gpui_component::{
     text::{TextView, TextViewStyle},
 };
 use image::{Frame, RgbaImage};
+#[cfg(feature = "installable-extensions")]
+use key_extension_api::LifecycleState;
 use key_extension_api::{
-    DataValue, EffectResult, ExtensionEffect, ExtensionError, ExtensionErrorCode,
+    ContributionId, ContributionSlot, DataValue, EffectResult, ExtensionEffect, ExtensionError,
+    ExtensionErrorCode, ExtensionId, SnapshotKind,
 };
-use key_extension_gpui::InvokeExtensionCommand;
+use key_extension_gpui::{BoundedStateMap, DeclarativeView, InvokeExtensionCommand};
 use key_extension_host::ArbitratedEffect;
+#[cfg(feature = "installable-extensions")]
+use key_extension_host::OwnedCommand;
+#[cfg(feature = "installable-extensions")]
+use key_extension_package::PackageSourceKind;
+use key_pdf_extension_api::{
+    OverlayAppearance, OverlayBatch, OverlayEmphasis, OverlayShape, OverlayTone, PdfCapability,
+    PdfExtensionError,
+};
+use key_pdf_gpui::{
+    DEFAULT_MAX_CACHE_BYTES as MAX_CACHE_BYTES,
+    DEFAULT_MAX_CACHED_TEXT_PAGES as MAX_CACHED_TEXT_PAGES,
+    DEFAULT_MAX_CACHED_TILES as MAX_CACHED_TILES, DEFAULT_MAX_ZOOM as MAX_ZOOM,
+    DEFAULT_MIN_ZOOM as MIN_ZOOM, DemandTier, InputDisposition, PdfCanvasMetrics, PdfCanvasPage,
+    PdfCanvasPagePaintContext, PdfCanvasSnapshot, PdfCanvasStyle, PdfCanvasTile, PdfReaderConfig,
+    PdfReaderLimits, ScrollBehavior as ViewportScrollBehavior, ScrollOffset, ViewportController,
+    ViewportMetrics, ViewportPoint, command_wheel_zoom_factor, content_rect_to_bounds,
+    desired_raster_size as viewport_raster_size, pdf_canvas,
+    tile_core_rect as viewport_tile_core_rect, tile_logical_rect,
+};
+#[cfg(test)]
+use key_pdf_gpui::{
+    DEFAULT_MAX_RASTER_DIMENSION as MAX_RASTER_DIMENSION, DEFAULT_TILE_BLEED as TILE_BLEED,
+    DEFAULT_TILE_SIZE as TILE_SIZE, TilePlanningInput,
+    inflate_tile_rect as viewport_inflate_tile_rect,
+    plan_visible_tiles as viewport_plan_visible_tiles,
+};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
 use std::time::{Duration, Instant};
 
+mod annotation_io;
 mod comments;
+#[cfg(debug_assertions)]
+mod qa;
+mod references;
+mod render;
+mod search;
+#[cfg(test)]
+mod tests;
+mod toc;
 mod ui;
 
-use comments::{CommentEditorPresentation, CommentEmptyPresentation};
+use annotation_io::{AnnotationIo, AnnotationIoEvent, AnnotationIoOperation};
 use key_ui_gpui::UnitTransition;
+#[cfg(debug_assertions)]
+use qa::{QaFeaturePhase, QaFluidPhase};
+use references::reference_panel_extent;
+#[cfg(debug_assertions)]
+use references::union_text_bounds;
+#[cfg(test)]
+use references::{
+    adjacent_group_index, citation_expanded_height, compact_authors, compact_journal,
+    compact_reference_panel_citation, compact_words, complete_grouped_reference_indices,
+    escape_markdown_text, link_card_position, link_hover_candidate_needs_restart,
+    link_preview_should_close, link_section_title, measured_preview_width, middle_truncate,
+    pointer_link_card_position, reference_hero_height, reference_panel_width,
+    reference_preview_width, scientific_reference_matches,
+};
+#[cfg(test)]
+use search::{SearchListRow, next_search_match_id, search_document_jump};
+use search::{SearchState, search_list_rows};
+#[cfg(test)]
+use toc::{
+    ResolvedTocDestination, TOC_BREADCRUMB_MAX_LABEL_CHARACTERS, TOC_CARD_MIN_HEIGHT,
+    TOC_STACK_MARGIN, active_toc_index, end_truncate, resolve_toc_destination,
+    toc_breadcrumb_entries, toc_callout_height, toc_callout_width, toc_cascade_amount,
+    toc_display_breadcrumbs, toc_stack_geometry, toc_title_match,
+};
+use toc::{advance_toc_hover_state, toc_hover_state_is_animating};
 use ui::{ChromeButtonStyle, chrome_button, empty_state, error_banner, icon_label};
 
 const TOOLBAR_HEIGHT: f32 = 52.0;
 const ERROR_BAR_HEIGHT: f32 = 34.0;
-const MIN_ZOOM: f32 = 0.2;
-const MAX_ZOOM: f32 = 5.0;
-const RENDER_QUANTUM: u32 = 64;
-const TILE_SIZE: u32 = 1_024;
-// PDFium may cull rotated glyphs close to a clipped bitmap edge. A 32-pixel
-// gutter eliminated the visible/culling differences across real 1024px
-// boundaries in 0°, 90°, and CropBox fixtures (only <=1-channel rounding
-// differences remain); only the core is displayed.
-const TILE_BLEED: u32 = 32;
-const MAX_RASTER_DIMENSION: u32 = 65_536;
-const MAX_CACHED_TILES: usize = 48;
-const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
-const MAX_CACHED_TEXT_PAGES: usize = 16;
 const MAX_COPY_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_VISIBLE_SEARCH_HIGHLIGHT_RUNS: usize = 4_000;
 const MAX_VISIBLE_ANNOTATION_QUADS: usize = 8_000;
 const MAX_VISIBLE_SELECTION_QUADS: usize = 8_000;
+const MAX_VISIBLE_EXTENSION_OVERLAY_REGIONS: usize = 8_192;
 const ZOOM_RENDER_DEBOUNCE: Duration = Duration::from_millis(150);
-const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 const COMMENT_AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 const SIDEBAR_WIDTH: f32 = 344.0;
 const REFERENCE_PANEL_MIN_WIDTH: f32 = 372.0;
@@ -107,17 +161,6 @@ const FLUID_PANEL_HORIZONTAL_MARGIN: f32 = 12.0;
 const FLUID_PANEL_VERTICAL_MARGIN: f32 = 18.0;
 const FLUID_CONTEXT_PILL_WIDTH: f32 = 214.0;
 const FLUID_CONTEXT_PILL_HEIGHT: f32 = 40.0;
-const TOC_RAIL_WIDTH: f32 = 54.0;
-const TOC_MARKER_LEFT: f32 = 8.0;
-const TOC_STACK_MARGIN: f32 = 22.0;
-const TOC_STACK_SPACING: f32 = 12.0;
-const TOC_CASCADE_RADIUS: f32 = 5.0;
-const TOC_CARD_MIN_HEIGHT: f32 = 82.0;
-const TOC_BREADCRUMB_CHARACTER_BUDGET: usize = 46;
-const TOC_BREADCRUMB_MIN_LABEL_CHARACTERS: usize = 8;
-const TOC_BREADCRUMB_MAX_LABEL_CHARACTERS: usize = 20;
-const TOC_HOVER_LEAVE_DELAY: Duration = Duration::from_millis(120);
-const MAX_TOC_HEADING_MATCHES: usize = 16;
 const LINK_CARD_WIDTH: f32 = 340.0;
 const LINK_CARD_MARGIN: f32 = 12.0;
 const LINK_CARD_GAP: f32 = 8.0;
@@ -152,11 +195,7 @@ const TITLEBAR_CONTROL_INSET: f32 = 76.0;
 #[cfg(not(target_os = "macos"))]
 const TITLEBAR_CONTROL_INSET: f32 = 0.0;
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Offset {
-    x: f32,
-    y: f32,
-}
+type Offset = ScrollOffset;
 
 #[derive(Clone, Copy, Debug)]
 struct PaintBudget {
@@ -185,15 +224,6 @@ fn is_inactive<T: Copy + PartialEq>(candidate: T, active: Option<T>) -> bool {
     Some(candidate) != active
 }
 
-fn annotation_actions_enabled(
-    has_context: bool,
-    annotations_loading: bool,
-    persistence_blocked: bool,
-    comment_editor_open: bool,
-) -> bool {
-    has_context && !annotations_loading && !persistence_blocked && !comment_editor_open
-}
-
 fn zoom_controls_enabled(document_open: bool, zoom: f32) -> (bool, bool) {
     (
         document_open && zoom > MIN_ZOOM + 0.001,
@@ -201,312 +231,33 @@ fn zoom_controls_enabled(document_open: bool, zoom: f32) -> (bool, bool) {
     )
 }
 
-fn comment_draft_needs_confirmation(editor_open: bool, draft_dirty: bool) -> bool {
-    editor_open && draft_dirty
-}
-
-fn comments_toolbar_label(
-    editor_open: bool,
-    compact_toolbar: bool,
-    very_compact_toolbar: bool,
-) -> &'static str {
-    if editor_open {
-        if compact_toolbar {
-            "Notes •"
-        } else {
-            "Comments · Editing"
+fn pdf_capability_extension_error(error: PdfExtensionError) -> ExtensionError {
+    let (code, retryable) = match &error {
+        PdfExtensionError::CapabilityUnavailable { .. } => {
+            (ExtensionErrorCode::CapabilityUnavailable, false)
         }
-    } else if very_compact_toolbar {
-        "Notes"
-    } else {
-        "Comments"
-    }
-}
-
-fn floating_pill_position(
-    anchor: Rect,
-    available_width: f32,
-    viewport_height: f32,
-    pill_width: f32,
-    pill_height: f32,
-) -> Offset {
-    let margin = 12.0;
-    let maximum_x = (available_width - pill_width - margin).max(margin);
-    let x = (anchor.x + anchor.width * 0.5 - pill_width * 0.5).clamp(margin, maximum_x);
-    let below = anchor.bottom() + 10.0;
-    let y = if below + pill_height <= viewport_height - margin {
-        below
-    } else {
-        (anchor.y - pill_height - 10.0).max(margin)
+        PdfExtensionError::PermissionDenied { .. } => (ExtensionErrorCode::PermissionDenied, false),
+        PdfExtensionError::NoActiveDocument | PdfExtensionError::Busy => {
+            (ExtensionErrorCode::TemporarilyUnavailable, true)
+        }
+        PdfExtensionError::StaleGeneration { .. } | PdfExtensionError::InvalidHandleKind { .. } => {
+            (ExtensionErrorCode::StaleResource, false)
+        }
+        PdfExtensionError::ResourceNotFound { .. } | PdfExtensionError::PageOutOfBounds { .. } => {
+            (ExtensionErrorCode::NotFound, false)
+        }
+        PdfExtensionError::InvalidInput { .. } | PdfExtensionError::Unsupported { .. } => {
+            (ExtensionErrorCode::InvalidRequest, false)
+        }
+        PdfExtensionError::LimitExceeded { .. } => (ExtensionErrorCode::QuotaExceeded, false),
+        PdfExtensionError::Cancelled => (ExtensionErrorCode::Cancelled, true),
+        PdfExtensionError::Internal { .. } => (ExtensionErrorCode::Internal, false),
     };
-    Offset { x, y }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct TocTitleMatch {
-    y: f32,
-    text_runs: Vec<TextBounds>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct ResolvedTocDestination {
-    y: Option<f32>,
-    text_runs: Vec<TextBounds>,
-    matched_title: bool,
-}
-
-fn toc_title_match(title: &str, text: &TextLayer) -> Option<TocTitleMatch> {
-    let query = SearchQuery::new(title).ok()?;
-    let SearchPageOutcome::Complete(results) =
-        search_page(0, text.as_slice(), &query, MAX_TOC_HEADING_MATCHES, || {
-            false
-        })
-    else {
-        return None;
-    };
-    let mut best: Option<(f32, f32, Vec<TextBounds>)> = None;
-    for result in results.matches {
-        let Some(top) = result
-            .highlight_runs
-            .iter()
-            .map(|bounds| bounds.top)
-            .min_by(f32::total_cmp)
-        else {
-            continue;
-        };
-        let Some(height) = result
-            .highlight_runs
-            .iter()
-            .map(|bounds| (bounds.bottom - bounds.top).max(0.0))
-            .max_by(f32::total_cmp)
-        else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|(best_height, best_top, _)| {
-            height > *best_height + 0.0001
-                || ((height - *best_height).abs() <= 0.0001 && top < *best_top)
-        }) {
-            best = Some((height, top, result.highlight_runs));
-        }
+    ExtensionError {
+        code,
+        message: error.to_string(),
+        retryable,
     }
-    best.map(|(_, top, text_runs)| TocTitleMatch {
-        y: top.clamp(0.0, 1.0),
-        text_runs,
-    })
-}
-
-fn resolve_toc_destination(
-    title: &str,
-    text: &TextLayer,
-    explicit_destination_y: Option<f32>,
-) -> ResolvedTocDestination {
-    if let Some(matched) = toc_title_match(title, text) {
-        ResolvedTocDestination {
-            y: Some(matched.y),
-            text_runs: matched.text_runs,
-            matched_title: true,
-        }
-    } else {
-        ResolvedTocDestination {
-            y: explicit_destination_y,
-            text_runs: Vec::new(),
-            matched_title: false,
-        }
-    }
-}
-
-fn toc_stack_geometry(viewport_height: f32, count: usize) -> Option<(f32, f32)> {
-    if count == 0 || !viewport_height.is_finite() || viewport_height <= 0.0 {
-        return None;
-    }
-    if count == 1 {
-        return Some((viewport_height * 0.5, 0.0));
-    }
-    let available = (viewport_height - TOC_STACK_MARGIN * 2.0).max(1.0);
-    let spacing = (available / (count - 1) as f32).min(TOC_STACK_SPACING);
-    let height = spacing * (count - 1) as f32;
-    Some(((viewport_height - height) * 0.5, spacing))
-}
-
-fn toc_cascade_amount(index: usize, hover_position: f32, hover_strength: f32) -> f32 {
-    if !hover_position.is_finite() || !hover_strength.is_finite() {
-        return 0.0;
-    }
-    let distance = (index as f32 - hover_position).abs();
-    (1.0 - distance / TOC_CASCADE_RADIUS).clamp(0.0, 1.0) * hover_strength.clamp(0.0, 1.0)
-}
-
-fn toc_hover_state_is_animating(position: f32, strength: f32, target: Option<usize>) -> bool {
-    let target_strength = if target.is_some() { 1.0 } else { 0.0 };
-    let strength_is_animating = (target_strength - strength).abs() > 0.002;
-    let position_is_animating = target.is_some_and(|index| (index as f32 - position).abs() > 0.002);
-    strength_is_animating || position_is_animating
-}
-
-fn advance_toc_hover_state(
-    position: &mut f32,
-    strength: &mut f32,
-    target: Option<usize>,
-    blend: f32,
-) {
-    if let Some(index) = target {
-        *position += (index as f32 - *position) * blend;
-    }
-    let target_strength = if target.is_some() { 1.0 } else { 0.0 };
-    *strength += (target_strength - *strength) * blend;
-    if !toc_hover_state_is_animating(*position, *strength, target) {
-        *strength = target_strength;
-        if let Some(index) = target {
-            *position = index as f32;
-        }
-    }
-}
-
-fn active_toc_index(entries: &[TocEntry], current_page: usize) -> Option<usize> {
-    entries
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, entry)| (entry.page <= current_page).then_some(index))
-        .or((!entries.is_empty()).then_some(0))
-}
-
-fn toc_breadcrumb_entries(entries: &[TocEntry], index: usize) -> Option<Vec<(usize, String)>> {
-    let current = entries.get(index)?;
-    let mut path = vec![(index, current.title.clone())];
-    let mut expected_depth = current.depth;
-    for (ancestor_index, entry) in entries[..index].iter().enumerate().rev() {
-        let Some(parent_depth) = expected_depth.checked_sub(1) else {
-            break;
-        };
-        if entry.depth == parent_depth {
-            path.push((ancestor_index, entry.title.clone()));
-            expected_depth = parent_depth;
-        }
-    }
-    path.reverse();
-    Some(path)
-}
-
-fn end_truncate(text: &str, maximum_characters: usize) -> String {
-    let character_count = text.chars().count();
-    if character_count <= maximum_characters || maximum_characters < 2 {
-        return text.to_owned();
-    }
-    let mut result = text
-        .chars()
-        .take(maximum_characters - 1)
-        .collect::<String>();
-    result.push('…');
-    result
-}
-
-fn toc_display_breadcrumbs(breadcrumbs: &[(usize, String)]) -> Vec<(usize, String)> {
-    if breadcrumbs.is_empty() {
-        return Vec::new();
-    }
-    let separators = breadcrumbs.len().saturating_sub(1) * 3;
-    let label_budget = TOC_BREADCRUMB_CHARACTER_BUDGET
-        .saturating_sub(separators)
-        .checked_div(breadcrumbs.len())
-        .unwrap_or(TOC_BREADCRUMB_MIN_LABEL_CHARACTERS)
-        .clamp(
-            TOC_BREADCRUMB_MIN_LABEL_CHARACTERS,
-            TOC_BREADCRUMB_MAX_LABEL_CHARACTERS,
-        );
-    breadcrumbs
-        .iter()
-        .map(|(index, title)| (*index, end_truncate(title, label_budget)))
-        .collect()
-}
-
-fn toc_callout_height(breadcrumbs: &[(usize, String)], width: f32) -> f32 {
-    let available_width = (width - 32.0).max(64.0);
-    let characters_per_line = (available_width / 6.5).floor().max(8.0);
-    let character_count = breadcrumbs
-        .iter()
-        .map(|(_, title)| title.chars().count())
-        .sum::<usize>()
-        .saturating_add(breadcrumbs.len().saturating_sub(1) * 3);
-    let lines = ((character_count as f32 / characters_per_line).ceil() as usize).max(1);
-    (64.0 + lines as f32 * 18.0).max(TOC_CARD_MIN_HEIGHT)
-}
-
-fn toc_callout_width(breadcrumbs: &[(usize, String)], maximum_width: f32) -> f32 {
-    let character_count = breadcrumbs
-        .iter()
-        .map(|(_, title)| title.chars().count())
-        .sum::<usize>()
-        .saturating_add(breadcrumbs.len().saturating_sub(1) * 3);
-    (character_count as f32 * 6.5 + 42.0).clamp(190.0, maximum_width.max(190.0))
-}
-
-fn link_section_title(
-    entries: &[TocEntry],
-    page: usize,
-    y_fraction: Option<f32>,
-) -> Option<String> {
-    let target_y = y_fraction.unwrap_or(0.0).clamp(0.0, 1.0);
-    entries
-        .iter()
-        .filter(|entry| entry.page == page)
-        .filter(|entry| entry.destination_y.unwrap_or(0.0) <= target_y + 0.025)
-        .max_by(|left, right| {
-            left.destination_y
-                .unwrap_or(0.0)
-                .total_cmp(&right.destination_y.unwrap_or(0.0))
-                .then(left.depth.cmp(&right.depth))
-        })
-        .or_else(|| entries.iter().find(|entry| entry.page == page))
-        .map(|entry| entry.title.clone())
-}
-
-fn link_card_position(
-    anchor: Rect,
-    viewport_width: f32,
-    viewport_height: f32,
-    card_width: f32,
-    estimated_height: f32,
-) -> Offset {
-    let maximum_x = (viewport_width - card_width - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN);
-    let x = (anchor.x + anchor.width * 0.5 - card_width * 0.5).clamp(LINK_CARD_MARGIN, maximum_x);
-    let below = anchor.bottom() + LINK_CARD_GAP;
-    let y = if below + estimated_height <= viewport_height - LINK_CARD_MARGIN {
-        below
-    } else {
-        anchor.y - estimated_height - LINK_CARD_GAP
-    }
-    .clamp(
-        LINK_CARD_MARGIN,
-        (viewport_height - estimated_height - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN),
-    );
-    Offset { x, y }
-}
-
-fn pointer_link_card_position(
-    pointer: Offset,
-    viewport_width: f32,
-    viewport_height: f32,
-    card_width: f32,
-    estimated_height: f32,
-) -> Offset {
-    let maximum_x = (viewport_width - card_width - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN);
-    let x = (pointer.x - card_width * 0.5).clamp(LINK_CARD_MARGIN, maximum_x);
-    let below = pointer.y + LINK_CARD_GAP;
-    let y = if below + estimated_height <= viewport_height - LINK_CARD_MARGIN {
-        below
-    } else {
-        pointer.y - estimated_height - LINK_CARD_GAP
-    }
-    .clamp(
-        LINK_CARD_MARGIN,
-        (viewport_height - estimated_height - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN),
-    );
-    Offset { x, y }
-}
-
-fn link_preview_should_close(source_hovered: bool, card_hovered: bool) -> bool {
-    !source_hovered && !card_hovered
 }
 
 #[derive(Debug)]
@@ -553,19 +304,6 @@ enum ReferenceSummaryTab {
 
 type RevealState = UnitTransition;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum DemandTier {
-    Visible,
-    Prefetch,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PlannedTile {
-    request: TileRequest,
-    tier: DemandTier,
-    distance: u64,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct PanState {
     pointer: Point<Pixels>,
@@ -576,6 +314,37 @@ struct PanState {
 enum SidePanel {
     Comments,
     Search,
+    Extensions,
+    Contribution,
+}
+
+struct ExtensionContributionPane {
+    id: ContributionId,
+    #[cfg_attr(not(feature = "installable-extensions"), allow(dead_code))]
+    owner: ExtensionId,
+    title: SharedString,
+    view: Entity<DeclarativeView>,
+}
+
+#[derive(Default)]
+struct ExtensionSnapshotDispatch {
+    scheduled: bool,
+}
+
+impl ExtensionSnapshotDispatch {
+    /// Returns true only for the first request in one coalescing window.
+    fn request(&mut self) -> bool {
+        if self.scheduled {
+            false
+        } else {
+            self.scheduled = true;
+            true
+        }
+    }
+
+    fn begin_dispatch(&mut self) {
+        self.scheduled = false;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -583,42 +352,6 @@ enum ReaderView {
     #[default]
     Classic,
     Fluid,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CommentListStyle {
-    Classic,
-    Fluid,
-}
-
-impl CommentListStyle {
-    fn list_id(self) -> &'static str {
-        match self {
-            Self::Classic => "comment-list",
-            Self::Fluid => "fluid-comment-list",
-        }
-    }
-
-    fn row_id(self) -> &'static str {
-        match self {
-            Self::Classic => "comment",
-            Self::Fluid => "fluid-comment",
-        }
-    }
-
-    fn row_height(self) -> f32 {
-        match self {
-            Self::Classic => 104.0,
-            Self::Fluid => 96.0,
-        }
-    }
-
-    fn preview_height(self) -> f32 {
-        match self {
-            Self::Classic => 44.0,
-            Self::Fluid => 42.0,
-        }
-    }
 }
 
 struct FluidPillState {
@@ -636,42 +369,6 @@ enum DraftDiscardAction {
     Open(PathBuf),
     Quit,
     CloseWindow,
-}
-
-#[cfg(debug_assertions)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QaFeaturePhase {
-    Seed,
-    WaitCommentEditor,
-    WaitCommentEdited,
-    WaitCommentSaved,
-    WaitCommentBack,
-    WaitCommentList,
-    WaitCommentsOpen,
-    WaitCommentsClosed,
-    WaitSearchOpen,
-    WaitSearch,
-    WaitNavigation,
-    WaitSearchReturn,
-    WaitSearchClosed,
-    WaitSearchReopened,
-    WaitSearchRepopulated,
-    WaitFinalNavigation,
-    Complete,
-}
-
-#[cfg(debug_assertions)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QaFluidPhase {
-    Seed,
-    WaitEditor,
-    WaitAutosave,
-    WaitList,
-    WaitReopenedEditor,
-    WaitFinalList,
-    WaitSearchOpen,
-    WaitSearchResults,
-    Complete,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -764,309 +461,6 @@ struct PendingCopy {
     text: String,
 }
 
-#[derive(Debug, Default)]
-struct SearchState {
-    query: String,
-    input_error: Option<SharedString>,
-    revision: u64,
-    pages: BTreeMap<usize, Arc<[SearchMatch]>>,
-    order: Vec<SearchMatchId>,
-    active: Option<SearchMatchId>,
-    searched_pages: usize,
-    total_highlight_runs: usize,
-    complete: bool,
-    truncated: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SearchListRow {
-    Page(usize),
-    Match { id: SearchMatchId, ordinal: usize },
-}
-
-fn search_list_rows(order: &[SearchMatchId]) -> Vec<SearchListRow> {
-    let mut rows = Vec::with_capacity(order.len().saturating_add(8));
-    let mut previous_page = None;
-    for (ordinal, id) in order.iter().copied().enumerate() {
-        if previous_page != Some(id.page) {
-            rows.push(SearchListRow::Page(id.page));
-            previous_page = Some(id.page);
-        }
-        rows.push(SearchListRow::Match { id, ordinal });
-    }
-    rows
-}
-
-fn search_preview_text(result: &SearchMatch, palette: ReaderPalette) -> StyledText {
-    let matched = result.preview_match.clone();
-    let mut runs = Vec::with_capacity(3);
-    for (range, weight) in [
-        (0..matched.start, FontWeight::NORMAL),
-        (matched.clone(), FontWeight::BOLD),
-        (matched.end..result.preview.len(), FontWeight::NORMAL),
-    ] {
-        if !range.is_empty() {
-            let mut selected_font = font(".SystemUIFont");
-            selected_font.weight = weight;
-            runs.push(TextRun {
-                len: range.len(),
-                font: selected_font,
-                color: palette.text,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-        }
-    }
-    StyledText::new(result.preview.clone()).with_runs(runs)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AnnotationIoOperation {
-    Load,
-    Save,
-}
-
-enum AnnotationIoCommand {
-    Load {
-        generation: u64,
-        path: PathBuf,
-        page_count: usize,
-    },
-    Save {
-        generation: u64,
-        path: PathBuf,
-        identity: DocumentIdentity,
-        expected_disk_revision: u64,
-        annotations: AnnotationSet,
-    },
-}
-
-enum AnnotationIoEvent {
-    Loaded {
-        generation: u64,
-        identity: DocumentIdentity,
-        annotations: AnnotationSet,
-    },
-    Saved {
-        generation: u64,
-        revision: u64,
-    },
-    Failed {
-        generation: u64,
-        operation: AnnotationIoOperation,
-        revision: Option<u64>,
-        message: String,
-    },
-}
-
-struct AnnotationIo {
-    commands: Option<mpsc::Sender<AnnotationIoCommand>>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl AnnotationIo {
-    fn start() -> (Self, mpsc::Receiver<AnnotationIoEvent>) {
-        let (command_tx, command_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::channel();
-        let thread = thread::Builder::new()
-            .name("annotation-sidecar".into())
-            .spawn(move || {
-                let mut deferred = None;
-                let mut observed_disk_revisions = HashMap::<(u64, PathBuf), u64>::new();
-                loop {
-                    let command = match deferred.take() {
-                        Some(command) => command,
-                        None => match command_rx.recv() {
-                            Ok(command) => command,
-                            Err(_) => break,
-                        },
-                    };
-                    match command {
-                        AnnotationIoCommand::Load {
-                            generation,
-                            path,
-                            page_count,
-                        } => match DocumentKey::from_pdf(path.clone(), page_count).and_then(|key| {
-                            JsonSidecarStore
-                                .load(&key)
-                                .map(|annotations| (key.identity().clone(), annotations))
-                        }) {
-                            Ok((identity, annotations)) => {
-                                // A load is an ordering boundary for the sole
-                                // current document; older generations can no
-                                // longer save and must not accumulate paths.
-                                observed_disk_revisions.clear();
-                                observed_disk_revisions
-                                    .insert((generation, path.clone()), annotations.revision());
-                                let _ = event_tx.send(AnnotationIoEvent::Loaded {
-                                    generation,
-                                    identity,
-                                    annotations,
-                                });
-                            }
-                            Err(error) => {
-                                observed_disk_revisions.clear();
-                                let _ = event_tx.send(AnnotationIoEvent::Failed {
-                                    generation,
-                                    operation: AnnotationIoOperation::Load,
-                                    revision: None,
-                                    message: error.to_string(),
-                                });
-                            }
-                        },
-                        AnnotationIoCommand::Save {
-                            generation,
-                            path,
-                            mut identity,
-                            expected_disk_revision,
-                            mut annotations,
-                        } => {
-                            // Saving a sidecar snapshot is much slower than a
-                            // color click. Collapse a queued same-document
-                            // burst to its newest revision while preserving a
-                            // load or another document's ordering boundary. The
-                            // first command's expected disk revision remains the
-                            // base for the whole coalesced burst.
-                            while let Ok(command) = command_rx.try_recv() {
-                                match command {
-                                    AnnotationIoCommand::Save {
-                                        generation: next_generation,
-                                        path: next_path,
-                                        identity: next_identity,
-                                        expected_disk_revision: _,
-                                        annotations: next_annotations,
-                                    } if next_generation == generation && next_path == path => {
-                                        identity = next_identity;
-                                        annotations = next_annotations;
-                                    }
-                                    command => {
-                                        deferred = Some(command);
-                                        break;
-                                    }
-                                }
-                            }
-                            let revision = annotations.revision();
-                            let revision_key = (generation, path.clone());
-                            let expected_disk_revision = observed_disk_revisions
-                                .get(&revision_key)
-                                .copied()
-                                .unwrap_or(expected_disk_revision);
-                            let document = DocumentKey::new(path.clone(), identity);
-                            let save_result = JsonSidecarStore.compare_and_save(
-                                &document,
-                                expected_disk_revision,
-                                &annotations,
-                            );
-                            match save_result {
-                                Ok(receipt) => {
-                                    observed_disk_revisions
-                                        .insert(revision_key, receipt.saved_revision);
-                                    let _ = event_tx.send(AnnotationIoEvent::Saved {
-                                        generation,
-                                        revision: receipt.saved_revision,
-                                    });
-                                }
-                                Err(error) => {
-                                    let _ = event_tx.send(AnnotationIoEvent::Failed {
-                                        generation,
-                                        operation: AnnotationIoOperation::Save,
-                                        revision: Some(revision),
-                                        message: error.to_string(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            })
-            .expect("failed to start the annotation sidecar thread");
-        (
-            Self {
-                commands: Some(command_tx),
-                thread: Some(thread),
-            },
-            event_rx,
-        )
-    }
-
-    fn load(&self, generation: u64, path: PathBuf, page_count: usize) -> bool {
-        self.commands.as_ref().is_some_and(|commands| {
-            commands
-                .send(AnnotationIoCommand::Load {
-                    generation,
-                    path,
-                    page_count,
-                })
-                .is_ok()
-        })
-    }
-
-    fn save(
-        &self,
-        generation: u64,
-        path: PathBuf,
-        identity: DocumentIdentity,
-        expected_disk_revision: u64,
-        annotations: AnnotationSet,
-    ) -> bool {
-        self.commands.as_ref().is_some_and(|commands| {
-            commands
-                .send(AnnotationIoCommand::Save {
-                    generation,
-                    path,
-                    identity,
-                    expected_disk_revision,
-                    annotations,
-                })
-                .is_ok()
-        })
-    }
-}
-
-impl Drop for AnnotationIo {
-    fn drop(&mut self) {
-        self.commands.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn next_search_match_id(
-    results: &[SearchMatchId],
-    active: Option<SearchMatchId>,
-    forward: bool,
-) -> Option<SearchMatchId> {
-    let len = results.len();
-    if len == 0 {
-        return None;
-    }
-    let current = active.and_then(|id| results.iter().position(|result| *result == id));
-    let index = match (current, forward) {
-        (Some(index), true) => (index + 1) % len,
-        (Some(index), false) => (index + len - 1) % len,
-        (None, true) => 0,
-        (None, false) => len - 1,
-    };
-    Some(results[index])
-}
-
-fn search_document_jump(result: &SearchMatch) -> DocumentJump {
-    let (x_fraction, y_fraction) = result.highlight_runs.first().map_or((0.5, 0.15), |run| {
-        ((run.left + run.right) * 0.5, (run.top + run.bottom) * 0.5)
-    });
-    DocumentJump::new(result.id.page)
-        .position(Some(x_fraction), Some(y_fraction))
-        .viewport_anchor_y(0.35)
-        .center_horizontal(true)
-        .focus(
-            result.highlight_runs.clone(),
-            NavigationFocusTone::SearchMatch,
-            NavigationFocusMotion::Pulse,
-        )
-}
-
 fn unsaved_annotation_revision(current: Option<u64>, saved: u64) -> Option<u64> {
     current.filter(|revision| *revision > saved)
 }
@@ -1111,6 +505,14 @@ enum ReaderStatus {
 
 pub struct PdfReader {
     extensions: ReaderExtensions,
+    extension_contribution: Option<ExtensionContributionPane>,
+    #[cfg(feature = "installable-extensions")]
+    extension_packages: Vec<InstalledPackageSummary>,
+    #[cfg(feature = "installable-extensions")]
+    extension_commands: Vec<OwnedCommand>,
+    extension_text_statistics: HashMap<usize, (usize, usize)>,
+    extension_snapshot_dispatch: ExtensionSnapshotDispatch,
+    extension_snapshot_task: Option<Task<()>>,
     worker: PdfWorker,
     annotation_io: AnnotationIo,
     link_preview_fetcher: LinkPreviewFetcher,
@@ -1135,7 +537,8 @@ pub struct PdfReader {
     scientific_signals: ScientificSignals,
     generation: u64,
     document: Option<DocumentState>,
-    layout: Option<Arc<DocumentLayout>>,
+    viewport: ViewportController,
+    extension_overlays: Option<Arc<OverlayBatch>>,
     rendered: HashMap<TileKey, CachedTile>,
     page_text: HashMap<usize, Arc<TextLayer>>,
     pending: HashSet<TileKey>,
@@ -1268,6 +671,14 @@ impl PdfReader {
             .detach();
             Self {
                 extensions,
+                extension_contribution: None,
+                #[cfg(feature = "installable-extensions")]
+                extension_packages: Vec::new(),
+                #[cfg(feature = "installable-extensions")]
+                extension_commands: Vec::new(),
+                extension_text_statistics: HashMap::new(),
+                extension_snapshot_dispatch: ExtensionSnapshotDispatch::default(),
+                extension_snapshot_task: None,
                 worker,
                 annotation_io,
                 link_preview_fetcher,
@@ -1292,7 +703,8 @@ impl PdfReader {
                 scientific_signals: ScientificSignals::default(),
                 generation: 0,
                 document: None,
-                layout: None,
+                viewport: ViewportController::new(PdfReaderConfig::default()),
+                extension_overlays: None,
                 rendered: HashMap::new(),
                 page_text: HashMap::new(),
                 pending: HashSet::new(),
@@ -1420,1245 +832,6 @@ impl PdfReader {
 
     pub fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_report(&self) -> String {
-        let cached_bytes = self
-            .rendered
-            .values()
-            .map(|tile| tile.byte_len)
-            .sum::<usize>();
-        let visible_exact: Vec<_> = self
-            .render_viewport
-            .iter()
-            .filter_map(|(key, tier)| (*tier == DemandTier::Visible).then_some(*key))
-            .collect();
-        let exact_cached = visible_exact
-            .iter()
-            .filter(|key| self.rendered.contains_key(key))
-            .count();
-        let visible_pages = visible_exact
-            .iter()
-            .map(|key| key.page)
-            .collect::<HashSet<_>>()
-            .len();
-        let max_tile_bytes = self
-            .rendered
-            .values()
-            .map(|tile| tile.byte_len)
-            .max()
-            .unwrap_or(0);
-        let mut highlight_colors = HashSet::new();
-        let mut highlight_count = 0;
-        let mut comment_count = 0;
-        if let Some(annotations) = self.annotations.as_ref() {
-            for annotation in annotations.iter() {
-                if let Some(color) = annotation.highlight() {
-                    highlight_count += 1;
-                    highlight_colors.insert(color);
-                }
-                comment_count += usize::from(annotation.comment_markdown().is_some());
-            }
-        }
-        let active_search = self
-            .search
-            .active
-            .and_then(|active| self.search.order.iter().position(|id| *id == active))
-            .map_or(0, |index| index + 1);
-        let theme_name = self
-            .selected_theme
-            .as_ref()
-            .map(|name| name.as_ref())
-            .unwrap_or_else(|| self.theme_preference.name());
-        let (link_preview, link_preview_state) = self
-            .previewed_link
-            .and_then(|id| {
-                let link = self
-                    .document
-                    .as_ref()?
-                    .links
-                    .iter()
-                    .find(|link| link.id == id)?;
-                let state = match &link.target {
-                    PdfLinkTarget::Internal { .. } => {
-                        self.resolved_internal_link(id)
-                            .map_or("internal-loading", |resolved| {
-                                if resolved.matched_source {
-                                    "internal-matched"
-                                } else {
-                                    "internal-fallback"
-                                }
-                            })
-                    }
-                    PdfLinkTarget::External { url } => match self
-                        .link_preview_session
-                        .as_ref()
-                        .and_then(|session| session.website(url))
-                    {
-                        Some(WebsitePreviewState::Loading) => "external-loading",
-                        Some(WebsitePreviewState::Ready(_)) => "external-ready",
-                        Some(WebsitePreviewState::Failed(_)) => "external-failed",
-                        None => "external-unavailable",
-                    },
-                };
-                Some((id + 1, state))
-            })
-            .unwrap_or((0, "none"));
-        let scholarly_state = self
-            .current_reference_text()
-            .and_then(|reference| self.scholarly_session.state(&reference))
-            .map_or("none", |state| match state {
-                ScholarlyMetadataState::Loading => "loading",
-                ScholarlyMetadataState::Ready(_) => "ready",
-                ScholarlyMetadataState::Failed(_) => "failed",
-            });
-        let citation_source = self
-            .previewed_link
-            .and_then(|id| {
-                let document = self.document.as_ref()?;
-                let link = document.links.iter().find(|link| link.id == id)?;
-                let text = self.page_text.get(&link.page)?;
-                Some(link_source_text(text, link.bounds))
-            })
-            .filter(|source| !source.is_empty())
-            .map(|source| source.split_whitespace().collect::<Vec<_>>().join("_"))
-            .unwrap_or_else(|| "none".to_owned());
-        format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} reference_preview={} reference_group={} citation_source={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} reference_panel={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} status={:?}",
-            self.view_mode,
-            theme_name,
-            if matches!(
-                self.render_appearance,
-                RenderAppearance::ForcedColors { .. }
-            ) {
-                "forced"
-            } else {
-                "normal"
-            },
-            u8::from(self.pdf_dark_mode_enabled),
-            self.document
-                .as_ref()
-                .map_or(0, |document| document.toc.len()),
-            self.document
-                .as_ref()
-                .map_or(0, |document| document.links.len()),
-            self.qa_link_navigations,
-            link_preview,
-            self.previewed_reference.map_or(0, |index| index + 1),
-            self.current_reference_texts().len(),
-            citation_source,
-            link_preview_state,
-            scholarly_state,
-            u8::from(self.scientific_document),
-            u8::from(self.scientific_analysis_complete),
-            self.scientific_signals.reference_entries,
-            self.scientific_signals.doi_entries,
-            self.scientific_signals.bracket_citations,
-            self.scientific_signals.superscript_citations,
-            self.toc_hovered.map_or(0, |index| index + 1),
-            self.toc_hover_strength,
-            self.qa_toc_text_matches,
-            self.qa_toc_callout_holds,
-            self.zoom,
-            self.rendered.len(),
-            cached_bytes,
-            max_tile_bytes,
-            self.page_text.len(),
-            self.text_viewport.len(),
-            self.pending.len(),
-            self.render_viewport.len(),
-            exact_cached,
-            visible_exact.len(),
-            visible_pages,
-            u8::from(self.render_debounce_until.is_some()),
-            self.scroll.x,
-            self.scroll.y,
-            self.sidebar.progress,
-            self.sidebar.target,
-            self.reference_panel.value(),
-            self.reference_panel.target(),
-            self.comment_pane.progress,
-            self.comment_pane.target,
-            u8::from(self.comment_editor.is_some()),
-            u8::from(self.comment_draft_dirty),
-            u8::from(self.comment_autosave_task.is_some()),
-            self.qa_sidebar_transitions,
-            self.qa_max_sidebar_anchor_error,
-            self.annotations.as_ref().map_or(0, AnnotationSet::len),
-            highlight_count,
-            highlight_colors.len(),
-            comment_count,
-            self.annotations.as_ref().map_or(0, AnnotationSet::revision),
-            self.annotation_enqueued_revision,
-            self.annotation_saved_revision,
-            u8::from(self.annotations_loading),
-            u8::from(self.annotation_persistence_blocked),
-            self.search.order.len(),
-            self.search.searched_pages,
-            self.search.total_highlight_runs,
-            active_search,
-            self.qa_search_focuses,
-            u8::from(self.search.complete),
-            self.status,
-        )
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_use_fluid_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_view_mode(ReaderView::Fluid, window, cx);
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_set_pdf_dark_mode(
-        &mut self,
-        enabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.pdf_dark_mode_enabled = enabled;
-        self.update_render_appearance(window, cx);
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_set_toc_hovered(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        let count = self
-            .document
-            .as_ref()
-            .map_or(0, |document| document.toc.len());
-        if index >= count {
-            return Err(format!(
-                "TOC hover index {index} is outside {count} entries"
-            ));
-        }
-        self.set_toc_hovered(index, true, window, cx);
-        Ok(())
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_navigate_toc(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        let count = self
-            .document
-            .as_ref()
-            .map_or(0, |document| document.toc.len());
-        if index >= count {
-            return Err(format!(
-                "TOC navigation index {index} is outside {count} entries"
-            ));
-        }
-        self.navigate_toc(index, window, cx);
-        Ok(())
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_navigate_link(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        let Some(link) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.links.get(index))
-        else {
-            return Err(format!("link index {index} is unavailable"));
-        };
-        if !matches!(link.target, PdfLinkTarget::Internal { .. }) {
-            return Err(format!("link index {index} is not an internal destination"));
-        }
-        self.activate_document_link(link.id, window, cx);
-        self.qa_link_navigations += 1;
-        Ok(())
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_hover_link(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        let Some((id, page, bounds)) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.links.get(index))
-            .map(|link| (link.id, link.page, link.bounds))
-        else {
-            return Err(format!("link index {index} is unavailable"));
-        };
-        if let Some(page_rect) = self.layout().and_then(|layout| layout.page_rect(page)) {
-            let bounds = normalized_bounds_in_page(page_rect, bounds);
-            self.set_link_card_pointer_immediate(point(
-                px(bounds.x + bounds.width * 0.5 - self.scroll.x),
-                px(bounds.y + bounds.height * 0.5 - self.scroll.y + self.content_top()),
-            ));
-        }
-        self.hovered_link = Some(id);
-        self.show_link_preview(id, window, cx);
-        self.hovered_link = None;
-        self.link_source_hovered = false;
-        self.schedule_link_preview_clear(window, cx);
-        self.set_link_card_hovered(true, window, cx);
-        Ok(())
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_hover_internal_link(
-        &mut self,
-        ordinal: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        let Some(id) = self.document.as_ref().and_then(|document| {
-            document
-                .links
-                .iter()
-                .filter(|link| matches!(link.target, PdfLinkTarget::Internal { .. }))
-                .nth(ordinal)
-                .map(|link| link.id)
-        }) else {
-            return Err(format!("internal link ordinal {ordinal} is unavailable"));
-        };
-        self.qa_hover_link(id, window, cx)
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_hover_scientific_reference(
-        &mut self,
-        ordinal: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        if self
-            .document
-            .as_ref()
-            .is_none_or(|document| ordinal >= document.scientific_references.len())
-        {
-            return Err(format!(
-                "scientific reference ordinal {ordinal} is unavailable"
-            ));
-        }
-        if let Some((page, bounds)) = self.document.as_ref().and_then(|document| {
-            let reference = document.scientific_references.get(ordinal)?;
-            Some((
-                reference.page,
-                reference
-                    .text_runs
-                    .iter()
-                    .copied()
-                    .reduce(union_text_bounds)?,
-            ))
-        }) && let Some(page_rect) = self.layout().and_then(|layout| layout.page_rect(page))
-        {
-            let bounds = normalized_bounds_in_page(page_rect, bounds);
-            self.set_link_card_pointer_immediate(point(
-                px(bounds.x + bounds.width * 0.5 - self.scroll.x),
-                px(bounds.y + bounds.height * 0.5 - self.scroll.y + self.content_top()),
-            ));
-        }
-        self.hovered_reference = Some(ordinal);
-        self.show_reference_preview(ordinal, window, cx);
-        self.hovered_reference = None;
-        self.link_source_hovered = false;
-        self.schedule_link_preview_clear(window, cx);
-        self.set_link_card_hovered(true, window, cx);
-        Ok(())
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_open_reference_details(
-        &mut self,
-        ordinal: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<bool, String> {
-        let reference = self
-            .document
-            .as_ref()
-            .and_then(|document| document.scientific_references.get(ordinal))
-            .map(|reference| reference.text.clone())
-            .ok_or_else(|| format!("scientific reference ordinal {ordinal} is unavailable"))?;
-        match self.scholarly_session.state(&reference) {
-            Some(ScholarlyMetadataState::Ready(_)) => {
-                self.open_reference_details(reference, window, cx);
-                if std::env::var_os("GPUI_PDF_READER_QA_REFERENCE_DETAILS_EXPANDED").is_some() {
-                    self.reference_citation_expansion.set_target(1.0);
-                    self.start_animation(window, cx);
-                }
-                Ok(true)
-            }
-            Some(ScholarlyMetadataState::Loading) | None => Ok(false),
-            Some(ScholarlyMetadataState::Failed(message)) => {
-                Err(format!("reference lookup failed: {message}"))
-            }
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_hold_toc_callout(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        let index = self
-            .toc_hovered
-            .ok_or_else(|| "TOC callout hold requires a hovered entry".to_owned())?;
-        self.set_toc_hovered(index, false, window, cx);
-        self.set_toc_callout_hovered(true, window, cx);
-        self.qa_toc_callout_holds += 1;
-        Ok(())
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_select_theme(
-        &mut self,
-        name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if name != "system"
-            && !theme::bundled_themes()
-                .iter()
-                .any(|theme| theme.name == name)
-        {
-            return false;
-        }
-        let command = self.extensions.theme_command().clone();
-        let selected = if name == "system" { "" } else { name };
-        self.invoke_extension_command(
-            &InvokeExtensionCommand {
-                command,
-                payload: Some(DataValue::String(selected.to_owned())),
-            },
-            window,
-            cx,
-        );
-        true
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_viewport_is_settled(&self) -> bool {
-        if !matches!(self.status, ReaderStatus::Ready)
-            || self.render_debounce_until.is_some()
-            || !self.pending.is_empty()
-            || self.annotations_loading
-            || (!self.annotation_persistence_blocked
-                && self.annotations.as_ref().is_some_and(|annotations| {
-                    annotations.revision() > self.annotation_saved_revision
-                }))
-            || (!self.search.query.is_empty()
-                && (!self.search.complete || self.search_debounce_task.is_some()))
-            || self.sidebar.is_animating()
-            || self.comment_pane.is_animating()
-            || self.reference_panel.is_animating()
-            || self.reference_details_transition.is_animating()
-            || self.reference_citation_expansion.is_animating()
-            || self.reference_summary_transition.is_animating()
-            || self.doi_copy_started.is_some()
-            || self.link_card_expansion.is_animating()
-            || self.link_card_pointer_is_animating()
-            || self.toc_hover_is_animating()
-            || self.pending_toc_navigation.is_some()
-            || self.pending_link_navigation.is_some()
-            || !self.scientific_analysis_complete
-            || self.previewed_link.is_some_and(|id| {
-                self.document
-                    .as_ref()
-                    .and_then(|document| document.links.iter().find(|link| link.id == id))
-                    .is_some_and(|link| match &link.target {
-                        PdfLinkTarget::Internal { .. } => self.resolved_internal_link(id).is_none(),
-                        PdfLinkTarget::External { url } => self
-                            .link_preview_session
-                            .as_ref()
-                            .and_then(|session| session.website(url))
-                            .is_some_and(|state| matches!(state, WebsitePreviewState::Loading)),
-                    })
-            })
-            || self
-                .current_reference_text()
-                .and_then(|reference| self.scholarly_session.state(&reference))
-                .is_some_and(|state| matches!(state, ScholarlyMetadataState::Loading))
-            || self.navigation_focus.is_busy(Instant::now())
-            || self.comment_autosave_task.is_some()
-        {
-            return false;
-        }
-        let mut visible = self
-            .render_viewport
-            .iter()
-            .filter_map(|(key, tier)| (*tier == DemandTier::Visible).then_some(key));
-        let Some(first) = visible.next() else {
-            return false;
-        };
-        self.rendered.contains_key(first) && visible.all(|key| self.rendered.contains_key(key))
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_command_wheel(
-        &mut self,
-        delta_y: f32,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.on_scroll_wheel(
-            &ScrollWheelEvent {
-                position,
-                delta: ScrollDelta::Pixels(Point::new(px(0.0), px(delta_y))),
-                modifiers: Modifiers {
-                    platform: true,
-                    ..Default::default()
-                },
-                touch_phase: TouchPhase::Moved,
-            },
-            window,
-            cx,
-        );
-    }
-
-    #[cfg(debug_assertions)]
-    fn qa_text_range(&self, page: usize, needle: &str) -> Option<TextRange> {
-        let characters = self.page_text.get(&page)?.as_slice();
-        let needle: Vec<_> = needle.chars().collect();
-        if needle.is_empty() || needle.len() > characters.len() {
-            return None;
-        }
-        let start = characters.windows(needle.len()).position(|window| {
-            window
-                .iter()
-                .map(|character| character.value)
-                .eq(needle.iter().copied())
-        })?;
-        Some(TextRange::new(
-            TextPosition { page, index: start },
-            TextPosition {
-                page,
-                index: start + needle.len() - 1,
-            },
-        ))
-    }
-
-    #[cfg(debug_assertions)]
-    fn qa_defer_keystrokes(
-        keys: &[&str],
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        let keystrokes = keys
-            .iter()
-            .map(|key| {
-                Keystroke::parse(key)
-                    .map(|keystroke| ((*key).to_owned(), keystroke))
-                    .map_err(|error| format!("invalid QA key {key:?}: {error}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        window.defer(cx, move |window, cx| {
-            for (name, keystroke) in keystrokes {
-                if !window.dispatch_keystroke(keystroke, cx) {
-                    eprintln!("GPUI_PDF_READER_QA_ERROR key {name:?} was not handled");
-                    cx.quit();
-                    return;
-                }
-            }
-        });
-        Ok(())
-    }
-
-    #[cfg(debug_assertions)]
-    fn qa_seed_annotations_and_comment(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        let annotations = self
-            .annotations
-            .as_ref()
-            .ok_or_else(|| "annotations have not loaded".to_owned())?;
-        if annotations.iter().next().is_some() {
-            return Err("feature scenario requires a PDF with no existing sidecar".to_owned());
-        }
-        if self.annotation_persistence_blocked {
-            return Err("annotation persistence is blocked".to_owned());
-        }
-
-        let needles = ["GPUI", "PDF", "Reader", "integration", "fixture"];
-        let ranges = needles
-            .iter()
-            .map(|needle| {
-                self.qa_text_range(0, needle)
-                    .ok_or_else(|| format!("fixture text {needle:?} was not extracted"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for (range, color) in ranges.into_iter().zip(HighlightColor::ALL) {
-            self.selection = Some(range.as_selection());
-            self.add_highlight(color, cx);
-        }
-
-        let comment_range = self
-            .qa_text_range(0, "Select this sentence")
-            .ok_or_else(|| "fixture comment text was not extracted".to_owned())?;
-        self.selection = Some(comment_range.as_selection());
-        self.open_comment_editor(comment_range, None, String::new(), window, cx);
-
-        let annotations = self
-            .annotations
-            .as_ref()
-            .ok_or_else(|| "annotations disappeared while seeding".to_owned())?;
-        if annotations.len() != 5 || annotations.revision() != 5 {
-            return Err(format!(
-                "feature seeding produced {} annotations at revision {}, expected 5/5 before the comment save",
-                annotations.len(),
-                annotations.revision()
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(debug_assertions)]
-    fn qa_validate_feature_scenario(&self) -> Result<(), String> {
-        let annotations = self
-            .annotations
-            .as_ref()
-            .ok_or_else(|| "annotations disappeared".to_owned())?;
-        let colors: HashSet<_> = annotations
-            .iter()
-            .filter_map(|annotation| annotation.highlight())
-            .collect();
-        let highlights = annotations
-            .iter()
-            .filter(|annotation| annotation.highlight().is_some())
-            .count();
-        let comments = annotations
-            .iter()
-            .filter(|annotation| annotation.comment_markdown().is_some())
-            .count();
-        if annotations.len() != 6
-            || highlights != 5
-            || colors.len() != HighlightColor::ALL.len()
-            || comments != 1
-            || self.annotation_saved_revision != annotations.revision()
-        {
-            return Err(format!(
-                "unexpected persisted feature state: annotations={}, highlights={highlights}, colors={}, comments={comments}, revision={}/{},",
-                annotations.len(),
-                colors.len(),
-                annotations.revision(),
-                self.annotation_saved_revision
-            ));
-        }
-        if self.search.order.len() < 3
-            || !self.search.complete
-            || self.search.total_highlight_runs == 0
-            || self.qa_search_focuses != 5
-            || self
-                .search
-                .active
-                .and_then(|active| self.search.order.iter().position(|id| *id == active))
-                != Some(1)
-        {
-            return Err(format!(
-                "unexpected search state: results={}, runs={}, active={:?}, focuses={}, complete={}",
-                self.search.order.len(),
-                self.search.total_highlight_runs,
-                self.search.active,
-                self.qa_search_focuses,
-                self.search.complete
-            ));
-        }
-        if self.sidebar.panel != SidePanel::Search
-            || self.sidebar.progress != 1.0
-            || self.sidebar.target != 1.0
-            || self.qa_sidebar_transitions < 4
-            || self.qa_max_sidebar_anchor_error > 0.002
-        {
-            return Err(format!(
-                "unexpected sidebar state: panel={:?}, progress={}, target={}, transitions={}, anchor_error={}",
-                self.sidebar.panel,
-                self.sidebar.progress,
-                self.sidebar.target,
-                self.qa_sidebar_transitions,
-                self.qa_max_sidebar_anchor_error
-            ));
-        }
-        Ok(())
-    }
-
-    /// Advances one deterministic native feature scenario without bypassing
-    /// production annotation persistence, sidebar animation, or PDFium search.
-    #[cfg(debug_assertions)]
-    pub fn qa_drive_feature_scenario(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<bool, String> {
-        match self.qa_feature_phase {
-            QaFeaturePhase::Seed => {
-                if !self.qa_viewport_is_settled()
-                    || self.annotations_loading
-                    || !self.page_text.contains_key(&0)
-                {
-                    return Ok(false);
-                }
-                self.qa_seed_annotations_and_comment(window, cx)?;
-                self.qa_feature_phase = QaFeaturePhase::WaitCommentEditor;
-            }
-            QaFeaturePhase::WaitCommentEditor => {
-                let Some(editor) = self.comment_editor.clone() else {
-                    return Err("comment editor disappeared before its native frame".to_owned());
-                };
-                if editor.read(cx).qa_has_painted() {
-                    // Repeating Add Comment used to silently replace the open
-                    // editor and lose its draft. Exercise the production
-                    // command path and require identity/range preservation.
-                    let pending_range = self.pending_comment_range;
-                    self.add_comment(&AddComment, window, cx);
-                    if self.comment_editor.as_ref() != Some(&editor)
-                        || self.pending_comment_range != pending_range
-                    {
-                        return Err("repeated Add Comment replaced the open draft".to_owned());
-                    }
-                    self.warning = None;
-                    if std::env::var_os("GPUI_PDF_READER_QA_MARKDOWN_MENU_VISUAL").is_some() {
-                        Self::qa_defer_keystrokes(&["/", "h"], window, cx)?;
-                        self.qa_feature_phase = QaFeaturePhase::Complete;
-                        return Ok(true);
-                    }
-                    // Exercise the same native key/input path a person uses:
-                    // a slash command, multiword text, and Return-driven list
-                    // continuation. The shared debounce must persist it
-                    // without an explicit save command.
-                    Self::qa_defer_keystrokes(
-                        &[
-                            "/", "b", "u", "l", "l", "e", "t", "enter", "i", "m", "p", "o", "r",
-                            "t", "a", "n", "t", "space", "c", "o", "p", "y", "enter", "c", "h",
-                            "e", "c", "k",
-                        ],
-                        window,
-                        cx,
-                    )?;
-                    self.qa_feature_phase = QaFeaturePhase::WaitCommentEdited;
-                }
-            }
-            QaFeaturePhase::WaitCommentEdited => {
-                let Some(editor) = self.comment_editor.as_ref() else {
-                    return Err("comment editor disappeared after native editing".to_owned());
-                };
-                if !self.comment_draft_dirty {
-                    return Err("native comment edits did not mark the draft dirty".to_owned());
-                }
-                if editor.read(cx).markdown() != "- important copy\n- check" {
-                    return Ok(false);
-                }
-                self.qa_feature_phase = QaFeaturePhase::WaitCommentSaved;
-            }
-            QaFeaturePhase::WaitCommentSaved => {
-                let annotations = self
-                    .annotations
-                    .as_ref()
-                    .ok_or_else(|| "annotations disappeared after comment save".to_owned())?;
-                if annotations.len() != 6 || annotations.revision() != 6 {
-                    return Ok(false);
-                }
-                if self.comment_draft_dirty {
-                    return Ok(false);
-                }
-                if self.comment_editor.is_none() {
-                    return Err("Classic autosave closed the comment editor".to_owned());
-                }
-                let comment = annotations
-                    .iter()
-                    .find_map(|annotation| annotation.comment_markdown().map(ToOwned::to_owned))
-                    .ok_or_else(|| "native comment save produced no Markdown".to_owned())?;
-                if comment != "- important copy\n- check" {
-                    return Err(format!(
-                        "native comment input/formatting produced unexpected Markdown: {comment:?}"
-                    ));
-                }
-                self.qa_feature_phase = QaFeaturePhase::WaitCommentBack;
-            }
-            QaFeaturePhase::WaitCommentBack => {
-                let Some(editor) = self.comment_editor.clone() else {
-                    return Err("comment editor disappeared before Back QA".to_owned());
-                };
-                if editor.read(cx).qa_has_painted() {
-                    Self::qa_defer_keystrokes(&["escape"], window, cx)?;
-                    self.qa_feature_phase = QaFeaturePhase::WaitCommentList;
-                }
-            }
-            QaFeaturePhase::WaitCommentList => {
-                if self.comment_editor.is_some() {
-                    return Ok(false);
-                }
-                let annotations = self
-                    .annotations
-                    .as_ref()
-                    .ok_or_else(|| "annotations disappeared after comment cancel".to_owned())?;
-                let comment = annotations
-                    .iter()
-                    .find_map(|annotation| annotation.comment_markdown());
-                if annotations.revision() != 6 || comment != Some("- important copy\n- check") {
-                    return Err("Back changed the persisted comment".to_owned());
-                }
-                let annotation = annotations
-                    .iter()
-                    .find(|annotation| annotation.comment_markdown().is_some())
-                    .ok_or_else(|| "Classic comment vanished before parity checks".to_owned())?;
-                let id = annotation.id();
-                let start = annotation.range().start();
-                let page = self
-                    .layout()
-                    .and_then(|layout| layout.page_rect(start.page))
-                    .ok_or_else(|| "Classic hit-test page is not laid out".to_owned())?;
-                let bounds = self
-                    .page_text
-                    .get(&start.page)
-                    .and_then(|text| text.get(start.index))
-                    .and_then(|character| character.bounds)
-                    .ok_or_else(|| "Classic hit-test character has no bounds".to_owned())?;
-                let pointer = point(
-                    px(page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x),
-                    px(self.content_top()
-                        + page.y
-                        + (bounds.top + bounds.bottom) * page.height * 0.5
-                        - self.scroll.y),
-                );
-                self.active_annotation = None;
-                self.on_mouse_down(
-                    &MouseDownEvent {
-                        button: MouseButton::Left,
-                        position: pointer,
-                        click_count: 1,
-                        ..Default::default()
-                    },
-                    window,
-                    cx,
-                );
-                self.on_mouse_up(
-                    &MouseUpEvent {
-                        button: MouseButton::Left,
-                        position: pointer,
-                        ..Default::default()
-                    },
-                    window,
-                    cx,
-                );
-                if self.active_annotation != Some(id)
-                    || self.selection.is_some()
-                    || !self.context_has_comment()
-                {
-                    return Err(
-                        "clicking a Classic highlight did not expose its toolbar context".into(),
-                    );
-                }
-                self.comment_on_context(window, cx);
-                if self.comment_editor.is_none() || self.editing_annotation != Some(id) {
-                    return Err("Classic toolbar Edit Comment did not open the annotation".into());
-                }
-                self.return_to_comment_list(window, cx);
-                self.open_comment_from_list(id, window, cx);
-                if self.comment_editor.is_none() || self.editing_annotation != Some(id) {
-                    return Err("Classic comment-list row did not open the editor".into());
-                }
-                self.return_to_comment_list(window, cx);
-                self.qa_feature_phase = QaFeaturePhase::WaitCommentsOpen;
-            }
-            QaFeaturePhase::WaitCommentsOpen => {
-                if self.qa_viewport_is_settled()
-                    && self.sidebar.panel == SidePanel::Comments
-                    && self.sidebar.progress == 1.0
-                {
-                    self.toggle_sidebar(SidePanel::Comments, window, cx);
-                    // A precise trackpad packet during the slide must move the
-                    // document without cancelling the sidebar's frame chain.
-                    self.scroll_by(0.0, 12.0, true, window, cx);
-                    // Middle-button panning used to cancel the same frame
-                    // chain through a separate input branch. Press/release is
-                    // enough to prove the slide remains scheduled.
-                    let pointer = point(px(100.0), px(self.content_top() + 100.0));
-                    self.on_mouse_down(
-                        &MouseDownEvent {
-                            button: MouseButton::Middle,
-                            position: pointer,
-                            ..Default::default()
-                        },
-                        window,
-                        cx,
-                    );
-                    self.on_mouse_up(
-                        &MouseUpEvent {
-                            button: MouseButton::Middle,
-                            position: pointer,
-                            ..Default::default()
-                        },
-                        window,
-                        cx,
-                    );
-                    self.qa_feature_phase = QaFeaturePhase::WaitCommentsClosed;
-                }
-            }
-            QaFeaturePhase::WaitCommentsClosed => {
-                if self.qa_viewport_is_settled() && self.sidebar.progress == 0.0 {
-                    if !self.focus_handle.is_focused(window) {
-                        return Err(
-                            "closing Comments left a hidden comment input focused".to_owned()
-                        );
-                    }
-                    self.show_sidebar(SidePanel::Search, window, cx);
-                    self.qa_feature_phase = QaFeaturePhase::WaitSearchOpen;
-                }
-            }
-            QaFeaturePhase::WaitSearchOpen => {
-                if self.qa_viewport_is_settled()
-                    && self.sidebar.panel == SidePanel::Search
-                    && self.sidebar.progress == 1.0
-                {
-                    window.focus(&self.search_field.focus_handle(cx));
-                    Self::qa_defer_keystrokes(&["p", "a", "g", "e"], window, cx)?;
-                    self.qa_feature_phase = QaFeaturePhase::WaitSearch;
-                }
-            }
-            QaFeaturePhase::WaitSearch => {
-                if self.qa_viewport_is_settled() {
-                    if self.search_field.read(cx).text() != "page" {
-                        return Err("native search typing did not update the field".to_owned());
-                    }
-                    if self.search.order.len() < 2 {
-                        return Err(format!(
-                            "fixture search returned only {} result(s)",
-                            self.search.order.len()
-                        ));
-                    }
-                    Self::qa_defer_keystrokes(&["enter"], window, cx)?;
-                    self.qa_feature_phase = QaFeaturePhase::WaitNavigation;
-                }
-            }
-            QaFeaturePhase::WaitNavigation => {
-                if self.qa_viewport_is_settled() {
-                    let active_position = self
-                        .search
-                        .active
-                        .and_then(|active| self.search.order.iter().position(|id| *id == active));
-                    if active_position != Some(1) {
-                        return Ok(false);
-                    }
-                    self.navigate_search(false, window, cx);
-                    self.qa_feature_phase = QaFeaturePhase::WaitSearchReturn;
-                }
-            }
-            QaFeaturePhase::WaitSearchReturn => {
-                if self.qa_viewport_is_settled() {
-                    // Closing a sidebar widens the viewport. Center the
-                    // document first so preserving its center is geometrically
-                    // possible instead of being dominated by a scroll-edge
-                    // clamp near the search hit.
-                    if let Some(layout) = self.layout() {
-                        self.scroll.x = (layout.content_width - self.viewport_width).max(0.0) * 0.5;
-                        self.scroll_target.x = self.scroll.x;
-                    }
-                    self.toggle_sidebar(SidePanel::Search, window, cx);
-                    self.qa_feature_phase = QaFeaturePhase::WaitSearchClosed;
-                }
-            }
-            QaFeaturePhase::WaitSearchClosed => {
-                if self.qa_viewport_is_settled() && self.sidebar.progress == 0.0 {
-                    if !self.focus_handle.is_focused(window) {
-                        return Err("closing Search left its hidden text field focused".to_owned());
-                    }
-                    if !self.search.query.is_empty()
-                        || !self.search.order.is_empty()
-                        || !self.search_field.read(cx).text().is_empty()
-                    {
-                        return Err("closing Search did not reset its query and results".to_owned());
-                    }
-                    self.show_sidebar(SidePanel::Search, window, cx);
-                    self.qa_feature_phase = QaFeaturePhase::WaitSearchReopened;
-                }
-            }
-            QaFeaturePhase::WaitSearchReopened => {
-                if self.qa_viewport_is_settled()
-                    && self.sidebar.panel == SidePanel::Search
-                    && self.sidebar.progress == 1.0
-                {
-                    window.focus(&self.search_field.focus_handle(cx));
-                    Self::qa_defer_keystrokes(&["p", "a", "g", "e"], window, cx)?;
-                    self.qa_feature_phase = QaFeaturePhase::WaitSearchRepopulated;
-                }
-            }
-            QaFeaturePhase::WaitSearchRepopulated => {
-                if self.qa_viewport_is_settled() && self.search.order.len() >= 2 {
-                    self.navigate_search(true, window, cx);
-                    self.qa_feature_phase = QaFeaturePhase::WaitFinalNavigation;
-                }
-            }
-            QaFeaturePhase::WaitFinalNavigation => {
-                if self.qa_viewport_is_settled() {
-                    self.qa_validate_feature_scenario()?;
-                    self.qa_feature_phase = QaFeaturePhase::Complete;
-                    return Ok(true);
-                }
-            }
-            QaFeaturePhase::Complete => return Ok(true),
-        }
-        Ok(false)
-    }
-
-    /// Exercises Fluid-only interaction semantics through native editor input,
-    /// production autosave/persistence, annotation hit testing, both comment
-    /// pane slide directions, and the overlay search-panel geometry.
-    #[cfg(debug_assertions)]
-    pub fn qa_drive_fluid_scenario(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Result<bool, String> {
-        match self.qa_fluid_phase {
-            QaFluidPhase::Seed => {
-                if !self.qa_viewport_is_settled()
-                    || self.annotations_loading
-                    || !self.page_text.contains_key(&0)
-                {
-                    return Ok(false);
-                }
-                if self
-                    .annotations
-                    .as_ref()
-                    .is_none_or(|annotations| annotations.iter().next().is_some())
-                {
-                    return Err("fluid scenario requires a PDF with no existing sidecar".into());
-                }
-                self.set_view_mode(ReaderView::Fluid, window, cx);
-                let range = self
-                    .qa_text_range(0, "Select this sentence")
-                    .ok_or_else(|| "fixture Fluid text was not extracted".to_owned())?;
-                self.selection = Some(range.as_selection());
-                if std::env::var_os("GPUI_PDF_READER_QA_FLUID_SELECTION_VISUAL").is_some() {
-                    self.qa_fluid_phase = QaFluidPhase::Complete;
-                    cx.notify();
-                    return Ok(true);
-                }
-                self.add_highlight(HighlightColor::Yellow, cx);
-                let id = self
-                    .active_annotation
-                    .ok_or_else(|| "Fluid highlight did not become active".to_owned())?;
-                if self.annotation_at_text_position(range.start()) != Some(id) {
-                    return Err("highlight hit lookup did not resolve the active annotation".into());
-                }
-                self.comment_on_context(window, cx);
-                self.qa_fluid_phase = QaFluidPhase::WaitEditor;
-            }
-            QaFluidPhase::WaitEditor => {
-                let Some(editor) = self.comment_editor.clone() else {
-                    return Err("Fluid comment editor disappeared before painting".into());
-                };
-                if editor.read(cx).qa_has_painted()
-                    && self.comment_pane.progress == 1.0
-                    && self.sidebar.progress == 1.0
-                {
-                    Self::qa_defer_keystrokes(
-                        &["f", "l", "u", "i", "d", "space", "n", "o", "t", "e"],
-                        window,
-                        cx,
-                    )?;
-                    self.qa_fluid_phase = QaFluidPhase::WaitAutosave;
-                }
-            }
-            QaFluidPhase::WaitAutosave => {
-                if !self.qa_viewport_is_settled() {
-                    return Ok(false);
-                }
-                let (id, range, comment, highlight) = self
-                    .annotations
-                    .as_ref()
-                    .and_then(|annotations| {
-                        annotations.iter().find_map(|annotation| {
-                            annotation.comment_markdown().map(|comment| {
-                                (
-                                    annotation.id(),
-                                    annotation.range(),
-                                    comment.to_owned(),
-                                    annotation.highlight(),
-                                )
-                            })
-                        })
-                    })
-                    .ok_or_else(|| "Fluid autosave produced no persisted comment".to_owned())?;
-                if comment != "fluid note" || highlight != Some(HighlightColor::Yellow) {
-                    return Err(format!(
-                        "Fluid autosave produced unexpected annotation: comment={comment:?}, highlight={highlight:?}"
-                    ));
-                }
-                if self.comment_editor.is_none()
-                    || self.comment_draft_dirty
-                    || self.editing_annotation != Some(id)
-                {
-                    return Err(
-                        "Fluid autosave closed the editor or left the saved draft dirty".into(),
-                    );
-                }
-                if self.context_range() != Some(range) || !self.context_has_comment() {
-                    return Err("Fluid context did not switch from Add note to Edit note".into());
-                }
-                self.return_to_comment_list(window, cx);
-                self.qa_fluid_phase = QaFluidPhase::WaitList;
-            }
-            QaFluidPhase::WaitList => {
-                if !self.qa_viewport_is_settled()
-                    || self.comment_editor.is_some()
-                    || self.comment_pane.progress != 0.0
-                {
-                    return Ok(false);
-                }
-                let (id, start) = self
-                    .annotations
-                    .as_ref()
-                    .and_then(|annotations| {
-                        annotations.iter().find_map(|annotation| {
-                            annotation
-                                .comment_markdown()
-                                .is_some()
-                                .then_some((annotation.id(), annotation.range().start()))
-                        })
-                    })
-                    .ok_or_else(|| "Fluid comment vanished after Back".to_owned())?;
-                let page = self
-                    .layout()
-                    .and_then(|layout| layout.page_rect(start.page))
-                    .ok_or_else(|| "Fluid hit-test page is not laid out".to_owned())?;
-                let bounds = self
-                    .page_text
-                    .get(&start.page)
-                    .and_then(|text| text.get(start.index))
-                    .and_then(|character| character.bounds)
-                    .ok_or_else(|| "Fluid hit-test character has no bounds".to_owned())?;
-                let pointer = point(
-                    px(page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x),
-                    px(self.content_top()
-                        + page.y
-                        + (bounds.top + bounds.bottom) * page.height * 0.5
-                        - self.scroll.y),
-                );
-                self.active_annotation = None;
-                self.on_mouse_down(
-                    &MouseDownEvent {
-                        button: MouseButton::Left,
-                        position: pointer,
-                        click_count: 1,
-                        ..Default::default()
-                    },
-                    window,
-                    cx,
-                );
-                self.on_mouse_up(
-                    &MouseUpEvent {
-                        button: MouseButton::Left,
-                        position: pointer,
-                        ..Default::default()
-                    },
-                    window,
-                    cx,
-                );
-                if self.active_annotation != Some(id) || self.selection.is_some() {
-                    return Err("clicking a Fluid highlight did not activate it cleanly".into());
-                }
-                if std::env::var_os("GPUI_PDF_READER_QA_FLUID_CONTEXT_VISUAL").is_some() {
-                    self.qa_fluid_phase = QaFluidPhase::Complete;
-                    return Ok(true);
-                }
-                self.open_comment_from_list(id, window, cx);
-                self.qa_fluid_phase = QaFluidPhase::WaitReopenedEditor;
-            }
-            QaFluidPhase::WaitReopenedEditor => {
-                let Some(editor) = self.comment_editor.clone() else {
-                    return Err("comment-list navigation did not open the Fluid editor".into());
-                };
-                if self.comment_pane.progress == 1.0 && editor.read(cx).qa_has_painted() {
-                    if editor.read(cx).markdown() != "fluid note" {
-                        return Err("reopened Fluid editor did not preserve Markdown".into());
-                    }
-                    if std::env::var_os("GPUI_PDF_READER_QA_FLUID_EDITOR_VISUAL").is_some() {
-                        self.qa_fluid_phase = QaFluidPhase::Complete;
-                        return Ok(true);
-                    }
-                    self.return_to_comment_list(window, cx);
-                    self.qa_fluid_phase = QaFluidPhase::WaitFinalList;
-                }
-            }
-            QaFluidPhase::WaitFinalList => {
-                if self.qa_viewport_is_settled()
-                    && self.comment_editor.is_none()
-                    && self.comment_pane.progress == 0.0
-                {
-                    self.show_sidebar(SidePanel::Search, window, cx);
-                    self.qa_fluid_phase = QaFluidPhase::WaitSearchOpen;
-                }
-            }
-            QaFluidPhase::WaitSearchOpen => {
-                if self.qa_viewport_is_settled()
-                    && self.sidebar.panel == SidePanel::Search
-                    && self.sidebar.progress == 1.0
-                {
-                    window.focus(&self.search_field.focus_handle(cx));
-                    Self::qa_defer_keystrokes(&["p", "a", "g", "e"], window, cx)?;
-                    self.qa_fluid_phase = QaFluidPhase::WaitSearchResults;
-                }
-            }
-            QaFluidPhase::WaitSearchResults => {
-                if !self.qa_viewport_is_settled() {
-                    return Ok(false);
-                }
-                let annotations = self
-                    .annotations
-                    .as_ref()
-                    .ok_or_else(|| "Fluid annotations disappeared".to_owned())?;
-                let annotation = annotations
-                    .iter()
-                    .next()
-                    .ok_or_else(|| "Fluid scenario annotation disappeared".to_owned())?;
-                if self.view_mode != ReaderView::Fluid
-                    || annotations.len() != 1
-                    || annotation.highlight() != Some(HighlightColor::Yellow)
-                    || annotation.comment_markdown() != Some("fluid note")
-                    || self.active_annotation != Some(annotation.id())
-                    || !self.context_has_comment()
-                    || self.context_anchor_in_viewport().is_none()
-                    || self.search.order.len() < 2
-                    || !self.search.complete
-                {
-                    return Err(format!(
-                        "unexpected final Fluid state: view={:?}, annotations={}, results={}, complete={}",
-                        self.view_mode,
-                        annotations.len(),
-                        self.search.order.len(),
-                        self.search.complete
-                    ));
-                }
-                let layout = self
-                    .layout()
-                    .ok_or_else(|| "Fluid layout disappeared".to_owned())?;
-                let base_max = (layout.content_width - self.viewport_width).max(0.0);
-                let expected_max = base_max + self.fluid_panel_occlusion();
-                if (self.max_scroll_x(layout) - expected_max).abs() > 0.01
-                    || self.fluid_panel_occlusion() <= SIDEBAR_WIDTH
-                {
-                    return Err("Fluid panel occlusion was not added to horizontal reach".into());
-                }
-                self.qa_fluid_phase = QaFluidPhase::Complete;
-                return Ok(true);
-            }
-            QaFluidPhase::Complete => return Ok(true),
-        }
-        Ok(false)
     }
 
     fn listen_for_worker_events(
@@ -2844,6 +1017,18 @@ impl PdfReader {
                 links,
             } if generation == self.generation => {
                 self.drop_all_images(window, cx);
+                let capability_title = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("PDF");
+                if let Err(error) = self.pdf_capabilities().begin_live_document(
+                    Some(capability_title),
+                    &pages,
+                    &toc,
+                    &links,
+                ) {
+                    self.record_pdf_capability_error("document snapshot", error);
+                }
                 self.link_preview_session = match LinkPreviewSession::new() {
                     Ok(session) => Some(session),
                     Err(error) => {
@@ -2864,11 +1049,17 @@ impl PdfReader {
                 }
                 self.document = Some(DocumentState {
                     path: path.clone(),
-                    pages,
+                    pages: pages.clone(),
                     toc,
                     links,
                     scientific_references: Vec::new(),
                 });
+                if let Err(error) = self.viewport.set_document_pages(pages) {
+                    self.close_pdf_capability_generation();
+                    self.status = ReaderStatus::Error(error.to_string().into());
+                    cx.notify();
+                    return;
+                }
                 self.page_text.clear();
                 self.pending.clear();
                 self.render_viewport.clear();
@@ -2905,12 +1096,10 @@ impl PdfReader {
                     self.link_card_reposition_revision.wrapping_add(1);
                 self.pending_link_click = None;
                 self.pending_link_navigation = None;
-                self.scroll = Offset::default();
-                self.scroll_target = Offset::default();
                 self.status = ReaderStatus::Ready;
-                self.fit_width = true;
-                self.apply_fit_width();
-                self.rebuild_layout();
+                self.viewport.fit_width();
+                self.sync_viewport_snapshot();
+                self.publish_pdf_selection();
                 let title = path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -3017,6 +1206,8 @@ impl PdfReader {
                 text,
             } if generation == self.generation => {
                 self.page_text.entry(page).or_insert(text);
+                self.publish_pdf_text(page);
+                self.publish_pdf_selection();
                 self.text_pending.remove(&page);
                 self.continue_pending_copy(cx);
                 self.complete_pending_toc_navigation(page, window, cx);
@@ -3040,6 +1231,8 @@ impl PdfReader {
                 self.page_text
                     .entry(page)
                     .or_insert_with(|| Arc::new(TextLayer::empty()));
+                self.publish_pdf_text(page);
+                self.publish_pdf_selection();
                 self.text_pending.remove(&page);
                 self.warning = Some(message.into());
                 self.continue_pending_copy(cx);
@@ -3139,6 +1332,13 @@ impl PdfReader {
                         document.links.push(link);
                     }
                 }
+                let link_publication = self
+                    .document
+                    .as_ref()
+                    .map(|document| self.pdf_capabilities().publish_live_links(&document.links));
+                if let Some(Err(error)) = link_publication {
+                    self.record_pdf_capability_error("link snapshot", error);
+                }
                 if let Some(id) = self.previewed_link {
                     self.request_scholarly_for_link(id);
                 }
@@ -3161,6 +1361,7 @@ impl PdfReader {
             }
             _ => {}
         }
+        self.schedule_extension_snapshot_sync(window, cx);
         cx.notify();
     }
 
@@ -3258,6 +1459,7 @@ impl PdfReader {
             self.begin_open_path(path, window, cx);
             return;
         }
+        self.schedule_extension_snapshot_sync(window, cx);
         cx.notify();
     }
 
@@ -3279,6 +1481,386 @@ impl PdfReader {
                             .ok();
                     });
                 }
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn install_extension_dialog(
+        &mut self,
+        _: &InstallExtension,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: false,
+            prompt: Some("Install .keyext or Development Extension".into()),
+        });
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                if let Ok(Ok(Some(paths))) = prompt.await
+                    && let Some(path) = paths.into_iter().next()
+                {
+                    let _ = cx.update(|window, cx| {
+                        weak.update(cx, |reader, cx| {
+                            reader.install_extension_path(path, window, cx)
+                        })
+                        .ok();
+                    });
+                }
+            })
+            .detach();
+    }
+
+    #[cfg(not(feature = "installable-extensions"))]
+    fn install_extension_dialog(
+        &mut self,
+        _: &InstallExtension,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.warning =
+            Some("This minimal build does not include the installable extension runtime".into());
+        cx.notify();
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn install_extension_path(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let preview = match self.extensions.preview_package(&path) {
+            Ok(preview) => preview,
+            Err(error) => {
+                self.warning = Some(format!("Could not review extension: {error}").into());
+                cx.notify();
+                return;
+            }
+        };
+        let source = match preview.source {
+            PackageSourceKind::KeyextArchive => "Package archive",
+            PackageSourceKind::DevelopmentDirectory => "Local development directory",
+        };
+        let trust = if preview.publisher_verified {
+            "Publisher signature verified"
+        } else {
+            "Publisher identity is not verified"
+        };
+        let ui_kind = preview.ui_kind.as_deref().unwrap_or("host-rendered");
+        let permissions = if preview.required_permissions.is_empty() {
+            "No required permissions requested.".to_owned()
+        } else {
+            preview
+                .required_permissions
+                .iter()
+                .map(|request| format!("• {:?}: {}", request.permission, request.reason))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let detail = format!(
+            "{} {}\nLicense: {}\nTrust: {trust}\nSource: {source}\nUI: {ui_kind}\n\nRequired permissions\n{permissions}",
+            preview.name, preview.version, preview.license
+        );
+        let title = if preview.is_upgrade {
+            "Review extension update"
+        } else {
+            "Review extension installation"
+        };
+        let action = if preview.is_upgrade {
+            "Update and Enable"
+        } else {
+            "Install and Enable"
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            title,
+            Some(&detail),
+            &[PromptButton::cancel("Cancel"), PromptButton::ok(action)],
+            cx,
+        );
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                if answer.await.ok() != Some(1) {
+                    return;
+                }
+                let _ = cx.update(|window, cx| {
+                    weak.update(cx, |reader, cx| {
+                        reader.install_extension_after_review(path, preview, window, cx)
+                    })
+                    .ok();
+                });
+            })
+            .detach();
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn install_extension_after_review(
+        &mut self,
+        path: PathBuf,
+        preview: PackageInstallPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let verb = if preview.is_upgrade {
+            "Updated"
+        } else {
+            "Installed"
+        };
+        let mut report = match self.extensions.install_reviewed_package(&path, &preview) {
+            Ok(report) => report,
+            Err(error) => {
+                self.warning = Some(format!("Could not install extension: {error}").into());
+                cx.notify();
+                return;
+            }
+        };
+        if matches!(report.activation, PackageActivation::AwaitingPermissions(_)) {
+            report = match self.extensions.approve_package(&report.extension) {
+                Ok(report) => report,
+                Err(error) => {
+                    self.warning =
+                        Some(format!("Could not enable {}: {error}", preview.name).into());
+                    self.refresh_extension_manager_state();
+                    crate::rebuild_application_menus(&mut self.extensions, cx);
+                    cx.notify();
+                    return;
+                }
+            };
+        }
+        self.handle_package_report(report, verb, window, cx);
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn handle_package_report(
+        &mut self,
+        report: crate::extension_packages::PackageInstallReport,
+        verb: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match report.activation {
+            PackageActivation::Active => {
+                self.warning = Some(format!("{verb} {} {}", report.name, report.version).into());
+                self.refresh_extension_manager_state();
+                crate::rebuild_application_menus(&mut self.extensions, cx);
+                self.schedule_extension_snapshot_sync(window, cx);
+            }
+            PackageActivation::Inactive(reason) => {
+                self.warning = Some(
+                    format!(
+                        "{verb} {} {}, but it is inactive: {reason}",
+                        report.name, report.version
+                    )
+                    .into(),
+                );
+                self.refresh_extension_manager_state();
+                crate::rebuild_application_menus(&mut self.extensions, cx);
+            }
+            PackageActivation::AwaitingPermissions(permissions) => {
+                let permission_detail = permissions
+                    .iter()
+                    .map(|request| format!("• {:?}: {}", request.permission, request.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let trust = if report.publisher_verified {
+                    "Publisher signature verified."
+                } else {
+                    "Local package; publisher identity is not verified."
+                };
+                let detail = format!(
+                    "{} {}\nLicense: {}\n{trust}\n\n{permission_detail}",
+                    report.name, report.version, report.license
+                );
+                let extension = report.extension;
+                let name = report.name;
+                let version = report.version;
+                let answer = window.prompt(
+                    PromptLevel::Warning,
+                    "Allow extension permissions?",
+                    Some(&detail),
+                    &[
+                        PromptButton::cancel("Keep Disabled"),
+                        PromptButton::ok("Allow and Enable"),
+                    ],
+                    cx,
+                );
+                let weak = cx.weak_entity();
+                window
+                    .spawn(cx, async move |cx| {
+                        let allow = answer.await.ok() == Some(1);
+                        let _ = cx.update(|window, cx| {
+                            weak.update(cx, |reader, cx| {
+                                if allow {
+                                    match reader.extensions.approve_package(&extension) {
+                                        Ok(report)
+                                            if report.activation == PackageActivation::Active =>
+                                        {
+                                            reader.warning = Some(
+                                                format!("{verb} {name} {version}").into(),
+                                            );
+                                        }
+                                        Ok(report) => {
+                                            reader.warning = Some(
+                                                format!(
+                                                    "Installed {name}, but activation remains {:?}",
+                                                    report.activation
+                                                )
+                                                .into(),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            reader.warning = Some(
+                                                format!("Could not enable {name}: {error}").into(),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    match reader.extensions.deny_package_permissions(&extension) {
+                                        Ok(()) => {
+                                            reader.warning = Some(
+                                                if verb == "Updated" {
+                                                    format!(
+                                                        "Kept the current {name} version; update not applied"
+                                                    )
+                                                } else {
+                                                    format!("Kept {name} disabled")
+                                                }
+                                                .into(),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            reader.warning = Some(
+                                                format!("Could not keep {name} disabled: {error}")
+                                                    .into(),
+                                            );
+                                        }
+                                    }
+                                }
+                                reader.refresh_extension_manager_state();
+                                crate::rebuild_application_menus(&mut reader.extensions, cx);
+                                reader.refresh_active_extension_view(window, cx);
+                                reader.schedule_extension_snapshot_sync(window, cx);
+                                cx.notify();
+                            })
+                            .ok();
+                        });
+                    })
+                    .detach();
+            }
+        }
+        cx.notify();
+    }
+
+    fn manage_extensions(
+        &mut self,
+        _: &ManageExtensions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(feature = "installable-extensions")]
+        self.refresh_extension_manager_state();
+        self.show_sidebar(SidePanel::Extensions, window, cx);
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn enable_extension(
+        &mut self,
+        extension: ExtensionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.extensions.enable_package(&extension) {
+            Ok(report) => self.handle_package_report(report, "Enabled", window, cx),
+            Err(error) => {
+                self.warning = Some(format!("Could not enable extension: {error}").into());
+                self.refresh_extension_manager_state();
+                cx.notify();
+            }
+        }
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn disable_extension(
+        &mut self,
+        extension: ExtensionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.extensions.disable_package(&extension) {
+            Ok(()) => {
+                if self
+                    .extension_contribution
+                    .as_ref()
+                    .is_some_and(|pane| pane.owner == extension)
+                {
+                    self.extension_contribution = None;
+                    self.sidebar.panel = SidePanel::Extensions;
+                }
+                self.warning = Some("Extension disabled".into());
+                self.refresh_extension_manager_state();
+                crate::rebuild_application_menus(&mut self.extensions, cx);
+            }
+            Err(error) => {
+                self.warning = Some(format!("Could not disable extension: {error}").into());
+            }
+        }
+        self.refresh_active_extension_view(window, cx);
+        cx.notify();
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn confirm_remove_extension(
+        &mut self,
+        extension: ExtensionId,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Remove extension?",
+            Some(&format!("Remove {name} from this reader session?")),
+            &[PromptButton::cancel("Cancel"), PromptButton::ok("Remove")],
+            cx,
+        );
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                if answer.await.ok() != Some(1) {
+                    return;
+                }
+                let _ = cx.update(|window, cx| {
+                    weak.update(cx, |reader, cx| {
+                        match reader.extensions.remove_package(&extension) {
+                            Ok(()) => {
+                                if reader
+                                    .extension_contribution
+                                    .as_ref()
+                                    .is_some_and(|pane| pane.owner == extension)
+                                {
+                                    reader.extension_contribution = None;
+                                    reader.sidebar.panel = SidePanel::Extensions;
+                                }
+                                reader.warning = Some(format!("Removed {name}").into());
+                                reader.refresh_extension_manager_state();
+                                crate::rebuild_application_menus(&mut reader.extensions, cx);
+                            }
+                            Err(error) => {
+                                reader.warning =
+                                    Some(format!("Could not remove {name}: {error}").into());
+                            }
+                        }
+                        reader.refresh_active_extension_view(window, cx);
+                        cx.notify();
+                    })
+                    .ok();
+                });
             })
             .detach();
     }
@@ -3330,7 +1912,9 @@ impl PdfReader {
 
     fn begin_open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_open = None;
+        self.extensions.invalidate_document_scope();
         self.generation = self.generation.wrapping_add(1);
+        self.close_pdf_capability_generation();
         self.link_preview_fetcher.begin_document(self.generation);
         self.scholarly_fetcher.begin_document(self.generation);
         self.link_preview_session = None;
@@ -3359,8 +1943,10 @@ impl PdfReader {
         self.scientific_document = false;
         self.drop_all_images(window, cx);
         self.document = None;
-        self.layout = None;
+        self.viewport.clear_document();
+        self.sync_viewport_snapshot();
         self.page_text.clear();
+        self.extension_text_statistics.clear();
         self.pending.clear();
         self.render_viewport.clear();
         self.text_viewport.clear();
@@ -3414,8 +2000,6 @@ impl PdfReader {
         self.toc_hover_revision = self.toc_hover_revision.wrapping_add(1);
         self.pending_toc_navigation = None;
         self.navigation_focus.cancel();
-        self.scroll = Offset::default();
-        self.scroll_target = Offset::default();
         self.animation_active = false;
         #[cfg(debug_assertions)]
         {
@@ -3442,64 +2026,146 @@ impl PdfReader {
     }
 
     fn layout(&self) -> Option<&DocumentLayout> {
-        self.layout.as_deref()
+        self.viewport.layout()
     }
 
-    fn rebuild_layout(&mut self) {
-        let Some(document) = self.document.as_ref() else {
-            self.layout = None;
+    fn pdf_capabilities(&self) -> Arc<PdfCapabilityBridge> {
+        self.extensions.pdf_capabilities()
+    }
+
+    fn close_pdf_capability_generation(&mut self) {
+        self.extension_overlays = None;
+        let _ = self.pdf_capabilities().close_document();
+    }
+
+    fn record_pdf_capability_error(&mut self, operation: &str, error: PdfExtensionError) {
+        if !matches!(error, PdfExtensionError::NoActiveDocument) {
+            self.warning = Some(format!("PDF extension {operation} unavailable: {error}").into());
+        }
+    }
+
+    fn publish_pdf_text(&mut self, page: usize) {
+        let Some(text) = self.page_text.get(&page).cloned() else {
             return;
         };
-        let layout = if let Some(layout) = self.layout.as_deref() {
-            // `open_path()` clears the layout before replacing the document,
-            // so an existing layout always owns this document's geometry.
-            debug_assert_eq!(layout.page_count(), document.pages.len());
-            layout.rescaled(self.zoom, self.viewport_width)
-        } else {
-            DocumentLayout::new(&document.pages, self.zoom, self.viewport_width)
+        self.extension_text_statistics
+            .insert(page, text_layer_statistics(&text));
+        if let Err(error) = self.pdf_capabilities().publish_live_text(page, &text) {
+            self.record_pdf_capability_error("text snapshot", error);
+        }
+    }
+
+    fn publish_pdf_selection(&mut self) {
+        let bridge = self.pdf_capabilities();
+        let selection = self.selection;
+        let result = bridge.publish_live_selection(selection, |page| {
+            self.page_text.get(&page).map(AsRef::as_ref)
+        });
+        if let Err(error) = result {
+            self.record_pdf_capability_error("selection snapshot", error);
+        }
+    }
+
+    fn publish_pdf_viewport(&mut self) {
+        let Some(layout) = self.layout().cloned() else {
+            return;
         };
-        self.layout = Some(Arc::new(layout));
+        let visible_width = self.panel_safe_viewport_width();
+        let result = self.pdf_capabilities().publish_live_viewport(
+            self.zoom,
+            &layout,
+            self.scroll.x,
+            self.scroll.y,
+            visible_width,
+            self.viewport_height,
+        );
+        if let Err(error) = result {
+            self.record_pdf_capability_error("viewport snapshot", error);
+        }
+    }
+
+    fn consume_pdf_extension_outputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bridge = self.pdf_capabilities();
+        match bridge.take_pending_navigation() {
+            Ok(Some(pending)) => {
+                let _accepted_revision = pending.receipt.viewport_revision;
+                self.perform_document_jump(pending.jump, window, cx);
+            }
+            Ok(None) | Err(PdfExtensionError::NoActiveDocument) => {}
+            Err(error) => self.record_pdf_capability_error("navigation", error),
+        }
+        match bridge.active_overlays() {
+            Ok(overlays) => self.extension_overlays = overlays,
+            Err(PdfExtensionError::NoActiveDocument) => self.extension_overlays = None,
+            Err(error) => self.record_pdf_capability_error("overlays", error),
+        }
+    }
+
+    /// Refreshes the paint-shell compatibility snapshot. The reusable
+    /// controller is the sole mutable authority for these values; keeping the
+    /// scalars here avoids coupling the rest of the product UI to its API in
+    /// one all-or-nothing migration.
+    fn sync_viewport_snapshot(&mut self) {
+        let snapshot = self.viewport.snapshot();
+        self.zoom = snapshot.zoom;
+        self.fit_width = snapshot.fit_width;
+        self.scroll = snapshot.scroll;
+        self.scroll_target = snapshot.scroll_target;
+        self.viewport_width = snapshot.metrics.width;
+        self.viewport_height = snapshot.metrics.height;
+        self.viewport.drain_events().for_each(drop);
+        self.publish_pdf_viewport();
     }
 
     fn update_viewport(&mut self, window: &Window) {
         let size = window.viewport_size();
-        let previous_width = self.viewport_width;
-        let previous_zoom = self.zoom;
         let full_width = f32::from(size.width).max(1.0);
-        self.viewport_width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
+        let width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
         let error_height = self.content_top() - TOOLBAR_HEIGHT;
-        self.viewport_height = (f32::from(size.height) - TOOLBAR_HEIGHT - error_height).max(1.0);
-        if self.fit_width {
-            self.apply_fit_width();
-        }
-        if (self.viewport_width - previous_width).abs() > 0.01
-            || (self.zoom - previous_zoom).abs() > 0.0001
-        {
-            self.rebuild_layout();
-        }
-        self.clamp_scroll();
+        let height = (f32::from(size.height) - TOOLBAR_HEIGHT - error_height).max(1.0);
+        let right_occlusion = if self.view_mode == ReaderView::Fluid {
+            fluid_sidebar_extent(width, self.sidebar.progress)
+                + reference_panel_extent(width, self.reference_panel.value())
+        } else {
+            0.0
+        };
+        self.viewport.set_viewport(ViewportMetrics {
+            width,
+            height,
+            right_occlusion,
+            scale_factor: window.scale_factor(),
+        });
+        self.sync_viewport_snapshot();
     }
 
     fn update_sidebar_viewport_preserving_anchor(&mut self, window: &Window) {
         let size = window.viewport_size();
         let full_width = f32::from(size.width).max(1.0);
         let next_width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
-        if (next_width - self.viewport_width).abs() > 0.01 {
-            self.viewport_width = next_width;
-            self.rebuild_layout();
-        }
+        let right_occlusion = if self.view_mode == ReaderView::Fluid {
+            fluid_sidebar_extent(next_width, self.sidebar.progress)
+                + reference_panel_extent(next_width, self.reference_panel.value())
+        } else {
+            0.0
+        };
+        self.viewport.set_viewport(ViewportMetrics {
+            width: next_width,
+            height: self.viewport_height,
+            right_occlusion,
+            scale_factor: window.scale_factor(),
+        });
+        self.sync_viewport_snapshot();
         if let Some(anchor) = self.sidebar_anchor
             && let Some((x, y)) = self
                 .layout()
                 .and_then(|layout| layout.content_point_for_anchor(anchor))
         {
-            self.scroll = Offset {
+            self.viewport.set_scroll(Offset {
                 x: x - self.panel_safe_viewport_width() * 0.5,
                 y: y - self.viewport_height * 0.5,
-            };
-            self.scroll_target = self.scroll;
+            });
+            self.sync_viewport_snapshot();
         }
-        self.clamp_scroll();
     }
 
     fn sidebar_reserved_width(&self, full_width: f32) -> f32 {
@@ -3529,8 +2195,8 @@ impl PdfReader {
         (self.viewport_width - self.fluid_panel_occlusion()).max(1.0)
     }
 
-    fn max_scroll_x(&self, layout: &DocumentLayout) -> f32 {
-        (layout.content_width - self.viewport_width + self.fluid_panel_occlusion()).max(0.0)
+    fn max_scroll_x(&self, _layout: &DocumentLayout) -> f32 {
+        self.viewport.maximum_scroll().x
     }
 
     fn set_view_mode(&mut self, mode: ReaderView, window: &mut Window, cx: &mut Context<Self>) {
@@ -3543,7 +2209,8 @@ impl PdfReader {
                 self.scroll.y + self.viewport_height * 0.5,
             )
         });
-        self.fit_width = false;
+        self.viewport.disable_fit_width();
+        self.sync_viewport_snapshot();
         self.cancel_comment_autosave();
         self.view_mode = mode;
         let editor_open = self.comment_editor.is_some();
@@ -3554,7 +2221,6 @@ impl PdfReader {
         };
         self.update_sidebar_viewport_preserving_anchor(window);
         self.sidebar_anchor = None;
-        self.clamp_scroll();
         self.request_visible_tiles(window);
         if self.comment_draft_dirty {
             self.schedule_comment_autosave(window, cx);
@@ -3568,6 +2234,228 @@ impl PdfReader {
 
     fn use_fluid_view(&mut self, _: &FluidView, window: &mut Window, cx: &mut Context<Self>) {
         self.set_view_mode(ReaderView::Fluid, window, cx);
+    }
+
+    #[cfg(feature = "installable-extensions")]
+    fn refresh_extension_manager_state(&mut self) {
+        self.extension_packages = self.extensions.installed_packages();
+        self.extension_commands = self.extensions.installed_commands();
+    }
+
+    fn refresh_active_extension_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .extension_contribution
+            .as_ref()
+            .map(|pane| pane.id.clone())
+        else {
+            return;
+        };
+        let Some(owned) = self.extensions.contribution_view(&id) else {
+            self.extension_contribution = None;
+            if self.sidebar.panel == SidePanel::Contribution {
+                self.sidebar.panel = SidePanel::Extensions;
+            }
+            return;
+        };
+        let Ok(state) = BoundedStateMap::new(owned.state, Default::default()) else {
+            self.warning = Some("Extension view state exceeded host rendering limits".into());
+            return;
+        };
+        if let Some(pane) = self.extension_contribution.as_ref() {
+            pane.view.update(cx, |view, cx| {
+                view.set_state(state, window, cx);
+            });
+        }
+    }
+
+    fn open_extension_contribution(
+        &mut self,
+        contribution: &ContributionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> EffectResult {
+        let Some(owned) = self.extensions.contribution_view(contribution) else {
+            return Err(ExtensionError {
+                code: ExtensionErrorCode::NotFound,
+                message: "the contribution is no longer active".into(),
+                retryable: true,
+            });
+        };
+        if !matches!(
+            owned.view.slot,
+            ContributionSlot::SidePanel | ContributionSlot::SettingsPanel
+        ) {
+            return Err(ExtensionError {
+                code: ExtensionErrorCode::CapabilityUnavailable,
+                message: "this reader currently opens side-panel and settings contributions".into(),
+                retryable: false,
+            });
+        }
+        let owner = owned.owner.clone();
+        #[cfg(feature = "installable-extensions")]
+        let title = self
+            .extension_packages
+            .iter()
+            .find(|summary| summary.extension == owner)
+            .map(|summary| SharedString::from(summary.name.clone()))
+            .unwrap_or_else(|| SharedString::from("Extension"));
+        #[cfg(not(feature = "installable-extensions"))]
+        let title = SharedString::from("Extension");
+        let id = owned.view.id.clone();
+        let view = cx.new(|cx| DeclarativeView::new(owned, window, cx));
+        self.extension_contribution = Some(ExtensionContributionPane {
+            id,
+            owner,
+            title,
+            view,
+        });
+        self.show_sidebar(SidePanel::Contribution, window, cx);
+        Ok(DataValue::Null)
+    }
+
+    fn close_extension_contribution(
+        &mut self,
+        contribution: Option<&ContributionId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> EffectResult {
+        if contribution.is_some_and(|id| {
+            self.extension_contribution
+                .as_ref()
+                .is_none_or(|pane| pane.id != *id)
+        }) {
+            return Ok(DataValue::Null);
+        }
+        if self.sidebar.panel == SidePanel::Contribution && self.sidebar.target > 0.5 {
+            self.toggle_sidebar(SidePanel::Contribution, window, cx);
+        }
+        self.extension_contribution = None;
+        Ok(DataValue::Null)
+    }
+
+    fn extension_snapshot_values(&self) -> Vec<(SnapshotKind, DataValue)> {
+        let page_count = self
+            .document
+            .as_ref()
+            .map_or(0, |document| document.pages.len());
+        let title = self
+            .document
+            .as_ref()
+            .and_then(|document| document.path.file_name())
+            .map(|name| bounded_snapshot_string(&name.to_string_lossy(), 256))
+            .unwrap_or_default();
+        let (word_count, character_count) = self.extension_text_statistics.values().copied().fold(
+            (0usize, 0usize),
+            |(words, characters), item| {
+                (
+                    words.saturating_add(item.0),
+                    characters.saturating_add(item.1),
+                )
+            },
+        );
+        let statistics = data_record([
+            ("page-count", DataValue::Integer(bounded_i64(page_count))),
+            ("word-count", DataValue::Integer(bounded_i64(word_count))),
+            (
+                "character-count",
+                DataValue::Integer(bounded_i64(character_count)),
+            ),
+            (
+                "text-pages-known",
+                DataValue::Integer(bounded_i64(self.extension_text_statistics.len())),
+            ),
+        ]);
+        let document = data_record([
+            ("open", DataValue::Boolean(self.document.is_some())),
+            (
+                "generation",
+                DataValue::Integer(bounded_i64(self.generation)),
+            ),
+            ("title", DataValue::String(title)),
+            ("statistics", statistics),
+            ("scientific", DataValue::Boolean(self.scientific_document)),
+        ]);
+
+        let current_page = self
+            .layout()
+            .map(|layout| layout.current_page(self.scroll.y, self.viewport_height));
+        let viewport = data_record([
+            ("zoom", DataValue::Number(f64::from(self.zoom))),
+            ("scroll-x", DataValue::Number(f64::from(self.scroll.x))),
+            ("scroll-y", DataValue::Number(f64::from(self.scroll.y))),
+            ("width", DataValue::Number(f64::from(self.viewport_width))),
+            ("height", DataValue::Number(f64::from(self.viewport_height))),
+            (
+                "current-page",
+                current_page.map_or(DataValue::Null, |page| {
+                    DataValue::Integer(bounded_i64(page))
+                }),
+            ),
+        ]);
+
+        let selection = self.selection.map_or_else(
+            || data_record([("active", DataValue::Boolean(false))]),
+            |selection| {
+                let (start, end) = selection.ordered();
+                data_record([
+                    ("active", DataValue::Boolean(true)),
+                    ("start-page", DataValue::Integer(bounded_i64(start.page))),
+                    (
+                        "start-character",
+                        DataValue::Integer(bounded_i64(start.index)),
+                    ),
+                    ("end-page", DataValue::Integer(bounded_i64(end.page))),
+                    ("end-character", DataValue::Integer(bounded_i64(end.index))),
+                ])
+            },
+        );
+        vec![
+            (SnapshotKind::Document, document),
+            (SnapshotKind::Viewport, viewport),
+            (SnapshotKind::Selection, selection),
+        ]
+    }
+
+    /// Executes bounded host ticks from event/animation callbacks, never from
+    /// `Render`. High-frequency navigation is coalesced by snapshot equality.
+    fn flush_extension_snapshots(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let report = match self
+            .extensions
+            .publish_snapshots(self.extension_snapshot_values())
+        {
+            Ok(report) => report,
+            Err(error) => {
+                self.warning = Some(format!("Extension snapshot failed: {error}").into());
+                return;
+            }
+        };
+        self.refresh_active_extension_view(window, cx);
+        if !report.effects.is_empty() {
+            self.execute_extension_effects(report.effects, window, cx);
+        }
+        if report.deferred_events > 0 {
+            self.schedule_extension_snapshot_sync(window, cx);
+        }
+    }
+
+    fn schedule_extension_snapshot_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.extension_snapshot_dispatch.request() {
+            return;
+        }
+        let weak = cx.weak_entity();
+        self.extension_snapshot_task = Some(window.spawn(cx, async move |cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(24))
+                .await;
+            let _ = cx.update(|window, cx| {
+                weak.update(cx, |reader, cx| {
+                    reader.extension_snapshot_task = None;
+                    reader.extension_snapshot_dispatch.begin_dispatch();
+                    reader.flush_extension_snapshots(window, cx);
+                })
+                .ok();
+            });
+        }));
     }
 
     fn apply_theme_selection(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -3602,6 +2490,9 @@ impl PdfReader {
             }
         };
         self.execute_extension_effects(effects, window, cx);
+        #[cfg(feature = "installable-extensions")]
+        self.refresh_extension_manager_state();
+        crate::rebuild_application_menus(&mut self.extensions, cx);
     }
 
     fn execute_extension_effects(
@@ -3610,6 +2501,7 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.refresh_active_extension_view(window, cx);
         const MAX_COMPLETION_CHAIN: usize = 64;
         let mut pending = VecDeque::from(effects);
         let mut completed = 0;
@@ -3621,13 +2513,17 @@ impl PdfReader {
             completed += 1;
             let result = self.execute_extension_effect(&effect, window, cx);
             match self.extensions.complete_effect(&effect, result) {
-                Ok(report) => pending.extend(report.effects),
+                Ok(report) => {
+                    pending.extend(report.effects);
+                    self.refresh_active_extension_view(window, cx);
+                }
                 Err(error) => {
                     self.warning = Some(format!("Extension completion failed: {error}").into());
                     break;
                 }
             }
         }
+        self.consume_pdf_extension_outputs(window, cx);
         cx.notify();
     }
 
@@ -3646,6 +2542,17 @@ impl PdfReader {
                 self.apply_theme_selection(name, window, cx);
                 Ok(DataValue::Null)
             }
+            ExtensionEffect::CapabilityCall {
+                capability,
+                operation,
+                input,
+            } if PdfCapability::from_name(capability.as_str()).is_some() => {
+                let capability = PdfCapability::from_name(capability.as_str())
+                    .expect("guard resolved a PDF capability");
+                self.pdf_capabilities()
+                    .call(capability, operation, input.clone())
+                    .map_err(pdf_capability_extension_error)
+            }
             ExtensionEffect::CopyText { text } => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 Ok(DataValue::Null)
@@ -3657,6 +2564,12 @@ impl PdfReader {
                     message: error.to_string(),
                     retryable: true,
                 }),
+            ExtensionEffect::OpenContribution { contribution } => {
+                self.open_extension_contribution(contribution, window, cx)
+            }
+            ExtensionEffect::CloseContribution { contribution } => {
+                self.close_extension_contribution(Some(contribution), window, cx)
+            }
             _ => Err(ExtensionError {
                 code: ExtensionErrorCode::CapabilityUnavailable,
                 message: "the reader does not implement this extension effect yet".into(),
@@ -3698,8 +2611,9 @@ impl PdfReader {
         }
         // A panel transition is a viewport slide. Holding zoom fixed avoids a
         // render-scale churn on every animation frame when Fit was last used.
-        self.fit_width = false;
-        self.scroll_target = self.scroll;
+        self.viewport.disable_fit_width();
+        self.viewport.set_scroll(self.scroll);
+        self.sync_viewport_snapshot();
         self.reference_panel.set_target(0.0);
         self.sidebar.toggle(panel);
         if search_was_open && (self.sidebar.panel != SidePanel::Search || self.sidebar.target < 0.5)
@@ -3750,821 +2664,22 @@ impl PdfReader {
         }
     }
 
-    fn find_document(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_sidebar(SidePanel::Search, window, cx);
-        window.focus(&self.search_field.focus_handle(cx));
-    }
-
-    fn toggle_comments(&mut self, _: &ToggleComments, window: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_sidebar(SidePanel::Comments, window, cx);
-    }
-
-    fn next_search_result(
-        &mut self,
-        _: &NextSearchResult,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.navigate_search(true, window, cx);
-    }
-
-    fn previous_search_result(
-        &mut self,
-        _: &PreviousSearchResult,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.navigate_search(false, window, cx);
-    }
-
-    fn set_search_query(&mut self, query: String, cx: &mut Context<Self>) {
-        let cleared_input_error = self.search.input_error.take().is_some();
-        if self.search.query == query {
-            if cleared_input_error {
-                if let Err(error) = SearchQuery::new(&query)
-                    && !matches!(error, crate::search::SearchQueryError::Empty)
-                {
-                    self.search.input_error = Some(error.to_string().into());
-                }
-                cx.notify();
-            }
-            return;
-        }
-        self.search.revision = self.search.revision.wrapping_add(1);
-        self.navigation_focus.cancel();
-        self.search.query = query.clone();
-        self.search.pages.clear();
-        self.search.order.clear();
-        self.search.active = None;
-        self.search.searched_pages = 0;
-        self.search.total_highlight_runs = 0;
-        self.search.complete = false;
-        self.search.truncated = false;
-        self.search_list_state.reset(0);
-        self.search_debounce_task = None;
-        let _ = self
-            .worker
-            .cancel_search(self.generation, self.search.revision);
-
-        let search_query = match SearchQuery::new(&query) {
-            Ok(query) => query,
-            Err(crate::search::SearchQueryError::Empty) => {
-                self.search.complete = true;
-                cx.notify();
-                return;
-            }
-            Err(error) => {
-                self.search.complete = true;
-                self.search.input_error = Some(error.to_string().into());
-                cx.notify();
-                return;
-            }
-        };
-        let generation = self.generation;
-        let revision = self.search.revision;
-        self.search_debounce_task = Some(cx.spawn(async move |weak, cx| {
-            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
-            weak.update(cx, |reader, cx| {
-                if reader.generation == generation && reader.search.revision == revision {
-                    reader.search_debounce_task = None;
-                    if !reader.worker.search(generation, revision, search_query) {
-                        reader.search.complete = true;
-                        reader.warning = Some("The PDF search worker is unavailable".into());
-                    }
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn activate_search_match(
-        &mut self,
-        id: SearchMatchId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(result) = self
-            .search
-            .pages
-            .get(&id.page)
-            .and_then(|matches| matches.iter().find(|result| result.id == id))
-        else {
-            return;
-        };
-        let jump = search_document_jump(result);
-        self.search.active = Some(id);
-        if let Some(index) = search_list_rows(&self.search.order).iter().position(
-            |row| matches!(row, SearchListRow::Match { id: candidate, .. } if *candidate == id),
-        ) {
-            self.search_list_state.scroll_to_reveal_item(index);
-        }
-        self.perform_document_jump(jump, window, cx);
-        #[cfg(debug_assertions)]
-        {
-            self.qa_search_focuses += 1;
-        }
-    }
-
-    fn navigate_search(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = next_search_match_id(&self.search.order, self.search.active, forward) else {
-            return;
-        };
-        self.activate_search_match(id, window, cx);
-    }
-
-    fn persist_annotations(&mut self) -> bool {
-        if self.annotation_persistence_blocked {
-            return false;
-        }
-        let (Some(document), Some(identity), Some(annotations)) = (
-            self.document.as_ref(),
-            self.annotation_identity.clone(),
-            self.annotations.clone(),
-        ) else {
-            return false;
-        };
-        let revision = annotations.revision();
-        if !self.annotation_io.save(
-            self.generation,
-            document.path.clone(),
-            identity,
-            self.annotation_saved_revision,
-            annotations,
-        ) {
-            self.annotation_failed_revision = Some(revision);
-            self.annotation_error = Some("The annotation sidecar worker is unavailable".into());
-            false
-        } else {
-            self.annotation_enqueued_revision = self.annotation_enqueued_revision.max(revision);
-            true
-        }
-    }
-
-    fn refresh_comment_order(&mut self) {
-        self.comment_order = self
-            .annotations
-            .as_ref()
-            .map(|annotations| {
-                let mut comments = Vec::with_capacity(annotations.len());
-                comments.extend(
-                    annotations
-                        .iter()
-                        .filter(|annotation| annotation.comment_markdown().is_some())
-                        .map(|annotation| annotation.id()),
-                );
-                comments
-            })
-            .unwrap_or_default();
-    }
-
-    fn add_highlight(&mut self, color: HighlightColor, cx: &mut Context<Self>) {
-        if self.annotations_loading {
-            self.annotation_error = Some("Annotations are still loading".into());
-            cx.notify();
-            return;
-        }
-        if self.annotation_persistence_blocked {
-            if self.annotation_error.is_none() {
-                self.annotation_error =
-                    Some("Annotations are disabled because the sidecar could not be loaded".into());
-            }
-            cx.notify();
-            return;
-        }
-        let range = self.selection.map(TextRange::from_selection).or_else(|| {
-            self.active_annotation.and_then(|id| {
-                self.annotations
-                    .as_ref()
-                    .and_then(|annotations| annotations.get(id))
-                    .map(|annotation| annotation.range())
-            })
-        });
-        let Some(range) = range else {
-            self.warning = Some("Select text before adding a highlight".into());
-            cx.notify();
-            return;
-        };
-        if range.end().index > MAX_TEXT_CHARACTER_INDEX {
-            self.warning = Some(
-                "Highlighting Select All is not supported yet; select a concrete text range".into(),
-            );
-            cx.notify();
-            return;
-        }
-        let Some(annotations) = self.annotations.as_mut() else {
-            return;
-        };
-        let existing = annotations
-            .overlapping(range)
-            .filter(|annotation| annotation.range() == range)
-            .max_by_key(|annotation| (annotation.updated_revision(), annotation.id()))
-            .map(|annotation| {
-                (
-                    annotation.id(),
-                    annotation.comment_markdown().map(ToOwned::to_owned),
-                )
-            });
-        let result = if let Some((id, comment)) = existing {
-            annotations
-                .update(id, range, Some(color), comment)
-                .map(|changed| (id, changed))
-        } else {
-            annotations
-                .add(range, Some(color), None)
-                .map(|id| (id, true))
-        };
-        match result {
-            Ok((id, changed)) => {
-                if self.annotation_failed_revision.is_none() && !self.annotation_persistence_blocked
-                {
-                    self.annotation_error = None;
-                }
-                self.active_annotation = Some(id);
-                self.selection = None;
-                if changed
-                    || self.annotations.as_ref().is_some_and(|annotations| {
-                        annotations.revision() > self.annotation_saved_revision
-                    })
-                {
-                    let _ = self.persist_annotations();
-                }
-                self.refresh_comment_order();
-            }
-            Err(error) => self.warning = Some(error.to_string().into()),
-        }
-        cx.notify();
-    }
-
-    fn add_comment(&mut self, _: &AddComment, window: &mut Window, cx: &mut Context<Self>) {
-        if self.comment_editor.is_some() {
-            self.warning =
-                Some("Finish or cancel the current comment before starting another".into());
-            self.show_sidebar(SidePanel::Comments, window, cx);
-            cx.notify();
-            return;
-        }
-        if self.annotations_loading {
-            self.annotation_error = Some("Annotations are still loading".into());
-            cx.notify();
-            return;
-        }
-        if self.annotation_persistence_blocked {
-            if self.annotation_error.is_none() {
-                self.annotation_error =
-                    Some("Comments are disabled because the sidecar could not be loaded".into());
-            }
-            cx.notify();
-            return;
-        }
-        let Some(selection) = self.selection else {
-            self.warning = Some("Select text before adding a comment".into());
-            cx.notify();
-            return;
-        };
-        let range = TextRange::from_selection(selection);
-        if range.end().index > MAX_TEXT_CHARACTER_INDEX {
-            self.warning = Some(
-                "Commenting on Select All is not supported yet; select a concrete text range"
-                    .into(),
-            );
-            cx.notify();
-            return;
-        }
-        let exact = self.annotations.as_ref().and_then(|annotations| {
-            annotations
-                .overlapping(range)
-                .filter(|annotation| annotation.range() == range)
-                .max_by_key(|annotation| (annotation.updated_revision(), annotation.id()))
-                .map(|annotation| {
-                    (
-                        annotation.id(),
-                        annotation.comment_markdown().unwrap_or("").to_owned(),
-                    )
-                })
-        });
-        let (editing, markdown) = exact
-            .map(|(id, markdown)| (Some(id), markdown))
-            .unwrap_or((None, String::new()));
-        self.open_comment_editor(range, editing, markdown, window, cx);
-    }
-
-    fn comment_on_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selection.is_some() {
-            self.add_comment(&AddComment, window, cx);
-            return;
-        }
-        let Some(id) = self.active_annotation else {
-            self.warning = Some("Select text before adding a comment".into());
-            cx.notify();
-            return;
-        };
-        let Some((range, markdown)) = self
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(id))
-            .map(|annotation| {
-                (
-                    annotation.range(),
-                    annotation.comment_markdown().unwrap_or("").to_owned(),
-                )
-            })
-        else {
-            return;
-        };
-        self.open_comment_editor(range, Some(id), markdown, window, cx);
-    }
-
-    fn context_range(&self) -> Option<TextRange> {
-        self.selection
-            .filter(|selection| selection.anchor != selection.focus)
-            .map(TextRange::from_selection)
-            .or_else(|| {
-                self.active_annotation.and_then(|id| {
-                    self.annotations
-                        .as_ref()
-                        .and_then(|annotations| annotations.get(id))
-                        .map(|annotation| annotation.range())
-                })
-            })
-    }
-
-    fn context_has_comment(&self) -> bool {
-        self.active_annotation.is_some_and(|id| {
-            self.annotations
-                .as_ref()
-                .and_then(|annotations| annotations.get(id))
-                .is_some_and(|annotation| annotation.comment_markdown().is_some())
-        }) || self.selection.is_some_and(|selection| {
-            if selection.anchor == selection.focus {
-                return false;
-            }
-            let range = TextRange::from_selection(selection);
-            self.annotations.as_ref().is_some_and(|annotations| {
-                annotations.overlapping(range).any(|annotation| {
-                    annotation.range() == range && annotation.comment_markdown().is_some()
-                })
-            })
-        })
-    }
-
-    fn context_anchor_in_viewport(&self) -> Option<Rect> {
-        let range = self.context_range()?;
-        let layout = self.layout()?;
-        let content_viewport = Rect {
-            x: self.scroll.x,
-            y: self.scroll.y,
-            width: self.viewport_width,
-            height: self.viewport_height,
-        };
-        let visible_pages: Vec<_> = layout
-            .visible_pages(self.scroll.y, self.viewport_height, 0.0)
-            .collect();
-        for page in visible_pages.into_iter().rev() {
-            if page < range.start().page || page > range.end().page {
-                continue;
-            }
-            let Some(chars) = self.page_text.get(&page) else {
-                continue;
-            };
-            let Some(page_rect) = layout.page_rect(page) else {
-                continue;
-            };
-            let Some(indices) = range.indices_on_page(page, chars.len()) else {
-                continue;
-            };
-            let mut bottom_line: Option<Rect> = None;
-            let mut visited = 0usize;
-            chars.for_each_visible_in_range_while(
-                page_rect,
-                content_viewport,
-                indices,
-                |_, rect| {
-                    visited += 1;
-                    if visited > MAX_VISIBLE_SELECTION_QUADS {
-                        return false;
-                    }
-                    bottom_line = Some(match bottom_line {
-                        None => rect,
-                        Some(current) => {
-                            let tolerance = current.height.max(rect.height) * 0.5;
-                            if rect.bottom() > current.bottom() + tolerance {
-                                rect
-                            } else if (rect.bottom() - current.bottom()).abs() <= tolerance {
-                                let left = current.x.min(rect.x);
-                                let top = current.y.min(rect.y);
-                                Rect {
-                                    x: left,
-                                    y: top,
-                                    width: current.right().max(rect.right()) - left,
-                                    height: current.bottom().max(rect.bottom()) - top,
-                                }
-                            } else {
-                                current
-                            }
-                        }
-                    });
-                    true
-                },
-            );
-            if let Some(line) = bottom_line {
-                return Some(Rect {
-                    x: line.x - self.scroll.x,
-                    y: line.y - self.scroll.y,
-                    width: line.width,
-                    height: line.height,
-                });
-            }
-        }
-        None
-    }
-
-    fn open_comment_editor(
-        &mut self,
-        range: TextRange,
-        editing: Option<AnnotationId>,
-        markdown: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let buffer = match RichTextBuffer::try_from_markdown(&markdown) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                self.annotation_error = Some(
-                    format!("Unable to open comment: {error}. The stored comment was not changed.")
-                        .into(),
-                );
-                self.show_sidebar(SidePanel::Comments, window, cx);
-                cx.notify();
-                return;
-            }
-        };
-        if self.annotation_failed_revision.is_none() && !self.annotation_persistence_blocked {
-            self.annotation_error = None;
-        }
-        let editor_limit = buffer.max_markdown_bytes();
-        let editor = cx.new(move |cx| {
-            MarkdownEditor::new(
-                cx,
-                buffer,
-                MarkdownEditorConfig {
-                    placeholder: "Write a comment…".into(),
-                    max_markdown_bytes: editor_limit,
-                    ..MarkdownEditorConfig::default()
-                },
-            )
-            .expect("comment editor buffer and configured limits must match")
-        });
-        cx.subscribe_in(
-            &editor,
-            window,
-            |reader, _, event, window, cx| match event {
-                MarkdownEditorEvent::Changed => reader.comment_editor_changed(window, cx),
-                MarkdownEditorEvent::Save(markdown) => {
-                    reader.cancel_comment_autosave();
-                    let _ = reader.write_comment(markdown.clone(), cx);
-                }
-                MarkdownEditorEvent::Cancel => reader.cancel_comment_editor(window, cx),
-            },
-        )
-        .detach();
-        self.pending_comment_range = Some(range);
-        self.editing_annotation = editing;
-        self.comment_editor = Some(editor.clone());
-        self.comment_draft_dirty = false;
-        self.comment_pane
-            .show_editor(self.view_mode == ReaderView::Fluid);
-        self.show_sidebar(SidePanel::Comments, window, cx);
-        if self.view_mode == ReaderView::Fluid {
-            self.start_animation(window, cx);
-        }
-        window.focus(&editor.focus_handle(cx));
-        cx.notify();
-    }
-
-    fn edit_comment(&mut self, id: AnnotationId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.comment_editor.is_some() {
-            return;
-        }
-        let Some((range, markdown)) = self
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(id))
-            .and_then(|annotation| {
-                annotation
-                    .comment_markdown()
-                    .map(|markdown| (annotation.range(), markdown.to_owned()))
-            })
-        else {
-            return;
-        };
-        self.open_comment_editor(range, Some(id), markdown, window, cx);
-    }
-
-    fn write_comment(&mut self, markdown: String, cx: &mut Context<Self>) -> bool {
-        if markdown.trim().is_empty() {
-            self.annotation_error = Some("A comment cannot be empty".into());
-            cx.notify();
-            return false;
-        }
-        let Some(range) = self.pending_comment_range else {
-            return false;
-        };
-        if self.annotation_failed_revision.is_none() && !self.annotation_persistence_blocked {
-            self.annotation_error = None;
-        }
-        let Some(annotations) = self.annotations.as_mut() else {
-            return false;
-        };
-        let result = if let Some(id) = self.editing_annotation {
-            let highlight = annotations
-                .get(id)
-                .and_then(|annotation| annotation.highlight());
-            annotations
-                .update(id, range, highlight, Some(markdown))
-                .map(|changed| (id, changed))
-        } else {
-            annotations
-                .add(range, None, Some(markdown))
-                .map(|id| (id, true))
-        };
-        match result {
-            Ok((id, changed)) => {
-                self.active_annotation = Some(id);
-                self.selection = None;
-                if changed
-                    || self.annotations.as_ref().is_some_and(|annotations| {
-                        annotations.revision() > self.annotation_saved_revision
-                    })
-                {
-                    let _ = self.persist_annotations();
-                }
-                self.refresh_comment_order();
-                self.comment_draft_dirty = false;
-                self.editing_annotation = Some(id);
-                cx.notify();
-                true
-            }
-            Err(error) => {
-                self.annotation_error = Some(error.to_string().into());
-                cx.notify();
-                false
-            }
-        }
-    }
-
-    fn comment_editor_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.comment_draft_dirty = true;
-        self.schedule_comment_autosave(window, cx);
-        cx.notify();
-    }
-
-    fn schedule_comment_autosave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.comment_autosave_revision = self.comment_autosave_revision.wrapping_add(1);
-        let revision = self.comment_autosave_revision;
-        let weak = cx.weak_entity();
-        self.comment_autosave_task = Some(window.spawn(cx, async move |cx| {
-            cx.background_executor()
-                .timer(COMMENT_AUTOSAVE_DEBOUNCE)
-                .await;
-            let _ = cx.update(|_, cx| {
-                weak.update(cx, |reader, cx| {
-                    if reader.comment_autosave_revision == revision {
-                        reader.comment_autosave_task = None;
-                        let _ = reader.flush_comment_autosave(cx);
-                    }
-                })
-                .ok();
-            });
-        }));
-    }
-
-    fn reset_search(&mut self, cx: &mut Context<Self>) {
-        let revision = self.search.revision.wrapping_add(1);
-        let _ = self.worker.cancel_search(self.generation, revision);
-        self.search = SearchState {
-            revision,
-            complete: true,
-            ..SearchState::default()
-        };
-        self.search_debounce_task = None;
-        self.navigation_focus.cancel();
-        self.search_list_state.reset(0);
-        if !self.search_field.read(cx).text().is_empty()
-            && let Err(rejection) = self
-                .search_field
-                .update(cx, |field, cx| field.set_text("", cx))
-        {
-            self.search.input_error = Some(rejection.to_string().into());
-        }
-        cx.notify();
-    }
-
-    fn cancel_comment_autosave(&mut self) {
-        self.comment_autosave_revision = self.comment_autosave_revision.wrapping_add(1);
-        self.comment_autosave_task = None;
-    }
-
-    fn flush_comment_autosave(&mut self, cx: &mut Context<Self>) -> bool {
-        self.cancel_comment_autosave();
-        if !self.comment_draft_dirty {
-            return true;
-        }
-        let Some(editor) = self.comment_editor.as_ref() else {
-            return true;
-        };
-        let markdown = editor.read(cx).markdown();
-        if markdown.trim().is_empty() {
-            return false;
-        }
-        self.write_comment(markdown, cx)
-    }
-
-    fn return_to_comment_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let markdown_is_blank = self
-            .comment_editor
-            .as_ref()
-            .is_none_or(|editor| editor.read(cx).is_blank());
-        if self.comment_draft_dirty && !markdown_is_blank && !self.flush_comment_autosave(cx) {
-            return;
-        }
-        self.cancel_comment_autosave();
-        self.comment_draft_dirty = false;
-        window.focus(&self.focus_handle);
-        if self.view_mode == ReaderView::Fluid {
-            self.comment_pane.show_list(true);
-            self.start_animation(window, cx);
-        } else {
-            self.comment_pane.show_list(false);
-            self.finish_comment_editor_close();
-        }
-        cx.notify();
-    }
-
-    fn cancel_comment_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.return_to_comment_list(window, cx);
-    }
-
-    fn discard_comment_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.cancel_comment_autosave();
-        self.comment_pane.show_list(false);
-        self.finish_comment_editor_close();
-        window.focus(&self.focus_handle);
-        cx.notify();
-    }
-
-    fn finish_comment_editor_close(&mut self) {
-        self.comment_editor = None;
-        self.comment_draft_dirty = false;
-        self.editing_annotation = None;
-        self.pending_comment_range = None;
-        self.comment_pane.close_editor_on_finish = false;
-    }
-
-    fn comment_draft_needs_confirmation(&self) -> bool {
-        comment_draft_needs_confirmation(self.comment_editor.is_some(), self.comment_draft_dirty)
-    }
-
-    fn confirm_discard_comment(
-        &mut self,
-        action: DraftDiscardAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.comment_discard_prompt_open {
-            return;
-        }
-
-        let (message, detail, discard_label) = match &action {
-            DraftDiscardAction::Open(_) => (
-                "Discard this comment draft?",
-                "Opening another PDF will permanently discard the unsaved comment.",
-                "Discard and Open",
-            ),
-            DraftDiscardAction::Quit => (
-                "Quit with an unsaved comment?",
-                "The comment draft will be permanently discarded.",
-                "Discard and Quit",
-            ),
-            DraftDiscardAction::CloseWindow => (
-                "Close with an unsaved comment?",
-                "The comment draft will be permanently discarded.",
-                "Discard and Close",
-            ),
-        };
-        self.comment_discard_prompt_open = true;
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            message,
-            Some(detail),
-            &[
-                PromptButton::cancel("Keep Editing"),
-                PromptButton::ok(discard_label),
-            ],
-            cx,
-        );
-        let weak = cx.weak_entity();
-        window
-            .spawn(cx, async move |cx| {
-                let discard = answer.await.ok() == Some(1);
-                let _ = cx.update(|window, cx| {
-                    weak.update(cx, |reader, cx| {
-                        reader.comment_discard_prompt_open = false;
-                        if discard {
-                            reader.discard_comment_editor(window, cx);
-                            match action {
-                                DraftDiscardAction::Open(path) => {
-                                    reader.open_path_after_comment_guard(path, window, cx)
-                                }
-                                DraftDiscardAction::Quit => cx.quit(),
-                                DraftDiscardAction::CloseWindow => window.remove_window(),
-                            }
-                        } else {
-                            reader.show_sidebar(SidePanel::Comments, window, cx);
-                            if let Some(editor) = reader.comment_editor.as_ref() {
-                                window.focus(&editor.focus_handle(cx));
-                            }
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                });
-            })
-            .detach();
-    }
-
     fn quit_application(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
         if self.comment_draft_needs_confirmation() {
             self.confirm_discard_comment(DraftDiscardAction::Quit, window, cx);
         } else {
+            self.close_pdf_capability_generation();
             cx.quit();
         }
     }
 
     pub fn should_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.comment_draft_needs_confirmation() {
+            self.close_pdf_capability_generation();
             return true;
         }
         self.confirm_discard_comment(DraftDiscardAction::CloseWindow, window, cx);
         false
-    }
-
-    fn navigate_annotation(
-        &mut self,
-        id: AnnotationId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(range) = self
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get(id))
-            .map(|annotation| annotation.range())
-        else {
-            return;
-        };
-        let start = range.start();
-        let Some(page_rect) = self
-            .layout()
-            .and_then(|layout| layout.page_rect(start.page))
-        else {
-            return;
-        };
-        let target = self
-            .page_text
-            .get(&start.page)
-            .and_then(|text| text.get(start.index))
-            .and_then(|character| character.bounds)
-            .map(|bounds| {
-                (
-                    page_rect.x + (bounds.left + bounds.right) * 0.5 * page_rect.width,
-                    page_rect.y + (bounds.top + bounds.bottom) * 0.5 * page_rect.height,
-                )
-            })
-            .unwrap_or((
-                page_rect.x + page_rect.width * 0.5,
-                page_rect.y + page_rect.height * 0.15,
-            ));
-        self.active_annotation = Some(id);
-        self.sidebar_anchor = None;
-        self.scroll_target = Offset {
-            x: target.0 - self.viewport_width * 0.5,
-            y: target.1 - self.viewport_height * 0.35,
-        };
-        self.clamp_scroll();
-        self.start_animation(window, cx);
-        cx.notify();
-    }
-
-    fn open_comment_from_list(
-        &mut self,
-        id: AnnotationId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.navigate_annotation(id, window, cx);
-        self.edit_comment(id, window, cx);
     }
 
     fn content_top(&self) -> f32 {
@@ -4576,21 +2691,7 @@ impl PdfReader {
             }
     }
 
-    fn apply_fit_width(&mut self) {
-        let Some(document) = self.document.as_ref() else {
-            return;
-        };
-        let widest = document
-            .pages
-            .iter()
-            .map(|page| page.width)
-            .fold(1.0_f32, f32::max);
-        let available = (self.viewport_width - crate::model::PAGE_MARGIN * 2.0).max(100.0);
-        self.zoom = (available / (widest * crate::model::PDF_POINTS_TO_LOGICAL_PIXELS))
-            .clamp(MIN_ZOOM, MAX_ZOOM);
-    }
-
-    fn request_visible_tiles(&mut self, window: &Window) {
+    fn request_visible_tiles(&mut self, _window: &Window) {
         // While a replacement document is opening, `self.document` still describes
         // the previous PDF. Never pair that stale layout with the new generation.
         if !matches!(self.status, ReaderStatus::Ready) {
@@ -4603,34 +2704,19 @@ impl PdfReader {
             return;
         }
         self.render_debounce_until = None;
-        let (Some(layout), Some(document)) = (self.layout(), self.document.as_ref()) else {
+        let (Some(_), Some(_)) = (self.layout(), self.document.as_ref()) else {
             return;
         };
-        let mut planned = plan_visible_tiles(
-            layout,
-            &document.pages,
-            self.scroll,
-            self.viewport_width,
-            self.viewport_height,
-            window.scale_factor(),
-        );
-        planned.sort_by_key(|tile| (tile.tier, tile.distance, tile.request.key));
+        // `update_viewport()` has already synchronized the window scale. The
+        // shared controller therefore owns both visibility and tile priority.
+        let plan = self.viewport.plan_tiles();
+        let planned = &plan.tiles;
         let mut viewport: Vec<_> = planned
             .iter()
             .map(|tile| (tile.request.key, tile.tier))
             .collect();
         viewport.sort_by_key(|(key, tier)| (*tier, *key));
-        let mut seen_text_pages = HashSet::new();
-        let text_viewport: Vec<_> = planned
-            .iter()
-            .filter(|tile| tile.tier == DemandTier::Visible)
-            .filter_map(|tile| {
-                seen_text_pages
-                    .insert(tile.request.key.page)
-                    .then_some(tile.request.key.page)
-            })
-            .take(MAX_CACHED_TEXT_PAGES)
-            .collect();
+        let text_viewport = plan.text_pages(MAX_CACHED_TEXT_PAGES);
 
         // Completion does not change these full desired signatures. That
         // matters: re-sending shrinking lists after every result can race the
@@ -4646,7 +2732,14 @@ impl PdfReader {
                 .iter()
                 .take_while(|tile| tile.tier == DemandTier::Visible)
                 .count();
-            let tile_requests: Vec<_> = demand.iter().map(|tile| tile.request).collect();
+            let tile_requests: Vec<_> = demand
+                .iter()
+                .map(|tile| TileRequest {
+                    key: tile.request.key,
+                    core_rect: tile.request.core_rect,
+                    render_rect: tile.request.render_rect,
+                })
+                .collect();
             let text_pages: Vec<_> = text_viewport
                 .iter()
                 .copied()
@@ -4833,20 +2926,6 @@ impl PdfReader {
         }
     }
 
-    fn clamp_scroll(&mut self) {
-        let Some(layout) = self.layout() else {
-            self.scroll = Offset::default();
-            self.scroll_target = Offset::default();
-            return;
-        };
-        let max_x = self.max_scroll_x(layout);
-        let max_y = (layout.content_height - self.viewport_height).max(0.0);
-        self.scroll.x = self.scroll.x.clamp(0.0, max_x);
-        self.scroll.y = self.scroll.y.clamp(0.0, max_y);
-        self.scroll_target.x = self.scroll_target.x.clamp(0.0, max_x);
-        self.scroll_target.y = self.scroll_target.y.clamp(0.0, max_y);
-    }
-
     fn scroll_by(
         &mut self,
         x: f32,
@@ -4866,20 +2945,23 @@ impl PdfReader {
             // anchor is intentionally no longer the expected outcome.
             self.qa_sidebar_anchor_reference = None;
         }
-        if !x.is_finite() || !y.is_finite() {
+        if immediate && !ui_is_animating {
+            self.animation_active = false;
+        }
+        let disposition = self.viewport.scroll_by(
+            Offset::new(x, y),
+            if immediate {
+                ViewportScrollBehavior::Immediate
+            } else {
+                ViewportScrollBehavior::Smooth
+            },
+        );
+        self.sync_viewport_snapshot();
+        if disposition == InputDisposition::IgnoredInvalid {
             return;
         }
+        self.schedule_extension_snapshot_sync(window, cx);
         if immediate {
-            if !ui_is_animating {
-                self.animation_active = false;
-            }
-            self.scroll_target = self.scroll;
-        }
-        self.scroll_target.x += x;
-        self.scroll_target.y += y;
-        self.clamp_scroll();
-        if immediate {
-            self.scroll = self.scroll_target;
             self.request_visible_tiles(window);
             if ui_is_animating {
                 self.start_animation(window, cx);
@@ -5007,12 +3089,10 @@ impl PdfReader {
             blend,
         );
         if self.sidebar_anchor.is_none() {
-            self.scroll.x += (self.scroll_target.x - self.scroll.x) * blend;
-            self.scroll.y += (self.scroll_target.y - self.scroll.y) * blend;
+            self.viewport.advance_navigation(dt);
+            self.sync_viewport_snapshot();
         }
-        let distance = (self.scroll_target.x - self.scroll.x).abs()
-            + (self.scroll_target.y - self.scroll.y).abs();
-        let navigation_settled = distance < 0.35
+        let navigation_settled = !self.viewport.is_scrolling()
             && !self.sidebar.is_animating()
             && !self.comment_pane.is_animating()
             && !self.reference_panel.is_animating()
@@ -5023,13 +3103,11 @@ impl PdfReader {
             && !self.link_card_expansion.is_animating()
             && !self.link_card_pointer_is_animating()
             && !self.toc_hover_is_animating();
-        if navigation_settled {
-            self.scroll = self.scroll_target;
-        }
         let focus_animating = self.navigation_focus.advance(now, navigation_settled);
         if navigation_settled && !focus_animating {
             self.animation_active = false;
         }
+        self.schedule_extension_snapshot_sync(window, cx);
         self.request_visible_tiles(window);
         cx.notify();
         if self.animation_active {
@@ -5081,31 +3159,15 @@ impl PdfReader {
         {
             return;
         }
-        let new_zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        if (new_zoom - self.zoom).abs() < 0.0001 {
-            return;
-        }
         let local_x = raw_x.clamp(0.0, self.viewport_width);
         let local_y = (raw_y - self.content_top()).clamp(0.0, self.viewport_height);
-        let anchor = self.layout().and_then(|layout| {
-            layout.anchor_at_content_point(self.scroll.x + local_x, self.scroll.y + local_y)
-        });
-
-        self.zoom = new_zoom;
-        self.fit_width = false;
-        self.rebuild_layout();
-        if let Some(anchor) = anchor
-            && let Some((x, y)) = self
-                .layout()
-                .and_then(|layout| layout.content_point_for_anchor(anchor))
-        {
-            self.scroll = Offset {
-                x: x - local_x,
-                y: y - local_y,
-            };
-            self.scroll_target = self.scroll;
+        let disposition = self
+            .viewport
+            .zoom_at(zoom, ViewportPoint::new(local_x, local_y));
+        self.sync_viewport_snapshot();
+        if disposition != InputDisposition::Applied {
+            return;
         }
-        self.clamp_scroll();
         self.defer_render_after_zoom(window, cx);
         cx.notify();
     }
@@ -5159,13 +3221,13 @@ impl PdfReader {
     }
 
     fn fit_width(&mut self, _: &FitWidth, window: &mut Window, cx: &mut Context<Self>) {
-        let before = self.zoom;
-        self.fit_width = true;
-        self.apply_fit_width();
-        let target = self.zoom;
-        self.zoom = before;
-        self.zoom_at(target, self.viewport_center(), window, cx);
-        self.fit_width = true;
+        let previous_zoom = self.zoom;
+        let disposition = self.viewport.fit_width();
+        self.sync_viewport_snapshot();
+        if disposition == InputDisposition::Applied && (self.zoom - previous_zoom).abs() > 0.0001 {
+            self.defer_render_after_zoom(window, cx);
+        }
+        cx.notify();
     }
 
     fn viewport_center(&self) -> Point<Pixels> {
@@ -5201,14 +3263,23 @@ impl PdfReader {
 
     fn first_page(&mut self, _: &FirstPage, window: &mut Window, cx: &mut Context<Self>) {
         self.navigation_focus.cancel();
-        self.scroll_target.y = 0.0;
+        self.viewport.scroll_to(
+            Offset::new(self.scroll_target.x, 0.0),
+            ViewportScrollBehavior::Smooth,
+        );
+        self.sync_viewport_snapshot();
         self.start_animation(window, cx);
     }
 
     fn last_page(&mut self, _: &LastPage, window: &mut Window, cx: &mut Context<Self>) {
         self.navigation_focus.cancel();
-        if let Some(layout) = self.layout() {
-            self.scroll_target.y = (layout.content_height - self.viewport_height).max(0.0);
+        if self.layout().is_some() {
+            let maximum = self.viewport.maximum_scroll();
+            self.viewport.scroll_to(
+                Offset::new(self.scroll_target.x, maximum.y),
+                ViewportScrollBehavior::Smooth,
+            );
+            self.sync_viewport_snapshot();
             self.start_animation(window, cx);
         }
     }
@@ -5287,6 +3358,7 @@ impl PdfReader {
             }
             _ => {}
         }
+        self.publish_pdf_selection();
         cx.notify();
     }
 
@@ -5299,12 +3371,11 @@ impl PdfReader {
         if let Some(pan) = self.pan {
             self.navigation_focus.cancel();
             let delta = event.position - pan.pointer;
-            self.scroll = Offset {
+            self.viewport.set_scroll(Offset {
                 x: pan.scroll.x - f32::from(delta.x),
                 y: pan.scroll.y - f32::from(delta.y),
-            };
-            self.scroll_target = self.scroll;
-            self.clamp_scroll();
+            });
+            self.sync_viewport_snapshot();
             self.request_visible_tiles(window);
             cx.notify();
             return;
@@ -5326,6 +3397,7 @@ impl PdfReader {
             } else if local_y > self.viewport_height - 28.0 {
                 self.scroll_by(0.0, 28.0, true, window, cx);
             }
+            self.publish_pdf_selection();
             cx.notify();
             return;
         }
@@ -5384,528 +3456,9 @@ impl PdfReader {
         }
         self.selecting = false;
         self.pan = None;
+        self.publish_pdf_selection();
+        self.schedule_extension_snapshot_sync(window, cx);
         cx.notify();
-    }
-
-    fn hit_test_link(&self, position: Point<Pixels>) -> Option<usize> {
-        let layout = self.layout()?;
-        let document = self.document.as_ref()?;
-        let x = self.scroll.x + f32::from(position.x);
-        let y = self.scroll.y + f32::from(position.y) - self.content_top();
-        let page = layout.page_at_content_point(x, y)?;
-        let page_rect = layout.page_rect(page)?;
-        document
-            .links
-            .iter()
-            .rev()
-            .filter(|link| link.page == page)
-            .find_map(|link| {
-                let bounds = normalized_bounds_in_page(page_rect, link.bounds);
-                bounds.contains(x, y).then_some(link.id)
-            })
-    }
-
-    fn hit_test_scientific_reference(&self, position: Point<Pixels>) -> Option<usize> {
-        if !self.scientific_document {
-            return None;
-        }
-        let layout = self.layout()?;
-        let document = self.document.as_ref()?;
-        let x = self.scroll.x + f32::from(position.x);
-        let y = self.scroll.y + f32::from(position.y) - self.content_top();
-        let page = layout.page_at_content_point(x, y)?;
-        let page_rect = layout.page_rect(page)?;
-        document
-            .scientific_references
-            .iter()
-            .enumerate()
-            .filter(|(_, reference)| reference.page == page)
-            .find_map(|(index, reference)| {
-                reference
-                    .text_runs
-                    .iter()
-                    .any(|run| normalized_bounds_in_page(page_rect, *run).contains(x, y))
-                    .then_some(index)
-            })
-    }
-
-    fn resolved_internal_link(&self, id: usize) -> Option<ResolvedInternalLink> {
-        let document = self.document.as_ref()?;
-        let link = document.links.iter().find(|link| link.id == id)?;
-        let PdfLinkTarget::Internal {
-            page,
-            x_fraction,
-            y_fraction,
-        } = link.target
-        else {
-            return None;
-        };
-        let source_text = self.page_text.get(&link.page)?;
-        let target_text = self.page_text.get(&page)?;
-        Some(resolve_internal_link(
-            source_text,
-            link.bounds,
-            target_text,
-            page,
-            x_fraction,
-            y_fraction,
-        ))
-    }
-
-    fn request_internal_link_text(&mut self, id: usize) -> bool {
-        let Some((source_page, target_page)) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.links.iter().find(|link| link.id == id))
-            .and_then(|link| match link.target {
-                PdfLinkTarget::Internal { page, .. } => Some((link.page, page)),
-                PdfLinkTarget::External { .. } => None,
-            })
-        else {
-            return false;
-        };
-        let pages = [source_page, target_page]
-            .into_iter()
-            .filter(|page| !self.page_text.contains_key(page))
-            .collect::<HashSet<_>>();
-        if pages.is_empty() {
-            return true;
-        }
-        self.text_pending.extend(pages.iter().copied());
-        let mut pages = pages.into_iter().collect::<Vec<_>>();
-        pages.sort_unstable();
-        if self
-            .worker
-            .ensure_text_pages(self.generation, pages.clone())
-        {
-            true
-        } else {
-            for page in pages {
-                self.text_pending.remove(&page);
-            }
-            false
-        }
-    }
-
-    fn request_scholarly_for_link(&mut self, id: usize) -> bool {
-        if !self.scientific_document {
-            return false;
-        }
-        let references = self.scientific_reference_indices_for_link(id);
-        if references.is_empty() {
-            self.request_destination_preview(id);
-            return false;
-        }
-        let texts = self
-            .document
-            .as_ref()
-            .map(|document| {
-                references
-                    .into_iter()
-                    .filter_map(|index| document.scientific_references.get(index))
-                    .map(|reference| reference.text.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        texts.into_iter().fold(false, |requested, reference| {
-            self.scholarly_session
-                .request(&self.scholarly_fetcher, self.generation, &reference)
-                || requested
-        })
-    }
-
-    fn request_scholarly_for_reference(&mut self, index: usize) -> bool {
-        let Some(reference) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.scientific_references.get(index))
-            .cloned()
-        else {
-            return false;
-        };
-        self.scholarly_session
-            .request(&self.scholarly_fetcher, self.generation, &reference.text)
-    }
-
-    #[cfg(debug_assertions)]
-    fn current_reference_text(&self) -> Option<String> {
-        self.current_reference_texts().into_iter().next()
-    }
-
-    fn current_reference_texts(&self) -> Vec<String> {
-        let Some(document) = self.document.as_ref() else {
-            return Vec::new();
-        };
-        if let Some(index) = self.previewed_reference {
-            return document
-                .scientific_references
-                .get(index)
-                .map(|reference| vec![reference.text.clone()])
-                .unwrap_or_default();
-        }
-        self.previewed_link
-            .map(|id| {
-                self.scientific_reference_indices_for_link(id)
-                    .into_iter()
-                    .filter_map(|index| document.scientific_references.get(index))
-                    .map(|reference| reference.text.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn jump_to_scientific_reference(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(reference) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.scientific_references.get(index))
-            .cloned()
-        else {
-            return;
-        };
-        self.perform_document_jump(
-            DocumentJump::new(reference.page)
-                .position(reference.x_fraction, reference.y_fraction)
-                .center_horizontal(reference.x_fraction.is_some())
-                .focus(
-                    reference.text_runs,
-                    NavigationFocusTone::Accent,
-                    NavigationFocusMotion::Sweep,
-                ),
-            window,
-            cx,
-        );
-    }
-
-    fn open_reference_details(
-        &mut self,
-        reference: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_reference_details_group(reference.clone(), vec![reference], window, cx);
-    }
-
-    fn open_reference_details_group(
-        &mut self,
-        reference: String,
-        mut group: Vec<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let center_anchor = self.layout().and_then(|layout| {
-            layout.anchor_at_content_point(
-                self.scroll.x + self.panel_safe_viewport_width() * 0.5,
-                self.scroll.y + self.viewport_height * 0.5,
-            )
-        });
-        self.sidebar_anchor = center_anchor;
-        #[cfg(debug_assertions)]
-        {
-            self.qa_sidebar_anchor_reference = center_anchor;
-        }
-        self.fit_width = false;
-        self.scroll_target = self.scroll;
-        if !group.contains(&reference) {
-            group.insert(0, reference.clone());
-        }
-        group.dedup();
-        self.reference_details_group = group;
-        self.reference_details = Some(reference);
-        self.reset_reference_detail_content_state();
-        self.reference_details_transition = RevealState::visible();
-        self.reference_details_direction = 1.0;
-        self.sidebar.target = 0.0;
-        self.reference_panel.set_target(1.0);
-        self.dismiss_link_preview(window, cx);
-        self.start_animation(window, cx);
-        cx.notify();
-    }
-
-    fn reset_reference_detail_content_state(&mut self) {
-        let preferred_summary = self
-            .reference_details
-            .as_deref()
-            .and_then(|reference| self.scholarly_session.state(reference))
-            .and_then(|state| match state {
-                ScholarlyMetadataState::Ready(metadata) if metadata.tldr_text.is_some() => {
-                    Some(ReferenceSummaryTab::Tldr)
-                }
-                ScholarlyMetadataState::Ready(metadata) if metadata.abstract_text.is_some() => {
-                    Some(ReferenceSummaryTab::Abstract)
-                }
-                _ => None,
-            })
-            .unwrap_or(ReferenceSummaryTab::Tldr);
-        self.reference_citation_expansion = RevealState::default();
-        self.reference_summary_tab = preferred_summary;
-        self.reference_summary_previous_tab = preferred_summary;
-        self.reference_summary_transition = RevealState::visible();
-        self.doi_copy_started = None;
-    }
-
-    fn navigate_reference_details(
-        &mut self,
-        forward: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let navigable = self.navigable_reference_details_group();
-        if navigable.len() < 2 {
-            return;
-        }
-        let Some(current) = self.reference_details.as_ref() else {
-            return;
-        };
-        let current_index = navigable
-            .iter()
-            .position(|reference| reference == current)
-            .unwrap_or(0);
-        let next_index = adjacent_group_index(current_index, navigable.len(), forward);
-        self.reference_details = navigable.get(next_index).cloned();
-        self.reference_details_direction = if forward { 1.0 } else { -1.0 };
-        self.reference_details_transition = RevealState::hidden();
-        self.reference_details_transition.set_target(1.0);
-        self.reset_reference_detail_content_state();
-        self.start_animation(window, cx);
-        cx.notify();
-    }
-
-    fn navigable_reference_details_group(&self) -> Vec<String> {
-        self.reference_details_group
-            .iter()
-            .filter(|reference| {
-                matches!(
-                    self.scholarly_session.state(reference),
-                    Some(ScholarlyMetadataState::Ready(_))
-                )
-            })
-            .cloned()
-            .collect()
-    }
-
-    fn close_reference_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let center_anchor = self.layout().and_then(|layout| {
-            layout.anchor_at_content_point(
-                self.scroll.x + self.panel_safe_viewport_width() * 0.5,
-                self.scroll.y + self.viewport_height * 0.5,
-            )
-        });
-        self.sidebar_anchor = center_anchor;
-        #[cfg(debug_assertions)]
-        {
-            self.qa_sidebar_anchor_reference = center_anchor;
-        }
-        self.fit_width = false;
-        self.scroll_target = self.scroll;
-        self.reference_panel.set_target(0.0);
-        self.start_animation(window, cx);
-        cx.notify();
-    }
-
-    fn scientific_reference_for_link(&self, id: usize) -> Option<&ScientificReference> {
-        let document = self.document.as_ref()?;
-        let link = document.links.iter().find(|link| link.id == id)?;
-        let PdfLinkTarget::Internal {
-            page,
-            x_fraction: _,
-            y_fraction,
-        } = link.target
-        else {
-            return None;
-        };
-        let resolved = self.resolved_internal_link(id);
-        document.scientific_references.iter().find(|reference| {
-            scientific_reference_matches(reference, page, resolved.as_ref(), y_fraction)
-        })
-    }
-
-    fn scientific_reference_indices_for_link(&self, id: usize) -> Vec<usize> {
-        let Some(primary_number) = self
-            .scientific_reference_for_link(id)
-            .map(|reference| reference.number)
-        else {
-            return Vec::new();
-        };
-        let Some(document) = self.document.as_ref() else {
-            return Vec::new();
-        };
-        let Some(primary_index) = document
-            .scientific_references
-            .iter()
-            .position(|reference| reference.number == primary_number)
-        else {
-            return Vec::new();
-        };
-        let Some(link) = document.links.iter().find(|link| link.id == id) else {
-            return vec![primary_index];
-        };
-        let Some(source_text) = self.page_text.get(&link.page) else {
-            return vec![primary_index];
-        };
-        let source = link_source_text(source_text, link.bounds);
-        complete_grouped_reference_indices(&document.scientific_references, &source, primary_number)
-            .unwrap_or_else(|| vec![primary_index])
-    }
-
-    fn request_destination_preview(&mut self, id: usize) -> bool {
-        if !self.scientific_document {
-            return false;
-        }
-        let Some((page, page_size, center_x, center_y)) =
-            self.document.as_ref().and_then(|document| {
-                let link = document.links.iter().find(|link| link.id == id)?;
-                let PdfLinkTarget::Internal {
-                    page,
-                    x_fraction,
-                    y_fraction,
-                } = link.target
-                else {
-                    return None;
-                };
-                let resolved = self.resolved_internal_link(id);
-                Some((
-                    page,
-                    *document.pages.get(page)?,
-                    resolved
-                        .as_ref()
-                        .and_then(|value| value.x_fraction)
-                        .or(x_fraction)
-                        .unwrap_or(0.5),
-                    resolved
-                        .as_ref()
-                        .and_then(|value| value.y_fraction)
-                        .or(y_fraction)
-                        .unwrap_or(0.5),
-                ))
-            })
-        else {
-            return false;
-        };
-        let longest = page_size.width.max(page_size.height).max(f32::MIN_POSITIVE);
-        let raster = RasterSize {
-            width: ((page_size.width / longest) * 1_200.0)
-                .round()
-                .clamp(1.0, 1_200.0) as u32,
-            height: ((page_size.height / longest) * 1_200.0)
-                .round()
-                .clamp(1.0, 1_200.0) as u32,
-        };
-        self.destination_preview_revision = self.destination_preview_revision.wrapping_add(1);
-        self.worker.render_preview(
-            self.generation,
-            self.destination_preview_revision,
-            self.render_appearance,
-            PreviewSpec {
-                page,
-                raster,
-                center_x,
-                center_y,
-            },
-        )
-    }
-
-    fn perform_internal_link_jump(
-        &mut self,
-        page: usize,
-        rough_x: Option<f32>,
-        rough_y: Option<f32>,
-        resolved: Option<ResolvedInternalLink>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let x_fraction = resolved
-            .as_ref()
-            .and_then(|resolved| resolved.x_fraction)
-            .or(rough_x);
-        let y_fraction = resolved
-            .as_ref()
-            .and_then(|resolved| resolved.y_fraction)
-            .or(rough_y);
-        let focus_runs = resolved.map_or_else(Vec::new, |resolved| resolved.text_runs);
-        let jump = DocumentJump::new(page)
-            .position(x_fraction, y_fraction)
-            .center_horizontal(x_fraction.is_some())
-            .focus(
-                focus_runs,
-                NavigationFocusTone::Accent,
-                NavigationFocusMotion::Sweep,
-            );
-        self.perform_document_jump(jump, window, cx);
-    }
-
-    fn complete_pending_link_navigation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.pending_link_navigation else {
-            return;
-        };
-        let Some(resolved) = self.resolved_internal_link(id) else {
-            return;
-        };
-        let Some((page, rough_x, rough_y)) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.links.iter().find(|link| link.id == id))
-            .and_then(|link| match link.target {
-                PdfLinkTarget::Internal {
-                    page,
-                    x_fraction,
-                    y_fraction,
-                } => Some((page, x_fraction, y_fraction)),
-                PdfLinkTarget::External { .. } => None,
-            })
-        else {
-            self.pending_link_navigation = None;
-            return;
-        };
-        self.pending_link_navigation = None;
-        self.perform_internal_link_jump(page, rough_x, rough_y, Some(resolved), window, cx);
-    }
-
-    fn activate_document_link(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.links.iter().find(|link| link.id == id))
-            .map(|link| link.target.clone())
-        else {
-            return;
-        };
-        match target {
-            PdfLinkTarget::Internal {
-                page,
-                x_fraction,
-                y_fraction,
-            } => {
-                if let Some(resolved) = self.resolved_internal_link(id) {
-                    self.pending_link_navigation = None;
-                    self.perform_internal_link_jump(
-                        page,
-                        x_fraction,
-                        y_fraction,
-                        Some(resolved),
-                        window,
-                        cx,
-                    );
-                } else if self.request_internal_link_text(id) {
-                    self.pending_link_navigation = Some(id);
-                    cx.notify();
-                } else {
-                    self.pending_link_navigation = None;
-                    self.perform_internal_link_jump(page, x_fraction, y_fraction, None, window, cx);
-                }
-            }
-            PdfLinkTarget::External { url } => {
-                if let Err(error) = open::that_detached(&url) {
-                    self.warning = Some(format!("Could not open link: {error}").into());
-                    cx.notify();
-                }
-            }
-        }
     }
 
     fn hit_test_text(&self, position: Point<Pixels>, nearest: bool) -> Option<TextPosition> {
@@ -6036,6 +3589,7 @@ impl PdfReader {
                 index: usize::MAX,
             },
         });
+        self.publish_pdf_selection();
         cx.notify();
     }
 
@@ -6086,7 +3640,7 @@ impl PdfReader {
         page: usize,
         page_rect: Rect,
         desired: RasterSize,
-    ) -> Vec<PaintTile> {
+    ) -> Vec<PdfCanvasTile> {
         let visible_exact: Vec<_> = self
             .render_viewport
             .iter()
@@ -6151,10 +3705,12 @@ impl PdfReader {
                 .filter(|(key, _)| key.page == page && key.raster == raster)
                 .collect();
             tiles.sort_by_key(|(key, _)| **key);
-            result.extend(tiles.into_iter().map(|(_, tile)| PaintTile {
-                core_rect: tile_logical_rect(page_rect, raster, tile.core_rect),
-                render_rect: tile_logical_rect(page_rect, raster, tile.render_rect),
-                image: tile.image.clone(),
+            result.extend(tiles.into_iter().map(|(_, tile)| {
+                PdfCanvasTile::new(
+                    tile_logical_rect(page_rect, raster, tile.core_rect),
+                    tile_logical_rect(page_rect, raster, tile.render_rect),
+                    tile.image.clone(),
+                )
             }));
         }
         result
@@ -6275,423 +3831,6 @@ impl PdfReader {
             )
     }
 
-    fn show_link_preview(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.links.iter().find(|link| link.id == id))
-            .map(|link| link.target.clone())
-        else {
-            return;
-        };
-        self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
-        self.pending_link_hover = None;
-        self.link_source_hovered = true;
-        if self.previewed_link != Some(id) || self.previewed_reference.is_some() {
-            self.link_card_expansion = RevealState::default();
-            self.clear_destination_preview(window, cx);
-        }
-        self.previewed_link = Some(id);
-        self.previewed_reference = None;
-        match target {
-            PdfLinkTarget::Internal { .. } => {
-                self.request_internal_link_text(id);
-                self.request_scholarly_for_link(id);
-                if self.current_reference_texts().iter().any(|reference| {
-                    matches!(
-                        self.scholarly_session.state(reference),
-                        Some(ScholarlyMetadataState::Ready(_))
-                    )
-                }) {
-                    self.link_card_expansion.set_target(1.0);
-                    self.start_animation(window, cx);
-                }
-            }
-            PdfLinkTarget::External { url } => {
-                if let Some(session) = self.link_preview_session.as_mut() {
-                    session.request_website(&self.link_preview_fetcher, self.generation, &url);
-                }
-            }
-        }
-        cx.notify();
-    }
-
-    fn toggle_reference_citation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.reference_citation_expansion.toggle();
-        self.start_animation(window, cx);
-        cx.notify();
-    }
-
-    fn select_reference_summary(
-        &mut self,
-        tab: ReferenceSummaryTab,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if tab == self.reference_summary_tab {
-            return;
-        }
-        self.reference_summary_previous_tab = self.reference_summary_tab;
-        self.reference_summary_tab = tab;
-        self.reference_summary_transition = RevealState::hidden();
-        self.reference_summary_transition.set_target(1.0);
-        self.start_animation(window, cx);
-        cx.notify();
-    }
-
-    fn copy_reference_doi(&mut self, doi: String, window: &mut Window, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(format!("https://doi.org/{doi}")));
-        self.doi_copy_started = Some(Instant::now());
-        self.start_animation(window, cx);
-        cx.notify();
-    }
-
-    fn show_reference_preview(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .document
-            .as_ref()
-            .and_then(|document| document.scientific_references.get(index))
-            .is_none()
-        {
-            return;
-        }
-        self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
-        self.pending_link_hover = None;
-        self.link_source_hovered = true;
-        if self.previewed_reference != Some(index) || self.previewed_link.is_some() {
-            self.link_card_expansion = RevealState::default();
-            self.clear_destination_preview(window, cx);
-        }
-        self.previewed_link = None;
-        self.previewed_reference = Some(index);
-        self.request_scholarly_for_reference(index);
-        if self.current_reference_texts().iter().any(|reference| {
-            matches!(
-                self.scholarly_session.state(reference),
-                Some(ScholarlyMetadataState::Ready(_))
-            )
-        }) {
-            self.link_card_expansion.set_target(1.0);
-            self.start_animation(window, cx);
-        }
-        cx.notify();
-    }
-
-    fn set_link_card_hovered(
-        &mut self,
-        hovered: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.link_card_hovered = hovered;
-        if hovered {
-            self.cancel_pending_link_hover();
-            self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);
-            cx.notify();
-        } else {
-            self.schedule_link_preview_clear(window, cx);
-        }
-    }
-
-    fn schedule_link_preview_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.schedule_stable_link_hover(None, point(px(-1.0), px(-1.0)), window, cx);
-    }
-
-    fn current_preview_target(&self) -> Option<PreviewTarget> {
-        self.previewed_link
-            .map(PreviewTarget::Link)
-            .or_else(|| self.previewed_reference.map(PreviewTarget::Reference))
-    }
-
-    fn show_preview_target(
-        &mut self,
-        target: PreviewTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match target {
-            PreviewTarget::Link(id) => self.show_link_preview(id, window, cx),
-            PreviewTarget::Reference(index) => self.show_reference_preview(index, window, cx),
-        }
-    }
-
-    fn cancel_pending_link_hover(&mut self) {
-        self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
-        self.pending_link_hover = None;
-    }
-
-    fn dismiss_link_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.cancel_pending_link_hover();
-        self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);
-        self.hovered_link = None;
-        self.hovered_reference = None;
-        self.link_source_hovered = false;
-        self.link_card_hovered = false;
-        self.previewed_link = None;
-        self.previewed_reference = None;
-        self.link_card_pointer = None;
-        self.link_card_pointer_target = None;
-        self.clear_destination_preview(window, cx);
-    }
-
-    fn link_pointer_in_viewport(&self, position: Point<Pixels>) -> Offset {
-        Offset {
-            x: f32::from(position.x),
-            y: f32::from(position.y) - self.content_top(),
-        }
-    }
-
-    fn set_link_card_pointer_immediate(&mut self, position: Point<Pixels>) {
-        self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);
-        let pointer = self.link_pointer_in_viewport(position);
-        self.link_card_pointer = Some(pointer);
-        self.link_card_pointer_target = Some(pointer);
-    }
-
-    fn schedule_link_card_reposition(
-        &mut self,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let target = self.link_pointer_in_viewport(position);
-        let already_at_target = self.link_card_pointer_target.is_some_and(|current| {
-            (current.x - target.x).abs() < 0.5 && (current.y - target.y).abs() < 0.5
-        });
-        // Every movement invalidates an older pending retarget, including a
-        // movement back to the position where the card already sits.
-        self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);
-        if already_at_target {
-            return;
-        }
-        let revision = self.link_card_reposition_revision;
-        let weak = cx.weak_entity();
-        window
-            .spawn(cx, async move |cx| {
-                cx.background_executor()
-                    .timer(LINK_CARD_MOVE_DEBOUNCE)
-                    .await;
-                let _ = cx.update(|window, cx| {
-                    weak.update(cx, |reader, cx| {
-                        if reader.link_card_reposition_revision == revision
-                            && reader.link_source_hovered
-                            && reader.current_preview_target().is_some()
-                        {
-                            reader.link_card_pointer_target = Some(target);
-                            reader.link_card_pointer.get_or_insert(target);
-                            reader.start_animation(window, cx);
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                });
-            })
-            .detach();
-    }
-
-    fn schedule_stable_link_hover(
-        &mut self,
-        target: Option<PreviewTarget>,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .pending_link_hover
-            .is_some_and(|pending| !link_hover_candidate_needs_restart(pending, target, position))
-        {
-            return;
-        }
-        self.link_hover_revision = self.link_hover_revision.wrapping_add(1);
-        let revision = self.link_hover_revision;
-        self.pending_link_hover = Some(PendingLinkHover { target, position });
-        let settle_delay = if target.is_some() {
-            LINK_HOVER_HANDOFF_DELAY
-        } else {
-            LINK_HOVER_CLOSE_DELAY
-        };
-        let weak = cx.weak_entity();
-        window
-            .spawn(cx, async move |cx| {
-                cx.background_executor().timer(settle_delay).await;
-                let _ = cx.update(|window, cx| {
-                    weak.update(cx, |reader, cx| {
-                        if reader.link_hover_revision == revision && !reader.link_card_hovered {
-                            let settled = reader.pending_link_hover.take();
-                            if let Some(PendingLinkHover {
-                                target: Some(target),
-                                position,
-                            }) = settled
-                            {
-                                reader.set_link_card_pointer_immediate(position);
-                                reader.show_preview_target(target, window, cx);
-                            } else if link_preview_should_close(
-                                reader.link_source_hovered,
-                                reader.link_card_hovered,
-                            ) {
-                                reader.dismiss_link_preview(window, cx);
-                            }
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                });
-            })
-            .detach();
-    }
-
-    fn on_document_hover(&mut self, hovered: &bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !hovered {
-            self.hovered_link = None;
-            self.hovered_reference = None;
-            self.link_source_hovered = false;
-            self.schedule_link_preview_clear(window, cx);
-        }
-    }
-
-    fn set_toc_hovered(
-        &mut self,
-        index: usize,
-        hovered: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if hovered {
-            self.toc_hover_revision = self.toc_hover_revision.wrapping_add(1);
-            if self.toc_hovered.is_none() && self.toc_hover_strength <= 0.002 {
-                self.toc_hover_position = index as f32;
-            }
-            self.toc_hovered = Some(index);
-            self.start_animation(window, cx);
-        } else if self.toc_hovered == Some(index) {
-            self.schedule_toc_hover_clear(window, cx);
-        }
-    }
-
-    fn set_toc_callout_hovered(
-        &mut self,
-        hovered: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if hovered {
-            self.toc_hover_revision = self.toc_hover_revision.wrapping_add(1);
-        } else {
-            self.schedule_toc_hover_clear(window, cx);
-        }
-    }
-
-    fn schedule_toc_hover_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.toc_hover_revision = self.toc_hover_revision.wrapping_add(1);
-        let revision = self.toc_hover_revision;
-        let weak = cx.weak_entity();
-        window
-            .spawn(cx, async move |cx| {
-                cx.background_executor().timer(TOC_HOVER_LEAVE_DELAY).await;
-                let _ = cx.update(|window, cx| {
-                    weak.update(cx, |reader, cx| {
-                        if reader.toc_hover_revision == revision {
-                            reader.toc_hovered = None;
-                            reader.start_animation(window, cx);
-                        }
-                    })
-                    .ok();
-                });
-            })
-            .detach();
-    }
-
-    fn navigate_toc(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((page, title, destination_y)) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.toc.get(index))
-            .map(|entry| (entry.page, entry.title.clone(), entry.destination_y))
-        else {
-            return;
-        };
-        self.sidebar_anchor = None;
-        self.selection = None;
-        self.active_annotation = None;
-        self.pending_toc_navigation = None;
-
-        if let Some(text) = self.page_text.get(&page) {
-            let resolved = resolve_toc_destination(&title, text, destination_y);
-            #[cfg(debug_assertions)]
-            if resolved.matched_title {
-                self.qa_toc_text_matches += 1;
-            }
-            self.scroll_to_toc_destination(page, resolved.y, resolved.text_runs, window, cx);
-            return;
-        }
-
-        self.pending_toc_navigation = Some(index);
-        if self.text_pending.insert(page) && !self.worker.extract_text(self.generation, page) {
-            self.text_pending.remove(&page);
-            self.pending_toc_navigation = None;
-            self.scroll_to_toc_destination(page, destination_y, Vec::new(), window, cx);
-        }
-        cx.notify();
-    }
-
-    fn complete_pending_toc_navigation(
-        &mut self,
-        page: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(index) = self.pending_toc_navigation else {
-            return;
-        };
-        let Some((entry_page, title, explicit_destination_y)) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.toc.get(index))
-            .map(|entry| (entry.page, entry.title.clone(), entry.destination_y))
-        else {
-            self.pending_toc_navigation = None;
-            return;
-        };
-        if entry_page != page {
-            return;
-        }
-        self.pending_toc_navigation = None;
-        let resolved = self.page_text.get(&page).map_or(
-            ResolvedTocDestination {
-                y: explicit_destination_y,
-                text_runs: Vec::new(),
-                matched_title: false,
-            },
-            |text| resolve_toc_destination(&title, text, explicit_destination_y),
-        );
-        #[cfg(debug_assertions)]
-        if resolved.matched_title {
-            self.qa_toc_text_matches += 1;
-        }
-        self.scroll_to_toc_destination(page, resolved.y, resolved.text_runs, window, cx);
-    }
-
-    fn scroll_to_toc_destination(
-        &mut self,
-        page: usize,
-        destination_y: Option<f32>,
-        focus_runs: Vec<TextBounds>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let jump = DocumentJump::new(page).position(None, destination_y).focus(
-            focus_runs,
-            NavigationFocusTone::Accent,
-            NavigationFocusMotion::Sweep,
-        );
-        self.perform_document_jump(jump, window, cx);
-    }
-
     fn perform_document_jump(
         &mut self,
         jump: DocumentJump,
@@ -6714,1925 +3853,16 @@ impl PdfReader {
         if let Some(focus) = resolved.focus {
             self.navigation_focus.queue(focus);
         }
-        self.scroll_target = Offset {
-            x: resolved.x,
-            y: resolved.y,
-        };
-        self.clamp_scroll();
+        self.viewport.scroll_to(
+            Offset {
+                x: resolved.x,
+                y: resolved.y,
+            },
+            ViewportScrollBehavior::Smooth,
+        );
+        self.sync_viewport_snapshot();
         self.start_animation(window, cx);
         cx.notify();
-    }
-
-    fn render_toc_navigation(
-        &mut self,
-        palette: ReaderPalette,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let document = self.document.as_ref()?;
-        let layout = self.layout()?;
-        if document.toc.is_empty() {
-            return None;
-        }
-
-        let (stack_top, marker_spacing) =
-            toc_stack_geometry(self.viewport_height, document.toc.len())?;
-        let marker_hit_height = if marker_spacing <= f32::EPSILON {
-            TOC_STACK_SPACING
-        } else {
-            marker_spacing.clamp(6.0, TOC_STACK_SPACING)
-        };
-        let current_page = layout.current_page(self.scroll.y, self.viewport_height);
-        let active = active_toc_index(&document.toc, current_page);
-        let hovered = self.toc_hovered.filter(|index| *index < document.toc.len());
-        let maximum_card_width = (self.viewport_width - TOC_RAIL_WIDTH - 28.0).clamp(190.0, 360.0);
-        let marker_data: Vec<_> = document
-            .toc
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                let selected = active == Some(index);
-                let cascade =
-                    toc_cascade_amount(index, self.toc_hover_position, self.toc_hover_strength);
-                let baseline = (14.0 - f32::from(entry.depth.min(4))).max(10.0);
-                let width = baseline + (52.0 - baseline) * cascade;
-                (
-                    index,
-                    stack_top + index as f32 * marker_spacing,
-                    selected,
-                    hovered == Some(index),
-                    width,
-                )
-            })
-            .collect();
-        let detail = hovered.and_then(|index| {
-            let entry = document.toc.get(index)?;
-            let marker_y = stack_top + self.toc_hover_position * marker_spacing;
-            let breadcrumbs =
-                toc_display_breadcrumbs(&toc_breadcrumb_entries(&document.toc, index)?);
-            let card_width = toc_callout_width(&breadcrumbs, maximum_card_width);
-            let card_height = toc_callout_height(&breadcrumbs, card_width)
-                .min((self.viewport_height - 20.0).max(TOC_CARD_MIN_HEIGHT));
-            Some((
-                entry.title.clone(),
-                entry.page,
-                breadcrumbs,
-                marker_y,
-                card_width,
-                card_height,
-            ))
-        });
-
-        let markers = marker_data
-            .into_iter()
-            .map(|(index, y, selected, is_hovered, width)| {
-                div()
-                    .id(("toc-marker", index))
-                    .absolute()
-                    .top(px(y - marker_hit_height * 0.5))
-                    .left_0()
-                    .h(px(marker_hit_height))
-                    .w(px(TOC_RAIL_WIDTH))
-                    .flex()
-                    .items_center()
-                    .pl(px(TOC_MARKER_LEFT))
-                    .cursor_pointer()
-                    .on_hover(cx.listener(move |reader, hovered, window, cx| {
-                        reader.set_toc_hovered(index, *hovered, window, cx)
-                    }))
-                    .on_click(cx.listener(move |reader, _, window, cx| {
-                        reader.navigate_toc(index, window, cx)
-                    }))
-                    .child(
-                        div()
-                            .h(px(if is_hovered { 3.0 } else { 2.0 }))
-                            .w(px(width))
-                            .rounded_full()
-                            .bg(if is_hovered {
-                                palette.text
-                            } else if hovered.is_none() && selected {
-                                palette.text.opacity(0.88)
-                            } else {
-                                palette.text_tertiary.opacity(0.48)
-                            }),
-                    )
-            });
-        let detail_card =
-            detail.map(
-                |(title, page, breadcrumbs, marker_y, card_width, card_height)| {
-                    let card_y = (marker_y - card_height * 0.5)
-                        .clamp(10.0, (self.viewport_height - card_height - 10.0).max(10.0));
-                    let breadcrumb_elements = breadcrumbs.into_iter().enumerate().map(
-                        |(position, (entry_index, title))| {
-                            div()
-                                .flex()
-                                .flex_shrink()
-                                .items_center()
-                                .gap_1()
-                                .when(position != 0, |group| {
-                                    group.child(
-                                        div()
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(palette.text_tertiary)
-                                            .child("›"),
-                                    )
-                                })
-                                .child(
-                                    div()
-                                        .id(("toc-breadcrumb", entry_index))
-                                        .max_w(px(card_width - 42.0))
-                                        .whitespace_normal()
-                                        .rounded_sm()
-                                        .px_1()
-                                        .text_xs()
-                                        .text_color(palette.text_secondary)
-                                        .cursor_pointer()
-                                        .hover(|item| {
-                                            item.bg(palette.control_hover).text_color(palette.text)
-                                        })
-                                        .on_click(cx.listener(move |reader, _, window, cx| {
-                                            reader.navigate_toc(entry_index, window, cx);
-                                            cx.stop_propagation();
-                                        }))
-                                        .child(title),
-                                )
-                        },
-                    );
-                    div()
-                        .id("toc-hover-detail")
-                        .block_mouse_except_scroll()
-                        .on_hover(cx.listener(|reader, hovered, window, cx| {
-                            reader.set_toc_callout_hovered(*hovered, window, cx)
-                        }))
-                        .absolute()
-                        .top(px(card_y))
-                        .left(px(TOC_RAIL_WIDTH + 6.0))
-                        .w(px(card_width))
-                        .h(px(card_height))
-                        .px_4()
-                        .py_3()
-                        .overflow_y_scroll()
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(palette.text.opacity(0.13))
-                        .bg(palette.surface)
-                        .shadow_sm()
-                        .text_color(palette.text)
-                        .child(
-                            div()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .w_full()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap_1()
-                                .children(breadcrumb_elements),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(palette.text_tertiary)
-                                .child(format!("Page {}", page + 1)),
-                        )
-                },
-            );
-
-        Some(
-            div()
-                .id("toc-navigation-rail")
-                .block_mouse_except_scroll()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left_0()
-                .w(px(TOC_RAIL_WIDTH))
-                .children(markers)
-                .children(detail_card)
-                .into_any_element(),
-        )
-    }
-
-    fn render_link_preview_card(
-        &mut self,
-        palette: ReaderPalette,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let target = self
-            .previewed_link
-            .map(PreviewTarget::Link)
-            .or_else(|| self.previewed_reference.map(PreviewTarget::Reference))?;
-        let document = self.document.as_ref()?;
-        let layout = self.layout()?;
-        let (mut anchor, content, estimated_height, desired_width, card_accent) = match target {
-            PreviewTarget::Reference(index) => {
-                let reference = document.scientific_references.get(index)?.clone();
-                let card_accent = reference_identity_color(&reference.text, palette);
-                let page_rect = layout.page_rect(reference.page)?;
-                let bounds = reference
-                    .text_runs
-                    .iter()
-                    .copied()
-                    .reduce(union_text_bounds)?;
-                let anchor = normalized_bounds_in_page(page_rect, bounds);
-                let state = self.scholarly_session.state(&reference.text).cloned();
-                let desired_width =
-                    reference_preview_width(state.as_ref(), self.link_card_expansion.value());
-                let content = self.render_reference_source_card(
-                    target,
-                    reference.text,
-                    state,
-                    card_accent,
-                    palette,
-                    cx,
-                );
-                (
-                    anchor,
-                    content,
-                    122.0 + self.link_card_expansion.value() * 104.0,
-                    desired_width,
-                    card_accent,
-                )
-            }
-            PreviewTarget::Link(id) => {
-                let link = document.links.iter().find(|link| link.id == id)?.clone();
-                let page_rect = layout.page_rect(link.page)?;
-                let anchor = normalized_bounds_in_page(page_rect, link.bounds);
-                match &link.target {
-                    PdfLinkTarget::External { url } => {
-                        let parsed = url::Url::parse(url).ok();
-                        let host = parsed
-                            .as_ref()
-                            .and_then(url::Url::host_str)
-                            .unwrap_or("External link")
-                            .to_owned();
-                        let state = self
-                            .link_preview_session
-                            .as_ref()
-                            .and_then(|session| session.website(url))
-                            .cloned();
-                        let (title, site_name, image_path, status) = match state {
-                            Some(WebsitePreviewState::Ready(preview)) => (
-                                preview.title.unwrap_or_else(|| host.clone()),
-                                preview.site_name,
-                                preview.image_path,
-                                None,
-                            ),
-                            Some(WebsitePreviewState::Failed(_)) => (
-                                host.clone(),
-                                None,
-                                None,
-                                Some("Preview unavailable".to_owned()),
-                            ),
-                            Some(WebsitePreviewState::Loading) => (
-                                host.clone(),
-                                None,
-                                None,
-                                Some("Loading website preview…".to_owned()),
-                            ),
-                            None => (
-                                host.clone(),
-                                None,
-                                None,
-                                Some("Website preview is unavailable".to_owned()),
-                            ),
-                        };
-                        let open_id = id;
-                        let desired_width = if image_path.is_some() {
-                            328.0
-                        } else {
-                            measured_preview_width(
-                                &[title.as_str(), site_name.as_deref().unwrap_or(&host)],
-                                228.0,
-                                360.0,
-                            )
-                        };
-                        let content = div()
-                            .min_w_0()
-                            .when_some(image_path, |content, image_path| {
-                                content.child(
-                                    div()
-                                        .mb_3()
-                                        .h(px(116.0))
-                                        .w_full()
-                                        .overflow_hidden()
-                                        .rounded_lg()
-                                        .bg(palette.canvas)
-                                        .child(
-                                            img(image_path)
-                                                .size_full()
-                                                .object_fit(gpui::ObjectFit::Cover),
-                                        ),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Icon::new(IconName::Globe)
-                                            .size(px(15.0))
-                                            .text_color(palette.text_tertiary),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(palette.text)
-                                            .child(title),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .min_w_0()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_xs()
-                                    .text_color(palette.text_tertiary)
-                                    .child(site_name.unwrap_or(host)),
-                            )
-                            .when_some(status, |content, status| {
-                                content.child(
-                                    div()
-                                        .mt_2()
-                                        .text_xs()
-                                        .text_color(palette.text_secondary)
-                                        .child(status),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .id(("link-preview-open", id))
-                                    .mt_3()
-                                    .h(px(32.0))
-                                    .px_3()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_1()
-                                    .rounded_md()
-                                    .bg(palette.blue)
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(palette.accent_foreground)
-                                    .cursor_pointer()
-                                    .hover(|button| button.bg(palette.blue.opacity(0.86)))
-                                    .active(|button| button.bg(palette.blue.opacity(0.72)))
-                                    .on_click(cx.listener(move |reader, _, window, cx| {
-                                        reader.activate_document_link(open_id, window, cx);
-                                        reader.dismiss_link_preview(window, cx);
-                                        cx.stop_propagation();
-                                    }))
-                                    .child(Icon::new(IconName::ExternalLink).size(px(14.0)))
-                                    .child("Open in browser"),
-                            )
-                            .into_any_element();
-                        (
-                            anchor,
-                            content,
-                            if self
-                                .link_preview_session
-                                .as_ref()
-                                .and_then(|session| session.website(url))
-                                .is_some_and(|state| {
-                                    matches!(state, WebsitePreviewState::Ready(preview) if preview.image_path.is_some())
-                                })
-                            {
-                                274.0
-                            } else {
-                                156.0
-                            },
-                            desired_width,
-                            palette.blue,
-                        )
-                    }
-                    PdfLinkTarget::Internal { page, .. } => {
-                        let reference_indices = self.scientific_reference_indices_for_link(id);
-                        if reference_indices.len() > 1 {
-                            let references = reference_indices
-                                .into_iter()
-                                .filter_map(|index| {
-                                    let reference =
-                                        document.scientific_references.get(index)?.clone();
-                                    let state =
-                                        self.scholarly_session.state(&reference.text).cloned();
-                                    Some((index, reference, state))
-                                })
-                                .collect::<Vec<_>>();
-                            let card_accent = references
-                                .first()
-                                .map(|(_, reference, _)| {
-                                    reference_identity_color(&reference.text, palette)
-                                })
-                                .unwrap_or(palette.purple);
-                            let estimated_height = (58.0 + references.len() as f32 * 122.0)
-                                .min((self.viewport_height - LINK_CARD_MARGIN * 2.0).max(160.0));
-                            (
-                                anchor,
-                                self.render_grouped_reference_source_card(
-                                    references,
-                                    card_accent,
-                                    palette,
-                                    cx,
-                                ),
-                                estimated_height,
-                                LINK_CARD_WIDTH,
-                                card_accent,
-                            )
-                        } else if let Some(reference) =
-                            self.scientific_reference_for_link(id).cloned()
-                        {
-                            let card_accent = reference_identity_color(&reference.text, palette);
-                            let state = self.scholarly_session.state(&reference.text).cloned();
-                            let desired_width = reference_preview_width(
-                                state.as_ref(),
-                                self.link_card_expansion.value(),
-                            );
-                            (
-                                anchor,
-                                self.render_reference_source_card(
-                                    target,
-                                    reference.text,
-                                    state,
-                                    card_accent,
-                                    palette,
-                                    cx,
-                                ),
-                                122.0 + self.link_card_expansion.value() * 104.0,
-                                desired_width,
-                                card_accent,
-                            )
-                        } else {
-                            let title = link_section_title(
-                                &document.toc,
-                                *page,
-                                match link.target {
-                                    PdfLinkTarget::Internal { y_fraction, .. } => y_fraction,
-                                    PdfLinkTarget::External { .. } => None,
-                                },
-                            )
-                            .unwrap_or_else(|| "Document section".to_owned());
-                            let preview = self
-                                .resolved_internal_link(id)
-                                .map(|resolved| resolved.preview)
-                                .filter(|preview| !preview.is_empty());
-                            let image = self
-                                .destination_preview
-                                .as_ref()
-                                .filter(|preview| {
-                                    preview.revision == self.destination_preview_revision
-                                })
-                                .map(|preview| preview.image.clone());
-                            let image_pending = image.is_none();
-                            let desired_width = if image.is_some() {
-                                328.0
-                            } else {
-                                measured_preview_width(
-                                    &[
-                                        title.as_str(),
-                                        preview.as_deref().unwrap_or("Document section"),
-                                    ],
-                                    240.0,
-                                    344.0,
-                                )
-                            };
-                            let content = div()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(palette.text)
-                                        .child(compact_words(&title, 12)),
-                                )
-                                .child(
-                                    div()
-                                        .mt_1()
-                                        .text_xs()
-                                        .text_color(palette.text_tertiary)
-                                        .child(format!("Page {}", page + 1)),
-                                )
-                                .child(
-                                    div()
-                                        .mt_3()
-                                        .h(px(112.0))
-                                        .w_full()
-                                        .overflow_hidden()
-                                        .rounded_lg()
-                                        .border_1()
-                                        .border_color(palette.separator)
-                                        .bg(palette.canvas)
-                                        .when_some(image, |thumbnail, image| {
-                                            thumbnail.child(
-                                                img(image)
-                                                    .size_full()
-                                                    .object_fit(gpui::ObjectFit::Cover),
-                                            )
-                                        })
-                                        .when(image_pending, |thumbnail| {
-                                            thumbnail
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .text_xs()
-                                                .text_color(palette.text_tertiary)
-                                                .child("Rendering preview…")
-                                        }),
-                                )
-                                .when_some(preview, |content, preview| {
-                                    content.child(
-                                        div()
-                                            .mt_2()
-                                            .text_xs()
-                                            .text_color(palette.text_secondary)
-                                            .child(compact_words(&preview, 22)),
-                                    )
-                                })
-                                .child(self.render_preview_jump(target, palette.purple, cx))
-                                .into_any_element();
-                            (anchor, content, 256.0, desired_width, palette.purple)
-                        }
-                    }
-                }
-            }
-        };
-        anchor.x -= self.scroll.x;
-        anchor.y -= self.scroll.y;
-        let card_width = desired_width.clamp(
-            220.0,
-            LINK_CARD_WIDTH.min((self.viewport_width - LINK_CARD_MARGIN * 2.0).max(220.0)),
-        );
-        let position = self.link_card_pointer.map_or_else(
-            || {
-                link_card_position(
-                    anchor,
-                    self.viewport_width,
-                    self.viewport_height,
-                    card_width,
-                    estimated_height,
-                )
-            },
-            |pointer| {
-                pointer_link_card_position(
-                    pointer,
-                    self.viewport_width,
-                    self.viewport_height,
-                    card_width,
-                    estimated_height,
-                )
-            },
-        );
-        Some(
-            div()
-                .id("link-preview-card")
-                .block_mouse_except_scroll()
-                .on_hover(cx.listener(|reader, hovered, window, cx| {
-                    reader.set_link_card_hovered(*hovered, window, cx)
-                }))
-                .absolute()
-                .top(px(position.y))
-                .left(px(position.x))
-                .w(px(card_width))
-                .max_h(px(
-                    (self.viewport_height - LINK_CARD_MARGIN * 2.0).max(120.0)
-                ))
-                .overflow_hidden()
-                .rounded_xl()
-                .border_1()
-                .border_color(card_accent.opacity(0.30))
-                .bg(palette.surface)
-                .shadow_sm()
-                .child(
-                    div()
-                        .id("link-preview-card-scroll")
-                        .max_h(px(
-                            (self.viewport_height - LINK_CARD_MARGIN * 2.0).max(120.0)
-                        ))
-                        .overflow_y_scroll()
-                        .child(div().h(px(3.0)).w_full().flex_none().bg(card_accent))
-                        .child(div().min_w_0().px_4().pt_3().pb_4().child(content)),
-                )
-                .into_any_element(),
-        )
-    }
-
-    fn render_grouped_reference_source_card(
-        &self,
-        references: Vec<(usize, ScientificReference, Option<ScholarlyMetadataState>)>,
-        identity_color: gpui::Hsla,
-        palette: ReaderPalette,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let group = references
-            .iter()
-            .map(|(_, reference, _)| reference.text.clone())
-            .collect::<Vec<_>>();
-        let count = references.len();
-        let rows = references.into_iter().enumerate().map(
-            |(position, (reference_index, reference, state))| {
-                let details_group = group.clone();
-                let details_reference = reference.text.clone();
-                let body = match state {
-                    Some(ScholarlyMetadataState::Ready(metadata)) => div()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(palette.text)
-                                .child(compact_words(&metadata.title, 14)),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
-                                .min_w_0()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_xs()
-                                .text_color(palette.text_secondary)
-                                .child(compact_citation_line(&metadata)),
-                        )
-                        .child(
-                            div()
-                                .mt_2()
-                                .flex()
-                                .items_center()
-                                .gap_4()
-                                .child(self.render_grouped_reference_jump(
-                                    reference_index,
-                                    palette,
-                                    cx,
-                                ))
-                                .child(
-                                    div()
-                                        .id(("grouped-reference-details", reference_index))
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(identity_color)
-                                        .cursor_pointer()
-                                        .hover(|button| button.opacity(0.68))
-                                        .active(|button| button.opacity(0.48))
-                                        .on_click(cx.listener(move |reader, _, window, cx| {
-                                            reader.open_reference_details_group(
-                                                details_reference.clone(),
-                                                details_group.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                            cx.stop_propagation();
-                                        }))
-                                        .child("View details")
-                                        .child(Icon::new(IconName::ArrowRight).size(px(12.0))),
-                                ),
-                        )
-                        .into_any_element(),
-                    Some(ScholarlyMetadataState::Failed(_)) => div()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_xs()
-                                .line_height(px(18.0))
-                                .text_color(palette.text_secondary)
-                                .child(compact_words(&reference.text, 18)),
-                        )
-                        .child(
-                            div()
-                                .mt_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(palette.text_tertiary)
-                                .child(Icon::new(IconName::CircleX).size(px(13.0)))
-                                .child("No source found"),
-                        )
-                        .child(div().mt_2().child(self.render_grouped_reference_jump(
-                            reference_index,
-                            palette,
-                            cx,
-                        )))
-                        .into_any_element(),
-                    Some(ScholarlyMetadataState::Loading) | None => div()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_xs()
-                                .line_height(px(18.0))
-                                .text_color(palette.text_secondary)
-                                .child(compact_words(&reference.text, 18)),
-                        )
-                        .child(
-                            div()
-                                .mt_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(palette.text_tertiary)
-                                .child(loading_source_icon(identity_color))
-                                .child("Checking source"),
-                        )
-                        .child(div().mt_2().child(self.render_grouped_reference_jump(
-                            reference_index,
-                            palette,
-                            cx,
-                        )))
-                        .into_any_element(),
-                };
-                div()
-                    .when(position != 0, |row| {
-                        row.mt_3()
-                            .pt_3()
-                            .border_t_1()
-                            .border_color(palette.separator)
-                    })
-                    .child(
-                        div()
-                            .mb_1()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(identity_color)
-                            .child(format!("REFERENCE {}", reference.number)),
-                    )
-                    .child(body)
-            },
-        );
-        div()
-            .min_w_0()
-            .child(
-                div()
-                    .mb_3()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.text)
-                            .child("Grouped citation"),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_full()
-                            .bg(identity_color.opacity(0.12))
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(identity_color)
-                            .child(format!("{count} sources")),
-                    ),
-            )
-            .children(rows)
-            .into_any_element()
-    }
-
-    fn render_grouped_reference_jump(
-        &self,
-        reference_index: usize,
-        palette: ReaderPalette,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        div()
-            .id(("grouped-reference-jump", reference_index))
-            .flex()
-            .items_center()
-            .gap_1()
-            .text_xs()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(palette.text_secondary)
-            .cursor_pointer()
-            .hover(|button| button.opacity(0.68))
-            .active(|button| button.opacity(0.48))
-            .on_click(cx.listener(move |reader, _, window, cx| {
-                reader.jump_to_scientific_reference(reference_index, window, cx);
-                reader.dismiss_link_preview(window, cx);
-                cx.stop_propagation();
-            }))
-            .child("Jump")
-            .child(Icon::new(IconName::ArrowRight).size(px(12.0)))
-            .into_any_element()
-    }
-
-    fn render_reference_source_card(
-        &self,
-        target: PreviewTarget,
-        reference: String,
-        state: Option<ScholarlyMetadataState>,
-        identity_color: gpui::Hsla,
-        palette: ReaderPalette,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let status = match state.clone() {
-            Some(ScholarlyMetadataState::Ready(metadata)) => {
-                let details_reference = reference.clone();
-                let citation = compact_citation_line(&metadata);
-                let progress = self.link_card_expansion.value();
-                let details = div()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.text)
-                            .child(compact_words(&metadata.title, 11)),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .min_w_0()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_xs()
-                            .text_color(palette.text_secondary)
-                            .child(citation),
-                    )
-                    .child(
-                        div()
-                            .id("view-reference-details")
-                            .mt_3()
-                            .h(px(32.0))
-                            .px_3()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_1()
-                            .rounded_md()
-                            .bg(identity_color.opacity(0.12))
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(identity_color)
-                            .cursor_pointer()
-                            .hover(move |button| button.bg(identity_color.opacity(0.19)))
-                            .active(|button| button.opacity(0.76))
-                            .on_click(cx.listener(move |reader, _, window, cx| {
-                                reader.open_reference_details(
-                                    details_reference.clone(),
-                                    window,
-                                    cx,
-                                );
-                                cx.stop_propagation();
-                            }))
-                            .child("View Reference details")
-                            .child(Icon::new(IconName::ArrowRight).size(px(14.0))),
-                    );
-                div()
-                    .h(px(20.0 + progress * 104.0))
-                    .min_w_0()
-                    .overflow_hidden()
-                    .when(progress < 0.65, |status| {
-                        status
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_sm()
-                            .text_color(palette.text_secondary)
-                            .child(loading_source_icon(identity_color))
-                            .child("Checking source")
-                    })
-                    .when(progress >= 0.65, |status| {
-                        status.child(details.opacity(((progress - 0.65) / 0.35).clamp(0.0, 1.0)))
-                    })
-                    .into_any_element()
-            }
-            Some(ScholarlyMetadataState::Failed(_)) => div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_sm()
-                .text_color(palette.text_secondary)
-                .child(Icon::new(IconName::CircleX).size(px(15.0)))
-                .child("No source found")
-                .into_any_element(),
-            Some(ScholarlyMetadataState::Loading) | None => div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_sm()
-                .text_color(palette.text_secondary)
-                .child(loading_source_icon(identity_color))
-                .child("Checking source")
-                .into_any_element(),
-        };
-        div()
-            .min_w_0()
-            .child(status)
-            .child(
-                div()
-                    .mt_3()
-                    .pt_3()
-                    .border_t_1()
-                    .border_color(palette.text.opacity(0.10))
-                    .child(self.render_preview_jump(target, identity_color, cx)),
-            )
-            .into_any_element()
-    }
-
-    fn render_preview_jump(
-        &self,
-        target: PreviewTarget,
-        accent: gpui::Hsla,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        div()
-            .id("link-preview-jump")
-            .h(px(30.0))
-            .px_2()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .rounded_md()
-            .text_xs()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(accent)
-            .cursor_pointer()
-            .hover(move |button| button.bg(accent.opacity(0.10)))
-            .active(move |button| button.bg(accent.opacity(0.17)))
-            .on_click(cx.listener(move |reader, _, window, cx| {
-                match target {
-                    PreviewTarget::Link(id) => reader.activate_document_link(id, window, cx),
-                    PreviewTarget::Reference(index) => {
-                        reader.jump_to_scientific_reference(index, window, cx)
-                    }
-                }
-                reader.dismiss_link_preview(window, cx);
-                cx.stop_propagation();
-            }))
-            .child("Jump to Document section")
-            .child(Icon::new(IconName::ArrowRight).size(px(14.0)))
-            .into_any_element()
-    }
-
-    fn render_reference_details_panel(
-        &mut self,
-        palette: ReaderPalette,
-        full_width: f32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let reference = self.reference_details.clone()?;
-        let Some(ScholarlyMetadataState::Ready(metadata)) =
-            self.scholarly_session.state(&reference).cloned()
-        else {
-            return None;
-        };
-        let panel_width = reference_panel_width(full_width);
-        if panel_width <= 0.0 {
-            return None;
-        }
-        let progress = self.reference_panel.value();
-        let right = 12.0 - (panel_width + 24.0) * (1.0 - progress);
-        let navigable_details = self.navigable_reference_details_group();
-        let detail_position = navigable_details
-            .iter()
-            .position(|candidate| candidate == &reference)
-            .unwrap_or(0);
-        let detail_count = navigable_details.len().max(1);
-        let page_transition = self.reference_details_transition.value();
-        let detail_offset =
-            self.reference_details_direction * (1.0 - page_transition) * (panel_width - 2.0);
-        let detail_opacity = (0.72 + page_transition * 0.28).clamp(0.0, 1.0);
-        let authors = if metadata.authors.is_empty() {
-            "Authors unavailable".to_owned()
-        } else {
-            metadata.authors.join(", ")
-        };
-        let journal = metadata
-            .journal
-            .clone()
-            .unwrap_or_else(|| "Journal unavailable".to_owned());
-        let source_line = format!(
-            "{} · {}",
-            metadata.source.label(),
-            metadata
-                .certainty
-                .map(|certainty| certainty.label())
-                .unwrap_or("DOI match")
-        );
-        let summary_height = (self.viewport_height * 0.30).clamp(150.0, 300.0);
-        let title_size = if metadata.title.chars().count() > 120 {
-            17.0
-        } else {
-            19.0
-        };
-        let doi_url = metadata
-            .doi
-            .as_ref()
-            .map(|doi| format!("https://doi.org/{doi}"));
-        let open_access = metadata.open_access;
-        let identity_color = reference_identity_color(&metadata.title, palette);
-        let access_icon = match open_access {
-            Some(true) => IconName::CircleCheck,
-            Some(false) => IconName::EyeOff,
-            None => IconName::Info,
-        };
-        let access_label = match open_access {
-            Some(true) => "Open access",
-            Some(false) => "Access may be restricted",
-            None => "Access unknown",
-        };
-        let access_color = if open_access == Some(true) {
-            palette.green
-        } else {
-            palette.text_secondary
-        };
-        let hero_height = reference_hero_height(&metadata.title);
-        let mut access_actions = Vec::new();
-        if let Some(url) = metadata.journal_url.clone() {
-            access_actions.push(self.render_reference_action(
-                "open-reference-journal",
-                IconName::BookOpen,
-                "Journal",
-                url,
-                false,
-                identity_color,
-                palette,
-                cx,
-            ));
-        }
-        if let Some(url) = metadata.full_text_url.clone() {
-            access_actions.push(self.render_reference_action(
-                "open-reference-pdf",
-                IconName::File,
-                "PDF",
-                url,
-                true,
-                identity_color,
-                palette,
-                cx,
-            ));
-        }
-        if let Some(url) = doi_url {
-            access_actions.push(self.render_reference_action(
-                "open-reference-doi",
-                IconName::ExternalLink,
-                "Publisher",
-                url,
-                false,
-                identity_color,
-                palette,
-                cx,
-            ));
-        }
-        if let Some(url) = metadata.landing_url.clone() {
-            access_actions.push(self.render_reference_action(
-                "open-reference-metadata",
-                IconName::Globe,
-                "Metadata",
-                url,
-                false,
-                identity_color,
-                palette,
-                cx,
-            ));
-        }
-        let hero_title = self.selectable_reference_text(
-            "reference-hero-title-text",
-            &metadata.title,
-            window,
-            cx,
-        );
-        let source_text =
-            self.selectable_reference_text("reference-source-text", &source_line, window, cx);
-        let citation = self.render_reference_citation(
-            &metadata,
-            &authors,
-            &journal,
-            identity_color,
-            palette,
-            window,
-            cx,
-        );
-        let summary = self.render_reference_summary(
-            &metadata,
-            panel_width,
-            summary_height,
-            identity_color,
-            palette,
-            window,
-            cx,
-        );
-        let header_doi = metadata.doi.as_deref().map(|doi| {
-            self.render_copyable_doi(
-                "reference-hero-doi",
-                "reference-hero-doi-text",
-                doi,
-                &middle_truncate(doi, 25),
-                identity_color,
-                palette,
-                window,
-                cx,
-            )
-        });
-        let navigation = (detail_count > 1).then(|| {
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .id("previous-reference-detail")
-                        .size(px(28.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_color(palette.text_secondary)
-                        .hover(|button| button.opacity(0.68))
-                        .active(|button| button.opacity(0.48))
-                        .on_click(cx.listener(|reader, _, window, cx| {
-                            reader.navigate_reference_details(false, window, cx);
-                            cx.stop_propagation();
-                        }))
-                        .child(Icon::new(IconName::ChevronLeft).size(px(15.0))),
-                )
-                .child(
-                    div()
-                        .min_w(px(42.0))
-                        .text_center()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(palette.text_tertiary)
-                        .child(format!("{} of {}", detail_position + 1, detail_count)),
-                )
-                .child(
-                    div()
-                        .id("next-reference-detail")
-                        .size(px(28.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_color(palette.text_secondary)
-                        .hover(|button| button.opacity(0.68))
-                        .active(|button| button.opacity(0.48))
-                        .on_click(cx.listener(|reader, _, window, cx| {
-                            reader.navigate_reference_details(true, window, cx);
-                            cx.stop_propagation();
-                        }))
-                        .child(Icon::new(IconName::ChevronRight).size(px(15.0))),
-                )
-        });
-        let content = div()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .h(px(58.0))
-                    .flex_none()
-                    .px_5()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(palette.separator)
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.text)
-                            .child("Reference details"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .children(navigation)
-                            .child(
-                                div()
-                                    .id("close-reference-details")
-                                    .size(px(30.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_color(palette.text_secondary)
-                                    .hover(|button| button.bg(palette.control_hover))
-                                    .active(|button| button.bg(palette.control_pressed))
-                                    .on_click(cx.listener(|reader, _, window, cx| {
-                                        reader.close_reference_details(window, cx);
-                                        cx.stop_propagation();
-                                    }))
-                                    .child(Icon::new(IconName::Close).size(px(16.0))),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .h(px(hero_height))
-                    .flex_none()
-                    .relative()
-                    .left(px(detail_offset))
-                    .opacity(detail_opacity)
-                    .overflow_hidden()
-                    .bg(identity_color.opacity(0.14))
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(5.0))
-                            .bg(identity_color),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .right(px(-54.0))
-                            .top(px(-64.0))
-                            .size(px(180.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(identity_color.opacity(0.28)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .right(px(22.0))
-                            .bottom(px(-70.0))
-                            .size(px(128.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(identity_color.opacity(0.20)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .right(px(28.0))
-                            .top(px(28.0))
-                            .text_color(identity_color.opacity(0.52))
-                            .child(Icon::new(IconName::BookOpen).size(px(38.0))),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(22.0))
-                            .right(px(22.0))
-                            .top(px(20.0))
-                            .bottom(px(16.0))
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .pr(px(70.0))
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(identity_color)
-                                    .child(source_text),
-                            )
-                            .child(
-                                div()
-                                    .mt_2()
-                                    .pr(px(70.0))
-                                    .text_size(px(title_size))
-                                    .line_height(px(title_size + 6.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(palette.text)
-                                    .child(hero_title),
-                            )
-                            .child(
-                                div()
-                                    .mt_2()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_xs()
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(access_color)
-                                            .child(Icon::new(access_icon).size(px(14.0)))
-                                            .child(access_label),
-                                    )
-                                    .when(metadata.doi.is_some(), |status| {
-                                        status.child(
-                                            div()
-                                                .size(px(3.0))
-                                                .flex_none()
-                                                .rounded_full()
-                                                .bg(palette.text_tertiary.opacity(0.56)),
-                                        )
-                                    })
-                                    .children(header_doi),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id(("reference-details-scroll", detail_position))
-                    .relative()
-                    .left(px(detail_offset))
-                    .opacity(detail_opacity)
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .overflow_y_scroll()
-                    .px_5()
-                    .pt_3()
-                    .pb_6()
-                    .child(citation)
-                    .when(!access_actions.is_empty(), |body| {
-                        body.child(
-                            div()
-                                .mt_6()
-                                .mb_1()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(identity_color)
-                                .child("ACCESS & LINKS"),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .flex()
-                                .gap_1()
-                                .overflow_hidden()
-                                .children(access_actions),
-                        )
-                    })
-                    .children(summary),
-            );
-        Some(
-            div()
-                .id("reference-details-panel")
-                .block_mouse_except_scroll()
-                .absolute()
-                .top(px(TOOLBAR_HEIGHT + FLUID_PANEL_VERTICAL_MARGIN))
-                .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
-                .right(px(right))
-                .w(px(panel_width))
-                .opacity(progress.max(0.01))
-                .child(FloatingPanel::new(palette, content))
-                .into_any_element(),
-        )
-    }
-
-    fn selectable_reference_text(
-        &self,
-        id: &'static str,
-        text: impl AsRef<str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        TextView::markdown(id, escape_markdown_text(text.as_ref()), window, cx)
-            .style(TextViewStyle::default().paragraph_gap(rems(0.0)))
-            .selectable(true)
-            .cursor(CursorStyle::IBeam)
-            .into_any_element()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_copyable_doi(
-        &self,
-        container_id: &'static str,
-        text_id: &'static str,
-        doi: &str,
-        display: &str,
-        identity_color: gpui::Hsla,
-        palette: ReaderPalette,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let doi_text = self.selectable_reference_text(text_id, display, window, cx);
-        let copy_doi = doi.to_owned();
-        let copy_progress = self.doi_copy_started.map_or(0.0, |started| {
-            (Instant::now().duration_since(started).as_secs_f32()
-                / DOI_COPY_FEEDBACK_DURATION.as_secs_f32())
-            .clamp(0.0, 1.0)
-        });
-        let copy_scale = 1.0 + (copy_progress * std::f32::consts::PI).sin() * 0.12;
-        let copy_id = if container_id == "reference-hero-doi" {
-            "copy-reference-hero-doi"
-        } else {
-            "copy-reference-citation-doi"
-        };
-        div()
-            .id(container_id)
-            .min_w_0()
-            .flex()
-            .items_center()
-            .gap_1()
-            .text_color(palette.text_secondary)
-            .child(Icon::new(IconName::ExternalLink).size(px(13.0)))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(doi_text),
-            )
-            .child(
-                div()
-                    .id(copy_id)
-                    .size(px(26.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_color(identity_color)
-                    .hover(|button| button.opacity(0.72))
-                    .active(|button| button.opacity(0.52))
-                    .on_click(cx.listener(move |reader, _, window, cx| {
-                        reader.copy_reference_doi(copy_doi.clone(), window, cx);
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        Icon::new(if copy_progress > 0.0 {
-                            IconName::Check
-                        } else {
-                            IconName::Copy
-                        })
-                        .size(px(14.0))
-                        .transform(Transformation::scale(size(copy_scale, copy_scale))),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_reference_summary_content(
-        &self,
-        text_id: &'static str,
-        text: &str,
-        tab: ReferenceSummaryTab,
-        metadata: &ScholarlyMetadata,
-        identity_color: gpui::Hsla,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let text = self.selectable_reference_text(text_id, text, window, cx);
-        let semantic_scholar_url = (tab == ReferenceSummaryTab::Tldr
-            && metadata.source == ScholarlySource::SemanticScholar)
-            .then(|| metadata.landing_url.clone())
-            .flatten();
-        let source_id = if text_id == "reference-summary-current-text" {
-            "reference-summary-current-source"
-        } else {
-            "reference-summary-previous-source"
-        };
-        div()
-            .min_w_0()
-            .child(text)
-            .when_some(semantic_scholar_url, |content, url| {
-                content.child(
-                    div()
-                        .id(source_id)
-                        .mt_3()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(identity_color)
-                        .cursor_pointer()
-                        .hover(|link| link.opacity(0.72))
-                        .active(|link| link.opacity(0.52))
-                        .on_click(cx.listener(move |reader, _, _, cx| {
-                            if let Err(error) = open::that_detached(&url) {
-                                reader.warning = Some(
-                                    format!("Could not open Semantic Scholar: {error}").into(),
-                                );
-                            }
-                            cx.stop_propagation();
-                            cx.notify();
-                        }))
-                        .child("Provided by Semantic Scholar")
-                        .child(Icon::new(IconName::ExternalLink).size(px(12.0))),
-                )
-            })
-            .into_any_element()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_reference_citation(
-        &self,
-        metadata: &ScholarlyMetadata,
-        authors: &str,
-        journal: &str,
-        identity_color: gpui::Hsla,
-        palette: ReaderPalette,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let progress = self.reference_citation_expansion.value();
-        let expanded_height = citation_expanded_height(authors, journal, metadata.doi.is_some());
-        let compact = compact_reference_panel_citation(metadata);
-        let compact_text =
-            self.selectable_reference_text("reference-citation-compact-text", &compact, window, cx);
-        let authors_text =
-            self.selectable_reference_text("reference-citation-authors-text", authors, window, cx);
-        let journal_text =
-            self.selectable_reference_text("reference-citation-journal-text", journal, window, cx);
-        let year = metadata
-            .year
-            .map(|year| year.to_string())
-            .unwrap_or_else(|| "Year unavailable".to_owned());
-        let year_text =
-            self.selectable_reference_text("reference-citation-year-text", &year, window, cx);
-        let expanded_doi = metadata.doi.as_deref().map(|doi| {
-            self.render_copyable_doi(
-                "reference-citation-doi",
-                "reference-citation-doi-text",
-                doi,
-                doi,
-                identity_color,
-                palette,
-                window,
-                cx,
-            )
-        });
-        div()
-            .child(
-                div()
-                    .id("reference-citation-toggle")
-                    .min_h(px(46.0))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|row| row.bg(palette.control_hover))
-                    .active(|row| row.bg(palette.control_pressed))
-                    .on_click(cx.listener(|reader, _, window, cx| {
-                        reader.toggle_reference_citation(window, cx);
-                        cx.stop_propagation();
-                    }))
-                    .child(
-                        Icon::new(IconName::CircleUser)
-                            .size(px(14.0))
-                            .text_color(identity_color),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_xs()
-                            .text_color(palette.text_secondary)
-                            .child(compact_text),
-                    )
-                    .child(
-                        div()
-                            .size(px(24.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(identity_color.opacity(0.10))
-                            .child(
-                                Icon::new(if progress > 0.5 {
-                                    IconName::ChevronUp
-                                } else {
-                                    IconName::ChevronDown
-                                })
-                                .size(px(14.0))
-                                .text_color(identity_color),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .h(px(expanded_height * progress))
-                    .opacity(progress)
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .px_2()
-                            .pt_2()
-                            .pb_3()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_start()
-                                    .gap_3()
-                                    .child(
-                                        Icon::new(IconName::CircleUser)
-                                            .size(px(14.0))
-                                            .text_color(palette.text_tertiary),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .text_sm()
-                                            .line_height(px(20.0))
-                                            .text_color(palette.text)
-                                            .child(authors_text),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .mt_3()
-                                    .flex()
-                                    .items_start()
-                                    .gap_3()
-                                    .child(
-                                        Icon::new(IconName::BookOpen)
-                                            .size(px(14.0))
-                                            .text_color(palette.text_tertiary),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .text_sm()
-                                            .line_height(px(20.0))
-                                            .text_color(palette.text)
-                                            .child(journal_text),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .mt_3()
-                                    .flex()
-                                    .items_start()
-                                    .gap_3()
-                                    .child(
-                                        Icon::new(IconName::Calendar)
-                                            .size(px(14.0))
-                                            .text_color(palette.text_tertiary),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .text_sm()
-                                            .line_height(px(20.0))
-                                            .text_color(palette.text)
-                                            .child(year_text),
-                                    ),
-                            )
-                            .when_some(expanded_doi, |details, doi| {
-                                details.child(
-                                    div()
-                                        .mt_3()
-                                        .min_w_0()
-                                        .pl(px(26.0))
-                                        .text_sm()
-                                        .line_height(px(20.0))
-                                        .child(doi),
-                                )
-                            }),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_reference_summary(
-        &self,
-        metadata: &ScholarlyMetadata,
-        panel_width: f32,
-        summary_height: f32,
-        identity_color: gpui::Hsla,
-        palette: ReaderPalette,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let has_tldr = metadata.tldr_text.is_some();
-        let has_abstract = metadata.abstract_text.is_some();
-        if !has_tldr && !has_abstract {
-            return None;
-        }
-        let current = if summary_text(metadata, self.reference_summary_tab).is_some() {
-            self.reference_summary_tab
-        } else if has_tldr {
-            ReferenceSummaryTab::Tldr
-        } else {
-            ReferenceSummaryTab::Abstract
-        };
-        let current_text = summary_text(metadata, current).unwrap_or_default();
-        let current_view = self.render_reference_summary_content(
-            "reference-summary-current-text",
-            current_text,
-            current,
-            metadata,
-            identity_color,
-            window,
-            cx,
-        );
-        let transition = self.reference_summary_transition.value();
-        let switching = self.reference_summary_transition.is_animating()
-            && self.reference_summary_previous_tab != current
-            && summary_text(metadata, self.reference_summary_previous_tab).is_some();
-        let previous_view = switching.then(|| {
-            self.render_reference_summary_content(
-                "reference-summary-previous-text",
-                summary_text(metadata, self.reference_summary_previous_tab).unwrap_or_default(),
-                self.reference_summary_previous_tab,
-                metadata,
-                identity_color,
-                window,
-                cx,
-            )
-        });
-        let direction = if self.reference_summary_previous_tab == ReferenceSummaryTab::Tldr
-            && current == ReferenceSummaryTab::Abstract
-        {
-            1.0
-        } else {
-            -1.0
-        };
-        let slide_width = (panel_width - 40.0).max(200.0);
-        let summary_pane = |id: &'static str, text: gpui::AnyElement, offset: f32, opacity: f32| {
-            div()
-                .id(id)
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(px(offset))
-                .w_full()
-                .opacity(opacity)
-                .overflow_y_scroll()
-                .pl_4()
-                .pr_2()
-                .py_2()
-                .border_l_2()
-                .border_color(identity_color.opacity(0.52))
-                .text_sm()
-                .line_height(px(21.0))
-                .text_color(palette.text_secondary)
-                .child(text)
-        };
-        let current_offset = if switching {
-            direction * (1.0 - transition) * slide_width
-        } else {
-            0.0
-        };
-        let previous_offset = -direction * transition * slide_width;
-        Some(
-            div()
-                .mt_5()
-                .child(
-                    div()
-                        .h(px(34.0))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .when(has_tldr && has_abstract, |tabs| {
-                            tabs.child(reference_summary_tab_button(
-                                "reference-summary-tldr-tab",
-                                "TL;DR",
-                                ReferenceSummaryTab::Tldr,
-                                current,
-                                identity_color,
-                                palette,
-                                cx,
-                            ))
-                            .child(reference_summary_tab_button(
-                                "reference-summary-abstract-tab",
-                                "Abstract",
-                                ReferenceSummaryTab::Abstract,
-                                current,
-                                identity_color,
-                                palette,
-                                cx,
-                            ))
-                        })
-                        .when(!(has_tldr && has_abstract), |label| {
-                            label.child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(identity_color)
-                                    .child(if has_tldr { "TL;DR" } else { "ABSTRACT" }),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .h(px(summary_height))
-                        .min_w_0()
-                        .overflow_hidden()
-                        .when_some(previous_view, |panes, previous_view| {
-                            panes.child(summary_pane(
-                                "reference-summary-previous-pane",
-                                previous_view,
-                                previous_offset,
-                                (1.0 - transition * 0.28).clamp(0.0, 1.0),
-                            ))
-                        })
-                        .child(summary_pane(
-                            "reference-summary-current-pane",
-                            current_view,
-                            current_offset,
-                            if switching {
-                                (0.72 + transition * 0.28).clamp(0.0, 1.0)
-                            } else {
-                                1.0
-                            },
-                        )),
-                )
-                .into_any_element(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_reference_action(
-        &self,
-        id: &'static str,
-        icon: IconName,
-        label: &'static str,
-        url: String,
-        primary: bool,
-        identity_color: gpui::Hsla,
-        palette: ReaderPalette,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        div()
-            .id(id)
-            .h(px(48.0))
-            .min_w_0()
-            .flex_1()
-            .px_2()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .cursor_pointer()
-            .hover(|row| row.opacity(0.72))
-            .active(|row| row.opacity(0.52))
-            .on_click(cx.listener(move |reader, _, _, cx| {
-                if let Err(error) = open::that_detached(&url) {
-                    reader.warning = Some(format!("Could not open reference: {error}").into());
-                }
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .size(px(26.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .bg(if primary {
-                        identity_color
-                    } else {
-                        identity_color.opacity(0.12)
-                    })
-                    .text_color(if primary {
-                        palette.accent_foreground
-                    } else {
-                        identity_color
-                    })
-                    .child(Icon::new(icon).size(px(13.0))),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if primary {
-                        identity_color
-                    } else {
-                        palette.text
-                    })
-                    .child(label),
-            )
-            .into_any_element()
     }
 
     fn render_fluid_main_pill(
@@ -8862,648 +4092,80 @@ impl PdfReader {
             .into_any_element()
     }
 
-    fn render_search_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_extension_contribution_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let palette = ReaderPalette::from_theme(Theme::global(cx));
-        let fluid = self.view_mode == ReaderView::Fluid;
-        let result_count = self.search.order.len();
-        let input_error = self.search.input_error.clone();
-        let page_count = self
-            .document
-            .as_ref()
-            .map_or(0, |document| document.pages.len());
-        let status: SharedString = if let Some(error) = input_error.clone() {
-            error
-        } else if self.search.query.trim().is_empty() {
-            "Type to search the document".into()
-        } else if self.search.complete {
-            format!(
-                "{} result{}{}",
-                result_count,
-                if result_count == 1 { "" } else { "s" },
-                if self.search.truncated {
-                    " (limit reached)"
-                } else {
-                    ""
-                }
-            )
-            .into()
-        } else {
-            format!(
-                "Searching… {} / {} pages",
-                self.search.searched_pages, page_count
-            )
-            .into()
+        let Some(pane) = self.extension_contribution.as_ref() else {
+            return empty_state(
+                palette,
+                IconName::LayoutDashboard,
+                "No extension panel",
+                "Open a contribution from the Extensions overview.",
+            );
         };
-        let active_index = self.search.active.and_then(|active| {
-            self.search
-                .order
-                .iter()
-                .position(|candidate| *candidate == active)
-        });
-        let navigation_enabled = result_count > 0;
-        let (empty_title, empty_detail): (SharedString, SharedString) = if input_error.is_some() {
-            (
-                "Search needs attention".into(),
-                "Fix the query above to continue searching.".into(),
-            )
-        } else if self.search.complete && !self.search.query.trim().is_empty() {
-            (
-                "No matches".into(),
-                "Try a different word or a shorter phrase.".into(),
-            )
-        } else {
-            (
-                "Find text in this document".into(),
-                "Matches will be highlighted as you type.".into(),
-            )
-        };
-        let results = if result_count == 0 {
-            div()
-                .flex_1()
-                .min_h(px(0.0))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .px_6()
-                .text_center()
-                .child(
-                    div()
-                        .size(px(38.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(palette.accent_soft)
-                        .text_color(palette.accent)
-                        .text_lg()
-                        .child(Icon::new(IconName::Search)),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(palette.text)
-                        .child(empty_title),
-                )
-                .child(
-                    div()
-                        .max_w(px(240.0))
-                        .text_xs()
-                        .line_height(px(18.0))
-                        .text_color(palette.text_secondary)
-                        .child(empty_detail),
-                )
-                .into_any_element()
-        } else {
-            let rows: Arc<[SearchListRow]> = search_list_rows(&self.search.order).into();
-            list(
-                self.search_list_state.clone(),
-                cx.processor(move |reader, index, _window, cx| {
-                    let Some(row) = rows.get(index).copied() else {
-                        return div().into_any_element();
-                    };
-                    match row {
-                        SearchListRow::Page(page) => div()
-                            .h(px(34.0))
-                            .w_full()
-                            .px_4()
-                            .pt_3()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(palette.text_secondary)
-                            .child(format!("PAGE {}", page + 1))
-                            .into_any_element(),
-                        SearchListRow::Match { id, ordinal } => {
-                            let Some(result) =
-                                reader.search.pages.get(&id.page).and_then(|matches| {
-                                    matches.iter().find(|result| result.id == id)
-                                })
-                            else {
-                                return div().into_any_element();
-                            };
-                            let preview = search_preview_text(result, palette);
-                            let active = reader.search.active == Some(id);
-                            div()
-                                .h(px(68.0))
-                                .w_full()
-                                .px_3()
-                                .py_1()
-                                .child(
-                                    div()
-                                        .id(("search-result", ordinal))
-                                        .size_full()
-                                        .overflow_hidden()
-                                        .flex()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(if active {
-                                            palette.accent_border
-                                        } else {
-                                            palette.separator
-                                        })
-                                        .bg(if active {
-                                            palette.accent_soft
-                                        } else {
-                                            palette.surface
-                                        })
-                                        .cursor_pointer()
-                                        .hover(move |row| {
-                                            row.bg(if active {
-                                                palette.accent_soft_hover
-                                            } else {
-                                                palette.surface_subtle
-                                            })
-                                        })
-                                        .on_click(cx.listener(move |reader, _, window, cx| {
-                                            reader.activate_search_match(id, window, cx)
-                                        }))
-                                        .when(active, |row| {
-                                            row.child(
-                                                div()
-                                                    .w(px(3.0))
-                                                    .h_full()
-                                                    .flex_none()
-                                                    .bg(palette.accent),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .px_3()
-                                                .py_2()
-                                                .h(px(58.0))
-                                                .overflow_hidden()
-                                                .text_sm()
-                                                .line_height(px(19.0))
-                                                .child(preview),
-                                        ),
-                                )
-                                .into_any_element()
-                        }
-                    }
-                }),
-            )
-            .flex_1()
-            .min_h(px(0.0))
-            .w_full()
-            .bg(palette.surface_subtle)
-            .when(fluid, |list| list.rounded_b_xl())
-            .into_any_element()
-        };
-
+        let title = pane.title.clone();
+        let view = pane.view.clone();
         div()
             .size_full()
             .flex()
             .flex_col()
-            .when(fluid, |panel| panel.rounded_xl())
             .bg(palette.surface)
             .text_color(palette.text)
             .child(
                 div()
                     .h(px(54.0))
                     .flex_none()
-                    .px_4()
+                    .px_3()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(palette.separator)
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Find in Document"),
-                    )
-                    .child(Self::chrome_button(
-                        palette,
-                        "close-search",
-                        Icon::new(IconName::Close).size(px(16.0)),
-                        ChromeButtonStyle::Ghost,
-                        true,
-                        cx.listener(|reader, _, window, cx| {
-                            reader.toggle_sidebar(SidePanel::Search, window, cx)
-                        }),
-                    )),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .p_4()
-                    .pb_3()
-                    .flex()
-                    .flex_col()
                     .gap_2()
                     .border_b_1()
                     .border_color(palette.separator)
-                    .child(self.search_field.clone())
-                    .child(
-                        div()
-                            .h(px(32.0))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if input_error.is_some() {
-                                        palette.error
-                                    } else {
-                                        palette.text_secondary
-                                    })
-                                    .child(if let Some(index) = active_index {
-                                        format!("{} of {}", index + 1, result_count).into()
-                                    } else {
-                                        status
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .child(Self::chrome_button(
-                                        palette,
-                                        "previous-search-result",
-                                        Icon::new(IconName::ArrowUp),
-                                        ChromeButtonStyle::Ghost,
-                                        navigation_enabled,
-                                        cx.listener(|reader, _, window, cx| {
-                                            reader.navigate_search(false, window, cx)
-                                        }),
-                                    ))
-                                    .child(Self::chrome_button(
-                                        palette,
-                                        "next-search-result",
-                                        Icon::new(IconName::ArrowDown),
-                                        ChromeButtonStyle::Ghost,
-                                        navigation_enabled,
-                                        cx.listener(|reader, _, window, cx| {
-                                            reader.navigate_search(true, window, cx)
-                                        }),
-                                    )),
-                            ),
-                    ),
-            )
-            .child(results)
-            .into_any_element()
-    }
-
-    fn render_comment_list(
-        &mut self,
-        style: CommentListStyle,
-        palette: ReaderPalette,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        uniform_list(
-            style.list_id(),
-            self.comment_order.len(),
-            cx.processor(move |reader, range: std::ops::Range<usize>, _window, cx| {
-                range
-                    .filter_map(|index| {
-                        let id = *reader.comment_order.get(index)?;
-                        let (page, preview, color, active) =
-                            reader.comment_row_presentation(id, palette)?;
-                        let action = match style {
-                            CommentListStyle::Fluid => div()
-                                .text_color(if active {
-                                    palette.accent
-                                } else {
-                                    palette.text_secondary
-                                })
-                                .child(Self::icon_label(IconName::ArrowRight, "Open"))
-                                .into_any_element(),
-                            CommentListStyle::Classic => div()
-                                .id(("edit-comment", index))
-                                .px_2()
-                                .py_1()
-                                .overflow_hidden()
-                                .rounded_md()
-                                .text_color(palette.accent)
-                                .hover(|button| button.bg(palette.accent_soft))
-                                .on_click(cx.listener(move |reader, _, window, cx| {
-                                    reader.edit_comment(id, window, cx)
-                                }))
-                                .child("Edit")
-                                .into_any_element(),
-                        };
-                        Some(
-                            div()
-                                .h(px(style.row_height()))
-                                .w_full()
-                                .px_3()
-                                .py_1()
-                                .child(
-                                    div()
-                                        .id((style.row_id(), index))
-                                        .size_full()
-                                        .overflow_hidden()
-                                        .flex()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(if active {
-                                            palette.accent_border
-                                        } else {
-                                            palette.separator
-                                        })
-                                        .bg(if active {
-                                            palette.accent_soft
-                                        } else {
-                                            palette.surface
-                                        })
-                                        .cursor_pointer()
-                                        .hover(move |row| {
-                                            row.bg(if active {
-                                                palette.accent_soft_hover
-                                            } else {
-                                                palette.surface_subtle
-                                            })
-                                        })
-                                        .on_click(cx.listener(move |reader, _, window, cx| {
-                                            reader.open_comment_from_list(id, window, cx);
-                                        }))
-                                        .child(div().w(px(4.0)).h_full().flex_none().bg(color))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .px_3()
-                                                .py_2()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .child(
-                                                            div()
-                                                                .text_color(if active {
-                                                                    palette.accent
-                                                                } else {
-                                                                    palette.text_secondary
-                                                                })
-                                                                .child(format!(
-                                                                    "PAGE {}",
-                                                                    page + 1
-                                                                )),
-                                                        )
-                                                        .child(action),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .h(px(style.preview_height()))
-                                                        .overflow_hidden()
-                                                        .text_sm()
-                                                        .line_height(px(20.0))
-                                                        .text_color(palette.text)
-                                                        .child(preview),
-                                                ),
-                                        ),
-                                ),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .track_scroll(self.comment_list_scroll.clone())
-        .flex_1()
-        .min_h(px(0.0))
-        .w_full()
-        .bg(palette.surface_subtle)
-        .when(style == CommentListStyle::Fluid, |list| list.rounded_b_xl())
-        .into_any_element()
-    }
-
-    fn render_fluid_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
-        let list_header = div()
-            .h(px(54.0))
-            .flex_none()
-            .px_4()
-            .flex()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(palette.separator)
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Comments"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
                     .child(Self::chrome_button(
                         palette,
-                        "fluid-close-comments",
+                        "extension-contribution-back",
+                        Self::icon_label(IconName::ChevronLeft, "Extensions"),
+                        ChromeButtonStyle::Ghost,
+                        true,
+                        cx.listener(|reader, _, window, cx| {
+                            reader.manage_extensions(&ManageExtensions, window, cx)
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(Self::chrome_button(
+                        palette,
+                        "close-extension-contribution",
                         Icon::new(IconName::Close).size(px(16.0)),
                         ChromeButtonStyle::Ghost,
                         true,
                         cx.listener(|reader, _, window, cx| {
-                            reader.toggle_sidebar(SidePanel::Comments, window, cx)
+                            let _ = reader.close_extension_contribution(None, window, cx);
                         }),
                     )),
-            );
-
-        let list_body = if self.comment_order.is_empty() {
-            let empty = CommentEmptyPresentation::new(
-                self.annotations_loading,
-                self.annotation_persistence_blocked,
-                true,
-            );
-            empty_state(palette, IconName::BookOpen, empty.title, empty.detail)
-        } else {
-            self.render_comment_list(CommentListStyle::Fluid, palette, cx)
-        };
-
-        let list_error = self
-            .annotation_error
-            .clone()
-            .map(|message| error_banner(palette, message));
-        let progress = self.comment_pane.progress;
-        let list_pane = div()
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .left(px(-SIDEBAR_WIDTH * progress))
-            .w_full()
-            .flex()
-            .flex_col()
-            .rounded_xl()
-            .bg(palette.surface)
-            .child(list_header)
-            .children(list_error)
-            .child(list_body);
-
-        let editor_pane = self.comment_editor.clone().map(|editor| {
-            let annotations_pending = self
-                .annotations
-                .as_ref()
-                .is_some_and(|annotations| annotations.revision() > self.annotation_saved_revision);
-            let presentation = CommentEditorPresentation::new(
-                true,
-                self.editing_annotation.is_some(),
-                self.comment_draft_dirty
-                    || self.comment_autosave_task.is_some()
-                    || annotations_pending,
-            );
-            let title = presentation.title;
-            let save_status = presentation.save_status;
-            let editor_error = self
-                .annotation_error
-                .clone()
-                .map(|message| error_banner(palette, message));
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(px(SIDEBAR_WIDTH * (1.0 - progress)))
-                .w_full()
-                .flex()
-                .flex_col()
-                .rounded_xl()
-                .bg(palette.surface)
-                .child(
-                    div()
-                        .h(px(54.0))
-                        .flex_none()
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .border_b_1()
-                        .border_color(palette.separator)
-                        .child(Self::chrome_button(
-                            palette,
-                            "fluid-comment-back",
-                            Self::icon_label(IconName::ChevronLeft, "Overview"),
-                            ChromeButtonStyle::Ghost,
-                            true,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.return_to_comment_list(window, cx)
-                            }),
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .px_2()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .max_w(px(150.0))
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(title),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(if save_status == "Saved" {
-                                            palette.green
-                                        } else {
-                                            palette.text_secondary
-                                        })
-                                        .child(save_status),
-                                ),
-                        )
-                        .child(Self::chrome_button(
-                            palette,
-                            "fluid-close-comment-editor",
-                            Icon::new(IconName::Close).size(px(16.0)),
-                            ChromeButtonStyle::Ghost,
-                            true,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.toggle_sidebar(SidePanel::Comments, window, cx)
-                            }),
-                        )),
-                )
-                .children(editor_error)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .p_4()
-                        .flex()
-                        .flex_col()
-                        .child(editor),
-                )
-        });
-
-        div()
-            .relative()
-            .size_full()
-            .overflow_hidden()
-            .rounded_xl()
-            .bg(palette.surface)
-            .text_color(palette.text)
-            .child(list_pane)
-            .children(editor_pane)
+            )
+            .child(
+                div()
+                    .id("extension-contribution-scroll")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .p_4()
+                    .child(view),
+            )
             .into_any_element()
     }
 
-    fn render_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        match self.view_mode {
-            ReaderView::Classic => self.render_classic_comments_panel(cx),
-            ReaderView::Fluid => self.render_fluid_comments_panel(cx),
-        }
-    }
-
-    fn comment_row_presentation(
-        &self,
-        id: AnnotationId,
-        palette: ReaderPalette,
-    ) -> Option<(usize, SharedString, Hsla, bool)> {
-        let annotation = self.annotations.as_ref()?.get(id)?;
-        let page = annotation.range().start().page;
-        let markdown = annotation.comment_markdown().unwrap_or("");
-        let preview = RichTextBuffer::try_from_markdown(markdown)
-            .map(|buffer| compact_preview(buffer.text(), 96))
-            .unwrap_or_else(|_| compact_preview(markdown, 96));
-        let color = match annotation.highlight() {
-            Some(HighlightColor::Yellow) => palette.yellow,
-            Some(HighlightColor::Green) => palette.green,
-            Some(HighlightColor::Blue) => palette.blue,
-            Some(HighlightColor::Pink) => palette.pink,
-            Some(HighlightColor::Purple) => palette.purple,
-            None => palette.warning,
-        };
-        Some((
-            page,
-            preview.into(),
-            color,
-            self.active_annotation == Some(id),
-        ))
-    }
-
-    fn render_classic_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_extensions_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let palette = ReaderPalette::from_theme(Theme::global(cx));
-        let error = self.annotation_error.clone();
-        let editor_open = self.comment_editor.is_some();
-        let annotations_pending = self
-            .annotations
-            .as_ref()
-            .is_some_and(|annotations| annotations.revision() > self.annotation_saved_revision);
-        let presentation = CommentEditorPresentation::new(
-            editor_open,
-            self.editing_annotation.is_some(),
-            self.comment_draft_dirty || self.comment_autosave_task.is_some() || annotations_pending,
-        );
-        let save_status = presentation.save_status;
-        let title = presentation.title;
         let header = div()
             .h(px(54.0))
             .flex_none()
@@ -9518,45 +4180,13 @@ impl PdfReader {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .when(editor_open, |heading| {
-                        heading.child(Self::chrome_button(
-                            palette,
-                            "classic-comment-back",
-                            Self::icon_label(IconName::ChevronLeft, "Overview"),
-                            ChromeButtonStyle::Ghost,
-                            true,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.return_to_comment_list(window, cx)
-                            }),
-                        ))
-                    })
+                    .child(Icon::new(IconName::LayoutDashboard).size(px(17.0)))
                     .child(
                         div()
                             .text_lg()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .when(editor_open, |heading| {
-                        heading.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_full()
-                                .bg(if save_status == "Saved" {
-                                    palette.green.opacity(0.12)
-                                } else {
-                                    palette.accent_soft
-                                })
-                                .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(if save_status == "Saved" {
-                                    palette.green
-                                } else {
-                                    palette.accent
-                                })
-                                .child(save_status),
-                        )
-                    }),
+                            .child("Extensions"),
+                    ),
             )
             .child(
                 div()
@@ -9565,1054 +4195,321 @@ impl PdfReader {
                     .gap_1()
                     .child(Self::chrome_button(
                         palette,
-                        "close-comments",
+                        "install-extension-from-manager",
+                        Icon::new(IconName::Plus).size(px(16.0)),
+                        ChromeButtonStyle::Ghost,
+                        cfg!(feature = "installable-extensions"),
+                        cx.listener(|reader, _, window, cx| {
+                            reader.install_extension_dialog(&InstallExtension, window, cx)
+                        }),
+                    ))
+                    .child(Self::chrome_button(
+                        palette,
+                        "close-extensions",
                         Icon::new(IconName::Close).size(px(16.0)),
                         ChromeButtonStyle::Ghost,
                         true,
                         cx.listener(|reader, _, window, cx| {
-                            reader.toggle_sidebar(SidePanel::Comments, window, cx)
+                            reader.toggle_sidebar(SidePanel::Extensions, window, cx)
                         }),
                     )),
             );
 
-        let body = if let Some(editor) = self.comment_editor.clone() {
+        #[cfg(not(feature = "installable-extensions"))]
+        let body = empty_state(
+            palette,
+            IconName::SquareTerminal,
+            "Installable extensions are not included",
+            "Use the standard build to install declarative or sandboxed WebAssembly packages.",
+        );
+
+        #[cfg(feature = "installable-extensions")]
+        let body = if self.extension_packages.is_empty() {
             div()
+                .id("extensions-scroll")
                 .flex_1()
                 .min_h(px(0.0))
-                .p_4()
                 .flex()
                 .flex_col()
-                .child(editor)
-                .into_any_element()
-        } else if self.comment_order.is_empty() {
-            let empty = CommentEmptyPresentation::new(
-                self.annotations_loading,
-                self.annotation_persistence_blocked,
-                false,
-            );
-            empty_state(palette, IconName::BookOpen, empty.title, empty.detail)
-        } else {
-            self.render_comment_list(CommentListStyle::Classic, palette, cx)
-        };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(palette.surface)
-            .text_color(palette.text)
-            .child(header)
-            .children(error.map(|message| error_banner(palette, message)))
-            .child(body)
-            .into_any_element()
-    }
-
-    fn paint_document(snapshot: PaintSnapshot, bounds: Bounds<Pixels>, window: &mut Window) {
-        let palette = snapshot.palette;
-        let content_viewport = Rect {
-            x: snapshot.scroll.x,
-            y: snapshot.scroll.y,
-            width: snapshot.viewport_width,
-            height: snapshot.viewport_height,
-        };
-        let mut pages = snapshot.pages;
-        pages.sort_by_key(|page| {
-            let has_active_annotation = page
-                .annotations
-                .iter()
-                .any(|annotation| Some(annotation.id) == snapshot.active_annotation);
-            let has_active_search = snapshot
-                .active_search
-                .is_some_and(|active| active.page == page.index);
-            !(has_active_annotation || has_active_search)
-        });
-        let mut annotation_budget = PaintBudget::new(MAX_VISIBLE_ANNOTATION_QUADS);
-        let mut search_budget = PaintBudget::new(MAX_VISIBLE_SEARCH_HIGHLIGHT_RUNS);
-        let mut selection_budget = PaintBudget::new(MAX_VISIBLE_SELECTION_QUADS);
-        for page in pages {
-            let rect = page.rect;
-            let page_bounds = Bounds::new(
-                point(
-                    bounds.left() + px(rect.x - snapshot.scroll.x),
-                    bounds.top() + px(rect.y - snapshot.scroll.y),
-                ),
-                size(px(rect.width), px(rect.height)),
-            );
-            let shadow_bounds = Bounds::new(
-                page_bounds.origin + point(px(0.0), px(4.0)),
-                page_bounds.size + size(px(0.0), px(8.0)),
-            );
-            window.paint_quad(quad(
-                shadow_bounds,
-                px(5.0),
-                palette.overlay.opacity(0.32),
-                px(0.0),
-                gpui::transparent_black(),
-                Default::default(),
-            ));
-            window.paint_quad(quad(
-                page_bounds,
-                px(2.0),
-                palette.paper,
-                px(1.0),
-                palette.paper_border,
-                Default::default(),
-            ));
-
-            for tile in page.tiles {
-                let render_bounds =
-                    content_rect_to_bounds(bounds, tile.render_rect, snapshot.scroll);
-                let core_bounds = content_rect_to_bounds(bounds, tile.core_rect, snapshot.scroll);
-                window.with_content_mask(
-                    Some(ContentMask {
-                        bounds: core_bounds,
-                    }),
-                    |window| {
-                        let _ = window.paint_image(
-                            render_bounds,
-                            Corners::default(),
-                            tile.image,
-                            0,
-                            false,
-                        );
-                    },
-                );
-            }
-
-            if let Some(chars) = page.text.as_ref() {
-                window.with_content_mask(
-                    Some(ContentMask {
-                        bounds: page_bounds,
-                    }),
-                    |window| {
-                        for annotation in &page.annotations {
-                            if annotation_budget.exhausted() {
-                                break;
-                            }
-                            let Some(range) =
-                                annotation.range.indices_on_page(page.index, chars.len())
-                            else {
-                                continue;
-                            };
-                            let active = Some(annotation.id) == snapshot.active_annotation;
-                            let color = match annotation.color {
-                                Some(HighlightColor::Yellow) if active => {
-                                    palette.yellow.opacity(0.53)
-                                }
-                                Some(HighlightColor::Yellow) => palette.yellow.opacity(0.38),
-                                Some(HighlightColor::Green) if active => {
-                                    palette.green.opacity(0.53)
-                                }
-                                Some(HighlightColor::Green) => palette.green.opacity(0.38),
-                                Some(HighlightColor::Blue) if active => palette.blue.opacity(0.53),
-                                Some(HighlightColor::Blue) => palette.blue.opacity(0.38),
-                                Some(HighlightColor::Pink) if active => palette.pink.opacity(0.53),
-                                Some(HighlightColor::Pink) => palette.pink.opacity(0.38),
-                                Some(HighlightColor::Purple) if active => {
-                                    palette.purple.opacity(0.53)
-                                }
-                                Some(HighlightColor::Purple) => palette.purple.opacity(0.38),
-                                None if active => palette.warning.opacity(0.47),
-                                None if annotation.has_comment => palette.warning.opacity(0.24),
-                                None => continue,
-                            };
-                            let exhausted = chars.for_each_visible_in_range_while(
-                                rect,
-                                content_viewport,
-                                range,
-                                |_, highlight| {
-                                    if !annotation_budget.take() {
-                                        return false;
-                                    }
-                                    window.paint_quad(quad(
-                                        content_rect_to_bounds(bounds, highlight, snapshot.scroll),
-                                        px(1.0),
-                                        color,
-                                        px(0.0),
-                                        gpui::transparent_black(),
-                                        Default::default(),
-                                    ));
-                                    !annotation_budget.exhausted()
-                                },
-                            );
-                            if !exhausted {
-                                break;
-                            }
-                        }
-                    },
-                );
-            }
-
-            if let Some(matches) = page.search.as_ref() {
-                window.with_content_mask(
-                    Some(ContentMask {
-                        bounds: page_bounds,
-                    }),
-                    |window| {
-                        let active = snapshot.active_search;
-                        for result in matches
-                            .iter()
-                            .filter(|result| !is_inactive(result.id, active))
-                            .chain(
-                                matches
-                                    .iter()
-                                    .filter(|result| is_inactive(result.id, active)),
-                            )
-                        {
-                            let is_active = !is_inactive(result.id, active);
-                            for run in &result.highlight_runs {
-                                if search_budget.exhausted() {
-                                    return;
-                                }
-                                let highlight = normalized_bounds_in_page(rect, *run);
-                                if !highlight.intersects(content_viewport) {
-                                    continue;
-                                }
-                                let painted = search_budget.take();
-                                debug_assert!(painted, "exhaustion checked above");
-                                window.paint_quad(quad(
-                                    content_rect_to_bounds(bounds, highlight, snapshot.scroll),
-                                    px(1.0),
-                                    if is_active {
-                                        palette.warning.opacity(0.53)
-                                    } else {
-                                        palette.yellow.opacity(0.33)
-                                    },
-                                    px(0.0),
-                                    gpui::transparent_black(),
-                                    Default::default(),
-                                ));
-                            }
-                        }
-                    },
-                );
-            }
-
-            if let (Some(selection), Some(chars)) = (snapshot.selection, page.text)
-                && !selection_budget.exhausted()
-                && let Some(range) = selection.indices_on_page(page.index, chars.len())
-            {
-                // Dense text pages are indexed once on the worker. Paint only
-                // selected glyphs that intersect this frame's viewport, and
-                // clip malformed PDF geometry to the physical page.
-                window.with_content_mask(
-                    Some(ContentMask {
-                        bounds: page_bounds,
-                    }),
-                    |window| {
-                        chars.for_each_visible_in_range_while(
-                            rect,
-                            content_viewport,
-                            range,
-                            |_, highlight| {
-                                if !selection_budget.take() {
-                                    return false;
-                                }
-                                let highlight_bounds =
-                                    content_rect_to_bounds(bounds, highlight, snapshot.scroll);
-                                window.paint_quad(quad(
-                                    highlight_bounds,
-                                    px(1.0),
-                                    palette.selection,
-                                    px(0.0),
-                                    gpui::transparent_black(),
-                                    Default::default(),
-                                ));
-                                !selection_budget.exhausted()
-                            },
-                        );
-                    },
-                );
-            }
-
-            if let Some(frame) = snapshot
-                .navigation_focus
-                .as_ref()
-                .filter(|frame| frame.target.page == page.index)
-            {
-                paint_navigation_focus(
-                    frame,
-                    rect,
-                    page_bounds,
-                    bounds,
-                    snapshot.scroll,
+                .child(empty_state(
                     palette,
-                    window,
-                );
-            }
-        }
-
-        let max_y = (snapshot.layout.content_height - snapshot.viewport_height).max(0.0);
-        if max_y > 0.0 {
-            let thumb_height = (snapshot.viewport_height * snapshot.viewport_height
-                / snapshot.layout.content_height)
-                .max(38.0)
-                .min(snapshot.viewport_height);
-            let travel = snapshot.viewport_height - thumb_height - 8.0;
-            let y = 4.0 + travel * (snapshot.scroll.y / max_y);
-            let thumb = Bounds::new(
-                point(bounds.right() - px(8.0), bounds.top() + px(y)),
-                size(px(5.0), px(thumb_height)),
-            );
-            window.paint_quad(quad(
-                thumb,
-                px(2.5),
-                palette.text_secondary.opacity(0.56),
-                px(0.0),
-                gpui::transparent_black(),
-                Default::default(),
-            ));
-        }
-
-        let max_x = snapshot.max_scroll_x;
-        if max_x > 0.0 {
-            let effective_content_width = snapshot.viewport_width + max_x;
-            let thumb_width = (snapshot.viewport_width * snapshot.viewport_width
-                / effective_content_width)
-                .max(38.0)
-                .min(snapshot.viewport_width);
-            let travel = snapshot.viewport_width - thumb_width - 12.0;
-            let x = 4.0 + travel * (snapshot.scroll.x / max_x);
-            let thumb = Bounds::new(
-                point(bounds.left() + px(x), bounds.bottom() - px(8.0)),
-                size(px(thumb_width), px(5.0)),
-            );
-            window.paint_quad(quad(
-                thumb,
-                px(2.5),
-                palette.text_secondary.opacity(0.56),
-                px(0.0),
-                gpui::transparent_black(),
-                Default::default(),
-            ));
-        }
-    }
-}
-
-impl Focusable for PdfReader {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for PdfReader {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_theme = Theme::global(cx);
-        let mut palette = ReaderPalette::from_theme(active_theme);
-        let forced_dark = matches!(
-            self.render_appearance,
-            RenderAppearance::ForcedColors { .. }
-        );
-        palette.paper = theme::pdf_paper_color(active_theme, forced_dark);
-        palette.paper_border = theme::pdf_paper_border(active_theme, forced_dark);
-        self.update_viewport(window);
-        self.request_visible_tiles(window);
-        let full_width = f32::from(window.viewport_size().width).max(1.0);
-        let compact_toolbar = full_width < 920.0;
-        let very_compact_toolbar = full_width < 800.0;
-
-        let page_count = self
-            .document
-            .as_ref()
-            .map(|document| document.pages.len())
-            .unwrap_or(0);
-        let current_page = self
-            .layout()
-            .map(|layout| layout.current_page(self.scroll.y, self.viewport_height) + 1)
-            .unwrap_or(0);
-        let filename: SharedString = self
-            .document
-            .as_ref()
-            .and_then(|document| document.path.file_name())
-            .map(|name| name.to_string_lossy().into_owned().into())
-            .unwrap_or_else(|| "GPUI PDF Reader".into());
-        let zoom_label: SharedString = format!("{}%", (self.zoom * 100.0).round() as u32).into();
-        let status_text = self.status_text();
-        let document_open = page_count > 0;
-        let (zoom_out_enabled, zoom_in_enabled) = zoom_controls_enabled(document_open, self.zoom);
-        let editor_open = self.comment_editor.is_some();
-        let comments_label =
-            comments_toolbar_label(editor_open, compact_toolbar, very_compact_toolbar);
-        let has_annotation_context = self.context_range().is_some();
-        let show_annotation_tools = has_annotation_context && !editor_open;
-        let annotation_tools_enabled = annotation_actions_enabled(
-            has_annotation_context,
-            self.annotations_loading,
-            self.annotation_persistence_blocked,
-            editor_open,
-        );
-        let search_selected = self.sidebar.panel == SidePanel::Search && self.sidebar.target > 0.5;
-        let comments_selected =
-            self.sidebar.panel == SidePanel::Comments && self.sidebar.target > 0.5;
-        let show_status = !matches!(status_text.as_ref(), "Ready" | "Open a PDF to begin");
-
-        let classic_toolbar = div()
-            .h(px(TOOLBAR_HEIGHT))
-            .flex_none()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .bg(palette.chrome)
-            .border_b_1()
-            .border_color(palette.separator)
-            .text_color(palette.text)
-            .child(
-                div()
-                    .h_full()
-                    .w(px(TITLEBAR_CONTROL_INSET))
-                    .flex_none()
-                    .window_control_area(WindowControlArea::Drag),
-            )
-            .child(Self::chrome_button(
-                palette,
-                "open-document",
-                if very_compact_toolbar {
-                    "Open"
-                } else {
-                    "Open…"
-                },
-                ChromeButtonStyle::Ghost,
-                true,
-                cx.listener(|reader, _, window, cx| reader.open_dialog(&OpenDocument, window, cx)),
-            ))
-            .child(
-                div()
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(palette.separator)
-                    .bg(palette.control)
-                    .child(Self::segment_button(
-                        palette,
-                        "zoom-out",
-                        Icon::new(IconName::Minus),
-                        zoom_out_enabled,
-                        cx.listener(|reader, _, window, cx| reader.zoom_out(&ZoomOut, window, cx)),
-                    ))
-                    .child(
-                        div()
-                            .h_full()
-                            .min_w(px(54.0))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .border_l_1()
-                            .border_r_1()
-                            .border_color(palette.separator)
-                            .text_sm()
-                            .text_color(if document_open {
-                                palette.text
-                            } else {
-                                palette.text_tertiary
-                            })
-                            .child(zoom_label.clone()),
-                    )
-                    .child(Self::segment_button(
-                        palette,
-                        "zoom-in",
-                        Icon::new(IconName::Plus),
-                        zoom_in_enabled,
-                        cx.listener(|reader, _, window, cx| reader.zoom_in(&ZoomIn, window, cx)),
-                    ))
-                    .when(!very_compact_toolbar, |controls| {
-                        controls
-                            .child(div().h_full().w(px(1.0)).bg(palette.separator))
-                            .child(Self::segment_button(
-                                palette,
-                                "fit-width",
-                                if compact_toolbar { "Fit" } else { "Fit Width" },
-                                document_open,
-                                cx.listener(|reader, _, window, cx| {
-                                    reader.fit_width(&FitWidth, window, cx)
-                                }),
-                            ))
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .h_full()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .window_control_area(WindowControlArea::Drag)
-                    .when(!compact_toolbar, |title| {
-                        title.child(
-                            div()
-                                .min_w(px(0.0))
-                                .max_w(px(260.0))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(filename.clone()),
-                        )
-                    })
-                    .when(document_open && !very_compact_toolbar, |title| {
-                        title.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_full()
-                                .bg(palette.control_hover)
-                                .text_xs()
-                                .text_color(palette.text_secondary)
-                                .child(format!("{current_page} / {page_count}")),
-                        )
-                    })
-                    .when(show_status, |title| {
-                        title.child(
-                            div()
-                                .max_w(px(180.0))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_xs()
-                                .text_color(palette.text_secondary)
-                                .child(status_text.clone()),
-                        )
-                    }),
-            )
-            .when(show_annotation_tools, |toolbar| {
-                toolbar.child(
-                    div()
-                        .h(px(34.0))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .px_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(palette.separator)
-                        .bg(palette.control)
-                        .when(!compact_toolbar, |controls| {
-                            controls.child(
-                                div()
-                                    .pl_2()
-                                    .pr_1()
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(palette.text_secondary)
-                                    .child("Highlight"),
-                            )
-                        })
-                        .children(
-                            [
-                                "highlight-yellow",
-                                "highlight-green",
-                                "highlight-blue",
-                                "highlight-pink",
-                                "highlight-purple",
-                            ]
-                            .into_iter()
-                            .zip(HighlightColor::ALL)
-                            .map(|(id, color)| {
-                                Self::highlight_button(
-                                    palette,
-                                    id,
-                                    color,
-                                    annotation_tools_enabled,
-                                    cx.listener(move |reader, _, _, cx| {
-                                        reader.add_highlight(color, cx)
-                                    }),
-                                )
-                            }),
-                        )
-                        .child(div().h(px(22.0)).w(px(1.0)).bg(palette.separator))
-                        .child(Self::segment_button(
-                            palette,
-                            "add-selection-comment",
-                            if self.context_has_comment() {
-                                if very_compact_toolbar {
-                                    "Edit"
-                                } else {
-                                    "Edit Comment"
-                                }
-                            } else if very_compact_toolbar {
-                                "Note"
-                            } else {
-                                "Comment"
-                            },
-                            annotation_tools_enabled,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.comment_on_context(window, cx)
-                            }),
-                        )),
-                )
-            })
-            .when(
-                !(very_compact_toolbar && show_annotation_tools),
-                |toolbar| {
-                    toolbar
-                        .child(Self::chrome_button(
-                            palette,
-                            "toggle-search",
-                            if compact_toolbar { "Find" } else { "Search" },
-                            if search_selected {
-                                ChromeButtonStyle::Selected
-                            } else {
-                                ChromeButtonStyle::Ghost
-                            },
-                            document_open,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.find_document(&Find, window, cx)
-                            }),
-                        ))
-                        .child(Self::chrome_button(
-                            palette,
-                            "toggle-comments",
-                            comments_label,
-                            if comments_selected {
-                                ChromeButtonStyle::Selected
-                            } else {
-                                ChromeButtonStyle::Ghost
-                            },
-                            document_open,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.toggle_comments(&ToggleComments, window, cx)
-                            }),
-                        ))
-                },
-            );
-
-        let fluid_toolbar = div()
-            .h(px(TOOLBAR_HEIGHT))
-            .flex_none()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .bg(palette.chrome)
-            .border_b_1()
-            .border_color(palette.separator)
-            .text_color(palette.text)
-            .child(
-                div()
-                    .h_full()
-                    .w(px(TITLEBAR_CONTROL_INSET))
-                    .flex_none()
-                    .window_control_area(WindowControlArea::Drag),
-            )
-            .child(Self::chrome_button(
-                palette,
-                "fluid-open-document",
-                "Open…",
-                ChromeButtonStyle::Ghost,
-                true,
-                cx.listener(|reader, _, window, cx| reader.open_dialog(&OpenDocument, window, cx)),
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .window_control_area(WindowControlArea::Drag)
-                    .child(
-                        div()
-                            .max_w(px(320.0))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(filename.clone()),
-                    )
-                    .when(document_open, |title| {
-                        title.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_full()
-                                .bg(palette.control_hover)
-                                .text_xs()
-                                .text_color(palette.text_secondary)
-                                .child(format!("{current_page} / {page_count}")),
-                        )
-                    })
-                    .when(show_status && !compact_toolbar, |title| {
-                        title.child(
-                            div()
-                                .max_w(px(180.0))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_xs()
-                                .text_color(palette.text_secondary)
-                                .child(status_text.clone()),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_full()
-                    .bg(palette.accent_soft)
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(palette.accent)
-                    .child("Fluid"),
-            );
-
-        let toolbar = match self.view_mode {
-            ReaderView::Classic => classic_toolbar.into_any_element(),
-            ReaderView::Fluid => fluid_toolbar.into_any_element(),
-        };
-        let toc_navigation = self.render_toc_navigation(palette, cx);
-        let link_preview = self.render_link_preview_card(palette, cx);
-
-        let content = if let Some(layout) = self.layout() {
-            let visible = layout.visible_pages(
-                self.scroll.y,
-                self.viewport_height,
-                self.viewport_height * 0.2,
-            );
-            let pages = visible
-                .filter_map(|index| {
-                    let rect = layout.page_rect(index)?;
-                    let desired = desired_raster_size(rect, window.scale_factor());
-                    let mut paint_annotations: Vec<_> = self
-                        .annotations
-                        .as_ref()
-                        .map(|annotations| {
-                            annotations
-                                .on_page(index)
-                                .map(|annotation| PaintAnnotation {
-                                    id: annotation.id(),
-                                    range: annotation.range(),
-                                    color: annotation.highlight(),
-                                    has_comment: annotation.comment_markdown().is_some(),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    paint_annotations.sort_by_key(|annotation| {
-                        is_inactive(annotation.id, self.active_annotation)
-                    });
-                    Some(PaintPage {
-                        index,
-                        rect,
-                        tiles: self.paint_tiles_for_page(index, rect, desired),
-                        text: self.page_text.get(&index).cloned(),
-                        annotations: paint_annotations,
-                        search: self.search.pages.get(&index).cloned(),
-                    })
-                })
-                .collect();
-            let snapshot = PaintSnapshot {
-                palette,
-                layout: self.layout.as_ref().unwrap().clone(),
-                pages,
-                scroll: self.scroll,
-                selection: self.selection,
-                active_annotation: self.active_annotation,
-                active_search: self.search.active,
-                navigation_focus: self.navigation_focus.frame(Instant::now()),
-                viewport_width: self.viewport_width,
-                viewport_height: self.viewport_height,
-                max_scroll_x: self.max_scroll_x(layout),
-            };
-            div()
-                .id("document-viewport")
-                .relative()
-                .flex_none()
-                .h_full()
-                .w(px(self.viewport_width))
-                .overflow_hidden()
-                .bg(palette.canvas)
-                .cursor(if self.pan.is_some() {
-                    CursorStyle::ClosedHand
-                } else if self.hovered_link.is_some() || self.hovered_reference.is_some() {
-                    CursorStyle::PointingHand
-                } else {
-                    CursorStyle::IBeam
-                })
-                .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-                .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
-                .on_mouse_move(cx.listener(Self::on_mouse_move))
-                .on_hover(cx.listener(Self::on_document_hover))
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
-                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
-                .child(
-                    canvas(
-                        |_, _, _| (),
-                        move |bounds, _, window, _| Self::paint_document(snapshot, bounds, window),
-                    )
-                    .size_full(),
-                )
-                .children(toc_navigation)
-                .into_any_element()
-        } else {
-            div()
-                .id("empty-state")
-                .flex_none()
-                .h_full()
-                .w(px(self.viewport_width))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .bg(palette.canvas_empty)
-                .text_color(palette.text)
-                .child(
-                    div()
-                        .mb_2()
-                        .size(px(58.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(palette.text.opacity(0.15))
-                        .bg(palette.surface.opacity(0.07))
-                        .shadow_sm()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("PDF"),
-                )
-                .child(
-                    div()
-                        .text_2xl()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Open a document"),
-                )
-                .child(
-                    div()
-                        .max_w(px(430.0))
-                        .text_center()
-                        .text_sm()
-                        .line_height(px(21.0))
-                        .text_color(palette.text_secondary)
-                        .child("Read, search, highlight, and comment with a fast native PDF workspace."),
-                )
-                .child(Self::chrome_button(
-                    palette,
-                    "empty-open-document",
-                    "Choose PDF…",
-                    ChromeButtonStyle::Primary,
-                    true,
-                    cx.listener(|reader, _, window, cx| {
-                        reader.open_dialog(&OpenDocument, window, cx)
-                    }),
+                    IconName::SquareTerminal,
+                    "No local extensions",
+                    "Install a .keyext archive or a development package. Native code is never loaded.",
                 ))
                 .child(
                     div()
-                        .mt_2()
-                        .text_xs()
-                        .text_color(palette.text_tertiary)
-                        .child("⌘O to open  ·  Pinch or ⌘-scroll to zoom"),
+                        .flex_none()
+                        .p_4()
+                        .pt_0()
+                        .flex()
+                        .justify_center()
+                        .child(Self::chrome_button(
+                            palette,
+                            "install-first-extension",
+                            Self::icon_label(IconName::Plus, "Install or Update…"),
+                            ChromeButtonStyle::Primary,
+                            true,
+                            cx.listener(|reader, _, window, cx| {
+                                reader.install_extension_dialog(&InstallExtension, window, cx)
+                            }),
+                        )),
                 )
+                .into_any_element()
+        } else {
+            let packages = self.extension_packages.clone();
+            let commands = self.extension_commands.clone();
+            div()
+                .id("extensions-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .children(packages.into_iter().enumerate().map(|(index, package)| {
+                    let active = package.state == LifecycleState::Active;
+                    let (state_label, state_color) =
+                        extension_state_presentation(package.state, palette);
+                    let source = match package.source {
+                        PackageSourceKind::KeyextArchive => "Archive",
+                        PackageSourceKind::DevelopmentDirectory => "Development",
+                    };
+                    let trust = if package.publisher_verified {
+                        "Verified publisher"
+                    } else {
+                        "Local · unverified"
+                    };
+                    let ui_kind = package
+                        .ui_kind
+                        .clone()
+                        .unwrap_or_else(|| "host-rendered".into());
+                    let license = format!("License · {}", package.license);
+                    let extension = package.extension.clone();
+                    let extension_for_toggle = extension.clone();
+                    let extension_for_remove = extension.clone();
+                    let name_for_remove = package.name.clone();
+                    let package_commands = commands
+                        .iter()
+                        .filter(|command| command.owner == extension)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    div()
+                        .id(("extension-package", index))
+                        .w_full()
+                        .overflow_hidden()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(palette.separator)
+                        .bg(palette.surface)
+                        .child(
+                            div()
+                                .p_3()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_start()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .child(
+                                                    div()
+                                                        .overflow_hidden()
+                                                        .whitespace_nowrap()
+                                                        .text_ellipsis()
+                                                        .text_sm()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child(package.name.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .mt_1()
+                                                        .text_xs()
+                                                        .text_color(palette.text_secondary)
+                                                        .child(format!(
+                                                            "{} · v{}",
+                                                            package.extension, package.version
+                                                        )),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_full()
+                                                .bg(state_color.opacity(0.12))
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(state_color)
+                                                .child(state_label),
+                                        ),
+                                )
+                                .child(
+                                    div().flex().flex_wrap().gap_1().children(
+                                        [source, trust, ui_kind.as_str(), license.as_str()]
+                                            .into_iter()
+                                            .map(|label| {
+                                                div()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_full()
+                                                    .bg(palette.surface_subtle)
+                                                    .text_xs()
+                                                    .text_color(palette.text_secondary)
+                                                    .child(label.to_owned())
+                                            }),
+                                    ),
+                                )
+                                .when(!package_commands.is_empty(), |card| {
+                                    card.child(div().pt_1().flex().flex_col().gap_1().children(
+                                        package_commands.into_iter().enumerate().map(
+                                            |(command_index, command)| {
+                                                let title = command.command.title.clone();
+                                                let action = InvokeExtensionCommand {
+                                                    command: command.command.id,
+                                                    payload: None,
+                                                };
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "extension-command-{index}-{command_index}"
+                                                    )))
+                                                    .h(px(30.0))
+                                                    .w_full()
+                                                    .px_2()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .rounded_md()
+                                                    .cursor_pointer()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(palette.accent)
+                                                    .hover(move |button| {
+                                                        button.bg(palette.accent_soft)
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |reader, _, window, cx| {
+                                                            reader.invoke_extension_command(
+                                                                &action, window, cx,
+                                                            )
+                                                        },
+                                                    ))
+                                                    .child(title)
+                                                    .child(
+                                                        Icon::new(IconName::ArrowRight)
+                                                            .size(px(14.0)),
+                                                    )
+                                            },
+                                        ),
+                                    ))
+                                })
+                                .child(
+                                    div()
+                                        .pt_1()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id(("extension-toggle", index))
+                                                .h(px(28.0))
+                                                .px_3()
+                                                .flex()
+                                                .items_center()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .border_1()
+                                                .border_color(palette.separator)
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .hover(move |button| {
+                                                    button.bg(palette.control_hover)
+                                                })
+                                                .on_click(cx.listener(
+                                                    move |reader, _, window, cx| {
+                                                        if active {
+                                                            reader.disable_extension(
+                                                                extension_for_toggle.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        } else {
+                                                            reader.enable_extension(
+                                                                extension_for_toggle.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }
+                                                    },
+                                                ))
+                                                .child(if active { "Disable" } else { "Enable" }),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("extension-remove", index))
+                                                .h(px(28.0))
+                                                .px_3()
+                                                .flex()
+                                                .items_center()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(palette.error)
+                                                .hover(move |button| button.bg(palette.error_soft))
+                                                .on_click(cx.listener(
+                                                    move |reader, _, window, cx| {
+                                                        reader.confirm_remove_extension(
+                                                            extension_for_remove.clone(),
+                                                            name_for_remove.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                ))
+                                                .child("Remove"),
+                                        ),
+                                ),
+                        )
+                }))
                 .into_any_element()
         };
 
-        let sidebar_content = match self.sidebar.panel {
-            SidePanel::Comments => self.render_comments_panel(cx),
-            SidePanel::Search => self.render_search_panel(cx),
-        };
-        let workspace = match self.view_mode {
-            ReaderView::Classic => {
-                let sidebar_width = self.sidebar.available_width(full_width);
-                let sidebar_inner_width =
-                    SIDEBAR_WIDTH.min((full_width - MIN_DOCUMENT_VIEWPORT_WIDTH).max(0.0));
-                let sidebar = div()
-                    .id("reader-sidebar")
-                    .h_full()
-                    .w(px(sidebar_width))
-                    .flex_none()
-                    .overflow_hidden()
-                    .bg(palette.surface)
-                    .border_l_1()
-                    .border_color(palette.separator)
-                    .child(
-                        div()
-                            .h_full()
-                            .w(px(sidebar_inner_width))
-                            .child(sidebar_content),
-                    );
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .w_full()
-                    .flex()
-                    .overflow_hidden()
-                    .child(content)
-                    .child(sidebar)
-                    .children(link_preview)
-                    .into_any_element()
-            }
-            ReaderView::Fluid => {
-                let panel_width = self.fluid_panel_width();
-                let sidebar_reveal =
-                    fluid_sidebar_extent(self.viewport_width, self.sidebar.progress);
-                let panel_reveal = self.fluid_panel_occlusion();
-                let available_width = (self.viewport_width - panel_reveal).max(1.0);
-                let main_pill = self.render_fluid_main_pill(
-                    FluidPillState {
-                        available_width,
-                        document_open,
-                        zoom_out_enabled,
-                        zoom_in_enabled,
-                        zoom_label,
-                        search_selected,
-                        comments_selected,
-                    },
-                    cx,
-                );
-                let has_stable_selection = self
-                    .selection
-                    .is_some_and(|selection| selection.anchor != selection.focus);
-                let show_context_pill = !self.selecting
-                    && self.comment_editor.is_none()
-                    && (has_stable_selection || self.active_annotation.is_some());
-                let context_enabled = show_context_pill
-                    && !self.annotations_loading
-                    && !self.annotation_persistence_blocked;
-                let context_pill = show_context_pill
-                    .then(|| self.context_anchor_in_viewport())
-                    .flatten()
-                    .map(|anchor| {
-                        let position = floating_pill_position(
-                            anchor,
-                            available_width,
-                            self.viewport_height,
-                            FLUID_CONTEXT_PILL_WIDTH,
-                            FLUID_CONTEXT_PILL_HEIGHT,
-                        );
-                        self.render_fluid_context_pill(position, context_enabled, cx)
-                    });
-                let sidebar = div()
-                    .id("fluid-sidebar-reveal")
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right_0()
-                    .w(px(sidebar_reveal))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .id("reader-sidebar")
-                            .absolute()
-                            .top(px(FLUID_PANEL_VERTICAL_MARGIN))
-                            .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
-                            .right(px(FLUID_PANEL_HORIZONTAL_MARGIN))
-                            .w(px(panel_width))
-                            .child(FloatingPanel::new(palette, sidebar_content)),
-                    );
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .w_full()
-                    .overflow_hidden()
-                    .child(content)
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(14.0))
-                            .left_0()
-                            .w(px(available_width))
-                            .flex()
-                            .justify_center()
-                            .child(main_pill),
-                    )
-                    .children(context_pill)
-                    .child(sidebar)
-                    .children(link_preview)
-                    .into_any_element()
-            }
-        };
-
-        let error_bar = if let ReaderStatus::Error(message) = &self.status {
-            Some(
-                div()
-                    .h(px(ERROR_BAR_HEIGHT))
-                    .flex_none()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .px_3()
-                    .bg(palette.error_soft)
-                    .text_color(palette.error)
-                    .text_sm()
-                    .child(message.clone()),
-            )
-        } else {
-            None
-        };
-
-        let reference_details_panel =
-            self.render_reference_details_panel(palette, full_width, window, cx);
         div()
-            .key_context("PdfReader")
-            .track_focus(&self.focus_handle)
             .size_full()
-            .relative()
             .flex()
             .flex_col()
-            .bg(palette.canvas)
-            .on_action(cx.listener(Self::open_dialog))
-            .on_action(cx.listener(Self::zoom_in))
-            .on_action(cx.listener(Self::zoom_out))
-            .on_action(cx.listener(Self::actual_size))
-            .on_action(cx.listener(Self::fit_width))
-            .on_action(cx.listener(Self::copy_selection))
-            .on_action(cx.listener(Self::select_all))
-            .on_action(cx.listener(Self::edit_copy))
-            .on_action(cx.listener(Self::edit_cut))
-            .on_action(cx.listener(Self::edit_paste))
-            .on_action(cx.listener(Self::edit_select_all))
-            .on_action(cx.listener(Self::scroll_up))
-            .on_action(cx.listener(Self::scroll_down))
-            .on_action(cx.listener(Self::scroll_left))
-            .on_action(cx.listener(Self::scroll_right))
-            .on_action(cx.listener(Self::page_up))
-            .on_action(cx.listener(Self::page_down))
-            .on_action(cx.listener(Self::first_page))
-            .on_action(cx.listener(Self::last_page))
-            .on_action(cx.listener(Self::find_document))
-            .on_action(cx.listener(Self::toggle_comments))
-            .on_action(cx.listener(Self::add_comment))
-            .on_action(cx.listener(Self::next_search_result))
-            .on_action(cx.listener(Self::previous_search_result))
-            .on_action(cx.listener(Self::use_classic_view))
-            .on_action(cx.listener(Self::use_fluid_view))
-            .on_action(cx.listener(Self::invoke_extension_command))
-            .on_action(cx.listener(Self::quit_application))
-            .child(toolbar)
-            .children(error_bar)
-            .child(workspace)
-            .children(reference_details_panel)
+            .when(self.view_mode == ReaderView::Fluid, |panel| {
+                panel.rounded_xl()
+            })
+            .overflow_hidden()
+            .bg(palette.surface)
+            .text_color(palette.text)
+            .child(header)
+            .child(body)
+            .into_any_element()
     }
 }
 
 #[derive(Clone)]
-struct PaintPage {
-    index: usize,
-    rect: Rect,
-    tiles: Vec<PaintTile>,
+struct PaintPageOverlay {
     text: Option<Arc<TextLayer>>,
     annotations: Vec<PaintAnnotation>,
     search: Option<Arc<[SearchMatch]>>,
+    extension_overlays: Vec<PaintExtensionOverlay>,
+}
+
+#[derive(Clone)]
+struct PaintExtensionOverlay {
+    regions: Vec<TextBounds>,
+    appearance: OverlayAppearance,
 }
 
 #[derive(Clone, Copy)]
@@ -10624,25 +4521,13 @@ struct PaintAnnotation {
 }
 
 #[derive(Clone)]
-struct PaintTile {
-    core_rect: Rect,
-    render_rect: Rect,
-    image: Arc<RenderImage>,
-}
-
-#[derive(Clone)]
 struct PaintSnapshot {
     palette: ReaderPalette,
-    layout: Arc<DocumentLayout>,
-    pages: Vec<PaintPage>,
-    scroll: Offset,
+    canvas: PdfCanvasSnapshot<PaintPageOverlay>,
     selection: Option<TextSelection>,
     active_annotation: Option<AnnotationId>,
     active_search: Option<SearchMatchId>,
     navigation_focus: Option<NavigationFocusFrame>,
-    viewport_width: f32,
-    viewport_height: f32,
-    max_scroll_x: f32,
 }
 
 fn normalized_bounds_in_page(page: Rect, bounds: TextBounds) -> Rect {
@@ -10651,6 +4536,80 @@ fn normalized_bounds_in_page(page: Rect, bounds: TextBounds) -> Rect {
         y: page.y + bounds.top * page.height,
         width: (bounds.right - bounds.left).max(0.0) * page.width,
         height: (bounds.bottom - bounds.top).max(0.0) * page.height,
+    }
+}
+
+fn paint_extension_overlay(
+    region: Rect,
+    appearance: OverlayAppearance,
+    canvas: Bounds<Pixels>,
+    scroll: Offset,
+    palette: ReaderPalette,
+    window: &mut Window,
+) {
+    let color = match appearance.tone {
+        OverlayTone::Accent => palette.accent,
+        OverlayTone::SearchMatch => palette.warning,
+        OverlayTone::Positive => palette.green,
+        OverlayTone::Caution => palette.yellow,
+        OverlayTone::Critical => palette.error,
+        OverlayTone::Neutral => palette.text_secondary,
+    };
+    let (fill_alpha, stroke_alpha, stroke_width) = match appearance.emphasis {
+        OverlayEmphasis::Subtle => (0.12, 0.42, 1.0),
+        OverlayEmphasis::Regular => (0.2, 0.64, 1.5),
+        OverlayEmphasis::Strong => (0.3, 0.86, 2.0),
+    };
+    match appearance.shape {
+        OverlayShape::Highlight => window.paint_quad(quad(
+            content_rect_to_bounds(canvas, region, scroll),
+            px((region.height * 0.14).clamp(1.0, 4.0)),
+            color.opacity(fill_alpha),
+            px(0.0),
+            gpui::transparent_black(),
+            Default::default(),
+        )),
+        OverlayShape::Outline => window.paint_quad(quad(
+            content_rect_to_bounds(canvas, region, scroll),
+            px((region.height * 0.14).clamp(1.0, 4.0)),
+            gpui::transparent_black(),
+            px(stroke_width),
+            color.opacity(stroke_alpha),
+            Default::default(),
+        )),
+        OverlayShape::Underline => {
+            let height = stroke_width.max(1.0);
+            let underline = Rect {
+                y: region.bottom() - height,
+                height,
+                ..region
+            };
+            window.paint_quad(quad(
+                content_rect_to_bounds(canvas, underline, scroll),
+                px(height * 0.5),
+                color.opacity(stroke_alpha),
+                px(0.0),
+                gpui::transparent_black(),
+                Default::default(),
+            ));
+        }
+        OverlayShape::Marker => {
+            let size = region.height.clamp(5.0, 11.0);
+            let marker = Rect {
+                x: region.x - size * 0.65,
+                y: region.y + (region.height - size) * 0.5,
+                width: size,
+                height: size,
+            };
+            window.paint_quad(quad(
+                content_rect_to_bounds(canvas, marker, scroll),
+                px(size * 0.5),
+                color.opacity(stroke_alpha),
+                px(0.0),
+                gpui::transparent_black(),
+                Default::default(),
+            ));
+        }
     }
 }
 
@@ -10810,42 +4769,12 @@ fn compact_preview(text: &str, max_characters: usize) -> String {
     result
 }
 
+#[cfg(test)]
 fn desired_raster_size(page_rect: Rect, scale_factor: f32) -> RasterSize {
-    if !page_rect.width.is_finite()
-        || !page_rect.height.is_finite()
-        || page_rect.width <= 0.0
-        || page_rect.height <= 0.0
-    {
-        return RasterSize {
-            width: 1,
-            height: 1,
-        };
-    }
-    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
-        scale_factor
-    } else {
-        1.0
-    };
-    let aspect = f64::from(page_rect.height) / f64::from(page_rect.width);
-    let width_cap =
-        ((f64::from(MAX_RASTER_DIMENSION) / aspect).floor() as u32).clamp(1, MAX_RASTER_DIMENSION);
-    let raw_width = (f64::from(page_rect.width) * f64::from(scale_factor)).ceil();
-    let raw_width = if raw_width.is_finite() {
-        raw_width.clamp(1.0, f64::from(width_cap)) as u32
-    } else {
-        width_cap
-    };
-    let width = raw_width
-        .div_ceil(RENDER_QUANTUM)
-        .saturating_mul(RENDER_QUANTUM)
-        .min(width_cap)
-        .max(1);
-    let height = (aspect * f64::from(width))
-        .round()
-        .clamp(1.0, f64::from(MAX_RASTER_DIMENSION)) as u32;
-    RasterSize { width, height }
+    viewport_raster_size(page_rect, scale_factor, &PdfReaderLimits::default())
 }
 
+#[cfg(test)]
 fn plan_visible_tiles(
     layout: &DocumentLayout,
     page_sizes: &[PageSize],
@@ -10853,169 +4782,31 @@ fn plan_visible_tiles(
     viewport_width: f32,
     viewport_height: f32,
     scale_factor: f32,
-) -> Vec<PlannedTile> {
-    if viewport_width <= 0.0
-        || viewport_height <= 0.0
-        || !viewport_width.is_finite()
-        || !viewport_height.is_finite()
-    {
-        return Vec::new();
-    }
-    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
-        scale_factor
-    } else {
-        1.0
-    };
-    let viewport = Rect {
-        x: scroll.x,
-        y: scroll.y,
-        width: viewport_width,
-        height: viewport_height,
-    };
-    let vertical_overscan = TILE_SIZE as f32 / scale_factor;
-    let viewport_center = (
-        f64::from(viewport.x + viewport.width * 0.5),
-        f64::from(viewport.y + viewport.height * 0.5),
-    );
-    let mut result = Vec::new();
-
-    for page in layout.visible_pages(scroll.y, viewport_height, vertical_overscan) {
-        let (Some(page_rect), Some(_)) = (layout.page_rect(page), page_sizes.get(page)) else {
-            continue;
-        };
-        let raster = desired_raster_size(page_rect, scale_factor);
-        let tile_logical_width = page_rect.width * TILE_SIZE as f32 / raster.width as f32;
-        let tile_logical_height = page_rect.height * TILE_SIZE as f32 / raster.height as f32;
-        let expanded = Rect {
-            x: viewport.x - tile_logical_width,
-            y: viewport.y - tile_logical_height,
-            width: viewport.width + tile_logical_width * 2.0,
-            height: viewport.height + tile_logical_height * 2.0,
-        };
-        let Some(intersection) = intersect_rect(page_rect, expanded) else {
-            continue;
-        };
-
-        let pixel_x = |content_x: f32, round_up: bool| {
-            let value = ((content_x - page_rect.x) / page_rect.width * raster.width as f32)
-                .clamp(0.0, raster.width as f32);
-            (if round_up {
-                value.ceil()
-            } else {
-                value.floor()
-            }) as u32
-        };
-        let pixel_y = |content_y: f32, round_up: bool| {
-            let value = ((content_y - page_rect.y) / page_rect.height * raster.height as f32)
-                .clamp(0.0, raster.height as f32);
-            (if round_up {
-                value.ceil()
-            } else {
-                value.floor()
-            }) as u32
-        };
-        let left = pixel_x(intersection.x, false);
-        let right = pixel_x(intersection.right(), true);
-        let top = pixel_y(intersection.y, false);
-        let bottom = pixel_y(intersection.bottom(), true);
-        if left >= right || top >= bottom {
-            continue;
-        }
-        let first_column = left / TILE_SIZE;
-        let last_column = (right - 1) / TILE_SIZE;
-        let first_row = top / TILE_SIZE;
-        let last_row = (bottom - 1) / TILE_SIZE;
-
-        for row in first_row..=last_row {
-            for column in first_column..=last_column {
-                let key = TileKey {
-                    page,
-                    raster,
-                    column,
-                    row,
-                };
-                let Some(core_rect) = tile_core_rect(key) else {
-                    continue;
-                };
-                let logical = tile_logical_rect(page_rect, raster, core_rect);
-                let tier = if intersect_rect(logical, viewport).is_some() {
-                    DemandTier::Visible
-                } else {
-                    DemandTier::Prefetch
-                };
-                let center_x = f64::from(logical.x + logical.width * 0.5);
-                let center_y = f64::from(logical.y + logical.height * 0.5);
-                let distance = ((center_x - viewport_center.0).powi(2)
-                    + (center_y - viewport_center.1).powi(2))
-                .round()
-                .clamp(0.0, u64::MAX as f64) as u64;
-                result.push(PlannedTile {
-                    request: TileRequest {
-                        key,
-                        core_rect,
-                        render_rect: inflate_tile_rect(core_rect, raster),
-                    },
-                    tier,
-                    distance,
-                });
-            }
-        }
-    }
-    result
+) -> Vec<key_pdf_gpui::PlannedTile> {
+    viewport_plan_visible_tiles(
+        layout,
+        page_sizes,
+        TilePlanningInput::new(
+            Rect {
+                x: scroll.x,
+                y: scroll.y,
+                width: viewport_width,
+                height: viewport_height,
+            },
+            scale_factor,
+        ),
+        &PdfReaderLimits::default(),
+    )
+    .tiles
 }
 
 fn tile_core_rect(key: TileKey) -> Option<PixelRect> {
-    let x = key.column.checked_mul(TILE_SIZE)?;
-    let y = key.row.checked_mul(TILE_SIZE)?;
-    if x >= key.raster.width || y >= key.raster.height {
-        return None;
-    }
-    Some(PixelRect {
-        x,
-        y,
-        width: TILE_SIZE.min(key.raster.width - x),
-        height: TILE_SIZE.min(key.raster.height - y),
-    })
+    viewport_tile_core_rect(key, &PdfReaderLimits::default())
 }
 
+#[cfg(test)]
 fn inflate_tile_rect(core: PixelRect, raster: RasterSize) -> PixelRect {
-    let x = core.x.saturating_sub(TILE_BLEED);
-    let y = core.y.saturating_sub(TILE_BLEED);
-    let right = core
-        .x
-        .saturating_add(core.width)
-        .saturating_add(TILE_BLEED)
-        .min(raster.width);
-    let bottom = core
-        .y
-        .saturating_add(core.height)
-        .saturating_add(TILE_BLEED)
-        .min(raster.height);
-    PixelRect {
-        x,
-        y,
-        width: right - x,
-        height: bottom - y,
-    }
-}
-
-fn tile_logical_rect(page: Rect, raster: RasterSize, pixels: PixelRect) -> Rect {
-    let x0 =
-        f64::from(page.x) + f64::from(page.width) * f64::from(pixels.x) / f64::from(raster.width);
-    let x1 = f64::from(page.x)
-        + f64::from(page.width) * f64::from(pixels.x.saturating_add(pixels.width))
-            / f64::from(raster.width);
-    let y0 =
-        f64::from(page.y) + f64::from(page.height) * f64::from(pixels.y) / f64::from(raster.height);
-    let y1 = f64::from(page.y)
-        + f64::from(page.height) * f64::from(pixels.y.saturating_add(pixels.height))
-            / f64::from(raster.height);
-    Rect {
-        x: x0 as f32,
-        y: y0 as f32,
-        width: (x1 - x0) as f32,
-        height: (y1 - y0) as f32,
-    }
+    viewport_inflate_tile_rect(core, raster, &PdfReaderLimits::default())
 }
 
 fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
@@ -11029,12 +4820,6 @@ fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
         width: right - left,
         height: bottom - top,
     })
-}
-
-fn command_wheel_zoom_factor(delta_y: f32) -> Option<f32> {
-    delta_y
-        .is_finite()
-        .then(|| (delta_y / 420.0).clamp(-1.5, 1.5).exp())
 }
 
 fn tile_distance_from_viewport(
@@ -11058,40 +4843,6 @@ fn tile_distance_from_viewport(
         .clamp(0.0, u64::MAX as f64) as u64
 }
 
-fn content_rect_to_bounds(canvas: Bounds<Pixels>, rect: Rect, scroll: Offset) -> Bounds<Pixels> {
-    Bounds::new(
-        point(
-            canvas.left() + px(rect.x - scroll.x),
-            canvas.top() + px(rect.y - scroll.y),
-        ),
-        size(px(rect.width), px(rect.height)),
-    )
-}
-
-fn text_bounds_overlap(left: TextBounds, right: TextBounds) -> bool {
-    left.left < right.right
-        && left.right > right.left
-        && left.top < right.bottom
-        && left.bottom > right.top
-}
-
-fn reference_panel_width(full_width: f32) -> f32 {
-    let maximum =
-        (full_width - MIN_DOCUMENT_VIEWPORT_WIDTH - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(0.0);
-    (full_width * 0.36)
-        .clamp(REFERENCE_PANEL_MIN_WIDTH, REFERENCE_PANEL_MAX_WIDTH)
-        .min(maximum)
-}
-
-fn reference_panel_extent(full_width: f32, progress: f32) -> f32 {
-    let width = reference_panel_width(full_width);
-    if width <= 0.0 {
-        0.0
-    } else {
-        (width + FLUID_PANEL_HORIZONTAL_MARGIN * 2.0) * progress.clamp(0.0, 1.0)
-    }
-}
-
 fn fluid_sidebar_width(full_width: f32) -> f32 {
     SIDEBAR_WIDTH.min((full_width - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(0.0))
 }
@@ -11101,1558 +4852,48 @@ fn fluid_sidebar_extent(full_width: f32, progress: f32) -> f32 {
         * progress.clamp(0.0, 1.0)
 }
 
-fn scientific_reference_matches(
-    reference: &ScientificReference,
-    target_page: usize,
-    resolved: Option<&ResolvedInternalLink>,
-    rough_y: Option<f32>,
-) -> bool {
-    if reference.page != target_page {
-        return false;
-    }
-    if resolved.is_some_and(|resolved| {
-        resolved.text_runs.iter().any(|resolved_run| {
-            reference
-                .text_runs
-                .iter()
-                .any(|reference_run| text_bounds_overlap(*resolved_run, *reference_run))
-        })
-    }) {
-        return true;
-    }
-    let target_y = resolved
-        .and_then(|resolved| resolved.y_fraction)
-        .or(rough_y);
-    let top = reference
-        .text_runs
-        .iter()
-        .map(|run| run.top)
-        .min_by(f32::total_cmp);
-    let bottom = reference
-        .text_runs
-        .iter()
-        .map(|run| run.bottom)
-        .max_by(f32::total_cmp);
-    matches!((target_y, top, bottom), (Some(y), Some(top), Some(bottom)) if y >= top - 0.012 && y <= bottom + 0.012)
-}
-
-fn union_text_bounds(left: TextBounds, right: TextBounds) -> TextBounds {
-    TextBounds {
-        left: left.left.min(right.left),
-        top: left.top.min(right.top),
-        right: left.right.max(right.right),
-        bottom: left.bottom.max(right.bottom),
-    }
-}
-
-fn complete_grouped_reference_indices(
-    references: &[ScientificReference],
-    source: &str,
-    primary_number: u32,
-) -> Option<Vec<usize>> {
-    let numbers = grouped_citation_numbers(source)?;
-    let indices = numbers
-        .iter()
-        .map(|number| {
-            references
-                .iter()
-                .position(|reference| reference.number == *number)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    indices
-        .iter()
-        .any(|index| references[*index].number == primary_number)
-        .then_some(indices)
-}
-
-fn adjacent_group_index(current: usize, count: usize, forward: bool) -> usize {
-    if count <= 1 {
-        return 0;
-    }
-    let current = current.min(count - 1);
-    if forward {
-        (current + 1) % count
-    } else {
-        (current + count - 1) % count
-    }
-}
-
-fn measured_preview_width(lines: &[&str], minimum: f32, maximum: f32) -> f32 {
-    let longest = lines
-        .iter()
-        .map(|line| line.chars().count().min(64))
-        .max()
-        .unwrap_or(0);
-    (longest as f32 * 6.6 + 54.0).clamp(minimum, maximum)
-}
-
-fn escape_markdown_text(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for character in text.chars() {
-        if matches!(
-            character,
-            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '<' | '>' | '#' | '+' | '-' | '!'
-        ) {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
-}
-
-fn summary_text(metadata: &ScholarlyMetadata, tab: ReferenceSummaryTab) -> Option<&str> {
-    match tab {
-        ReferenceSummaryTab::Tldr => metadata.tldr_text.as_deref(),
-        ReferenceSummaryTab::Abstract => metadata.abstract_text.as_deref(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn reference_summary_tab_button(
-    id: &'static str,
-    label: &'static str,
-    tab: ReferenceSummaryTab,
-    selected: ReferenceSummaryTab,
-    identity_color: gpui::Hsla,
-    palette: ReaderPalette,
-    cx: &mut Context<PdfReader>,
-) -> gpui::AnyElement {
-    let active = tab == selected;
-    div()
-        .id(id)
-        .h(px(28.0))
-        .px_3()
-        .flex()
-        .items_center()
-        .rounded_full()
-        .cursor_pointer()
-        .bg(if active {
-            identity_color.opacity(0.14)
-        } else {
-            palette.surface
-        })
-        .text_xs()
-        .font_weight(if active {
-            FontWeight::SEMIBOLD
-        } else {
-            FontWeight::NORMAL
-        })
-        .text_color(if active {
-            identity_color
-        } else {
-            palette.text_secondary
-        })
-        .hover(move |button| button.bg(identity_color.opacity(0.11)))
-        .on_click(cx.listener(move |reader, _, window, cx| {
-            reader.select_reference_summary(tab, window, cx);
-            cx.stop_propagation();
-        }))
-        .child(label)
-        .into_any_element()
-}
-
-fn citation_expanded_height(authors: &str, journal: &str, has_doi: bool) -> f32 {
-    let author_lines = authors.chars().count().div_ceil(44).clamp(1, 5);
-    let journal_lines = journal.chars().count().div_ceil(44).clamp(1, 3);
-    72.0 + (author_lines + journal_lines) as f32 * 20.0 + if has_doi { 40.0 } else { 0.0 }
-}
-
-fn link_hover_candidate_needs_restart(
-    pending: PendingLinkHover,
-    target: Option<PreviewTarget>,
-    position: Point<Pixels>,
-) -> bool {
-    if pending.target != target {
-        return true;
-    }
-    let dx = f32::from(position.x - pending.position.x);
-    let dy = f32::from(position.y - pending.position.y);
-    dx.mul_add(dx, dy * dy) > LINK_HOVER_STABILITY_RADIUS * LINK_HOVER_STABILITY_RADIUS
-}
-
-fn reference_identity_color(title: &str, palette: ReaderPalette) -> gpui::Hsla {
-    let signature = title.bytes().fold(0_u32, |hash, byte| {
-        hash.wrapping_mul(16777619).wrapping_add(u32::from(byte))
-    });
-    match signature % 4 {
-        0 => palette.blue,
-        1 => palette.pink,
-        2 => palette.purple,
-        _ => palette.green,
-    }
-}
-
-fn reference_hero_height(title: &str) -> f32 {
-    let wrapped_lines = title.chars().count().div_ceil(28).clamp(1, 5);
-    116.0 + (wrapped_lines.saturating_sub(1) as f32 * 24.0)
-}
-
-fn reference_preview_width(state: Option<&ScholarlyMetadataState>, expansion_progress: f32) -> f32 {
-    let compact_width = 232.0;
-    let Some(ScholarlyMetadataState::Ready(metadata)) = state else {
-        return compact_width;
-    };
-    let title = compact_words(&metadata.title, 11);
-    let citation = compact_citation_line(metadata);
-    let expanded_width =
-        measured_preview_width(&[title.as_str(), citation.as_str()], 280.0, LINK_CARD_WIDTH);
-    compact_width + (expanded_width - compact_width) * expansion_progress.clamp(0.0, 1.0)
-}
-
-fn compact_words(text: &str, maximum_words: usize) -> String {
-    let words = text.split_whitespace().collect::<Vec<_>>();
-    if words.len() <= maximum_words {
-        return words.join(" ");
-    }
-    format!("{}…", words[..maximum_words].join(" "))
-}
-
-fn author_last_name(author: &str) -> &str {
-    author
-        .split_whitespace()
-        .last()
-        .unwrap_or(author)
-        .trim_matches(|character: char| matches!(character, ',' | ';'))
-}
-
-fn compact_authors(authors: &[String]) -> String {
-    if authors.is_empty() {
-        return "Unknown author".to_owned();
-    }
-    if authors.len() > 3 {
-        return format!("{} et al.", author_last_name(&authors[0]));
-    }
-    let joined = authors
-        .iter()
-        .map(|author| author_last_name(author))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if joined.chars().count() > 38 {
-        format!("{} et al.", author_last_name(&authors[0]))
-    } else {
-        joined
-    }
-}
-
-fn compact_journal(journal: &str) -> String {
-    let mut result = journal.chars().take(28).collect::<String>();
-    if journal.chars().count() > 28 {
-        result.push('…');
-    }
-    result
-}
-
-fn middle_truncate(text: &str, maximum_characters: usize) -> String {
-    let characters = text.chars().collect::<Vec<_>>();
-    if characters.len() <= maximum_characters || maximum_characters < 3 {
-        return text.to_owned();
-    }
-    let left = (maximum_characters - 1).div_ceil(2);
-    let right = maximum_characters - 1 - left;
-    format!(
-        "{}…{}",
-        characters[..left].iter().collect::<String>(),
-        characters[characters.len() - right..]
-            .iter()
-            .collect::<String>()
+fn data_record<const N: usize>(items: [(&str, DataValue); N]) -> DataValue {
+    DataValue::Record(
+        items
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
     )
 }
 
-fn compact_reference_panel_citation(metadata: &ScholarlyMetadata) -> String {
-    let mut parts = vec![compact_authors(&metadata.authors)];
-    if let Some(journal) = metadata
-        .journal_short
-        .as_deref()
-        .or(metadata.journal.as_deref())
-    {
-        parts.push(middle_truncate(journal, 22));
-    }
-    if let Some(year) = metadata.year {
-        parts.push(year.to_string());
-    }
-    parts.join(" · ")
+fn bounded_i64(value: impl TryInto<i64>) -> i64 {
+    value.try_into().unwrap_or(i64::MAX)
 }
 
-fn compact_citation_line(metadata: &ScholarlyMetadata) -> String {
-    let mut parts = vec![compact_authors(&metadata.authors)];
-    if let Some(journal) = metadata.journal.as_deref() {
-        parts.push(compact_journal(journal));
-    }
-    if let Some(year) = metadata.year {
-        parts.push(year.to_string());
-    }
-    parts.join(" · ")
+fn bounded_snapshot_string(value: &str, maximum_characters: usize) -> String {
+    value.chars().take(maximum_characters).collect()
 }
 
-fn loading_source_icon(color: gpui::Hsla) -> gpui::AnyElement {
-    Icon::new(IconName::LoaderCircle)
-        .size(px(15.0))
-        .text_color(color)
-        .with_animation(
-            "reference-source-spinner",
-            Animation::new(Duration::from_millis(800))
-                .repeat()
-                .with_easing(ease_in_out),
-            |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
-        )
-        .into_any_element()
+fn text_layer_statistics(text: &TextLayer) -> (usize, usize) {
+    let mut words = 0usize;
+    let mut in_word = false;
+    for character in text.iter() {
+        let whitespace = character.value.is_whitespace();
+        if !whitespace && !in_word {
+            words = words.saturating_add(1);
+        }
+        in_word = !whitespace;
+    }
+    (words, text.len())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gpui_component::{ThemeColor, ThemeMode};
-
-    #[test]
-    fn scientific_lookup_is_limited_to_exact_reference_ranges() {
-        let reference = ScientificReference {
-            number: 7,
-            page: 9,
-            x_fraction: Some(0.2),
-            y_fraction: Some(0.72),
-            text: "7. A real paper reference".to_owned(),
-            text_runs: vec![TextBounds {
-                left: 0.1,
-                top: 0.70,
-                right: 0.9,
-                bottom: 0.78,
-            }],
-        };
-        let figure = ResolvedInternalLink {
-            x_fraction: Some(0.5),
-            y_fraction: Some(0.22),
-            text_runs: vec![TextBounds {
-                left: 0.1,
-                top: 0.20,
-                right: 0.8,
-                bottom: 0.25,
-            }],
-            preview: "Figure 2".to_owned(),
-            matched_source: true,
-        };
-        let citation = ResolvedInternalLink {
-            x_fraction: Some(0.5),
-            y_fraction: Some(0.72),
-            text_runs: reference.text_runs.clone(),
-            preview: reference.text.clone(),
-            matched_source: true,
-        };
-        assert!(!scientific_reference_matches(
-            &reference,
-            9,
-            Some(&figure),
-            Some(0.72)
-        ));
-        assert!(scientific_reference_matches(
-            &reference,
-            9,
-            Some(&citation),
-            None
-        ));
-        assert!(!scientific_reference_matches(
-            &reference,
-            8,
-            Some(&citation),
-            Some(0.72)
-        ));
-    }
-
-    #[test]
-    fn grouped_reference_resolution_requires_every_bibliography_entry() {
-        let reference = |number| ScientificReference {
-            number,
-            page: 9,
-            x_fraction: Some(0.2),
-            y_fraction: Some(0.1 + number as f32 * 0.01),
-            text: format!("{number}. Reference {number}"),
-            text_runs: Vec::new(),
-        };
-        let complete = vec![reference(20), reference(21), reference(22)];
-        assert_eq!(
-            complete_grouped_reference_indices(&complete, "[20-22]", 20),
-            Some(vec![0, 1, 2])
-        );
-        assert_eq!(
-            complete_grouped_reference_indices(&complete, "[20-22]", 19),
-            None
-        );
-        let incomplete = vec![reference(20), reference(22)];
-        assert_eq!(
-            complete_grouped_reference_indices(&incomplete, "[20-22]", 20),
-            None
-        );
-        assert_eq!(adjacent_group_index(0, 3, true), 1);
-        assert_eq!(adjacent_group_index(2, 3, true), 0);
-        assert_eq!(adjacent_group_index(0, 3, false), 2);
-        assert_eq!(adjacent_group_index(7, 1, false), 0);
-    }
-
-    #[test]
-    fn compact_reference_labels_are_bounded_and_use_last_names() {
-        let authors = vec![
-            "Ada Lovelace".to_owned(),
-            "Grace Hopper".to_owned(),
-            "Alan Turing".to_owned(),
-        ];
-        assert_eq!(compact_authors(&authors), "Lovelace, Hopper, Turing");
-        let many = [authors, vec!["Katherine Johnson".to_owned()]].concat();
-        assert_eq!(compact_authors(&many), "Lovelace et al.");
-        assert_eq!(compact_words("one two three four", 3), "one two three…");
-        assert!(compact_journal("A very long journal title that needs shortening").ends_with('…'));
-    }
-
-    #[test]
-    fn reference_previews_measure_content_and_expand_their_shell_smoothly() {
-        let short = measured_preview_width(&["Short"], 220.0, 340.0);
-        let long = measured_preview_width(
-            &["A substantially longer title that should earn a wider preview shell"],
-            220.0,
-            340.0,
-        );
-        assert_eq!(short, 220.0);
-        assert!(long > short);
-        assert_eq!(long, 340.0);
-
-        let ready = ScholarlyMetadataState::Ready(Box::new(ScholarlyMetadata {
-            source: crate::scholarly::ScholarlySource::OpenAlex,
-            title: "A substantially longer scientific title for adaptive sizing".to_owned(),
-            abstract_text: None,
-            tldr_text: None,
-            authors: vec!["Ada Author".to_owned(), "Ben Writer".to_owned()],
-            year: Some(2025),
-            journal: Some("Journal of Responsive Interfaces".to_owned()),
-            journal_short: Some("J Resp Interfaces".to_owned()),
-            journal_url: None,
-            doi: Some("10.1000/adaptive".to_owned()),
-            open_access: Some(true),
-            full_text_url: None,
-            landing_url: None,
-            certainty: None,
-        }));
-        let collapsed = reference_preview_width(Some(&ready), 0.0);
-        let halfway = reference_preview_width(Some(&ready), 0.5);
-        let expanded = reference_preview_width(Some(&ready), 1.0);
-        assert_eq!(collapsed, 232.0);
-        assert!(halfway > collapsed && halfway < expanded);
-        assert!(expanded <= LINK_CARD_WIDTH);
-        assert_eq!(reference_preview_width(None, 1.0), 232.0);
-        assert_eq!(reference_hero_height("Short title"), 116.0);
-        assert_eq!(
-            reference_hero_height(
-                "A journal with a deliberately long descriptive name that wraps cleanly"
-            ),
-            164.0
-        );
-        let ScholarlyMetadataState::Ready(metadata) = &ready else {
-            unreachable!();
-        };
-        assert_eq!(
-            compact_reference_panel_citation(metadata),
-            "Author, Writer · J Resp Interfaces · 2025"
-        );
-    }
-
-    #[test]
-    fn dense_link_hover_requires_a_stable_neighbor_before_handoff() {
-        assert!(LINK_CARD_MOVE_DEBOUNCE < LINK_HOVER_HANDOFF_DELAY);
-        assert!(LINK_HOVER_HANDOFF_DELAY < LINK_HOVER_CLOSE_DELAY);
-        assert!(LINK_HOVER_CLOSE_DELAY >= Duration::from_millis(300));
-        let origin = point(px(100.0), px(200.0));
-        let pending = PendingLinkHover {
-            target: Some(PreviewTarget::Link(1)),
-            position: origin,
-        };
-        assert!(!link_hover_candidate_needs_restart(
-            pending,
-            Some(PreviewTarget::Link(1)),
-            point(px(102.0), px(201.0)),
-        ));
-        assert!(link_hover_candidate_needs_restart(
-            pending,
-            Some(PreviewTarget::Link(2)),
-            origin,
-        ));
-        assert!(link_hover_candidate_needs_restart(
-            pending,
-            Some(PreviewTarget::Link(1)),
-            point(px(104.0), px(200.0)),
-        ));
-    }
-
-    #[test]
-    fn reference_detail_helpers_bound_expansion_and_preserve_literal_text() {
-        assert_eq!(escape_markdown_text("DOI_10*[x]"), "DOI\\_10\\*\\[x\\]");
-        assert_eq!(
-            middle_truncate("10.1234/a-very-long-doi", 15),
-            "10.1234…ong-doi"
-        );
-        assert!(citation_expanded_height("One Author", "A Journal", false) >= 112.0);
-        assert!(
-            citation_expanded_height(&"Author ".repeat(80), &"Journal ".repeat(20), true) <= 272.0
-        );
-    }
-
-    #[test]
-    fn reusable_reveal_state_reverses_and_settles() {
-        let mut reveal = RevealState::hidden();
-        reveal.set_target(1.0);
-        for _ in 0..60 {
-            reveal.advance(1.0 / 60.0);
-        }
-        assert_eq!(reveal.value(), 1.0);
-        reveal.set_target(0.0);
-        for _ in 0..60 {
-            reveal.advance(1.0 / 60.0);
-        }
-        assert_eq!(reveal.value(), 0.0);
-    }
-
-    #[test]
-    fn reference_panel_geometry_is_responsive_and_preserves_document_space() {
-        assert_eq!(reference_panel_width(250.0), 0.0);
-        assert_eq!(reference_panel_extent(250.0, 1.0), 0.0);
-        assert_eq!(reference_panel_width(500.0), 176.0);
-        assert!((reference_panel_width(1_100.0) - 396.0).abs() < 0.001);
-        assert_eq!(reference_panel_width(2_000.0), REFERENCE_PANEL_MAX_WIDTH);
-
-        let full_extent = reference_panel_extent(1_100.0, 1.0);
-        assert!((full_extent - 420.0).abs() < 0.001);
-        assert_eq!(reference_panel_extent(1_100.0, -2.0), 0.0);
-        assert_eq!(reference_panel_extent(1_100.0, 2.0), full_extent);
-        assert!(1_100.0 - full_extent >= MIN_DOCUMENT_VIEWPORT_WIDTH);
-
-        assert_eq!(fluid_sidebar_extent(1_100.0, 0.0), 0.0);
-        assert_eq!(fluid_sidebar_extent(1_100.0, 1.0), 368.0);
-        assert_eq!(fluid_sidebar_extent(1_100.0, -1.0), 0.0);
-        assert_eq!(fluid_sidebar_extent(1_100.0, 2.0), 368.0);
-        assert!(reference_panel_extent(1_100.0, 1.0) > 0.0);
-    }
-
-    #[test]
-    fn toc_helpers_center_the_stack_cascade_hover_and_preserve_navigation() {
-        let entries = vec![
-            TocEntry {
-                title: "Part one".to_owned(),
-                page: 0,
-                depth: 0,
-                destination_y: Some(0.25),
-            },
-            TocEntry {
-                title: "Details".to_owned(),
-                page: 1,
-                depth: 1,
-                destination_y: None,
-            },
-            TocEntry {
-                title: "Part two".to_owned(),
-                page: 2,
-                depth: 0,
-                destination_y: None,
-            },
-        ];
-        let layout = DocumentLayout::new(
-            &[
-                PageSize {
-                    width: 612.0,
-                    height: 792.0,
-                },
-                PageSize {
-                    width: 612.0,
-                    height: 792.0,
-                },
-                PageSize {
-                    width: 612.0,
-                    height: 792.0,
-                },
-            ],
-            1.0,
-            900.0,
-        );
-
-        assert_eq!(active_toc_index(&entries, 0), Some(0));
-        assert_eq!(active_toc_index(&entries, 1), Some(1));
-        assert_eq!(active_toc_index(&entries, 2), Some(2));
-        assert_eq!(
-            toc_breadcrumb_entries(&entries, 1),
-            Some(vec![(0, "Part one".to_owned()), (1, "Details".to_owned())])
-        );
-        assert_eq!(
-            toc_breadcrumb_entries(&entries, 2),
-            Some(vec![(2, "Part two".to_owned())])
-        );
-        let short_breadcrumbs = toc_breadcrumb_entries(&entries, 1).unwrap();
-        assert!(toc_callout_width(&short_breadcrumbs, 360.0) < 280.0);
-        assert_eq!(
-            toc_callout_height(
-                &short_breadcrumbs,
-                toc_callout_width(&short_breadcrumbs, 360.0)
-            ),
-            TOC_CARD_MIN_HEIGHT
-        );
-        let long_breadcrumbs = vec![
-            (
-                0,
-                "A very long parent section title that must wrap".to_owned(),
-            ),
-            (
-                1,
-                "An equally long child section title that must remain fully visible".to_owned(),
-            ),
-        ];
-        let compact_breadcrumbs = toc_display_breadcrumbs(&long_breadcrumbs);
-        assert_eq!(
-            compact_breadcrumbs
-                .iter()
-                .map(|(index, _)| *index)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        assert!(compact_breadcrumbs.iter().all(|(_, title)| {
-            title.chars().count() <= TOC_BREADCRUMB_MAX_LABEL_CHARACTERS && title.ends_with('…')
-        }));
-        assert!(toc_callout_width(&compact_breadcrumbs, 360.0) < 360.0);
-        assert_eq!(
-            toc_callout_height(
-                &compact_breadcrumbs,
-                toc_callout_width(&compact_breadcrumbs, 360.0)
-            ),
-            TOC_CARD_MIN_HEIGHT
-        );
-        assert_eq!(end_truncate("Résumé détaillé", 8), "Résumé …");
-
-        assert_eq!(toc_stack_geometry(600.0, 3), Some((288.0, 12.0)));
-        assert_eq!(toc_stack_geometry(600.0, 1), Some((300.0, 0.0)));
-        let (dense_top, dense_spacing) = toc_stack_geometry(100.0, 100).unwrap();
-        assert!((dense_top - TOC_STACK_MARGIN).abs() < 0.001);
-        assert!(dense_spacing < 1.0);
-
-        assert_eq!(toc_cascade_amount(4, 4.0, 1.0), 1.0);
-        assert!((toc_cascade_amount(3, 4.0, 1.0) - 0.8).abs() < 0.001);
-        assert!((toc_cascade_amount(2, 4.0, 0.5) - 0.3).abs() < 0.001);
-        assert_eq!(toc_cascade_amount(9, 4.0, 1.0), 0.0);
-        assert!((toc_cascade_amount(4, 4.5, 1.0) - 0.9).abs() < 0.001);
-        assert!((toc_cascade_amount(5, 4.5, 1.0) - 0.9).abs() < 0.001);
-
-        let mut hover_position = 3.0;
-        let mut hover_strength = 1.0;
-        advance_toc_hover_state(&mut hover_position, &mut hover_strength, Some(7), 0.5);
-        assert_eq!(hover_position, 5.0);
-        assert_eq!(hover_strength, 1.0);
-        assert!(toc_hover_state_is_animating(
-            hover_position,
-            hover_strength,
-            Some(7)
-        ));
-        advance_toc_hover_state(&mut hover_position, &mut hover_strength, None, 0.5);
-        assert_eq!(hover_position, 5.0);
-        assert_eq!(hover_strength, 0.5);
-        assert!(toc_hover_state_is_animating(
-            hover_position,
-            hover_strength,
-            None
-        ));
-        let page_only = DocumentJump::new(2)
-            .resolve(&layout, 0.0, 800.0, 600.0, 0.0)
-            .unwrap();
-        assert_eq!(page_only.y, layout.page_rect(2).unwrap().y);
-        let page = layout.page_rect(1).unwrap();
-        let positioned = DocumentJump::new(1)
-            .position(None, Some(0.5))
-            .resolve(&layout, 0.0, 800.0, 600.0, 0.0)
-            .unwrap();
-        assert_eq!(positioned.y, page.y + page.height * 0.5 - 300.0);
-    }
-
-    #[test]
-    fn link_preview_helpers_choose_destination_context_and_keep_cards_on_screen() {
-        let entries = vec![
-            TocEntry {
-                title: "Introduction".to_owned(),
-                page: 1,
-                depth: 0,
-                destination_y: Some(0.1),
-            },
-            TocEntry {
-                title: "Detailed results".to_owned(),
-                page: 1,
-                depth: 1,
-                destination_y: Some(0.62),
-            },
-        ];
-        assert_eq!(
-            link_section_title(&entries, 1, Some(0.7)).as_deref(),
-            Some("Detailed results")
-        );
-        assert_eq!(
-            link_section_title(&entries, 1, Some(0.2)).as_deref(),
-            Some("Introduction")
-        );
-
-        let position = link_card_position(
-            Rect {
-                x: 740.0,
-                y: 560.0,
-                width: 30.0,
-                height: 16.0,
-            },
-            800.0,
-            600.0,
-            340.0,
-            190.0,
-        );
-        assert!(position.x >= LINK_CARD_MARGIN);
-        assert!(position.x + 340.0 <= 800.0 - LINK_CARD_MARGIN + 0.001);
-        assert!(position.y >= LINK_CARD_MARGIN);
-        assert!(position.y + 190.0 <= 600.0 - LINK_CARD_MARGIN + 0.001);
-        let pointer_position =
-            pointer_link_card_position(Offset { x: 400.0, y: 240.0 }, 800.0, 600.0, 340.0, 190.0);
-        assert!((pointer_position.x + 170.0 - 400.0).abs() < 0.001);
-        assert_eq!(pointer_position.y, 240.0 + LINK_CARD_GAP);
-        let edge_position =
-            pointer_link_card_position(Offset { x: 790.0, y: 590.0 }, 800.0, 600.0, 340.0, 190.0);
-        assert!(edge_position.x + 340.0 <= 800.0 - LINK_CARD_MARGIN + 0.001);
-        assert!(edge_position.y < 590.0);
-        assert!(!link_preview_should_close(true, false));
-        assert!(!link_preview_should_close(false, true));
-        assert!(!link_preview_should_close(true, true));
-        assert!(link_preview_should_close(false, false));
-    }
-
-    #[test]
-    fn toc_title_matching_prefers_the_largest_exact_page_match() {
-        let source = "Methods body Methods";
-        let characters = source
-            .chars()
-            .enumerate()
-            .map(|(index, value)| {
-                let second_heading = index >= 13;
-                let top = if second_heading { 0.62 } else { 0.12 };
-                let height = if second_heading { 0.06 } else { 0.02 };
-                TextChar {
-                    value,
-                    bounds: (!value.is_whitespace()).then_some(TextBounds {
-                        left: index as f32 * 0.02,
-                        top,
-                        right: index as f32 * 0.02 + 0.015,
-                        bottom: top + height,
-                    }),
-                }
-            })
-            .collect();
-        let text = TextLayer::new(characters);
-        let matched = toc_title_match("methods", &text).expect("heading should match");
-        assert!((matched.y - 0.62).abs() < 0.001);
-        assert!(!matched.text_runs.is_empty());
-
-        let resolved = resolve_toc_destination("methods", &text, Some(0.12));
-        assert_eq!(resolved.y, Some(0.62));
-        assert!(resolved.matched_title);
-        assert!(!resolved.text_runs.is_empty());
-
-        assert_eq!(
-            resolve_toc_destination("missing heading", &text, Some(0.12)),
-            ResolvedTocDestination {
-                y: Some(0.12),
-                text_runs: Vec::new(),
-                matched_title: false,
-            }
-        );
-        assert_eq!(toc_title_match("missing heading", &text), None);
-    }
-
-    #[test]
-    fn pdf_render_appearance_follows_theme_mode_and_colors() {
-        let light = Theme::from(ThemeColor::light().as_ref());
-        assert_eq!(
-            render_appearance_from_theme(&light, true),
-            RenderAppearance::Normal
-        );
-
-        let mut dark = Theme::from(ThemeColor::dark().as_ref());
-        dark.mode = ThemeMode::Dark;
-        let expected_background = gpui::Rgba::from(theme::pdf_paper_color(&dark, true));
-        let expected_foreground = gpui::Rgba::from(dark.foreground);
-        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-        assert_eq!(
-            render_appearance_from_theme(&dark, true),
-            RenderAppearance::ForcedColors {
-                background: RenderColor {
-                    red: channel(expected_background.r),
-                    green: channel(expected_background.g),
-                    blue: channel(expected_background.b),
-                },
-                foreground: RenderColor {
-                    red: channel(expected_foreground.r),
-                    green: channel(expected_foreground.g),
-                    blue: channel(expected_foreground.b),
-                },
-            }
-        );
-        assert_eq!(
-            render_appearance_from_theme(&dark, false),
-            RenderAppearance::Normal
-        );
-    }
-
-    struct TestDirectory(PathBuf);
-
-    impl TestDirectory {
-        fn new(label: &str) -> Self {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "gpui-pdf-reader-reader-{label}-{}-{nonce}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn letter_pages(count: usize) -> Vec<PageSize> {
-        vec![
-            PageSize {
-                width: 612.0,
-                height: 792.0,
-            };
-            count
-        ]
-    }
-
-    #[test]
-    fn annotation_controls_enable_for_any_writable_text_context_without_an_open_editor() {
-        assert!(annotation_actions_enabled(true, false, false, false));
-        assert!(!annotation_actions_enabled(false, false, false, false));
-        assert!(!annotation_actions_enabled(true, true, false, false));
-        assert!(!annotation_actions_enabled(true, false, true, false));
-        assert!(!annotation_actions_enabled(true, false, false, true));
-    }
-
-    #[test]
-    fn zoom_controls_disable_without_a_document_and_at_their_exact_limits() {
-        assert_eq!(zoom_controls_enabled(false, 1.0), (false, false));
-        assert_eq!(zoom_controls_enabled(true, MIN_ZOOM), (false, true));
-        assert_eq!(zoom_controls_enabled(true, 1.0), (true, true));
-        assert_eq!(zoom_controls_enabled(true, MAX_ZOOM), (true, false));
-    }
-
-    #[test]
-    fn only_a_modified_open_comment_requires_discard_confirmation() {
-        assert!(!comment_draft_needs_confirmation(false, false));
-        assert!(!comment_draft_needs_confirmation(false, true));
-        assert!(!comment_draft_needs_confirmation(true, false));
-        assert!(comment_draft_needs_confirmation(true, true));
-    }
-
-    #[test]
-    fn hidden_comment_editor_remains_visible_in_the_responsive_toolbar_label() {
-        assert_eq!(comments_toolbar_label(false, false, false), "Comments");
-        assert_eq!(comments_toolbar_label(false, true, true), "Notes");
-        assert_eq!(
-            comments_toolbar_label(true, false, false),
-            "Comments · Editing"
-        );
-        assert_eq!(comments_toolbar_label(true, true, false), "Notes •");
-        assert_eq!(comments_toolbar_label(true, true, true), "Notes •");
-    }
-
-    #[test]
-    fn fluid_context_pill_stays_on_screen_and_prefers_below_the_selection() {
-        let below = floating_pill_position(
-            Rect {
-                x: 160.0,
-                y: 120.0,
-                width: 80.0,
-                height: 18.0,
-            },
-            500.0,
-            600.0,
-            FLUID_CONTEXT_PILL_WIDTH,
-            FLUID_CONTEXT_PILL_HEIGHT,
-        );
-        assert_eq!(below.y, 148.0);
-        assert!((below.x - 93.0).abs() < f32::EPSILON);
-
-        let clamped_left = floating_pill_position(
-            Rect {
-                x: -200.0,
-                y: 20.0,
-                width: 10.0,
-                height: 10.0,
-            },
-            500.0,
-            600.0,
-            FLUID_CONTEXT_PILL_WIDTH,
-            FLUID_CONTEXT_PILL_HEIGHT,
-        );
-        assert_eq!(clamped_left.x, 12.0);
-
-        let above = floating_pill_position(
-            Rect {
-                x: 450.0,
-                y: 570.0,
-                width: 30.0,
-                height: 18.0,
-            },
-            500.0,
-            600.0,
-            FLUID_CONTEXT_PILL_WIDTH,
-            FLUID_CONTEXT_PILL_HEIGHT,
-        );
-        assert_eq!(above.x, 274.0);
-        assert_eq!(above.y, 520.0);
-    }
-
-    #[test]
-    fn comment_pane_slides_both_directions_and_only_closes_after_back_finishes() {
-        let mut pane = CommentPaneState::default();
-        pane.show_editor(true);
-        assert_eq!(pane.target, 1.0);
-        assert!(!pane.close_editor_on_finish);
-        for _ in 0..240 {
-            pane.advance(1.0 / 60.0);
-        }
-        assert_eq!(pane.progress, 1.0);
-        assert!(!pane.is_animating());
-
-        pane.show_list(true);
-        assert_eq!(pane.target, 0.0);
-        assert!(pane.close_editor_on_finish);
-        pane.advance(1.0 / 60.0);
-        assert!(pane.progress > 0.0);
-        assert!(pane.is_animating());
-        for _ in 0..240 {
-            pane.advance(1.0 / 60.0);
-        }
-        assert_eq!(pane.progress, 0.0);
-        assert!(!pane.is_animating());
-        assert!(pane.close_editor_on_finish);
-    }
-
-    #[test]
-    fn high_zoom_raster_is_sharp_without_allocating_a_full_page() {
-        let raster = desired_raster_size(
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                width: 4_080.0,
-                height: 5_280.0,
-            },
-            2.0,
-        );
-        assert!(raster.width > 4_096);
-        assert!(raster.height > 4_096);
-        assert!(raster.width <= MAX_RASTER_DIMENSION);
-        assert!(raster.height <= MAX_RASTER_DIMENSION);
-
-        let key = TileKey {
-            page: 0,
-            raster,
-            column: 3,
-            row: 4,
-        };
-        let core = tile_core_rect(key).unwrap();
-        let rendered = inflate_tile_rect(core, raster);
-        assert!(core.width <= TILE_SIZE && core.height <= TILE_SIZE);
-        assert!(rendered.width <= TILE_SIZE + TILE_BLEED * 2);
-        assert!(rendered.height <= TILE_SIZE + TILE_BLEED * 2);
-        assert!(rendered.width as usize * rendered.height as usize * 4 < 5 * 1024 * 1024);
-    }
-
-    #[test]
-    fn tile_grid_clips_partial_edges_without_zero_sized_tiles() {
-        let raster = RasterSize {
-            width: 2_050,
-            height: 1_025,
-        };
-        let first = tile_core_rect(TileKey {
-            page: 0,
-            raster,
-            column: 0,
-            row: 0,
-        })
-        .unwrap();
-        let last = tile_core_rect(TileKey {
-            page: 0,
-            raster,
-            column: 2,
-            row: 1,
-        })
-        .unwrap();
-        assert_eq!(first.width, 1_024);
-        assert_eq!(
-            last,
-            PixelRect {
-                x: 2_048,
-                y: 1_024,
-                width: 2,
-                height: 1
-            }
-        );
-        assert!(
-            tile_core_rect(TileKey {
-                page: 0,
-                raster,
-                column: 3,
-                row: 0,
-            })
-            .is_none()
-        );
-        assert!(
-            tile_core_rect(TileKey {
-                page: 0,
-                raster,
-                column: u32::MAX,
-                row: 0,
-            })
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn planner_requests_bounded_tiles_from_both_partially_visible_pages() {
-        let pages = letter_pages(2);
-        let layout = DocumentLayout::new(&pages, 1.0, 1_100.0);
-        let first = layout.page_rect(0).unwrap();
-        let second = layout.page_rect(1).unwrap();
-        let scroll = Offset {
-            x: 0.0,
-            y: first.bottom() - 80.0,
-        };
-        let viewport_height = second.y - scroll.y + 90.0;
-        let planned = plan_visible_tiles(&layout, &pages, scroll, 1_100.0, viewport_height, 2.0);
-        let visible_pages: HashSet<_> = planned
-            .iter()
-            .filter_map(|tile| (tile.tier == DemandTier::Visible).then_some(tile.request.key.page))
-            .collect();
-        assert_eq!(visible_pages, HashSet::from([0, 1]));
-        assert!(planned.iter().all(|tile| {
-            tile.request.render_rect.width <= TILE_SIZE + TILE_BLEED * 2
-                && tile.request.render_rect.height <= TILE_SIZE + TILE_BLEED * 2
-                && tile.request.core_rect.width > 0
-                && tile.request.core_rect.height > 0
-        }));
-        let unique: HashSet<_> = planned.iter().map(|tile| tile.request.key).collect();
-        assert_eq!(unique.len(), planned.len());
-    }
-
-    #[test]
-    fn horizontal_panning_only_demands_nearby_columns() {
-        let pages = letter_pages(1);
-        let layout = DocumentLayout::new(&pages, 5.0, 900.0);
-        let page = layout.page_rect(0).unwrap();
-        let raster = desired_raster_size(page, 2.0);
-        let scroll = Offset {
-            x: page.x + page.width * 0.65,
-            y: page.y + 400.0,
-        };
-        let planned = plan_visible_tiles(&layout, &pages, scroll, 700.0, 600.0, 2.0);
-        let columns: HashSet<_> = planned.iter().map(|tile| tile.request.key.column).collect();
-        assert!(!columns.is_empty());
-        assert!(columns.len() <= 4);
-        assert!(
-            columns
-                .iter()
-                .all(|column| *column < raster.width.div_ceil(TILE_SIZE))
-        );
-        assert!(!columns.contains(&0));
-    }
-
-    #[test]
-    fn adjacent_tile_destinations_share_the_same_global_edge() {
-        let page = Rect {
-            x: 12.25,
-            y: 30.5,
-            width: 777.3,
-            height: 1_005.8,
-        };
-        let raster = RasterSize {
-            width: 1_663,
-            height: 2_151,
-        };
-        let left = tile_logical_rect(
-            page,
-            raster,
-            PixelRect {
-                x: 0,
-                y: 0,
-                width: 1_024,
-                height: 1_024,
-            },
-        );
-        let right = tile_logical_rect(
-            page,
-            raster,
-            PixelRect {
-                x: 1_024,
-                y: 0,
-                width: raster.width - 1_024,
-                height: 1_024,
-            },
-        );
-        assert!((left.right() - right.x).abs() < 0.0001);
-        assert!((right.right() - page.right()).abs() < 0.0001);
-    }
-
-    #[test]
-    fn invalid_raster_inputs_are_finite_and_bounded() {
-        for rect in [
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                width: f32::NAN,
-                height: 1.0,
-            },
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                width: 0.0,
-                height: f32::INFINITY,
-            },
-        ] {
-            assert_eq!(
-                desired_raster_size(rect, f32::INFINITY),
-                RasterSize {
-                    width: 1,
-                    height: 1
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn accelerated_command_wheel_zoom_is_finite_and_clamped_per_packet() {
-        assert_eq!(command_wheel_zoom_factor(0.0), Some(1.0));
-        assert_eq!(command_wheel_zoom_factor(f32::NAN), None);
-        assert_eq!(command_wheel_zoom_factor(f32::INFINITY), None);
-
-        let maximum = command_wheel_zoom_factor(f32::MAX).unwrap();
-        let minimum = command_wheel_zoom_factor(-f32::MAX).unwrap();
-        assert!((maximum - 1.5_f32.exp()).abs() < f32::EPSILON);
-        assert!((minimum - (-1.5_f32).exp()).abs() < f32::EPSILON);
-        assert!(minimum > 0.0 && maximum.is_finite());
-    }
-
-    #[test]
-    fn sidebar_animation_opens_closes_reverses_and_clamps_width() {
-        let mut sidebar = SidebarState::default();
-        assert_eq!(sidebar.available_width(1_200.0), 0.0);
-        sidebar.toggle(SidePanel::Comments);
-        assert_eq!(sidebar.target, 1.0);
-
-        let mut previous = sidebar.progress;
-        for _ in 0..240 {
-            sidebar.advance(1.0 / 60.0);
-            assert!(sidebar.progress >= previous);
-            assert!((0.0..=1.0).contains(&sidebar.progress));
-            previous = sidebar.progress;
-        }
-        assert_eq!(sidebar.progress, 1.0);
-        assert_eq!(sidebar.available_width(1_200.0), SIDEBAR_WIDTH);
-        assert_eq!(sidebar.available_width(500.0), 200.0);
-        assert_eq!(sidebar.available_width(250.0), 0.0);
-
-        sidebar.toggle(SidePanel::Comments);
-        sidebar.advance(1.0 / 60.0);
-        let closing_progress = sidebar.progress;
-        assert!(closing_progress < 1.0);
-        sidebar.toggle(SidePanel::Comments);
-        assert_eq!(sidebar.target, 1.0);
-        sidebar.advance(1.0 / 60.0);
-        assert!(sidebar.progress > closing_progress);
-
-        sidebar.toggle(SidePanel::Comments);
-        for _ in 0..240 {
-            sidebar.advance(1.0 / 60.0);
-        }
-        assert_eq!(sidebar.progress, 0.0);
-        assert!(!sidebar.is_animating());
-    }
-
-    #[test]
-    fn paint_budget_is_hard_and_active_items_sort_first() {
-        let mut budget = PaintBudget::new(3);
-        assert!(!budget.exhausted());
-        assert!(budget.take());
-        assert!(budget.take());
-        assert!(budget.take());
-        assert!(budget.exhausted());
-        assert!(!budget.take());
-        assert!(!budget.take());
-
-        let mut ids = [AnnotationId(3), AnnotationId(1), AnnotationId(2)];
-        ids.sort_by_key(|id| is_inactive(*id, Some(AnnotationId(2))));
-        assert_eq!(ids[0], AnnotationId(2));
-        assert!(ids[1..].contains(&AnnotationId(1)));
-        assert!(ids[1..].contains(&AnnotationId(3)));
-    }
-
-    #[test]
-    fn switching_sidebar_panels_keeps_the_sidebar_open() {
-        let mut sidebar = SidebarState::default();
-        sidebar.toggle(SidePanel::Comments);
-        for _ in 0..240 {
-            sidebar.advance(1.0 / 60.0);
-        }
-        sidebar.toggle(SidePanel::Search);
-        assert_eq!(sidebar.panel, SidePanel::Search);
-        assert_eq!(sidebar.target, 1.0);
-        assert_eq!(sidebar.progress, 1.0);
-    }
-
-    #[test]
-    fn search_list_groups_matches_under_one_heading_per_page() {
-        let rows = search_list_rows(&[
-            SearchMatchId {
-                page: 1,
-                start: 2,
-                end: 3,
-            },
-            SearchMatchId {
-                page: 1,
-                start: 8,
-                end: 9,
-            },
-            SearchMatchId {
-                page: 4,
-                start: 1,
-                end: 2,
-            },
-        ]);
-        assert_eq!(rows.len(), 5);
-        assert_eq!(rows[0], SearchListRow::Page(1));
-        assert!(matches!(rows[1], SearchListRow::Match { ordinal: 0, .. }));
-        assert!(matches!(rows[2], SearchListRow::Match { ordinal: 1, .. }));
-        assert_eq!(rows[3], SearchListRow::Page(4));
-        assert!(matches!(rows[4], SearchListRow::Match { ordinal: 2, .. }));
-    }
-
-    #[test]
-    fn search_jump_uses_result_geometry_and_a_bounded_fallback() {
-        let result = SearchMatch {
-            id: SearchMatchId {
-                page: 3,
-                start: 7,
-                end: 12,
-            },
-            preview: "result".to_owned(),
-            preview_match: 0..6,
-            highlight_runs: vec![
-                TextBounds {
-                    left: 0.2,
-                    top: 0.4,
-                    right: 0.5,
-                    bottom: 0.46,
-                },
-                TextBounds {
-                    left: 0.2,
-                    top: 0.52,
-                    right: 0.42,
-                    bottom: 0.58,
-                },
-            ],
-        };
-
-        let layout = DocumentLayout::new(
-            &[PageSize {
-                width: 600.0,
-                height: 800.0,
-            }; 6],
-            1.0,
-            900.0,
-        );
-        let target = search_document_jump(&result)
-            .resolve(&layout, 0.0, 500.0, 400.0, 500.0)
-            .unwrap()
-            .focus
-            .unwrap();
-        assert_eq!(target.page, 3);
-        assert!((target.y_fraction - 0.43).abs() < 0.001);
-        assert_eq!(target.text_runs, result.highlight_runs);
-        assert_eq!(target.tone, NavigationFocusTone::SearchMatch);
-        assert_eq!(target.motion, NavigationFocusMotion::Pulse);
-
-        let fallback = search_document_jump(&SearchMatch {
-            id: SearchMatchId {
-                page: 5,
-                start: 1,
-                end: 2,
-            },
-            preview: "unlocated".to_owned(),
-            preview_match: 0..9,
-            highlight_runs: Vec::new(),
-        })
-        .resolve(&layout, 0.0, 500.0, 400.0, 500.0)
-        .unwrap()
-        .focus
-        .unwrap();
-        assert_eq!(fallback.page, 5);
-        assert_eq!(fallback.y_fraction, 0.15);
-        assert!(fallback.text_runs.is_empty());
-        assert_eq!(fallback.tone, NavigationFocusTone::SearchMatch);
-        assert_eq!(fallback.motion, NavigationFocusMotion::Pulse);
-    }
-
-    #[test]
-    fn search_navigation_handles_initial_stale_and_wrapped_results() {
-        let first = SearchMatchId {
-            page: 0,
-            start: 2,
-            end: 5,
-        };
-        let second = SearchMatchId {
-            page: 2,
-            start: 7,
-            end: 10,
-        };
-        let stale = SearchMatchId {
-            page: 9,
-            start: 0,
-            end: 0,
-        };
-        let results = [first, second];
-
-        assert_eq!(next_search_match_id(&[], None, true), None);
-        assert_eq!(next_search_match_id(&results, None, true), Some(first));
-        assert_eq!(next_search_match_id(&results, None, false), Some(second));
-        assert_eq!(
-            next_search_match_id(&results, Some(first), true),
-            Some(second)
-        );
-        assert_eq!(
-            next_search_match_id(&results, Some(second), true),
-            Some(first)
-        );
-        assert_eq!(
-            next_search_match_id(&results, Some(first), false),
-            Some(second)
-        );
-        assert_eq!(
-            next_search_match_id(&results, Some(stale), true),
-            Some(first)
-        );
-        assert_eq!(
-            next_search_match_id(&results, Some(stale), false),
-            Some(second)
-        );
-    }
-
-    #[test]
-    fn pending_document_open_waits_opens_or_cancels_without_losing_its_path() {
-        let first = PathBuf::from("next.pdf");
-        let mut pending = Some(first.clone());
-
-        assert_eq!(
-            transition_pending_open(&mut pending, Some(6), 5, false),
-            PendingOpenTransition::Waiting
-        );
-        assert_eq!(pending, Some(first.clone()));
-        assert_eq!(
-            transition_pending_open(&mut pending, Some(6), 6, false),
-            PendingOpenTransition::Open(first)
-        );
-        assert_eq!(pending, None);
-
-        let replacement = PathBuf::from("replacement.pdf");
-        pending = Some(replacement.clone());
-        assert_eq!(
-            transition_pending_open(&mut pending, Some(1), 0, true),
-            PendingOpenTransition::Cancelled(replacement)
-        );
-        assert_eq!(pending, None);
-        assert_eq!(
-            transition_pending_open(&mut pending, None, 0, false),
-            PendingOpenTransition::None
-        );
-    }
-
-    #[test]
-    fn comment_previews_collapse_whitespace_and_truncate_by_unicode_character() {
-        assert_eq!(compact_preview("  Café\n\t日本語  ", 32), "Café 日本語");
-        assert_eq!(compact_preview("😀😀😀😀", 3), "😀😀😀…");
-        assert_eq!(compact_preview("one   two three", 7), "one two…");
-        assert_eq!(compact_preview("", 3), "");
-    }
-
-    #[test]
-    fn annotation_io_revalidates_pdf_identity_immediately_before_save() {
-        let directory = TestDirectory::new("identity-recheck");
-        let pdf = directory.path().join("document.pdf");
-        std::fs::write(&pdf, b"original pdf bytes").unwrap();
-        let identity = DocumentIdentity::from_pdf(&pdf, 1).unwrap();
-        let mut annotations = AnnotationSet::new(1);
-        annotations
-            .add(
-                TextRange::new(
-                    TextPosition { page: 0, index: 0 },
-                    TextPosition { page: 0, index: 4 },
-                ),
-                Some(HighlightColor::Yellow),
-                None,
-            )
-            .unwrap();
-
-        std::fs::write(&pdf, b"changed pdf bytes that invalidate identity").unwrap();
-        let (io, events) = AnnotationIo::start();
-        assert!(io.save(7, pdf.clone(), identity, 0, annotations));
-        let event = events.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(
-            event,
-            AnnotationIoEvent::Failed {
-                generation: 7,
-                operation: AnnotationIoOperation::Save,
-                revision: Some(1),
-                ..
-            }
-        ));
-        assert!(!crate::annotations::sidecar_path(&pdf).unwrap().exists());
-    }
-
-    #[test]
-    fn annotation_io_queued_revisions_leave_the_latest_snapshot_on_disk() {
-        let directory = TestDirectory::new("latest-revision");
-        let pdf = directory.path().join("document.pdf");
-        std::fs::write(&pdf, b"stable pdf bytes").unwrap();
-        let identity = DocumentIdentity::from_pdf(&pdf, 1).unwrap();
-        let range = TextRange::new(
-            TextPosition { page: 0, index: 1 },
-            TextPosition { page: 0, index: 3 },
-        );
-        let mut revision_one = AnnotationSet::new(1);
-        revision_one
-            .add(range, Some(HighlightColor::Green), None)
-            .unwrap();
-        let mut revision_two = revision_one.clone();
-        revision_two
-            .add(
-                TextRange::new(
-                    TextPosition { page: 0, index: 8 },
-                    TextPosition { page: 0, index: 12 },
-                ),
-                None,
-                Some("**persisted** comment".into()),
-            )
-            .unwrap();
-
-        let (io, events) = AnnotationIo::start();
-        assert!(io.save(3, pdf.clone(), identity.clone(), 0, revision_one));
-        assert!(io.save(3, pdf.clone(), identity.clone(), 0, revision_two.clone()));
-        let mut revisions = Vec::new();
-        loop {
-            match events.recv_timeout(Duration::from_secs(2)).unwrap() {
-                AnnotationIoEvent::Saved { revision, .. } => {
-                    revisions.push(revision);
-                    if revision == 2 {
-                        break;
-                    }
-                }
-                AnnotationIoEvent::Failed { message, .. } => panic!("save failed: {message}"),
-                AnnotationIoEvent::Loaded { .. } => panic!("unexpected load event"),
-            }
-        }
-        assert!(matches!(revisions.as_slice(), [2] | [1, 2]));
-        let document = DocumentKey::new(pdf.clone(), identity.clone());
-        assert_eq!(JsonSidecarStore.load(&document).unwrap(), revision_two);
-    }
-
-    #[test]
-    fn annotation_io_rejects_a_stale_second_writer_without_overwriting_disk() {
-        let directory = TestDirectory::new("concurrent-writers");
-        let pdf = directory.path().join("document.pdf");
-        std::fs::write(&pdf, b"stable pdf bytes").unwrap();
-        let identity = DocumentIdentity::from_pdf(&pdf, 1).unwrap();
-
-        let (first_writer, first_events) = AnnotationIo::start();
-        let (second_writer, second_events) = AnnotationIo::start();
-        assert!(first_writer.load(11, pdf.clone(), 1));
-        assert!(second_writer.load(22, pdf.clone(), 1));
-        for events in [&first_events, &second_events] {
-            match events.recv_timeout(Duration::from_secs(2)).unwrap() {
-                AnnotationIoEvent::Loaded { annotations, .. } => {
-                    assert_eq!(annotations.revision(), 0)
-                }
-                AnnotationIoEvent::Saved { .. } => panic!("unexpected save event during load"),
-                AnnotationIoEvent::Failed { message, .. } => {
-                    panic!("initial sidecar load failed: {message}")
-                }
-            }
-        }
-
-        let first_range = TextRange::new(
-            TextPosition { page: 0, index: 1 },
-            TextPosition { page: 0, index: 3 },
-        );
-        let mut first_revision = AnnotationSet::new(1);
-        first_revision
-            .add(first_range, Some(HighlightColor::Green), None)
-            .unwrap();
-        assert!(first_writer.save(11, pdf.clone(), identity.clone(), 0, first_revision.clone(),));
-        assert!(matches!(
-            first_events.recv_timeout(Duration::from_secs(2)).unwrap(),
-            AnnotationIoEvent::Saved {
-                generation: 11,
-                revision: 1
-            }
-        ));
-
-        let mut first_latest = first_revision;
-        first_latest
-            .add(
-                TextRange::new(
-                    TextPosition { page: 0, index: 8 },
-                    TextPosition { page: 0, index: 12 },
-                ),
-                None,
-                Some("first writer's comment".into()),
-            )
-            .unwrap();
-        // The deliberately stale fallback proves that a successful local save
-        // advanced the worker's observed on-disk revision from 0 to 1.
-        assert!(first_writer.save(11, pdf.clone(), identity.clone(), 0, first_latest.clone(),));
-        assert!(matches!(
-            first_events.recv_timeout(Duration::from_secs(2)).unwrap(),
-            AnnotationIoEvent::Saved {
-                generation: 11,
-                revision: 2
-            }
-        ));
-
-        let mut stale_second_writer = AnnotationSet::new(1);
-        stale_second_writer
-            .add(first_range, Some(HighlightColor::Purple), None)
-            .unwrap();
-        assert!(second_writer.save(22, pdf.clone(), identity.clone(), 0, stale_second_writer,));
-        match second_events.recv_timeout(Duration::from_secs(2)).unwrap() {
-            AnnotationIoEvent::Failed {
-                generation: 22,
-                operation: AnnotationIoOperation::Save,
-                revision: Some(1),
-                message,
-            } => {
-                assert!(message.contains("expected revision 0"));
-                assert!(message.contains("found revision 2"));
-            }
-            AnnotationIoEvent::Saved { .. } => {
-                panic!("a stale second writer overwrote the sidecar")
-            }
-            AnnotationIoEvent::Loaded { .. } => panic!("unexpected load event during save"),
-            AnnotationIoEvent::Failed { message, .. } => {
-                panic!("unexpected conflict shape: {message}")
-            }
-        }
-        let document = DocumentKey::new(pdf, identity);
-        assert_eq!(JsonSidecarStore.load(&document).unwrap(), first_latest);
+#[cfg(feature = "installable-extensions")]
+fn extension_state_presentation(
+    state: LifecycleState,
+    palette: ReaderPalette,
+) -> (&'static str, Hsla) {
+    match state {
+        LifecycleState::Active => ("Active", palette.green),
+        LifecycleState::Suspended => ("Suspended", palette.warning),
+        LifecycleState::Failed => ("Failed", palette.error),
+        LifecycleState::Disabled => ("Disabled", palette.text_secondary),
+        LifecycleState::Installed | LifecycleState::Validated => ("Ready", palette.accent),
+        LifecycleState::Unloading => ("Stopping", palette.warning),
+        LifecycleState::Removed => ("Removed", palette.text_tertiary),
     }
 }

@@ -677,13 +677,13 @@ impl ViewportController {
 
     #[must_use]
     pub fn maximum_scroll(&self) -> ScrollOffset {
-        self.layout.as_ref().map_or_else(ScrollOffset::default, |layout| {
-            ScrollOffset {
+        self.layout
+            .as_ref()
+            .map_or_else(ScrollOffset::default, |layout| ScrollOffset {
                 x: (layout.content_width - self.metrics.width + self.metrics.right_occlusion)
                     .max(0.0),
                 y: (layout.content_height - self.metrics.height).max(0.0),
-            }
-        })
+            })
     }
 
     #[must_use]

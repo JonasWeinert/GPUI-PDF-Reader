@@ -14,6 +14,9 @@ mod ui;
 mod validation;
 mod value;
 
+/// Version of the runtime-neutral Rust and WIT extension semantics.
+pub const EXTENSION_API_VERSION: &str = "0.1.0";
+
 pub use capability::*;
 pub use id::*;
 pub use manifest::*;
