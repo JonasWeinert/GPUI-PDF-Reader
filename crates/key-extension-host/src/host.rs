@@ -544,6 +544,17 @@ impl ExtensionHost {
         )
     }
 
+    /// Deferred adapter work retained for one extension. Package managers use
+    /// this to keep asynchronous activation provisional until the worker has
+    /// either produced its first valid update or failed in isolation.
+    #[must_use]
+    pub fn pending_extension_work(&self, extension: &ExtensionId) -> usize {
+        self.runtimes
+            .get(extension)
+            .and_then(|runtime| runtime.instance.as_ref())
+            .map_or(0, |instance| instance.pending_deferred_work())
+    }
+
     /// Establishes a document-state barrier. Host snapshots from the prior
     /// document are removed, queued work is discarded, and outstanding effect
     /// tokens are invalidated so an old completion cannot gain authority over

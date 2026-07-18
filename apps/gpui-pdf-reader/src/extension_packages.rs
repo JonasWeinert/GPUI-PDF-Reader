@@ -38,6 +38,7 @@ const MAX_COMPILED_COMPONENT_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PackageActivation {
     Active,
+    Activating,
     AwaitingPermissions(Vec<PermissionRequest>),
     Inactive(String),
 }
@@ -241,6 +242,13 @@ struct PermissionSnapshot {
     decisions: Vec<(Permission, PermissionDecision)>,
 }
 
+#[derive(Clone)]
+struct ActivatingUpgrade {
+    old: ManagedPackage,
+    old_lifecycle: LifecycleState,
+    permission_snapshot: PermissionSnapshot,
+}
+
 struct ActivationAttempt {
     report: PackageInstallReport,
     runtime_failed: bool,
@@ -277,6 +285,7 @@ pub struct InstallableExtensionManager {
     /// A permission-gated upgrade is held separately so the currently active
     /// package remains fully usable until the user has made a decision.
     pending_upgrades: BTreeMap<ExtensionId, PendingUpgrade>,
+    activating_upgrades: BTreeMap<ExtensionId, ActivatingUpgrade>,
 }
 
 impl InstallableExtensionManager {
@@ -298,6 +307,7 @@ impl InstallableExtensionManager {
             wasm: WasmRuntime::new(WasmRuntimeLimits::default())?,
             packages: BTreeMap::new(),
             pending_upgrades: BTreeMap::new(),
+            activating_upgrades: BTreeMap::new(),
         })
     }
 
@@ -504,6 +514,7 @@ impl InstallableExtensionManager {
     ) -> Result<(), ExtensionPackageError> {
         self.require_managed(extension)?;
         self.pending_upgrades.remove(extension);
+        self.activating_upgrades.remove(extension);
         host.unload(extension)?;
         Ok(())
     }
@@ -545,6 +556,7 @@ impl InstallableExtensionManager {
     ) -> Result<(), ExtensionPackageError> {
         self.require_managed(extension)?;
         self.pending_upgrades.remove(extension);
+        self.activating_upgrades.remove(extension);
         host.remove(extension)?;
         host.remove_wasm_adapter(extension);
         self.packages.remove(extension);
@@ -584,6 +596,7 @@ impl InstallableExtensionManager {
                 Some(LifecycleState::Active | LifecycleState::Suspended)
             )
         {
+            self.activating_upgrades.remove(extension);
             host.unload(extension)?;
         }
         Ok(())
@@ -870,6 +883,19 @@ impl InstallableExtensionManager {
                 });
             }
         };
+        let mut attempt = attempt;
+        if old_lifecycle == LifecycleState::Active && host.pending_extension_work(&extension) > 0 {
+            attempt.report.activation = PackageActivation::Activating;
+            self.activating_upgrades.insert(
+                extension,
+                ActivatingUpgrade {
+                    old,
+                    old_lifecycle,
+                    permission_snapshot,
+                },
+            );
+            return Ok(attempt.report);
+        }
         let lifecycle_restored = match old_lifecycle {
             LifecycleState::Active => host.state(&extension) == Some(LifecycleState::Active),
             LifecycleState::Disabled => host.state(&extension) == Some(LifecycleState::Disabled),
@@ -881,6 +907,9 @@ impl InstallableExtensionManager {
                 PackageActivation::Inactive(reason) => reason.clone(),
                 PackageActivation::AwaitingPermissions(_) => {
                     "additional permissions are required".into()
+                }
+                PackageActivation::Activating => {
+                    "extension runtime did not settle activation".into()
                 }
                 PackageActivation::Active => "extension runtime failed during activation".into(),
             };
@@ -895,6 +924,66 @@ impl InstallableExtensionManager {
             return Err(ExtensionPackageError::UpgradeActivationFailed { extension, reason });
         }
         Ok(attempt.report)
+    }
+
+    /// Finalizes asynchronous Wasm upgrades only after the worker's activation
+    /// result has crossed the normal host tick. Until then the previous package
+    /// snapshot is retained for transactional rollback.
+    pub fn settle_activating_upgrades(
+        &mut self,
+        host: &mut ExtensionHost,
+    ) -> Vec<(
+        ExtensionId,
+        Result<PackageInstallReport, ExtensionPackageError>,
+    )> {
+        let ready = self
+            .activating_upgrades
+            .keys()
+            .filter(|extension| host.pending_extension_work(extension) == 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        ready
+            .into_iter()
+            .map(|extension| {
+                let pending = self
+                    .activating_upgrades
+                    .remove(&extension)
+                    .expect("ready upgrade remains tracked");
+                if host.state(&extension) == Some(LifecycleState::Active) {
+                    let managed = self
+                        .packages
+                        .get(&extension)
+                        .expect("activating package remains managed");
+                    return (
+                        extension,
+                        Ok(package_report(managed, PackageActivation::Active)),
+                    );
+                }
+                // Package-facing failures stay deliberately coarse: detailed
+                // Wasmtime diagnostics remain available in the host log but
+                // are not exposed through a trust or permission prompt.
+                let reason = "extension runtime failed during activation".into();
+                let result = self
+                    .rollback_upgrade(
+                        host,
+                        &extension,
+                        pending.old,
+                        pending.old_lifecycle,
+                        &pending.permission_snapshot,
+                    )
+                    .map_err(|rollback| ExtensionPackageError::UpgradeRollbackFailed {
+                        extension: extension.clone(),
+                        reason: safe_package_error_reason(&rollback),
+                    })
+                    .and_then(|()| {
+                        Err(ExtensionPackageError::UpgradeActivationFailed {
+                            extension: extension.clone(),
+                            reason,
+                        })
+                    });
+                (extension, result)
+            })
+            .collect()
     }
 
     fn activate_replacement(
@@ -1549,7 +1638,12 @@ fn package_metadata(package: &LoadedPackage) -> PackageMetadata {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, str::FromStr};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        str::FromStr,
+        time::{Duration, Instant},
+    };
 
     use key_extension_api::{
         CURRENT_MANIFEST_SCHEMA, CapabilityId, CapabilityRequirements, CommandBehavior,
@@ -1566,6 +1660,21 @@ mod tests {
     const HEALTHY_COMPONENT: &[u8] =
         include_bytes!("../../../extensions/reference-document-statistics/package/component.wasm");
     const EMPTY_COMPONENT: &[u8] = b"\0asm\r\0\x01\0";
+
+    fn drain_host(host: &mut ExtensionHost) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            host.process_tick();
+            if host.pending_event_count() == 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "extension host did not settle before the test deadline"
+            );
+            std::thread::yield_now();
+        }
+    }
 
     fn manifest(id: &str, entrypoint: ExtensionEntrypoint) -> ExtensionManifest {
         ExtensionManifest {
@@ -2260,9 +2369,16 @@ mod tests {
                 .is_some(),
             "compiled candidate adapter must be retained across approval"
         );
-        let error = manager
+        let activation = manager
             .grant_permissions_and_activate(&mut host, &installed.extension)
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(activation.activation, PackageActivation::Activating);
+        drain_host(&mut host);
+        let settlements = manager.settle_activating_upgrades(&mut host);
+        assert_eq!(settlements.len(), 1);
+        let (settled_extension, settlement) = settlements.into_iter().next().unwrap();
+        assert_eq!(settled_extension, installed.extension);
+        let error = settlement.unwrap_err();
         assert!(matches!(
             error,
             ExtensionPackageError::UpgradeActivationFailed { .. }
@@ -2296,6 +2412,31 @@ mod tests {
                 .contains("extension runtime failed during activation")
         );
         assert!(!error.to_string().contains("failed to find export"));
+    }
+
+    #[test]
+    fn healthy_wasm_upgrade_commits_only_after_worker_settlement() {
+        let id = "org.example.async-upgrade";
+        let first = development_package(&at_version(wasm(id), "1.0.0"));
+        let second = development_package(&at_version(wasm(id), "2.0.0"));
+        let mut host = ExtensionHost::new(Default::default());
+        let mut manager = InstallableExtensionManager::new().unwrap();
+        let installed = manager.install(&mut host, first.path()).unwrap();
+
+        let provisional = manager.install(&mut host, second.path()).unwrap();
+        assert_eq!(provisional.activation, PackageActivation::Activating);
+        assert!(manager.settle_activating_upgrades(&mut host).is_empty());
+
+        drain_host(&mut host);
+        let settlements = manager.settle_activating_upgrades(&mut host);
+        assert_eq!(settlements.len(), 1);
+        let (extension, settlement) = settlements.into_iter().next().unwrap();
+        assert_eq!(extension, installed.extension);
+        let committed = settlement.unwrap();
+        assert_eq!(committed.version, "2.0.0");
+        assert_eq!(committed.activation, PackageActivation::Active);
+        assert_eq!(manager.summaries(&host)[0].version, "2.0.0");
+        assert_eq!(host.state(&extension), Some(LifecycleState::Active));
     }
 
     #[test]
@@ -2440,7 +2581,7 @@ mod tests {
             },
         )
         .unwrap();
-        host.process_tick();
+        drain_host(&mut host);
         let view = host
             .collect_contributions()
             .views

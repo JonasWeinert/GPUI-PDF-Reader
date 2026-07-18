@@ -1658,6 +1658,17 @@ impl PdfReader {
                 crate::rebuild_application_menus(&mut self.extensions, cx);
                 self.schedule_extension_snapshot_sync(window, cx);
             }
+            PackageActivation::Activating => {
+                self.warning = Some(
+                    format!(
+                        "Checking {} {} before completing the update…",
+                        report.name, report.version
+                    )
+                    .into(),
+                );
+                self.refresh_extension_manager_state();
+                self.schedule_extension_snapshot_sync(window, cx);
+            }
             PackageActivation::Inactive(reason) => {
                 self.warning = Some(
                     format!(
@@ -2493,11 +2504,20 @@ impl PdfReader {
                 return;
             }
         };
+        let activation_updates = self.extensions.settle_package_activations();
+        if let Some(update) = activation_updates.last() {
+            self.warning = Some(update.message.clone().into());
+            self.refresh_extension_manager_state();
+            crate::rebuild_application_menus(&mut self.extensions, cx);
+        }
         self.refresh_active_extension_view(window, cx);
         if !report.effects.is_empty() {
             self.execute_extension_effects(report.effects, window, cx);
         }
-        if report.deferred_events > 0 || self.extensions.has_pending_service_work() {
+        if report.deferred_events > 0
+            || self.extensions.has_pending_service_work()
+            || self.extensions.has_pending_extension_work()
+        {
             self.schedule_extension_snapshot_sync(window, cx);
         }
     }

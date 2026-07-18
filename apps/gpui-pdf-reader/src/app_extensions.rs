@@ -83,6 +83,12 @@ pub struct ReaderExtensions {
     pending_sources: BTreeMap<ExtensionId, std::path::PathBuf>,
 }
 
+/// User-facing outcome produced when a provisional asynchronous package
+/// upgrade either commits or rolls back on a later host tick.
+pub struct PackageActivationUpdate {
+    pub message: String,
+}
+
 #[cfg(feature = "installable-extensions")]
 #[derive(Clone)]
 struct ExtensionRestoreFailure {
@@ -338,6 +344,57 @@ impl ReaderExtensions {
         self.services.active_task_count() > 0
     }
 
+    #[must_use]
+    pub fn has_pending_extension_work(&self) -> bool {
+        self.host.pending_event_count() > 0
+    }
+
+    /// Commits durable package state only after a Wasm upgrade has actually
+    /// crossed its worker boundary. A failed candidate is rolled back by the
+    /// package manager while the old registry entry and assets remain intact.
+    pub fn settle_package_activations(&mut self) -> Vec<PackageActivationUpdate> {
+        #[cfg(not(feature = "installable-extensions"))]
+        {
+            Vec::new()
+        }
+        #[cfg(feature = "installable-extensions")]
+        {
+            let Some(packages) = self.packages.as_mut() else {
+                return Vec::new();
+            };
+            let settlements = packages.settle_activating_upgrades(&mut self.host);
+            let mut updates = Vec::with_capacity(settlements.len());
+            for (extension, settlement) in settlements {
+                match settlement {
+                    Ok(report) => {
+                        let source = self.pending_sources.remove(&extension);
+                        let durable = self
+                            .persist_managed_package(&extension, source.as_deref(), true)
+                            .and_then(|()| self.sync_extension_assets(&extension, true));
+                        match durable {
+                            Ok(()) => updates.push(PackageActivationUpdate {
+                                message: format!("Updated {} {}", report.name, report.version),
+                            }),
+                            Err(error) => updates.push(PackageActivationUpdate {
+                                message: format!(
+                                    "Extension activated, but its durable state could not be updated: {error}"
+                                ),
+                            }),
+                        }
+                    }
+                    Err(error) => {
+                        self.pending_sources.remove(&extension);
+                        updates.push(PackageActivationUpdate {
+                            message: format!("Extension update was rolled back: {error}"),
+                        });
+                    }
+                }
+                self.last_snapshots.clear();
+            }
+            updates
+        }
+    }
+
     pub fn contributions(&mut self) -> CollectedContributions {
         self.host.collect_contributions()
     }
@@ -494,10 +551,13 @@ impl ReaderExtensions {
             .content_sha256(&reviewed.extension)
             .is_ok_and(|hash| hash == reviewed.content_sha256_hex());
         if committed {
-            let enabled = report.activation == crate::extension_packages::PackageActivation::Active;
-            self.persist_managed_package(&reviewed.extension, Some(path), enabled)?;
-            self.sync_extension_assets(&reviewed.extension, enabled)?;
-            self.pending_sources.remove(&reviewed.extension);
+            if report.activation != crate::extension_packages::PackageActivation::Activating {
+                let enabled =
+                    report.activation == crate::extension_packages::PackageActivation::Active;
+                self.persist_managed_package(&reviewed.extension, Some(path), enabled)?;
+                self.sync_extension_assets(&reviewed.extension, enabled)?;
+                self.pending_sources.remove(&reviewed.extension);
+            }
         } else if !reviewed.is_upgrade {
             self.persist_managed_package(&reviewed.extension, Some(path), false)?;
         }
@@ -517,10 +577,12 @@ impl ReaderExtensions {
             ))
         })?;
         let report = packages.grant_permissions_and_activate(&mut self.host, extension)?;
-        let source = self.pending_sources.remove(extension);
-        let enabled = report.activation == crate::extension_packages::PackageActivation::Active;
-        self.persist_managed_package(extension, source.as_deref(), enabled)?;
-        self.sync_extension_assets(extension, enabled)?;
+        if report.activation != crate::extension_packages::PackageActivation::Activating {
+            let source = self.pending_sources.remove(extension);
+            let enabled = report.activation == crate::extension_packages::PackageActivation::Active;
+            self.persist_managed_package(extension, source.as_deref(), enabled)?;
+            self.sync_extension_assets(extension, enabled)?;
+        }
         self.last_snapshots.clear();
         Ok(report)
     }
