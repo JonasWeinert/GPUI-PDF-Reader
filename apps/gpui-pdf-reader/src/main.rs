@@ -123,13 +123,20 @@ fn main() {
         });
         rebuild_application_menus(&mut extensions, cx);
         let application_host = cx.new(|_| application_host::ApplicationHost::new(extensions));
+        let progressive_qa = cfg!(debug_assertions)
+            && std::env::var_os("GPUI_PDF_READER_QA_PROGRESSIVE_OPEN").is_some();
         let mut initial_paths = initial_paths.into_iter();
         let window =
             application_host::open_pdf_window(application_host.clone(), initial_paths.next(), cx)
                 .expect("failed to open the GPUI PDF Reader window");
+        let mut deferred_paths = Vec::new();
         for path in initial_paths {
-            application_host::open_pdf_window(application_host.clone(), Some(path), cx)
-                .expect("failed to open an additional GPUI PDF Reader window");
+            if progressive_qa {
+                deferred_paths.push(path);
+            } else {
+                application_host::open_pdf_window(application_host.clone(), Some(path), cx)
+                    .expect("failed to open an additional GPUI PDF Reader window");
+            }
         }
 
         window
@@ -140,7 +147,7 @@ fn main() {
 
         // Native QA remains debug-only and is isolated from application startup.
         #[cfg(debug_assertions)]
-        qa::install(window, cx);
+        qa::install(window, application_host.clone(), deferred_paths, cx);
         let host_for_close = application_host.clone();
         cx.on_window_closed(move |cx| {
             let open = cx.windows();

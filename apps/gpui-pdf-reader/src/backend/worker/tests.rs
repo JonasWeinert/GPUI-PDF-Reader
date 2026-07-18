@@ -16,6 +16,10 @@ fn empty_worker_state(generation: u64) -> WorkerState {
         pending_renders: HashMap::new(),
         pending_preview: HashMap::new(),
         pending_text: HashMap::new(),
+        background_enabled: true,
+        hibernated: false,
+        resume_pending: false,
+        has_opened: false,
     }
 }
 
@@ -226,11 +230,11 @@ fn no_match_page_emits_no_empty_result_event() {
     else {
         panic!("search unexpectedly cancelled");
     };
-    let (events, received) = mpsc::sync_channel(1);
+    let (events, received) = flume::bounded(1);
     assert!(send_search_page_results(&events, 7, 4, results));
     assert!(matches!(
         received.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
+        Err(flume::TryRecvError::Empty)
     ));
 }
 
@@ -421,6 +425,6 @@ fn dropping_last_worker_handle_stops_document_adapter() {
     drop(worker);
     assert!(matches!(
         events.recv_timeout(Duration::from_secs(2)),
-        Err(mpsc::RecvTimeoutError::Disconnected)
+        Err(flume::RecvTimeoutError::Disconnected)
     ));
 }

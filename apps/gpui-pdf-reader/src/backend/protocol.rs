@@ -66,6 +66,9 @@ pub struct PreviewSpec {
 #[derive(Debug)]
 pub enum WorkerEvent {
     Ready,
+    Resumed {
+        generation: u64,
+    },
     Opened {
         generation: u64,
         path: PathBuf,
@@ -153,6 +156,16 @@ pub(super) enum WorkerCommand {
         generation: u64,
         path: PathBuf,
         cancellation: CancellationSource,
+    },
+    SetBackgroundEnabled {
+        generation: u64,
+        enabled: bool,
+    },
+    Hibernate {
+        generation: u64,
+    },
+    Resume {
+        generation: u64,
     },
     RenderViewport {
         generation: u64,

@@ -1,6 +1,6 @@
 //! Compile-time minimal-bundle replacement for optional scholarly providers.
 
-use std::{collections::HashMap, sync::mpsc};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScholarlySource {
@@ -80,8 +80,8 @@ impl ScholarlyEvent {
 pub struct ScholarlyFetcher;
 
 impl ScholarlyFetcher {
-    pub fn new() -> (Self, mpsc::Receiver<ScholarlyEvent>) {
-        let (_sender, receiver) = mpsc::channel();
+    pub fn new() -> (Self, flume::Receiver<ScholarlyEvent>) {
+        let (_sender, receiver) = flume::unbounded();
         (Self, receiver)
     }
 

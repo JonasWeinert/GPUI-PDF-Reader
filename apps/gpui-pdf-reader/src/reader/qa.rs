@@ -10,9 +10,13 @@ pub(crate) struct QaReaderResourceSnapshot {
     pub(crate) cached_tile_bytes: u64,
     pub(crate) estimated_tile_resident_bytes: u64,
     pub(crate) tile_cache_limit_bytes: u64,
+    pub(crate) base_tile_cache_limit_bytes: u64,
     pub(crate) cached_tiles: u64,
     pub(crate) pending_tiles: u64,
     pub(crate) cached_text_pages: u64,
+    pub(crate) cache_retention_percent: u64,
+    pub(crate) cache_trimmed: bool,
+    pub(crate) worker_hibernated: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -72,6 +76,7 @@ impl PdfReader {
             .values()
             .map(|tile| tile.byte_len as u64)
             .sum::<u64>();
+        let (tile_cache_limit_bytes, _) = self.effective_tile_cache_limits();
         QaReaderResourceSnapshot {
             activity: self.resource_allocation.activity,
             allocated_cpu_bytes: self.resource_allocation.amount.cpu_memory_bytes,
@@ -79,10 +84,14 @@ impl PdfReader {
             allocated_workers: self.resource_allocation.amount.worker_slots,
             cached_tile_bytes,
             estimated_tile_resident_bytes: cached_tile_bytes.saturating_mul(2),
-            tile_cache_limit_bytes: self.max_cache_bytes as u64,
+            tile_cache_limit_bytes: tile_cache_limit_bytes as u64,
+            base_tile_cache_limit_bytes: self.max_cache_bytes as u64,
             cached_tiles: self.rendered.len() as u64,
             pending_tiles: self.pending.len() as u64,
             cached_text_pages: self.page_text.len() as u64,
+            cache_retention_percent: self.idle_cache_retention_percent as u64,
+            cache_trimmed: self.idle_cache_trimmed,
+            worker_hibernated: self.worker_hibernated,
         }
     }
 
@@ -1123,6 +1132,26 @@ impl PdfReader {
     }
 
     #[cfg(debug_assertions)]
+    pub fn qa_resource_is_settled(&self) -> bool {
+        match self.resource_allocation.activity {
+            ActivityLevel::BackgroundCold => {
+                self.pending.is_empty()
+                    && self.render_viewport.is_empty()
+                    && self.rendered.is_empty()
+            }
+            ActivityLevel::Suspended => {
+                self.pending.is_empty()
+                    && self.render_viewport.is_empty()
+                    && self.rendered.is_empty()
+                    && self.worker_hibernated
+            }
+            ActivityLevel::BackgroundWarm
+            | ActivityLevel::ForegroundIdle
+            | ActivityLevel::ForegroundInteractive => self.qa_viewport_is_settled(),
+        }
+    }
+
+    #[cfg(debug_assertions)]
     pub fn qa_command_wheel(
         &mut self,
         delta_y: f32,
@@ -1130,12 +1159,25 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.qa_wheel(0.0, delta_y, true, position, window, cx);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn qa_wheel(
+        &mut self,
+        delta_x: f32,
+        delta_y: f32,
+        zoom: bool,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.on_scroll_wheel(
             &ScrollWheelEvent {
                 position,
-                delta: ScrollDelta::Pixels(Point::new(px(0.0), px(delta_y))),
+                delta: ScrollDelta::Pixels(Point::new(px(delta_x), px(delta_y))),
                 modifiers: Modifiers {
-                    platform: true,
+                    platform: zoom,
                     ..Default::default()
                 },
                 touch_phase: TouchPhase::Moved,

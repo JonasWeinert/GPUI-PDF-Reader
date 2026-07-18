@@ -669,6 +669,10 @@ impl<D, S, E> ManagedDocument<D, S, E> {
             .map(|(key, _)| *key)?;
         self.pending.remove(&key)
     }
+
+    fn highest_pending_priority(&self) -> Option<DemandPriority> {
+        self.pending.values().map(|pending| pending.priority).max()
+    }
 }
 
 impl<D, S, E> Drop for ManagedDocument<D, S, E> {
@@ -884,12 +888,25 @@ fn next_runnable<D, S, E>(
     documents: &mut HashMap<SupervisorDocumentId, ManagedDocument<D, S, E>>,
     rotation: &mut VecDeque<SupervisorDocumentId>,
 ) -> Option<SupervisorDocumentId> {
+    let highest = rotation
+        .iter()
+        .filter_map(|id| {
+            documents.get(id).and_then(|document| {
+                document
+                    .pending_events
+                    .is_empty()
+                    .then(|| document.highest_pending_priority())
+                    .flatten()
+            })
+        })
+        .max()?;
     let count = rotation.len();
     for _ in 0..count {
         let id = rotation.pop_front()?;
         rotation.push_back(id);
         if documents.get(&id).is_some_and(|document| {
-            document.pending_events.is_empty() && !document.pending.is_empty()
+            document.pending_events.is_empty()
+                && document.highest_pending_priority() == Some(highest)
         }) {
             return Some(id);
         }

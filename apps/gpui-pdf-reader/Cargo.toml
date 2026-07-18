@@ -16,6 +16,7 @@ installable-extensions = ["dep:key-extension-package", "dep:key-extension-wasm"]
 scholarly-network = ["dep:key-reference"]
 
 [dependencies]
+flume = "0.11.1"
 image.workspace = true
 key-editor-gpui = { path = "../../crates/key-editor-gpui" }
 key-extension-api = { path = "../../crates/key-extension-api" }

@@ -6,7 +6,6 @@ use key_sidecar_store::{
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::mpsc;
 #[cfg(test)]
 use std::time::Duration;
 
@@ -36,18 +35,18 @@ pub(super) enum AnnotationIoEvent {
 
 /// Compatibility receiver that keeps the reader-facing event contract narrow
 /// while the shared service carries client and document routing metadata.
-pub(super) struct AnnotationIoEvents(mpsc::Receiver<AnnotationServiceEvent>);
+pub(super) struct AnnotationIoEvents(flume::Receiver<AnnotationServiceEvent>);
 
 impl AnnotationIoEvents {
-    pub(super) fn recv(&self) -> Result<AnnotationIoEvent, mpsc::RecvError> {
-        self.0.recv().map(map_event)
+    pub(super) async fn recv_async(&self) -> Result<AnnotationIoEvent, flume::RecvError> {
+        self.0.recv_async().await.map(map_event)
     }
 
     #[cfg(test)]
     pub(super) fn recv_timeout(
         &self,
         timeout: Duration,
-    ) -> Result<AnnotationIoEvent, mpsc::RecvTimeoutError> {
+    ) -> Result<AnnotationIoEvent, flume::RecvTimeoutError> {
         self.0.recv_timeout(timeout).map(map_event)
     }
 }

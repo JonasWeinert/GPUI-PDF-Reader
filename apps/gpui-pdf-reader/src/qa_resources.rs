@@ -10,6 +10,7 @@ static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 static PEAK_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+static PEAK_PHYSICAL_FOOTPRINT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct QaTrackingAllocator;
 
@@ -103,48 +104,65 @@ pub(crate) struct ProcessMemorySnapshot {
     pub(crate) virtual_bytes: u64,
     pub(crate) resident_bytes: u64,
     pub(crate) peak_resident_bytes: u64,
+    /// macOS task-ledger footprint, which most closely matches Activity
+    /// Monitor's Memory column and includes task-owned graphics allocations.
+    pub(crate) physical_footprint_bytes: u64,
+    /// Highest footprint observed by the QA sampler during this process.
+    pub(crate) peak_physical_footprint_bytes: u64,
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
     use mach2::kern_return::KERN_SUCCESS;
     use mach2::task::task_info;
-    use mach2::task_info::{MACH_TASK_BASIC_INFO, task_info_t};
+    use mach2::task_info::{TASK_VM_INFO, task_info_t};
     use mach2::traps::mach_task_self;
 
     #[repr(C)]
     #[derive(Default)]
-    struct TimeValue {
-        seconds: i32,
-        microseconds: i32,
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct MachTaskBasicInfo {
+    struct TaskVmInfoThroughFootprint {
         virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
         resident_size: u64,
-        resident_size_max: u64,
-        user_time: TimeValue,
-        system_time: TimeValue,
-        policy: i32,
-        suspend_count: i32,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        physical_footprint: u64,
     }
 
-    let mut info = MachTaskBasicInfo::default();
-    let mut count = (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+    let mut info = TaskVmInfoThroughFootprint::default();
+    let mut count =
+        (std::mem::size_of::<TaskVmInfoThroughFootprint>() / std::mem::size_of::<u32>()) as u32;
     let result = unsafe {
         task_info(
             mach_task_self(),
-            MACH_TASK_BASIC_INFO,
-            (&mut info as *mut MachTaskBasicInfo).cast::<i32>() as task_info_t,
+            TASK_VM_INFO,
+            (&mut info as *mut TaskVmInfoThroughFootprint).cast::<i32>() as task_info_t,
             &mut count,
         )
     };
+    let peak_physical_footprint_bytes = PEAK_PHYSICAL_FOOTPRINT_BYTES
+        .fetch_max(info.physical_footprint, Ordering::Relaxed)
+        .max(info.physical_footprint);
     (result == KERN_SUCCESS).then_some(ProcessMemorySnapshot {
         virtual_bytes: info.virtual_size,
         resident_bytes: info.resident_size,
-        peak_resident_bytes: info.resident_size_max,
+        peak_resident_bytes: info.resident_size_peak,
+        physical_footprint_bytes: info.physical_footprint,
+        peak_physical_footprint_bytes,
     })
 }
 
@@ -179,5 +197,7 @@ mod tests {
         assert!(snapshot.virtual_bytes >= snapshot.resident_bytes);
         assert!(snapshot.peak_resident_bytes >= snapshot.resident_bytes);
         assert!(snapshot.resident_bytes > 0);
+        assert!(snapshot.physical_footprint_bytes > 0);
+        assert!(snapshot.peak_physical_footprint_bytes >= snapshot.physical_footprint_bytes);
     }
 }

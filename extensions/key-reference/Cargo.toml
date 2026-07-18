@@ -9,6 +9,7 @@ description = "Reusable, bounded website-preview and scholarly-reference service
 path = "src/lib.rs"
 
 [dependencies]
+flume = "0.11.1"
 image = { workspace = true, features = ["avif", "jpeg", "png", "webp"] }
 key-safe-http = { path = "../../crates/key-safe-http" }
 serde_json.workspace = true

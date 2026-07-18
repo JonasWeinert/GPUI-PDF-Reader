@@ -105,7 +105,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod annotation_io;
@@ -174,6 +174,33 @@ const LINK_CARD_GAP: f32 = 8.0;
 const LINK_HOVER_HANDOFF_DELAY: Duration = Duration::from_millis(180);
 const LINK_HOVER_CLOSE_DELAY: Duration = Duration::from_millis(320);
 const LINK_HOVER_STABILITY_RADIUS: f32 = 3.0;
+const RESOURCE_HIBERNATE_DELAY: Duration = Duration::from_millis(900);
+const DEFAULT_IDLE_CACHE_TRIM_DELAY: Duration = Duration::from_millis(900);
+
+fn configured_idle_cache_retention() -> (usize, Duration) {
+    #[cfg(debug_assertions)]
+    {
+        let percent = std::env::var("GPUI_PDF_READER_QA_CACHE_RETENTION_PERCENT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100)
+            .clamp(1, 100);
+        let delay = std::env::var("GPUI_PDF_READER_QA_CACHE_TRIM_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_IDLE_CACHE_TRIM_DELAY);
+        (percent, delay)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        (100, DEFAULT_IDLE_CACHE_TRIM_DELAY)
+    }
+}
+
+fn retained_cache_limit(base: usize, percent: usize) -> usize {
+    base.saturating_mul(percent).div_ceil(100)
+}
 
 fn resource_cache_limits(activity: ActivityLevel, amount: ResourceAmount) -> (usize, usize, usize) {
     if activity == ActivityLevel::Suspended
@@ -715,6 +742,14 @@ pub struct PdfReader {
     max_cached_tiles: usize,
     max_cached_text_pages: usize,
     allow_prefetch: bool,
+    resource_hibernate_revision: u64,
+    resource_hibernate_task: Option<Task<()>>,
+    worker_hibernated: bool,
+    idle_cache_retention_percent: usize,
+    idle_cache_trim_delay: Duration,
+    idle_cache_trimmed: bool,
+    idle_cache_trim_revision: u64,
+    idle_cache_trim_task: Option<Task<()>>,
 }
 
 impl PdfReader {
@@ -741,6 +776,8 @@ impl PdfReader {
         let ((link_preview_fetcher, link_preview_events), (scholarly_fetcher, scholarly_events)) =
             (LinkPreviewFetcher::new(), ScholarlyFetcher::new());
         let extensions = application_host.read(cx).extensions();
+        let (idle_cache_retention_percent, idle_cache_trim_delay) =
+            configured_idle_cache_retention();
         let extension_warning = extensions
             .borrow()
             .startup_error()
@@ -929,6 +966,14 @@ impl PdfReader {
                 max_cached_tiles: MAX_CACHED_TILES,
                 max_cached_text_pages: MAX_CACHED_TEXT_PAGES,
                 allow_prefetch: true,
+                resource_hibernate_revision: 0,
+                resource_hibernate_task: None,
+                worker_hibernated: false,
+                idle_cache_retention_percent,
+                idle_cache_trim_delay,
+                idle_cache_trimmed: false,
+                idle_cache_trim_revision: 0,
+                idle_cache_trim_task: None,
             }
         });
 
@@ -978,10 +1023,21 @@ impl PdfReader {
         self.max_cache_bytes = max_cache_bytes;
         self.max_cached_tiles = max_cached_tiles;
         self.max_cached_text_pages = max_cached_text_pages;
+        self.mark_cache_active();
         self.allow_prefetch = matches!(
             allocation.activity,
             ActivityLevel::ForegroundIdle | ActivityLevel::ForegroundInteractive
         ) && allocation.amount.worker_slots > 0;
+
+        let background_enabled = matches!(
+            allocation.activity,
+            ActivityLevel::ForegroundIdle
+                | ActivityLevel::ForegroundInteractive
+                | ActivityLevel::BackgroundWarm
+        );
+        let _ = self
+            .worker
+            .set_background_enabled(self.generation, background_enabled);
 
         if matches!(
             allocation.activity,
@@ -1001,8 +1057,23 @@ impl PdfReader {
             self.render_viewport.clear();
             self.text_viewport.clear();
             self.page_text.clear();
+            self.idle_cache_trim_task = None;
             self.drop_all_images(window, cx);
+            if allocation.activity == ActivityLevel::Suspended {
+                self.schedule_resource_hibernation(window, cx);
+            } else {
+                self.cancel_resource_hibernation();
+            }
         } else {
+            self.cancel_resource_hibernation();
+            if self.worker_hibernated {
+                if !self.worker.resume(self.generation) {
+                    self.status = ReaderStatus::Error("The PDF renderer is unavailable".into());
+                    cx.notify();
+                    return;
+                }
+                self.worker_hibernated = false;
+            }
             self.evict_distant_tiles(window, cx);
             self.evict_distant_text();
             // This also replaces foreground prefetch demand with a visible-only
@@ -1010,6 +1081,96 @@ impl PdfReader {
             self.request_visible_tiles(window);
         }
         cx.notify();
+    }
+
+    fn cancel_resource_hibernation(&mut self) {
+        self.resource_hibernate_revision = self.resource_hibernate_revision.wrapping_add(1);
+        self.resource_hibernate_task = None;
+    }
+
+    fn mark_cache_active(&mut self) {
+        if self.idle_cache_retention_percent >= 100 {
+            return;
+        }
+        self.idle_cache_trimmed = false;
+        self.idle_cache_trim_revision = self.idle_cache_trim_revision.wrapping_add(1);
+        self.idle_cache_trim_task = None;
+    }
+
+    fn effective_tile_cache_limits(&self) -> (usize, usize) {
+        if !self.idle_cache_trimmed {
+            return (self.max_cache_bytes, self.max_cached_tiles);
+        }
+        (
+            retained_cache_limit(self.max_cache_bytes, self.idle_cache_retention_percent),
+            retained_cache_limit(self.max_cached_tiles, self.idle_cache_retention_percent),
+        )
+    }
+
+    fn schedule_idle_cache_trim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.idle_cache_retention_percent >= 100
+            || self.idle_cache_trimmed
+            || self.idle_cache_trim_task.is_some()
+            || matches!(
+                self.resource_allocation.activity,
+                ActivityLevel::BackgroundCold | ActivityLevel::Suspended
+            )
+        {
+            return;
+        }
+        self.idle_cache_trim_revision = self.idle_cache_trim_revision.wrapping_add(1);
+        let revision = self.idle_cache_trim_revision;
+        let delay = self.idle_cache_trim_delay;
+        let weak = cx.weak_entity();
+        self.idle_cache_trim_task = Some(window.spawn(cx, async move |cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = cx.update(|window, cx| {
+                weak.update(cx, |reader, cx| {
+                    if reader.idle_cache_trim_revision != revision {
+                        return;
+                    }
+                    reader.idle_cache_trim_task = None;
+                    if !reader.pending.is_empty() {
+                        reader.schedule_idle_cache_trim(window, cx);
+                        return;
+                    }
+                    reader.idle_cache_trimmed = true;
+                    reader.evict_distant_tiles(window, cx);
+                    cx.notify();
+                })
+                .ok();
+            });
+        }));
+    }
+
+    fn schedule_resource_hibernation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.worker_hibernated {
+            return;
+        }
+        self.resource_hibernate_revision = self.resource_hibernate_revision.wrapping_add(1);
+        let revision = self.resource_hibernate_revision;
+        let weak = cx.weak_entity();
+        self.resource_hibernate_task = Some(window.spawn(cx, async move |cx| {
+            cx.background_executor()
+                .timer(RESOURCE_HIBERNATE_DELAY)
+                .await;
+            let _ = cx.update(|_, cx| {
+                weak.update(cx, |reader, cx| {
+                    if reader.resource_hibernate_revision != revision
+                        || reader.resource_allocation.activity != ActivityLevel::Suspended
+                        || reader.worker_hibernated
+                    {
+                        return;
+                    }
+                    if reader.worker.hibernate(reader.generation) {
+                        reader.worker_hibernated = true;
+                    }
+                    reader.resource_hibernate_task = None;
+                    cx.notify();
+                })
+                .ok();
+            });
+        }));
     }
 
     fn open_dialog(&mut self, _: &OpenDocument, window: &mut Window, cx: &mut Context<Self>) {
@@ -1045,22 +1206,14 @@ impl PdfReader {
 
     fn listen_for_worker_events(
         entity: &Entity<Self>,
-        events: mpsc::Receiver<WorkerEvent>,
+        events: flume::Receiver<WorkerEvent>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let events = Arc::new(Mutex::new(events));
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
-                loop {
-                    let events = events.clone();
-                    let receive = async_cx
-                        .background_executor()
-                        .spawn(async move { events.lock().unwrap().recv() });
-                    let Ok(event) = receive.await else {
-                        break;
-                    };
+                while let Ok(event) = events.recv_async().await {
                     let _ = async_cx.update(|window, cx| {
                         weak.update(cx, |reader, cx| {
                             reader.handle_worker_event(event, window, cx)
@@ -1078,18 +1231,10 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let events = Arc::new(Mutex::new(events));
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
-                loop {
-                    let events = events.clone();
-                    let receive = async_cx
-                        .background_executor()
-                        .spawn(async move { events.lock().unwrap().recv() });
-                    let Ok(event) = receive.await else {
-                        break;
-                    };
+                while let Ok(event) = events.recv_async().await {
                     let _ = async_cx.update(|window, cx| {
                         weak.update(cx, |reader, cx| {
                             reader.handle_annotation_event(event, window, cx)
@@ -1103,22 +1248,14 @@ impl PdfReader {
 
     fn listen_for_link_preview_events(
         entity: &Entity<Self>,
-        events: mpsc::Receiver<LinkPreviewEvent>,
+        events: flume::Receiver<LinkPreviewEvent>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let events = Arc::new(Mutex::new(events));
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
-                loop {
-                    let events = events.clone();
-                    let receive = async_cx
-                        .background_executor()
-                        .spawn(async move { events.lock().unwrap().recv() });
-                    let Ok(event) = receive.await else {
-                        break;
-                    };
+                while let Ok(event) = events.recv_async().await {
                     let _ = async_cx.update(|_, cx| {
                         weak.update(cx, |reader, cx| {
                             if event.generation() != reader.generation {
@@ -1140,22 +1277,14 @@ impl PdfReader {
 
     fn listen_for_scholarly_events(
         entity: &Entity<Self>,
-        events: mpsc::Receiver<ScholarlyEvent>,
+        events: flume::Receiver<ScholarlyEvent>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let events = Arc::new(Mutex::new(events));
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
-                loop {
-                    let events = events.clone();
-                    let receive = async_cx
-                        .background_executor()
-                        .spawn(async move { events.lock().unwrap().recv() });
-                    let Ok(event) = receive.await else {
-                        break;
-                    };
+                while let Ok(event) = events.recv_async().await {
                     let _ = async_cx.update(|window, cx| {
                         weak.update(cx, |reader, cx| {
                             if event.generation() == reader.generation
@@ -1181,18 +1310,11 @@ impl PdfReader {
     }
 
     fn listen_for_native_pinch(entity: &Entity<Self>, window: &mut Window, cx: &mut App) {
-        let receiver = Arc::new(Mutex::new(crate::native_gestures::subscribe_pinch_monitor()));
+        let receiver = crate::native_gestures::subscribe_pinch_monitor();
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
-                loop {
-                    let receiver = receiver.clone();
-                    let receive = async_cx
-                        .background_executor()
-                        .spawn(async move { receiver.lock().unwrap().recv() });
-                    let Ok(pinch) = receive.await else {
-                        break;
-                    };
+                while let Ok(pinch) = receiver.recv_async().await {
                     let _ = async_cx.update(|window, cx| {
                         if !window.is_window_active() {
                             return;
@@ -1220,6 +1342,13 @@ impl PdfReader {
                 if self.document.is_none() && !matches!(self.status, ReaderStatus::Loading(_)) {
                     self.status = ReaderStatus::Empty;
                 }
+            }
+            WorkerEvent::Resumed { generation } if generation == self.generation => {
+                self.render_viewport.clear();
+                self.text_viewport.clear();
+                self.pending.clear();
+                self.text_pending.clear();
+                self.request_visible_tiles(window);
             }
             WorkerEvent::Opened {
                 generation,
@@ -1340,6 +1469,7 @@ impl PdfReader {
             } if generation == self.generation && appearance == self.render_appearance => {
                 let page = key.page;
                 self.pending.remove(&key);
+                self.mark_cache_active();
 
                 let expected_len = width
                     .checked_mul(height)
@@ -3209,6 +3339,14 @@ impl PdfReader {
         if !matches!(self.status, ReaderStatus::Ready) {
             return;
         }
+        if self.worker_hibernated
+            || matches!(
+                self.resource_allocation.activity,
+                ActivityLevel::BackgroundCold | ActivityLevel::Suspended
+            )
+        {
+            return;
+        }
         if self
             .render_debounce_until
             .is_some_and(|deadline| Instant::now() < deadline)
@@ -3240,6 +3378,7 @@ impl PdfReader {
         // matters: re-sending shrinking lists after every result can race the
         // worker and reinsert work it has just finished.
         if viewport != self.render_viewport || text_viewport != self.text_viewport {
+            self.mark_cache_active();
             let demand: Vec<_> = planned
                 .iter()
                 .filter_map(|tile| {
@@ -3362,8 +3501,10 @@ impl PdfReader {
             .values()
             .map(|tile| tile.byte_len)
             .sum::<usize>();
-        if self.rendered.len() <= self.max_cached_tiles && cached_bytes <= self.max_cache_bytes {
+        let (max_cache_bytes, max_cached_tiles) = self.effective_tile_cache_limits();
+        if self.rendered.len() <= max_cached_tiles && cached_bytes <= max_cache_bytes {
             Self::retire_images(retired, window, cx);
+            self.schedule_idle_cache_trim(window, cx);
             return;
         }
         let protected: HashSet<_> = self
@@ -3395,8 +3536,7 @@ impl PdfReader {
             )
         });
         for key in candidates {
-            if self.rendered.len() <= self.max_cached_tiles && cached_bytes <= self.max_cache_bytes
-            {
+            if self.rendered.len() <= max_cached_tiles && cached_bytes <= max_cache_bytes {
                 break;
             }
             if let Some(cache) = self.rendered.remove(&key) {
@@ -3405,6 +3545,7 @@ impl PdfReader {
             }
         }
         Self::retire_images(retired, window, cx);
+        self.schedule_idle_cache_trim(window, cx);
     }
 
     fn evict_distant_text(&mut self) {

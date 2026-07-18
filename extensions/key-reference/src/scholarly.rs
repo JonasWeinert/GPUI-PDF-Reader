@@ -6,7 +6,7 @@ use crate::{ReferenceDocumentScope, ReferenceExecutor};
 use key_safe_http::CancellationToken;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use url::Url;
 
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
@@ -111,39 +111,39 @@ impl ScholarlyEvent {
 }
 
 pub struct ScholarlyFetcher {
-    events: mpsc::Sender<ScholarlyEvent>,
+    events: flume::Sender<ScholarlyEvent>,
     scope: ReferenceDocumentScope,
     provider: Arc<dyn ScholarlyMetadataProvider>,
 }
 
 impl ScholarlyFetcher {
-    pub fn new() -> (Self, mpsc::Receiver<ScholarlyEvent>) {
+    pub fn new() -> (Self, flume::Receiver<ScholarlyEvent>) {
         Self::with_executor(ReferenceExecutor::global())
     }
 
-    pub fn with_executor(executor: ReferenceExecutor) -> (Self, mpsc::Receiver<ScholarlyEvent>) {
+    pub fn with_executor(executor: ReferenceExecutor) -> (Self, flume::Receiver<ScholarlyEvent>) {
         Self::with_provider_and_scope(
             Arc::new(NetworkScholarlyMetadataProvider),
             executor.document_scope(),
         )
     }
 
-    pub fn with_scope(scope: ReferenceDocumentScope) -> (Self, mpsc::Receiver<ScholarlyEvent>) {
+    pub fn with_scope(scope: ReferenceDocumentScope) -> (Self, flume::Receiver<ScholarlyEvent>) {
         Self::with_provider_and_scope(Arc::new(NetworkScholarlyMetadataProvider), scope)
     }
 
     /// Creates a fetcher around a deterministic or host-supplied provider.
     pub fn with_provider(
         provider: Arc<dyn ScholarlyMetadataProvider>,
-    ) -> (Self, mpsc::Receiver<ScholarlyEvent>) {
+    ) -> (Self, flume::Receiver<ScholarlyEvent>) {
         Self::with_provider_and_scope(provider, ReferenceExecutor::global().document_scope())
     }
 
     pub fn with_provider_and_scope(
         provider: Arc<dyn ScholarlyMetadataProvider>,
         scope: ReferenceDocumentScope,
-    ) -> (Self, mpsc::Receiver<ScholarlyEvent>) {
-        let (events, receiver) = mpsc::channel();
+    ) -> (Self, flume::Receiver<ScholarlyEvent>) {
+        let (events, receiver) = flume::unbounded();
         (
             Self {
                 events,

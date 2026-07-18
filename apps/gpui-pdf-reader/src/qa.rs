@@ -4,11 +4,13 @@
 //! enabled. The environment protocol stays app-specific while `PdfReader`
 //! exposes the narrow instrumentation hooks used by the native E2E scripts.
 
+use crate::application_host::{ApplicationHost, open_pdf_window};
 use crate::reader::PdfReader;
 use crate::reader::qa::QaReaderResourceSnapshot;
 use crate::workspace_window::WorkspaceWindow;
-use gpui::{App, Entity, Keystroke, Point, Window, WindowHandle};
+use gpui::{App, AsyncWindowContext, Entity, Keystroke, Point, Window, WindowHandle};
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +44,12 @@ struct QaConfig {
     resource_trace: bool,
     resource_sample_interval: Duration,
     resource_stress: bool,
+    progressive_open: bool,
+    resource_chaos: bool,
+    chaos_rounds: usize,
+    chaos_actions_per_window: usize,
+    chaos_seed: u64,
+    render_dwell: Duration,
 }
 
 impl QaConfig {
@@ -92,6 +100,16 @@ impl QaConfig {
                     .clamp(20, 5_000),
             ),
             resource_stress: flag("GPUI_PDF_READER_QA_RESOURCE_STRESS"),
+            progressive_open: flag("GPUI_PDF_READER_QA_PROGRESSIVE_OPEN"),
+            resource_chaos: flag("GPUI_PDF_READER_QA_RESOURCE_CHAOS"),
+            chaos_rounds: optional_value("GPUI_PDF_READER_QA_CHAOS_ROUNDS").unwrap_or(2),
+            chaos_actions_per_window: optional_value("GPUI_PDF_READER_QA_CHAOS_ACTIONS_PER_WINDOW")
+                .unwrap_or(4),
+            chaos_seed: optional_value("GPUI_PDF_READER_QA_CHAOS_SEED")
+                .unwrap_or(0x6b65_792d_7064_6621),
+            render_dwell: Duration::from_millis(
+                optional_value("GPUI_PDF_READER_QA_RENDER_DWELL_MS").unwrap_or(320),
+            ),
         }
     }
 
@@ -114,6 +132,8 @@ impl QaConfig {
             || self.expected_window_count.is_some()
             || self.resource_trace
             || self.resource_stress
+            || self.progressive_open
+            || self.resource_chaos
     }
 
     fn has_navigation_setup(&self) -> bool {
@@ -152,7 +172,12 @@ where
 }
 
 /// Installs the opt-in native QA driver for a reader window.
-pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
+pub fn install(
+    window: WindowHandle<WorkspaceWindow>,
+    application_host: Entity<ApplicationHost>,
+    deferred_paths: Vec<PathBuf>,
+    cx: &mut App,
+) {
     apply_initial_overrides(window, cx);
     let config = QaConfig::from_environment();
     if !config.requested() {
@@ -188,6 +213,47 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
                         cx.background_executor().timer(POLL_INTERVAL).await;
                     }
                     trace_marker(&resource_trace, "startup", "settled", cx);
+
+                    if config.progressive_open {
+                        trace_marker(&resource_trace, "progressive-open-1", "settled", cx);
+                        for (index, path) in deferred_paths.into_iter().enumerate() {
+                            let count = index + 2;
+                            let operation = format!("progressive-open-{count}");
+                            trace_marker(&resource_trace, &operation, "before", cx);
+                            let opened = cx.update(|_, cx| {
+                                open_pdf_window(application_host.clone(), Some(path), cx)
+                            });
+                            let handle = match opened {
+                                Ok(Ok(handle)) => handle,
+                                Ok(Err(error)) => {
+                                    fail_and_quit(
+                                        cx,
+                                        &format!("progressive PDF open failed: {error}"),
+                                    );
+                                    return;
+                                }
+                                Err(error) => {
+                                    fail_and_quit(
+                                        cx,
+                                        &format!("progressive window update failed: {error}"),
+                                    );
+                                    return;
+                                }
+                            };
+                            if let Err(error) = wait_for_reader_settled(
+                                handle,
+                                config.timeout,
+                                config.render_dwell,
+                                cx,
+                            )
+                            .await
+                            {
+                                fail_and_quit(cx, &error);
+                                return;
+                            }
+                            trace_marker(&resource_trace, &operation, "settled", cx);
+                        }
+                    }
 
                     if let Some(expected) = config.expected_window_count {
                         let deadline = Instant::now() + config.timeout;
@@ -294,6 +360,124 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
                             cx.background_executor().timer(POLL_INTERVAL).await;
                         }
                         trace_marker(&resource_trace, "resource-stress", "settled", cx);
+                    }
+
+                    if config.resource_chaos {
+                        trace_marker(&resource_trace, "resource-chaos", "before", cx);
+                        let mut handles = cx
+                            .update(|_, cx| {
+                                cx.windows()
+                                    .into_iter()
+                                    .filter_map(|handle| handle.downcast::<WorkspaceWindow>())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let mut random = QaRandom::new(config.chaos_seed);
+                        for round in 0..config.chaos_rounds {
+                            random.shuffle(&mut handles);
+                            for (window_index, handle) in handles.iter().copied().enumerate() {
+                                let operation = format!("chaos-{round}-window-{window_index}");
+                                trace_marker(&resource_trace, &operation, "activate", cx);
+                                if handle
+                                    .update(cx, |_, window, _| window.activate_window())
+                                    .is_err()
+                                {
+                                    fail_and_quit(cx, "chaos activation lost a workspace window");
+                                    return;
+                                }
+                                if let Err(error) = wait_for_reader_settled(
+                                    handle,
+                                    config.timeout,
+                                    config.render_dwell,
+                                    cx,
+                                )
+                                .await
+                                {
+                                    fail_and_quit(cx, &error);
+                                    return;
+                                }
+
+                                for action in 0..config.chaos_actions_per_window {
+                                    let kind = random.next_usize(5);
+                                    let magnitude = 120.0 + random.next_usize(5) as f32 * 70.0;
+                                    let signed = if random.next_usize(2) == 0 {
+                                        magnitude
+                                    } else {
+                                        -magnitude
+                                    };
+                                    let action_name = match kind {
+                                        0 => "zoom",
+                                        1 => "scroll-y",
+                                        2 => "scroll-x",
+                                        3 => "scroll-diagonal",
+                                        _ => "zoom-reverse",
+                                    };
+                                    let marker = format!(
+                                        "{operation}-action-{action}-{action_name}-{signed}"
+                                    );
+                                    trace_marker(&resource_trace, &marker, "before", cx);
+                                    let outcome = handle.update(cx, |workspace, window, cx| {
+                                        let reader = workspace.reader().ok_or_else(|| {
+                                            "chaos reader is unavailable".to_owned()
+                                        })?;
+                                        let viewport = window.viewport_size();
+                                        let x = viewport.width
+                                            * (0.2 + random.next_usize(61) as f32 / 100.0);
+                                        let y = viewport.height
+                                            * (0.2 + random.next_usize(61) as f32 / 100.0);
+                                        let position = Point::new(x, y);
+                                        reader.update(cx, |reader, cx| match kind {
+                                            0 => reader.qa_wheel(
+                                                0.0, signed, true, position, window, cx,
+                                            ),
+                                            1 => reader.qa_wheel(
+                                                0.0, signed, false, position, window, cx,
+                                            ),
+                                            2 => reader.qa_wheel(
+                                                signed, 0.0, false, position, window, cx,
+                                            ),
+                                            3 => reader.qa_wheel(
+                                                signed * 0.45,
+                                                signed,
+                                                false,
+                                                position,
+                                                window,
+                                                cx,
+                                            ),
+                                            _ => reader.qa_wheel(
+                                                0.0, -signed, true, position, window, cx,
+                                            ),
+                                        });
+                                        Ok::<_, String>(())
+                                    });
+                                    if !matches!(outcome, Ok(Ok(()))) {
+                                        fail_and_quit(cx, "chaos input failed");
+                                        return;
+                                    }
+                                    if let Err(error) = wait_for_reader_settled(
+                                        handle,
+                                        config.timeout,
+                                        config.render_dwell,
+                                        cx,
+                                    )
+                                    .await
+                                    {
+                                        fail_and_quit(cx, &error);
+                                        return;
+                                    }
+                                    trace_marker(&resource_trace, &marker, "settled", cx);
+                                }
+                            }
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1_500))
+                            .await;
+                        if let Err(error) = wait_for_all_resources_settled(config.timeout, cx).await
+                        {
+                            fail_and_quit(cx, &error);
+                            return;
+                        }
+                        trace_marker(&resource_trace, "resource-chaos", "settled", cx);
                     }
 
                     if config.has_navigation_setup() {
@@ -505,7 +689,12 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
                             let settled = cx
                                 .update(|window, cx| {
                                     reader_entity(window, cx).is_some_and(|reader| {
-                                        reader.read(cx).qa_viewport_is_settled()
+                                        let reader = reader.read(cx);
+                                        if config.progressive_open || config.resource_chaos {
+                                            reader.qa_resource_is_settled()
+                                        } else {
+                                            reader.qa_viewport_is_settled()
+                                        }
                                     })
                                 })
                                 .unwrap_or(false);
@@ -602,7 +791,7 @@ fn workspace_window_counts(current: &Window, cx: &App) -> (usize, usize, usize) 
                 continue;
             };
             pdf_views += 1;
-            settled += usize::from(reader.read(cx).qa_viewport_is_settled());
+            settled += usize::from(reader.read(cx).qa_resource_is_settled());
             continue;
         }
         let Some(handle) = handle.downcast::<WorkspaceWindow>() else {
@@ -615,7 +804,7 @@ fn workspace_window_counts(current: &Window, cx: &App) -> (usize, usize, usize) 
             continue;
         };
         pdf_views += 1;
-        settled += usize::from(reader.read(cx).qa_viewport_is_settled());
+        settled += usize::from(reader.read(cx).qa_resource_is_settled());
     }
     (windows.len(), pdf_views, settled)
 }
@@ -643,12 +832,14 @@ impl QaResourceTrace {
         let process = crate::qa_resources::process_memory_snapshot().unwrap_or_default();
         let views = workspace_resource_totals(window, cx);
         eprintln!(
-            "GPUI_PDF_READER_QA_RESOURCE seq={sequence} elapsed_us={elapsed_us} operation={operation} phase={phase} physical_memory={} low_power={} virtual={} resident={} resident_peak={} alloc_live={} alloc_peak={} alloc_calls={} dealloc_calls={} realloc_calls={} allocated_bytes={} deallocated_bytes={} views={} interactive={} idle={} warm={} cold={} suspended={} allocation_cpu={} allocation_gpu={} allocation_workers={} tile_bytes={} tile_resident_estimate={} tile_limit={} tiles={} pending_tiles={} text_pages={}",
+            "GPUI_PDF_READER_QA_RESOURCE seq={sequence} elapsed_us={elapsed_us} operation={operation} phase={phase} physical_memory={} low_power={} virtual={} resident={} resident_peak={} footprint={} footprint_peak={} alloc_live={} alloc_peak={} alloc_calls={} dealloc_calls={} realloc_calls={} allocated_bytes={} deallocated_bytes={} views={} interactive={} idle={} warm={} cold={} suspended={} allocation_cpu={} allocation_gpu={} allocation_workers={} tile_bytes={} tile_resident_estimate={} tile_limit={} tile_base_limit={} tiles={} pending_tiles={} text_pages={} trimmed_views={} hibernated_views={} retention_percent={}",
             self.system.physical_memory_bytes,
             u8::from(self.system.low_power_mode),
             process.virtual_bytes,
             process.resident_bytes,
             process.peak_resident_bytes,
+            process.physical_footprint_bytes,
+            process.peak_physical_footprint_bytes,
             allocator.live_bytes,
             allocator.peak_live_bytes,
             allocator.alloc_calls,
@@ -668,9 +859,13 @@ impl QaResourceTrace {
             views.cached_tile_bytes,
             views.estimated_tile_resident_bytes,
             views.tile_cache_limit_bytes,
+            views.base_tile_cache_limit_bytes,
             views.cached_tiles,
             views.pending_tiles,
             views.cached_text_pages,
+            views.trimmed_views,
+            views.hibernated_views,
+            views.cache_retention_percent,
         );
     }
 }
@@ -741,9 +936,13 @@ struct QaWorkspaceResourceTotals {
     cached_tile_bytes: u64,
     estimated_tile_resident_bytes: u64,
     tile_cache_limit_bytes: u64,
+    base_tile_cache_limit_bytes: u64,
     cached_tiles: u64,
     pending_tiles: u64,
     cached_text_pages: u64,
+    trimmed_views: u64,
+    hibernated_views: u64,
+    cache_retention_percent: u64,
 }
 
 impl QaWorkspaceResourceTotals {
@@ -775,11 +974,19 @@ impl QaWorkspaceResourceTotals {
         self.tile_cache_limit_bytes = self
             .tile_cache_limit_bytes
             .saturating_add(snapshot.tile_cache_limit_bytes);
+        self.base_tile_cache_limit_bytes = self
+            .base_tile_cache_limit_bytes
+            .saturating_add(snapshot.base_tile_cache_limit_bytes);
         self.cached_tiles = self.cached_tiles.saturating_add(snapshot.cached_tiles);
         self.pending_tiles = self.pending_tiles.saturating_add(snapshot.pending_tiles);
         self.cached_text_pages = self
             .cached_text_pages
             .saturating_add(snapshot.cached_text_pages);
+        self.trimmed_views += u64::from(snapshot.cache_trimmed);
+        self.hibernated_views += u64::from(snapshot.worker_hibernated);
+        self.cache_retention_percent = self
+            .cache_retention_percent
+            .max(snapshot.cache_retention_percent);
     }
 }
 
@@ -805,6 +1012,85 @@ fn workspace_resource_totals(current: &Window, cx: &App) -> QaWorkspaceResourceT
         totals.add(reader.read(cx).qa_resource_snapshot());
     }
     totals
+}
+
+async fn wait_for_reader_settled(
+    handle: WindowHandle<WorkspaceWindow>,
+    timeout: Duration,
+    dwell: Duration,
+    cx: &mut AsyncWindowContext,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut stable_since = None;
+    loop {
+        let settled = handle
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .reader()
+                    .is_some_and(|reader| reader.read(cx).qa_viewport_is_settled())
+            })
+            .unwrap_or(false);
+        if settled {
+            let since = stable_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= dwell {
+                return Ok(());
+            }
+        } else {
+            stable_since = None;
+        }
+        if Instant::now() >= deadline {
+            return Err("PDF viewport did not settle during progressive resource QA".to_owned());
+        }
+        cx.background_executor().timer(POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_all_resources_settled(
+    timeout: Duration,
+    cx: &mut AsyncWindowContext,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (windows, pdf_views, settled) = cx
+            .update(|window, cx| workspace_window_counts(window, cx))
+            .unwrap_or_default();
+        if windows > 0 && pdf_views > 0 && settled == pdf_views {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "resource settlement timed out: windows={windows} pdf_views={pdf_views} settled={settled}"
+            ));
+        }
+        cx.background_executor().timer(POLL_INTERVAL).await;
+    }
+}
+
+struct QaRandom(u64);
+
+impl QaRandom {
+    fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0
+    }
+
+    fn next_usize(&mut self, upper: usize) -> usize {
+        debug_assert!(upper > 0);
+        (self.next() % upper as u64) as usize
+    }
+
+    fn shuffle<T>(&mut self, values: &mut [T]) {
+        for index in (1..values.len()).rev() {
+            values.swap(index, self.next_usize(index + 1));
+        }
+    }
 }
 
 fn fail_and_quit(cx: &mut gpui::AsyncWindowContext, message: &str) {
@@ -840,9 +1126,25 @@ mod tests {
             resource_trace: false,
             resource_sample_interval: Duration::from_millis(DEFAULT_RESOURCE_SAMPLE_MS),
             resource_stress: false,
+            progressive_open: false,
+            resource_chaos: false,
+            chaos_rounds: 2,
+            chaos_actions_per_window: 4,
+            chaos_seed: 1,
+            render_dwell: Duration::from_millis(320),
         };
 
         assert!(!config.requested());
         assert!(!config.has_navigation_setup());
+    }
+
+    #[test]
+    fn chaos_randomization_is_deterministic_and_bounded() {
+        let mut first = QaRandom::new(42);
+        let mut second = QaRandom::new(42);
+        let first_values = (0..32).map(|_| first.next_usize(7)).collect::<Vec<_>>();
+        let second_values = (0..32).map(|_| second.next_usize(7)).collect::<Vec<_>>();
+        assert_eq!(first_values, second_values);
+        assert!(first_values.iter().all(|value| *value < 7));
     }
 }

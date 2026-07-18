@@ -337,8 +337,8 @@ fn one_owner_thread_handles_multiple_non_send_documents_and_operation_types() {
         vec![
             Call::Open("alpha"),
             Call::Open("beta"),
-            Call::Render("alpha", 1),
             Call::Text("beta", 0),
+            Call::Render("alpha", 1),
         ]
     );
 }
@@ -376,6 +376,39 @@ fn round_robin_fairness_serves_another_document_before_continuing_a_busy_one() {
     assert_eq!(renders[0], Call::Render("alpha", 3));
     assert_eq!(renders[1], Call::Render("beta", 9));
     assert!(matches!(renders[2], Call::Render("alpha", _)));
+}
+
+#[test]
+fn global_priority_preempts_background_work_in_other_documents() {
+    let probe = Arc::new(Probe::default());
+    let supervisor = supervisor(probe.clone(), SupervisorPolicy::default());
+    let (alpha, alpha_events, alpha_session) = attach_open(&supervisor, "alpha");
+    let (beta, beta_events, beta_session) = attach_open(&supervisor, "beta");
+
+    probe.block_one_render();
+    alpha
+        .replace_render_viewport(vec![
+            render(&alpha_session, 1, DemandPriority::BACKGROUND),
+            render(&alpha_session, 2, DemandPriority::BACKGROUND),
+            render(&alpha_session, 3, DemandPriority::BACKGROUND),
+        ])
+        .unwrap();
+    probe.wait_until_render_entered();
+    beta.replace_render_viewport(vec![render(&beta_session, 9, DemandPriority::VISIBLE)])
+        .unwrap();
+    probe.release_render();
+
+    expect_render_ready(&beta_events, 9);
+    for _ in 0..3 {
+        let _ = alpha_events.recv_timeout(TIMEOUT).unwrap();
+    }
+    let renders = probe
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, Call::Render(..)))
+        .collect::<Vec<_>>();
+    assert!(matches!(renders[0], Call::Render("alpha", _)));
+    assert_eq!(renders[1], Call::Render("beta", 9));
 }
 
 #[test]

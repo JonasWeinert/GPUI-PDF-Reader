@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug)]
 pub struct NativePinch {
@@ -10,12 +10,12 @@ pub struct NativePinch {
 
 #[derive(Default)]
 struct PinchBroadcast {
-    subscribers: Mutex<Vec<mpsc::Sender<NativePinch>>>,
+    subscribers: Mutex<Vec<flume::Sender<NativePinch>>>,
 }
 
 impl PinchBroadcast {
-    fn subscribe(&self) -> mpsc::Receiver<NativePinch> {
-        let (sender, receiver) = mpsc::channel();
+    fn subscribe(&self) -> flume::Receiver<NativePinch> {
+        let (sender, receiver) = flume::unbounded();
         self.subscribers
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -36,7 +36,7 @@ static PINCH_BROADCAST: OnceLock<Arc<PinchBroadcast>> = OnceLock::new();
 /// Subscribes one window to the process-wide native magnification monitor.
 /// Readers still check GPUI activation before applying an event, so the one
 /// AppKit event is routed only to its active PDF window.
-pub fn subscribe_pinch_monitor() -> mpsc::Receiver<NativePinch> {
+pub fn subscribe_pinch_monitor() -> flume::Receiver<NativePinch> {
     PINCH_BROADCAST
         .get_or_init(|| {
             let broadcast = Arc::new(PinchBroadcast::default());

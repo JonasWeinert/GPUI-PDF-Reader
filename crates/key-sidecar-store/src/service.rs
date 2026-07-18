@@ -90,7 +90,7 @@ enum Command {
     Attach {
         client_id: AnnotationClientId,
         document_id: AnnotationDocumentId,
-        events: mpsc::SyncSender<AnnotationServiceEvent>,
+        events: flume::Sender<AnnotationServiceEvent>,
         lease: Weak<ClientLease>,
     },
     Load {
@@ -159,7 +159,7 @@ impl DocumentLane {
 }
 
 struct ClientSink {
-    events: mpsc::SyncSender<AnnotationServiceEvent>,
+    events: flume::Sender<AnnotationServiceEvent>,
     pending: VecDeque<AnnotationServiceEvent>,
 }
 
@@ -223,7 +223,7 @@ impl AnnotationService {
     ) -> Result<
         (
             AnnotationServiceClient,
-            mpsc::Receiver<AnnotationServiceEvent>,
+            flume::Receiver<AnnotationServiceEvent>,
         ),
         AnnotationServiceStartError,
     > {
@@ -233,7 +233,7 @@ impl AnnotationService {
         let document_id = next_id(&self.inner.next_document_id)
             .map(AnnotationDocumentId)
             .ok_or(AnnotationServiceStartError::IdsExhausted)?;
-        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+        let (event_tx, event_rx) = flume::bounded(EVENT_CAPACITY);
         let lease = Arc::new(ClientLease {
             detached: AtomicBool::new(false),
         });
@@ -621,11 +621,11 @@ fn flush_sink(sink: &mut ClientSink) -> bool {
     while let Some(event) = sink.pending.pop_front() {
         match sink.events.try_send(event) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(event)) => {
+            Err(flume::TrySendError::Full(event)) => {
                 sink.pending.push_front(event);
                 return true;
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(flume::TrySendError::Disconnected(_)) => return false,
         }
     }
     true
@@ -813,8 +813,8 @@ fn send_event(
     if sink.pending.is_empty() {
         match sink.events.try_send(event) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(event)) => sink.pending.push_back(event),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(flume::TrySendError::Full(event)) => sink.pending.push_back(event),
+            Err(flume::TrySendError::Disconnected(_)) => {
                 clients.remove(&client_id);
             }
         }
@@ -863,7 +863,7 @@ mod tests {
         annotations
     }
 
-    fn receive(events: &mpsc::Receiver<AnnotationServiceEvent>) -> AnnotationServiceEventKind {
+    fn receive(events: &flume::Receiver<AnnotationServiceEvent>) -> AnnotationServiceEventKind {
         events.recv_timeout(Duration::from_secs(2)).unwrap().kind
     }
 
@@ -1120,7 +1120,7 @@ mod tests {
         }
         assert!(matches!(
             saturated_events.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout)
+            Err(flume::RecvTimeoutError::Timeout)
         ));
     }
 
@@ -1240,7 +1240,7 @@ mod tests {
         ));
         assert!(matches!(
             events.recv_timeout(Duration::from_millis(100)),
-            Err(mpsc::RecvTimeoutError::Timeout)
+            Err(flume::RecvTimeoutError::Timeout)
         ));
         assert_eq!(
             *trace.lock().unwrap(),

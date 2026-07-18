@@ -39,6 +39,7 @@ const MAX_PENDING_ENGINE_WORK_PER_DOCUMENT: usize = 8_192;
 pub(crate) type PdfEngineSupervisor = EngineSupervisor<PdfiumDocumentSource, PdfiumEngineError>;
 pub(crate) type PdfDocumentClient = DocumentClient<PdfiumDocumentSource, PdfiumEngineError>;
 type DemandKey = (DocumentGeneration, RequestId);
+type WorkerEventSender = flume::Sender<WorkerEvent>;
 
 pub(crate) enum AdapterInput {
     Command(WorkerCommand),
@@ -142,6 +143,10 @@ struct WorkerState {
     pending_renders: HashMap<DemandKey, RenderRequest>,
     pending_preview: HashMap<DemandKey, PreviewRequest>,
     pending_text: HashMap<DemandKey, PendingText>,
+    background_enabled: bool,
+    hibernated: bool,
+    resume_pending: bool,
+    has_opened: bool,
 }
 
 impl WorkerState {
@@ -159,6 +164,10 @@ impl WorkerState {
             pending_renders: HashMap::new(),
             pending_preview: HashMap::new(),
             pending_text: HashMap::new(),
+            background_enabled: true,
+            hibernated: false,
+            resume_pending: false,
+            has_opened: false,
         }
     }
 
@@ -175,12 +184,35 @@ impl WorkerState {
         self.pending_renders.clear();
         self.pending_preview.clear();
         self.pending_text.clear();
+        self.background_enabled = true;
+        self.hibernated = false;
+        self.resume_pending = false;
+        self.has_opened = false;
+    }
+
+    fn pause_background(&mut self, document: &PdfDocumentClient) {
+        self.background_enabled = false;
+        self.visible_text = None;
+        clear_text_kind_matches(self, |kind| {
+            matches!(
+                kind,
+                PendingTextKind::Search { .. } | PendingTextKind::Analysis
+            )
+        });
+        if let Some(search) = self.search.as_mut() {
+            search.waiting = false;
+        }
+        if let Some(scientific) = self.scientific.as_mut() {
+            scientific.waiting = false;
+        }
+        let _ = document.cancel(WorkClass::SearchText);
+        let _ = document.cancel(WorkClass::DocumentAnalysisText);
     }
 }
 
 pub(crate) fn run_worker(
     mailbox: mpsc::Receiver<AdapterInput>,
-    events: mpsc::SyncSender<WorkerEvent>,
+    events: WorkerEventSender,
     document: PdfDocumentClient,
     supervisor_event_pending: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -249,7 +281,7 @@ pub(crate) fn run_worker(
 
 fn accept_input(
     input: AdapterInput,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     document: &PdfDocumentClient,
     state: &mut WorkerState,
 ) -> bool {
@@ -262,7 +294,7 @@ fn accept_input(
 
 fn accept_command(
     command: WorkerCommand,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     document: &PdfDocumentClient,
     state: &mut WorkerState,
 ) -> bool {
@@ -282,6 +314,43 @@ fn accept_command(
                     Some(generation),
                     format!("Could not open PDF: {error}"),
                 );
+            }
+        }
+        WorkerCommand::SetBackgroundEnabled {
+            generation,
+            enabled,
+        } => {
+            if state.generation == Some(generation) {
+                if enabled {
+                    state.background_enabled = true;
+                } else {
+                    state.pause_background(document);
+                }
+            }
+        }
+        WorkerCommand::Hibernate { generation } => {
+            if state.generation == Some(generation) {
+                state.pause_background(document);
+                state.session = None;
+                state.text_cache.clear();
+                state.pending_renders.clear();
+                state.pending_preview.clear();
+                state.pending_text.clear();
+                state.hibernated = true;
+                state.resume_pending = false;
+                let _ = document.close();
+            }
+        }
+        WorkerCommand::Resume { generation } => {
+            if state.generation == Some(generation) && state.hibernated {
+                let Some(path) = state.path.clone() else {
+                    return true;
+                };
+                state.resume_pending = state.has_opened;
+                state.hibernated = false;
+                if let Err(error) = document.open(PdfiumDocumentSource::file(path)) {
+                    return send_error(events, Some(generation), error.to_string());
+                }
             }
         }
         WorkerCommand::RenderViewport {
@@ -381,7 +450,7 @@ fn accept_command(
 
 fn accept_supervisor_event(
     event: SupervisorEvent<PdfiumEngineError>,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     document: &PdfDocumentClient,
     state: &mut WorkerState,
 ) -> bool {
@@ -402,6 +471,11 @@ fn accept_supervisor_event(
             };
             state.session = Some(session);
             state.page_count = descriptor.page_count();
+            state.has_opened = true;
+            if state.resume_pending {
+                state.resume_pending = false;
+                return events.send(WorkerEvent::Resumed { generation }).is_ok();
+            }
             state.scientific = Some(ScientificJob {
                 generation,
                 analyzer: ScientificAnalyzer::new(descriptor.page_count(), descriptor.links()),
@@ -450,7 +524,7 @@ fn accept_supervisor_event(
 fn replace_render_viewport(
     document: &PdfDocumentClient,
     state: &mut WorkerState,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     requests: Vec<RenderRequest>,
 ) -> bool {
     state.pending_renders.clear();
@@ -498,7 +572,7 @@ fn replace_render_viewport(
 
 fn accept_render_event(
     event: RenderEvent<PdfiumEngineError>,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     state: &mut WorkerState,
 ) -> bool {
     match event {
@@ -562,7 +636,7 @@ fn accept_render_event(
 fn replace_preview(
     document: &PdfDocumentClient,
     state: &mut WorkerState,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     generation: u64,
     revision: u64,
     appearance: RenderAppearance,
@@ -623,7 +697,7 @@ fn replace_preview(
 
 fn accept_preview_event(
     event: PreviewEvent<PdfiumEngineError>,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     state: &mut WorkerState,
 ) -> bool {
     match event {
@@ -679,7 +753,7 @@ fn accept_preview_event(
 }
 
 fn schedule_visible_text_if_due(
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     document: &PdfDocumentClient,
     state: &mut WorkerState,
 ) -> bool {
@@ -715,7 +789,7 @@ fn schedule_visible_text_if_due(
 fn replace_copy_text(
     document: &PdfDocumentClient,
     state: &mut WorkerState,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     generation: u64,
     pages: Vec<usize>,
 ) -> bool {
@@ -738,7 +812,7 @@ fn replace_copy_text(
 fn schedule_text_pages(
     document: &PdfDocumentClient,
     state: &mut WorkerState,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     generation: u64,
     pages: Vec<usize>,
     kind: PendingTextKind,
@@ -805,7 +879,7 @@ fn schedule_text_pages(
 
 fn accept_text_event(
     event: TextEvent<PdfiumEngineError>,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     document: &PdfDocumentClient,
     state: &mut WorkerState,
 ) -> bool {
@@ -839,7 +913,7 @@ fn accept_text_event(
 }
 
 fn handle_text_ready(
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     _document: &PdfDocumentClient,
     state: &mut WorkerState,
     pending: PendingText,
@@ -877,7 +951,7 @@ fn handle_text_ready(
 }
 
 fn handle_text_failure(
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     _document: &PdfDocumentClient,
     state: &mut WorkerState,
     pending: PendingText,
@@ -924,10 +998,13 @@ fn handle_text_failure(
 }
 
 fn drive_one_background_step(
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     document: &PdfDocumentClient,
     state: &mut WorkerState,
 ) -> bool {
+    if !state.background_enabled || state.hibernated || state.session.is_none() {
+        return false;
+    }
     if drive_search(events, document, state) {
         return true;
     }
@@ -935,7 +1012,7 @@ fn drive_one_background_step(
 }
 
 fn drive_search(
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     document: &PdfDocumentClient,
     state: &mut WorkerState,
 ) -> bool {
@@ -1000,7 +1077,7 @@ fn drive_search(
 }
 
 fn process_search_page(
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     state: &mut WorkerState,
     page: usize,
     text: Arc<TextLayer>,
@@ -1045,7 +1122,7 @@ fn process_search_page(
 }
 
 fn drive_scientific(
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     document: &PdfDocumentClient,
     state: &mut WorkerState,
 ) -> bool {
@@ -1107,7 +1184,7 @@ fn drive_scientific(
 }
 
 fn ingest_scientific_page(
-    _events: &mpsc::SyncSender<WorkerEvent>,
+    _events: &WorkerEventSender,
     state: &mut WorkerState,
     page: usize,
     text: Arc<TextLayer>,
@@ -1252,7 +1329,7 @@ fn cap_search_highlight_runs(results: &mut SearchPageResults, remaining_runs: us
     added_runs
 }
 
-fn send_search_finished(events: &mpsc::SyncSender<WorkerEvent>, search: &SearchJob) -> bool {
+fn send_search_finished(events: &WorkerEventSender, search: &SearchJob) -> bool {
     events
         .send(WorkerEvent::SearchFinished {
             generation: search.generation,
@@ -1267,7 +1344,7 @@ fn send_search_finished(events: &mpsc::SyncSender<WorkerEvent>, search: &SearchJ
 }
 
 fn send_search_page_results(
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     generation: u64,
     revision: u64,
     results: SearchPageResults,
@@ -1309,7 +1386,7 @@ fn advance_search_revision(state: &mut WorkerState, generation: u64, revision: u
 #[allow(clippy::too_many_arguments)]
 fn accept_search_demand(
     state: &mut WorkerState,
-    events: &mpsc::SyncSender<WorkerEvent>,
+    events: &WorkerEventSender,
     document: &PdfDocumentClient,
     generation: u64,
     revision: u64,
@@ -1371,11 +1448,7 @@ fn cancel_searches_before(state: &mut WorkerState, generation: u64, next_revisio
     }
 }
 
-fn send_error(
-    events: &mpsc::SyncSender<WorkerEvent>,
-    generation: Option<u64>,
-    message: String,
-) -> bool {
+fn send_error(events: &WorkerEventSender, generation: Option<u64>, message: String) -> bool {
     events
         .send(WorkerEvent::Error {
             generation,

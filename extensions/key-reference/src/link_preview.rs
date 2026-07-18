@@ -13,7 +13,7 @@ use std::io::Cursor;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
@@ -86,19 +86,19 @@ impl LinkPreviewEvent {
 }
 
 pub struct LinkPreviewFetcher {
-    events: mpsc::Sender<LinkPreviewEvent>,
+    events: flume::Sender<LinkPreviewEvent>,
     scope: ReferenceDocumentScope,
     provider: Arc<dyn WebsitePreviewProvider>,
 }
 
 impl LinkPreviewFetcher {
-    pub fn new() -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
+    pub fn new() -> (Self, flume::Receiver<LinkPreviewEvent>) {
         Self::with_executor(ReferenceExecutor::global())
     }
 
     /// Uses a host-owned process service while creating an independent
     /// document scope for this compatibility adapter.
-    pub fn with_executor(executor: ReferenceExecutor) -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
+    pub fn with_executor(executor: ReferenceExecutor) -> (Self, flume::Receiver<LinkPreviewEvent>) {
         Self::with_provider_and_scope(
             Arc::new(NetworkWebsitePreviewProvider),
             executor.document_scope(),
@@ -107,7 +107,7 @@ impl LinkPreviewFetcher {
 
     /// Uses a scope shared with other document services such as scholarly
     /// metadata, giving the host one cancellation lifetime per open PDF.
-    pub fn with_scope(scope: ReferenceDocumentScope) -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
+    pub fn with_scope(scope: ReferenceDocumentScope) -> (Self, flume::Receiver<LinkPreviewEvent>) {
         Self::with_provider_and_scope(Arc::new(NetworkWebsitePreviewProvider), scope)
     }
 
@@ -115,15 +115,15 @@ impl LinkPreviewFetcher {
     /// provider. This is useful for tests and alternative network adapters.
     pub fn with_provider(
         provider: Arc<dyn WebsitePreviewProvider>,
-    ) -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
+    ) -> (Self, flume::Receiver<LinkPreviewEvent>) {
         Self::with_provider_and_scope(provider, ReferenceExecutor::global().document_scope())
     }
 
     pub fn with_provider_and_scope(
         provider: Arc<dyn WebsitePreviewProvider>,
         scope: ReferenceDocumentScope,
-    ) -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
-        let (events, receiver) = mpsc::channel();
+    ) -> (Self, flume::Receiver<LinkPreviewEvent>) {
+        let (events, receiver) = flume::unbounded();
         (
             Self {
                 events,

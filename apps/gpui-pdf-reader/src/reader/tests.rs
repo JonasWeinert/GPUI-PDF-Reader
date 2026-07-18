@@ -47,6 +47,20 @@ fn resource_cache_limits_scale_and_suspend_without_hidden_minimums() {
 }
 
 #[test]
+fn idle_cache_retention_scales_without_rounding_small_nonzero_limits_to_zero() {
+    assert_eq!(
+        retained_cache_limit(64 * RESOURCE_MIB as usize, 50),
+        32 * RESOURCE_MIB as usize
+    );
+    assert_eq!(
+        retained_cache_limit(64 * RESOURCE_MIB as usize, 10),
+        6_710_887
+    );
+    assert_eq!(retained_cache_limit(1, 10), 1);
+    assert_eq!(retained_cache_limit(0, 10), 0);
+}
+
+#[test]
 fn extension_statistics_count_known_text_without_copying_it_into_snapshots() {
     let text = TextLayer::new(
         "one  two\nthree"

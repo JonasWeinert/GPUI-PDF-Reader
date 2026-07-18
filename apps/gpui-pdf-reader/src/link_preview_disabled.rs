@@ -1,6 +1,6 @@
 //! Compile-time minimal-bundle replacement for optional website previews.
 
-use std::{collections::HashMap, path::PathBuf, sync::mpsc};
+use std::{collections::HashMap, path::PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebsitePreview {
@@ -38,8 +38,8 @@ impl LinkPreviewEvent {
 pub struct LinkPreviewFetcher;
 
 impl LinkPreviewFetcher {
-    pub fn new() -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
-        let (_sender, receiver) = mpsc::channel();
+    pub fn new() -> (Self, flume::Receiver<LinkPreviewEvent>) {
+        let (_sender, receiver) = flume::unbounded();
         (Self, receiver)
     }
 

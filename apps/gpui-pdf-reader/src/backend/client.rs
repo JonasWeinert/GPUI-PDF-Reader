@@ -127,14 +127,14 @@ impl Drop for WorkerLifetime {
 }
 
 impl PdfWorker {
-    pub(crate) fn start(supervisor: PdfEngineSupervisor) -> (Self, mpsc::Receiver<WorkerEvent>) {
+    pub(crate) fn start(supervisor: PdfEngineSupervisor) -> (Self, flume::Receiver<WorkerEvent>) {
         // Commands and routed engine events share one bounded mailbox. The
         // orchestration thread can therefore sleep without polling or a
         // second forwarding thread, while a busy document remains bounded.
         let (command_tx, command_rx) = mpsc::sync_channel(DOCUMENT_MAILBOX_CAPACITY);
         // A tile is under five MiB. Back-pressure prevents bitmap copies from
         // accumulating if the UI thread is temporarily busy.
-        let (event_tx, event_rx) = mpsc::sync_channel(1);
+        let (event_tx, event_rx) = flume::bounded(1);
         let cancellations = Arc::new(WorkerCancellations::default());
         // Preserve the old one-event raster back-pressure even though engine
         // events and commands now share the orchestration mailbox.
@@ -206,6 +206,44 @@ impl PdfWorker {
             path,
             cancellation,
         })
+    }
+
+    pub fn set_background_enabled(&self, generation: u64, enabled: bool) -> bool {
+        self.send(WorkerCommand::SetBackgroundEnabled {
+            generation,
+            enabled,
+        })
+    }
+
+    pub fn hibernate(&self, generation: u64) -> bool {
+        self.cancellations.cancel_explicit_text();
+        self.cancellations.cancel_search();
+        let _ = self
+            .engine_document
+            .cancel(key_pdf_runtime::WorkClass::RenderViewport);
+        let _ = self
+            .engine_document
+            .cancel(key_pdf_runtime::WorkClass::VisibleText);
+        let _ = self
+            .engine_document
+            .cancel(key_pdf_runtime::WorkClass::CopyText);
+        let _ = self
+            .engine_document
+            .cancel(key_pdf_runtime::WorkClass::SearchText);
+        let _ = self
+            .engine_document
+            .cancel(key_pdf_runtime::WorkClass::LinkResolutionText);
+        let _ = self
+            .engine_document
+            .cancel(key_pdf_runtime::WorkClass::DocumentAnalysisText);
+        let _ = self
+            .engine_document
+            .cancel(key_pdf_runtime::WorkClass::Preview);
+        self.send(WorkerCommand::Hibernate { generation })
+    }
+
+    pub fn resume(&self, generation: u64) -> bool {
+        self.send(WorkerCommand::Resume { generation })
     }
 
     pub fn render_viewport(
