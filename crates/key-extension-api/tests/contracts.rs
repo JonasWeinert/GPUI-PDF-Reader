@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use key_extension_api::*;
 
 fn extension_id(value: &str) -> ExtensionId {
@@ -310,4 +312,18 @@ fn event_and_effect_envelopes_round_trip_without_runtime_types() {
     let encoded = serde_json::to_string(&request).unwrap();
     let decoded: EffectRequest = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, request);
+}
+
+#[test]
+fn native_and_wasm_adapters_share_one_state_and_effect_update_shape() {
+    let update = ExtensionUpdate {
+        state: Some(BTreeMap::from([
+            ("pages".into(), DataValue::Integer(12)),
+            ("status".into(), DataValue::String("ready".into())),
+        ])),
+        effects: Vec::new(),
+    };
+    let encoded = serde_json::to_vec(&update).unwrap();
+    let decoded: ExtensionUpdate = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, update);
 }

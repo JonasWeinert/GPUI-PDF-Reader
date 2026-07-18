@@ -254,7 +254,7 @@ fn typed_event_transport_crosses_a_real_component_boundary() {
     let runtime = WasmRuntime::new(WasmRuntimeLimits::default()).unwrap();
     let mut instance = runtime.instantiate(&transport_component()).unwrap();
     instance.activate().unwrap();
-    let effects = instance
+    let update = instance
         .dispatch(&EventEnvelope {
             cause: CauseContext {
                 id: CauseId::new(1, 2),
@@ -268,7 +268,8 @@ fn typed_event_transport_crosses_a_real_component_boundary() {
             },
         })
         .unwrap();
-    assert!(effects.is_empty());
+    assert!(update.effects.is_empty());
+    assert!(update.state.is_none());
 }
 
 #[test]

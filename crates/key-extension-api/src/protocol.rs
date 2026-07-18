@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -116,6 +118,35 @@ pub struct EventEnvelope {
     pub source: EventSource,
     pub sequence: u64,
     pub event: ExtensionEvent,
+}
+
+/// One bounded state/effect update returned by either a trusted native adapter
+/// or a sandboxed component. `state` replaces the extension's immutable UI
+/// state snapshot atomically; omitting it retains the prior snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionUpdate {
+    #[serde(default)]
+    pub state: Option<BTreeMap<String, DataValue>>,
+    #[serde(default)]
+    pub effects: Vec<EffectRequest>,
+}
+
+impl ExtensionUpdate {
+    #[must_use]
+    pub fn with_effects(effects: Vec<EffectRequest>) -> Self {
+        Self {
+            state: None,
+            effects,
+        }
+    }
+
+    #[must_use]
+    pub fn with_state(state: BTreeMap<String, DataValue>) -> Self {
+        Self {
+            state: Some(state),
+            effects: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

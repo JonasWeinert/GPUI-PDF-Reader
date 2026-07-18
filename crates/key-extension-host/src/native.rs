@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use key_extension_api::{
-    CapabilitySnapshot, CauseContext, EffectRequest, EventEnvelope, EventSubscription,
-    ExtensionEntrypoint, ExtensionError, ExtensionId, GenerationId, NativeAdapterId,
+    CapabilitySnapshot, CauseContext, EventEnvelope, EventSubscription, ExtensionEntrypoint,
+    ExtensionError, ExtensionId, ExtensionUpdate, GenerationId, NativeAdapterId,
 };
 
 #[derive(Clone, Debug)]
@@ -13,17 +13,8 @@ pub struct ActivationContext {
     pub capabilities: CapabilitySnapshot,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct NativeUpdate {
-    pub effects: Vec<EffectRequest>,
-}
-
-impl NativeUpdate {
-    #[must_use]
-    pub fn with_effects(effects: Vec<EffectRequest>) -> Self {
-        Self { effects }
-    }
-}
+/// Compatibility name for the runtime-neutral update used by every adapter.
+pub type NativeUpdate = ExtensionUpdate;
 
 /// Trusted built-in implementation of the same semantic protocol used by
 /// sandbox adapters. Calls are always made outside platform paint callbacks.

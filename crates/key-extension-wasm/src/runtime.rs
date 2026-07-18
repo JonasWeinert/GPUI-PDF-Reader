@@ -4,7 +4,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use key_extension_api::{EffectRequest, EventEnvelope, LifecycleState};
+use key_extension_api::{EffectRequest, EventEnvelope, ExtensionUpdate, LifecycleState};
 use wasmtime::{
     Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap,
     component::{Component, Instance, Linker},
@@ -257,12 +257,9 @@ impl WasmExtensionInstance {
         Ok(output)
     }
 
-    /// Serialize one typed host event and deserialize the requested typed
-    /// effects returned by the component.
-    pub fn dispatch(
-        &mut self,
-        event: &EventEnvelope,
-    ) -> Result<Vec<EffectRequest>, WasmDiagnostic> {
+    /// Serialize one typed host event and deserialize the bounded state/effect
+    /// update returned by the component.
+    pub fn dispatch(&mut self, event: &EventEnvelope) -> Result<ExtensionUpdate, WasmDiagnostic> {
         let input = serde_json::to_vec(event).map_err(|error| {
             WasmDiagnostic::new(
                 WasmDiagnosticCode::Serialization,
@@ -271,25 +268,35 @@ impl WasmExtensionInstance {
             )
         })?;
         let output = self.call_bytes("handle-event", &input)?;
-        let effects: Vec<EffectRequest> = serde_json::from_slice(&output).map_err(|error| {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum GuestUpdate {
+            Current(ExtensionUpdate),
+            Legacy(Vec<EffectRequest>),
+        }
+        let update: GuestUpdate = serde_json::from_slice(&output).map_err(|error| {
             WasmDiagnostic::new(
                 WasmDiagnosticCode::Serialization,
                 WasmStage::Invocation,
                 error.to_string(),
             )
         })?;
-        if effects.len() > self.runtime.limits.maximum_effects_per_event {
+        let update = match update {
+            GuestUpdate::Current(update) => update,
+            GuestUpdate::Legacy(effects) => ExtensionUpdate::with_effects(effects),
+        };
+        if update.effects.len() > self.runtime.limits.maximum_effects_per_event {
             return Err(WasmDiagnostic::new(
                 WasmDiagnosticCode::TooManyEffects,
                 WasmStage::Invocation,
                 format!(
                     "component returned {} effects; limit is {}",
-                    effects.len(),
+                    update.effects.len(),
                     self.runtime.limits.maximum_effects_per_event
                 ),
             ));
         }
-        Ok(effects)
+        Ok(update)
     }
 
     /// Deactivate and drop the entire Store. All component memories, tables,

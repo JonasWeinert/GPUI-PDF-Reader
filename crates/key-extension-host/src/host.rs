@@ -242,6 +242,8 @@ pub struct OwnedMenu {
 pub struct OwnedView {
     pub owner: ExtensionId,
     pub view: UiContribution,
+    /// Immutable state snapshot resolved by the trusted host renderer.
+    pub state: BTreeMap<String, DataValue>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -261,6 +263,7 @@ struct ActiveRuntime {
     capabilities: CapabilitySnapshot,
     subscriptions: Vec<EventSubscription>,
     instance: Option<Box<dyn NativeExtension>>,
+    state: BTreeMap<String, DataValue>,
     violations: u16,
 }
 
@@ -456,6 +459,13 @@ impl ExtensionHost {
         self.registry.get(extension).map(PackageRecord::state)
     }
 
+    /// Returns the current immutable extension-owned UI state snapshot. State
+    /// only exists while an extension runtime is active or suspended.
+    #[must_use]
+    pub fn extension_state(&self, extension: &ExtensionId) -> Option<&BTreeMap<String, DataValue>> {
+        self.runtimes.get(extension).map(|runtime| &runtime.state)
+    }
+
     #[must_use]
     pub fn diagnostics(&self) -> Vec<HostDiagnostic> {
         self.diagnostics.snapshot()
@@ -585,6 +595,12 @@ impl ExtensionHost {
                 capabilities: capabilities.clone(),
                 subscriptions,
                 instance,
+                state: manifest
+                    .settings
+                    .fields
+                    .iter()
+                    .map(|setting| (setting.key.clone(), setting.default.clone()))
+                    .collect(),
                 violations: 0,
             },
         );
@@ -1068,9 +1084,24 @@ impl ExtensionHost {
         extension: &ExtensionId,
         generation: GenerationId,
         cause: CauseContext,
-        update: NativeUpdate,
+        mut update: NativeUpdate,
         accepted: &mut Vec<ArbitratedEffect>,
     ) {
+        if let Some(state) = update.state.take() {
+            if state_is_bounded(&state, &self.config.validation_limits) {
+                if let Some(runtime) = self.runtimes.get_mut(extension)
+                    && runtime.generation == generation
+                {
+                    runtime.state = state;
+                }
+            } else {
+                self.record_violation(
+                    extension,
+                    DiagnosticCode::EffectRejected,
+                    "extension state update exceeded host limits or used an invalid key",
+                );
+            }
+        }
         if update.effects.len() > self.config.maximum_effects_per_event {
             self.record_violation(
                 extension,
@@ -1648,9 +1679,15 @@ impl ExtensionHost {
                 }));
             result
                 .views
-                .extend(contributions.views.into_iter().map(|view| OwnedView {
-                    owner: owner.clone(),
-                    view,
+                .extend(contributions.views.into_iter().map(|view| {
+                    OwnedView {
+                        owner: owner.clone(),
+                        view,
+                        state: self
+                            .runtimes
+                            .get(&owner)
+                            .map_or_else(BTreeMap::new, |runtime| runtime.state.clone()),
+                    }
                 }));
         }
         result
@@ -1861,6 +1898,18 @@ fn value_is_bounded(value: &DataValue, limits: &ValidationLimits) -> bool {
         }
     }
     visit(value, limits, 1, &mut 0)
+}
+
+fn state_is_bounded(state: &BTreeMap<String, DataValue>, limits: &ValidationLimits) -> bool {
+    state.len() <= limits.maximum_list_items
+        && state.keys().all(|key| {
+            !key.is_empty()
+                && key.len() <= limits.maximum_string_bytes
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        && value_is_bounded(&DataValue::Record(state.clone()), limits)
 }
 
 fn order_owned_menus(menus: &mut Vec<OwnedMenu>) -> bool {
@@ -2098,6 +2147,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Behavior {
         None,
+        State,
         Copy,
         DuplicateNotify,
         Fail,
@@ -2129,6 +2179,10 @@ mod tests {
             }
             match self.behavior {
                 Behavior::None => Ok(NativeUpdate::default()),
+                Behavior::State => Ok(NativeUpdate::with_state(BTreeMap::from([(
+                    "status".into(),
+                    DataValue::String("ready".into()),
+                )]))),
                 Behavior::Fail => Err(ExtensionError {
                     code: ExtensionErrorCode::Internal,
                     message: "test failure".into(),
@@ -2219,6 +2273,32 @@ mod tests {
             Err(HostError::LicenseDenied { .. })
         ));
         assert_eq!(host.diagnostics().len(), 2);
+    }
+
+    #[test]
+    fn native_updates_publish_bounded_state_through_the_shared_contract() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.state");
+        let mut package = native_manifest(extension.as_str());
+        add_command(&mut package);
+        install_native(
+            &mut host,
+            package,
+            Behavior::State,
+            Arc::default(),
+            Arc::default(),
+        );
+        host.activate(&extension).unwrap();
+        host.invoke_command(&command_for(&extension), DataValue::Null)
+            .unwrap();
+        host.process_tick();
+        assert_eq!(
+            host.extension_state(&extension)
+                .and_then(|state| state.get("status")),
+            Some(&DataValue::String("ready".into()))
+        );
+        host.unload(&extension).unwrap();
+        assert!(host.extension_state(&extension).is_none());
     }
 
     #[test]

@@ -3363,7 +3363,10 @@ version = "0.1.0"
 dependencies = [
  "key-extension-api",
  "key-extension-host",
+ "key-extension-package",
+ "serde",
  "serde_json",
+ "toml 0.8.23",
  "wasmtime",
  "wat",
 ]

@@ -1,0 +1,167 @@
+schema_version = 1
+id = "org.key.reference.document-statistics"
+name = "Reference Document Statistics"
+version = "1.0.0"
+description = "Sandboxed Component Model lifecycle and PDF statistics side-panel pilot."
+license = "MIT"
+dependencies = []
+
+[publisher]
+id = "key-reference"
+name = "Key Reference Extensions"
+
+[compatibility]
+extension_api = "^0.1"
+minimum_host = "0.1.0"
+platforms = []
+
+[entrypoint]
+kind = "wasm_component"
+component = "component.wasm"
+world = "key:extension-runtime/extension@0.1.0"
+ui = "ui.json"
+
+[capabilities]
+optional = []
+provided = []
+
+[[capabilities.required]]
+id = "key:pdf/document-metadata"
+version = "^0.1"
+
+[capabilities.required.scope]
+kind = "active_document"
+
+[[capabilities.required]]
+id = "key:pdf/text"
+version = "^0.1"
+
+[capabilities.required.scope]
+kind = "active_document"
+
+[[permissions]]
+reason = "Display page count and document identity."
+required = true
+
+[permissions.permission]
+kind = "read_document_metadata"
+
+[[permissions]]
+reason = "Count words and characters in the active document."
+required = true
+
+[permissions.permission]
+kind = "read_document_text"
+scope = "active_document"
+
+[[permissions]]
+reason = "Show the document statistics panel."
+required = true
+
+[permissions.permission]
+kind = "add_side_panel"
+
+[[contributions.commands]]
+id = "org.key.reference.document-statistics/open"
+title = "Show document statistics"
+description = "Open the sandboxed document statistics side panel."
+category = "Document"
+
+[[contributions.menus]]
+id = "org.key.reference.document-statistics/tools-menu"
+slot = "tools.analysis"
+
+[contributions.menus.order]
+priority = 0
+before = []
+after = []
+
+[[contributions.menus.items]]
+id = "show-statistics"
+kind = "command"
+label = "Document statistics"
+command = "org.key.reference.document-statistics/open"
+
+[contributions.menus.items.order]
+priority = 0
+before = []
+after = []
+
+[contributions.menus.items.visible]
+source = "constant"
+value = true
+
+[contributions.menus.items.icon]
+kind = "host"
+value = "chart"
+
+[contributions.menus.items.enabled]
+source = "constant"
+value = true
+
+[[contributions.views]]
+id = "org.key.reference.document-statistics/panel"
+slot = "side_panel"
+
+[contributions.views.order]
+priority = 0
+before = []
+after = []
+
+[contributions.views.root]
+id = "panel-root"
+kind = "column"
+
+[contributions.views.root.visible]
+source = "constant"
+value = true
+
+[[contributions.views.root.children]]
+id = "title"
+kind = "styled_text"
+selectable = true
+
+[contributions.views.root.children.visible]
+source = "constant"
+value = true
+
+[[contributions.views.root.children.spans]]
+text = "Document statistics"
+emphasis = "strong"
+
+[[contributions.views.root.children]]
+id = "runtime"
+kind = "badge"
+label = "Sandboxed WebAssembly"
+tone = "positive"
+
+[contributions.views.root.children.visible]
+source = "constant"
+value = true
+
+[[contributions.views.root.children]]
+id = "divider"
+kind = "divider"
+
+[contributions.views.root.children.visible]
+source = "constant"
+value = true
+
+[[contributions.views.root.children]]
+id = "status"
+kind = "text"
+text = "The sandbox received a bounded document event."
+selectable = true
+
+[contributions.views.root.children.visible]
+source = "binding"
+value = ["runtime-ready"]
+
+[settings]
+version = 0
+fields = []
+
+[storage]
+settings_bytes = 0
+document_bytes = 0
+ephemeral_cache_bytes = 65536

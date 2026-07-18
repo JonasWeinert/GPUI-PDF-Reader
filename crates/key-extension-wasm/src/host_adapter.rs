@@ -84,7 +84,6 @@ impl NativeExtension for WasmHostExtension {
     fn handle_event(&mut self, event: &EventEnvelope) -> Result<NativeUpdate, ExtensionError> {
         self.instance
             .dispatch(event)
-            .map(NativeUpdate::with_effects)
             .map_err(extension_error_from_diagnostic)
     }
 

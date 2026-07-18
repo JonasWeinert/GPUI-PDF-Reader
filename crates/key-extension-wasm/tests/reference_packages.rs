@@ -1,0 +1,271 @@
+#![cfg(feature = "wasmtime-runtime")]
+
+use std::{path::PathBuf, str::FromStr};
+
+use key_extension_api::{
+    DataValue, EventSubscription, ExtensionEntrypoint, ExtensionEvent, ExtensionVersion,
+    HostCompatibility, LifecycleState, SnapshotKind,
+};
+use key_extension_host::{ExtensionHost, HostError, PackageMetadata, PermissionDecision};
+use key_extension_package::{
+    DenyAllSignatureVerifier, LoadedPackage, PackageError, PackageLimits, PackageLoader,
+    SignaturePolicy,
+};
+use key_extension_wasm::{
+    WasmDiagnosticCode, WasmHostAdapterConfig, WasmRuntime, WasmRuntimeLimits, compile_host_adapter,
+};
+
+fn package_root(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("extensions")
+        .join(name)
+        .join("package")
+}
+
+fn package_loader(limits: PackageLimits) -> PackageLoader {
+    PackageLoader::new(
+        limits,
+        SignaturePolicy {
+            require_signed_archives: false,
+            allow_unsigned_development_directories: true,
+        },
+    )
+}
+
+fn load(name: &str) -> LoadedPackage {
+    package_loader(PackageLimits::default())
+        .load_development_directory(package_root(name), &DenyAllSignatureVerifier)
+        .expect("checked-in reference package must load")
+}
+
+#[test]
+fn declarative_theme_pack_loads_and_uses_host_owned_contributions() {
+    let package = load("reference-theme-pack");
+    let manifest = package.manifest();
+    assert!(matches!(
+        manifest.entrypoint,
+        ExtensionEntrypoint::Declarative { .. }
+    ));
+    assert!(package.component().is_none());
+    assert!(manifest.permissions.is_empty());
+    assert_eq!(manifest.contributions.commands.len(), 1);
+    assert_eq!(
+        manifest.contributions.menus[0].slot.as_str(),
+        "view.appearance"
+    );
+    assert_eq!(manifest.contributions.views.len(), 1);
+
+    let ui: serde_json::Value = serde_json::from_slice(
+        package
+            .ui()
+            .expect("declarative package retains UI")
+            .bytes(),
+    )
+    .expect("reference UI is valid JSON");
+    assert_eq!(ui["tokens_only"], true);
+
+    let extension = manifest.id.clone();
+    let mut host = ExtensionHost::new(Default::default());
+    host.install(manifest.clone(), PackageMetadata::bundled())
+        .expect("declarative package installs through the common registry");
+    host.activate(&extension)
+        .expect("declarative package activates without executable code");
+    let contributions = host.collect_contributions();
+    assert_eq!(contributions.menus.len(), 1);
+    assert_eq!(contributions.views.len(), 1);
+    host.unload(&extension)
+        .expect("declarative package unloads");
+    assert_eq!(host.state(&extension), Some(LifecycleState::Disabled));
+    assert!(host.collect_contributions().views.is_empty());
+}
+
+#[test]
+fn statistics_component_runs_through_permissioned_shared_lifecycle() {
+    let package = load("reference-document-statistics");
+    let manifest = package.manifest().clone();
+    let ExtensionEntrypoint::WasmComponent {
+        component, world, ..
+    } = &manifest.entrypoint
+    else {
+        panic!("statistics pilot must be a Component Model package");
+    };
+    let component_bytes = package
+        .component()
+        .expect("validated package retains component bytes")
+        .bytes();
+    let runtime = WasmRuntime::new(WasmRuntimeLimits::default()).expect("runtime starts");
+    let adapter = compile_host_adapter(
+        &runtime,
+        WasmHostAdapterConfig {
+            extension: manifest.id.clone(),
+            component: component.clone(),
+            world: world.clone(),
+            subscriptions: vec![
+                EventSubscription::Lifecycle,
+                EventSubscription::Snapshot(SnapshotKind::Document),
+            ],
+        },
+        component_bytes,
+    )
+    .expect("checked-in component compiles");
+
+    let mut host = ExtensionHost::new(Default::default());
+    let capability_version = ExtensionVersion::from_str("0.1.0").expect("static version");
+    for request in &manifest.capabilities.required {
+        host.register_host_capability(request.id.clone(), capability_version.clone());
+    }
+    host.register_wasm_adapter(adapter);
+    host.install(manifest.clone(), PackageMetadata::bundled())
+        .expect("statistics package installs");
+
+    assert!(matches!(
+        host.activate(&manifest.id),
+        Err(HostError::PermissionsRequired { ref permissions, .. })
+            if permissions == &manifest.permissions
+    ));
+    assert!(
+        host.collect_contributions().views.is_empty(),
+        "unapproved packages must not contribute UI"
+    );
+    for request in &manifest.permissions {
+        host.set_permission_decision(
+            manifest.id.clone(),
+            request.permission.clone(),
+            PermissionDecision::Granted,
+        );
+    }
+    let activation = host
+        .activate(&manifest.id)
+        .expect("explicit permission grant permits activation");
+    assert_eq!(activation.capabilities.granted.len(), 2);
+    assert_eq!(host.state(&manifest.id), Some(LifecycleState::Active));
+    let initial = host.collect_contributions();
+    assert_eq!(initial.views.len(), 1);
+    assert!(initial.views[0].state.is_empty());
+
+    host.enqueue_host_event(
+        &manifest.id,
+        ExtensionEvent::SnapshotChanged {
+            snapshot: SnapshotKind::Document,
+            value: DataValue::Null,
+        },
+    )
+    .expect("bounded document snapshot queues");
+    let tick = host.process_tick();
+    assert_eq!(tick.processed_events, 1);
+    assert!(
+        tick.effects.is_empty(),
+        "transport pilot has no direct authority"
+    );
+    let published = host.collect_contributions();
+    assert_eq!(published.views.len(), 1);
+    assert_eq!(
+        published.views[0].state.get("runtime-ready"),
+        Some(&DataValue::Boolean(true)),
+        "state must cross the real component boundary and survive host validation"
+    );
+
+    host.suspend(&manifest.id, "lifecycle conformance")
+        .expect("guest suspends");
+    assert_eq!(host.state(&manifest.id), Some(LifecycleState::Suspended));
+    assert!(host.resume(&manifest.id).expect("guest resumes").is_empty());
+    host.unload(&manifest.id)
+        .expect("guest unloads and drops its store");
+    assert_eq!(host.state(&manifest.id), Some(LifecycleState::Disabled));
+}
+
+#[test]
+fn statistics_package_and_runtime_enforce_independent_component_bounds() {
+    let root = package_root("reference-document-statistics");
+    let component_len = std::fs::metadata(root.join("component.wasm"))
+        .expect("generated component exists")
+        .len();
+    let package_error = package_loader(PackageLimits {
+        maximum_component_bytes: component_len - 1,
+        ..PackageLimits::default()
+    })
+    .load_development_directory(&root, &DenyAllSignatureVerifier)
+    .expect_err("package boundary rejects an oversized declared component");
+    assert!(matches!(
+        package_error,
+        PackageError::FileTooLarge { ref path, .. } if path == "component.wasm"
+    ));
+
+    let component = std::fs::read(root.join("component.wasm")).expect("component is readable");
+    let source = std::fs::read_to_string(
+        root.parent()
+            .expect("package directory has extension root")
+            .join("source/component.wat"),
+    )
+    .expect("auditable component source is readable");
+    assert_eq!(
+        wat::parse_str(source).expect("source compiles"),
+        component,
+        "checked-in binary must be exactly reproducible from its WAT source"
+    );
+    let runtime = WasmRuntime::new(WasmRuntimeLimits {
+        maximum_component_bytes: component.len() - 1,
+        ..WasmRuntimeLimits::default()
+    })
+    .expect("limits are coherent");
+    assert_eq!(
+        runtime
+            .compile(&component)
+            .expect_err("runtime bound applies")
+            .code,
+        WasmDiagnosticCode::ComponentTooLarge
+    );
+
+    let runtime = WasmRuntime::new(WasmRuntimeLimits {
+        maximum_input_bytes: 4,
+        ..WasmRuntimeLimits::default()
+    })
+    .expect("limits are coherent");
+    let mut instance = runtime
+        .instantiate(&component)
+        .expect("component instantiates");
+    instance.activate().expect("component activates");
+    assert_eq!(
+        instance
+            .call_bytes("handle-event", b"12345")
+            .expect_err("input is rejected before the guest boundary")
+            .code,
+        WasmDiagnosticCode::InputLimitExceeded
+    );
+    assert_eq!(instance.state(), LifecycleState::Active);
+
+    let runtime = WasmRuntime::new(WasmRuntimeLimits {
+        maximum_output_bytes: 1,
+        ..WasmRuntimeLimits::default()
+    })
+    .expect("limits are coherent");
+    let mut instance = runtime
+        .instantiate(&component)
+        .expect("component instantiates");
+    instance.activate().expect("component activates");
+    assert_eq!(
+        instance
+            .call_bytes("handle-event", b"{}")
+            .expect_err("output is bounded before JSON deserialization")
+            .code,
+        WasmDiagnosticCode::OutputLimitExceeded
+    );
+}
+
+#[test]
+fn package_api_compatibility_stays_on_the_pre_stable_contract() {
+    for package in [
+        load("reference-theme-pack"),
+        load("reference-document-statistics"),
+    ] {
+        let HostCompatibility { extension_api, .. } = &package.manifest().compatibility;
+        assert!(
+            extension_api.matches(
+                &ExtensionVersion::from_str("0.1.0").expect("static extension API version")
+            ),
+            "{} must remain loadable by the current extension API",
+            package.manifest().id
+        );
+    }
+}

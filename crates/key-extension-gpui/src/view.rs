@@ -85,10 +85,13 @@ impl DeclarativeView {
     #[must_use]
     pub fn new(
         owned: OwnedView,
-        state: BoundedStateMap,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // `ExtensionHost` validates every state update against limits no looser
+        // than the renderer's defaults before attaching it to `OwnedView`.
+        let state = BoundedStateMap::new(owned.state.clone(), Default::default())
+            .expect("host-owned extension view state is bounded");
         let mut fields = Vec::new();
         collect_text_fields(&owned.view.root, &mut fields);
 
