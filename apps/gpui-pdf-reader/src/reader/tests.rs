@@ -31,6 +31,33 @@ fn raw_input_snapshot_requests_coalesce_until_async_dispatch_begins() {
     assert!(dispatch.request());
 }
 
+#[cfg(feature = "installable-extensions")]
+#[test]
+fn extension_picker_accepts_both_project_and_package_directories() {
+    let directory = TestDirectory::new("extension-picker");
+    let extension = directory.path().join("example-extension");
+    let package = extension.join("package");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("manifest.toml"), "schema_version = 1\n").unwrap();
+
+    assert_eq!(
+        resolve_extension_package_selection(extension),
+        package,
+        "selecting the visible extension root should resolve its package directory"
+    );
+    assert_eq!(
+        resolve_extension_package_selection(package.clone()),
+        package,
+        "selecting the package directory itself must remain unchanged"
+    );
+    let archive = directory.path().join("example.keyext");
+    std::fs::write(&archive, b"archive placeholder").unwrap();
+    assert_eq!(
+        resolve_extension_package_selection(archive.clone()),
+        archive
+    );
+}
+
 #[test]
 fn scientific_lookup_is_limited_to_exact_reference_ranges() {
     let reference = ScientificReference {

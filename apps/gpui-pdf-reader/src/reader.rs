@@ -1520,16 +1520,57 @@ impl PdfReader {
         let weak = cx.weak_entity();
         window
             .spawn(cx, async move |cx| {
-                if let Ok(Ok(Some(paths))) = prompt.await
-                    && let Some(path) = paths.into_iter().next()
-                {
-                    let _ = cx.update(|window, cx| {
+                let path = match prompt.await {
+                    Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                    Ok(Ok(None)) => return,
+                    Ok(Err(error)) => {
+                        let message = format!("Could not select an extension: {error}");
+                        let _ = cx.update(|_, cx| {
+                            weak.update(cx, |reader, cx| {
+                                reader.warning = Some(message.into());
+                                cx.notify();
+                            })
+                            .ok();
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        let message = format!("Extension selection was interrupted: {error}");
+                        let _ = cx.update(|_, cx| {
+                            weak.update(cx, |reader, cx| {
+                                reader.warning = Some(message.into());
+                                cx.notify();
+                            })
+                            .ok();
+                        });
+                        return;
+                    }
+                };
+                let Some(path) = path else {
+                    let _ = cx.update(|_, cx| {
                         weak.update(cx, |reader, cx| {
-                            reader.install_extension_path(path, window, cx)
+                            reader.warning = Some("The extension picker returned no path".into());
+                            cx.notify();
                         })
                         .ok();
                     });
-                }
+                    return;
+                };
+
+                // NSOpenPanel resolves its completion before AppKit has fully
+                // dismissed the sheet. Starting the permission-review prompt
+                // in that callback can silently drop the second modal. Cross
+                // one foreground turn before opening the review UI.
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let path = resolve_extension_package_selection(path);
+                let _ = cx.update(|window, cx| {
+                    weak.update(cx, |reader, cx| {
+                        reader.install_extension_path(path, window, cx)
+                    })
+                    .ok();
+                });
             })
             .detach();
     }
@@ -5126,6 +5167,18 @@ fn data_record<const N: usize>(items: [(&str, DataValue); N]) -> DataValue {
             .map(|(key, value)| (key.to_owned(), value))
             .collect(),
     )
+}
+
+#[cfg(feature = "installable-extensions")]
+fn resolve_extension_package_selection(path: PathBuf) -> PathBuf {
+    if path.is_dir()
+        && !path.join("manifest.toml").is_file()
+        && path.join("package/manifest.toml").is_file()
+    {
+        path.join("package")
+    } else {
+        path
+    }
 }
 
 fn bounded_i64(value: impl TryInto<i64>) -> i64 {
