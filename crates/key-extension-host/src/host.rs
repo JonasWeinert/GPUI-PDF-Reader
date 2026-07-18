@@ -1134,6 +1134,10 @@ impl ExtensionHost {
         // work, then run the exact same state/effect arbitration used by an
         // inline adapter. No guest callback occurs in this method.
         let completed = self.drain_deferred_adapter_updates();
+        let dispatch_budget = self
+            .config
+            .maximum_events_per_tick
+            .saturating_sub(completed.len());
         for (extension, update) in completed {
             self.apply_deferred_adapter_update(&extension, update, &mut report);
         }
@@ -1144,9 +1148,7 @@ impl ExtensionHost {
             let Some(event) = self.queue.pop_front() else {
                 break;
             };
-            if event.eligible_tick <= self.tick
-                && selected.len() < self.config.maximum_events_per_tick
-            {
+            if event.eligible_tick <= self.tick && selected.len() < dispatch_budget {
                 selected.push(event);
             } else {
                 self.queue.push_back(event);
@@ -1321,16 +1323,14 @@ impl ExtensionHost {
         let Some(runtime) = self.runtimes.get(extension) else {
             return;
         };
-        if runtime.generation != completed.generation
-            || self.state(extension) != Some(LifecycleState::Active)
-        {
+        if runtime.generation != completed.generation {
             return;
         }
         let generation = runtime.generation;
         match completed.call {
             DeferredCall::Activation { cause } | DeferredCall::Resume { cause } => {
                 match completed.result {
-                    Ok(update) => {
+                    Ok(update) if self.state(extension) == Some(LifecycleState::Active) => {
                         self.arbitrate_update(
                             extension,
                             generation,
@@ -1339,13 +1339,22 @@ impl ExtensionHost {
                             &mut report.effects,
                         );
                     }
-                    Err(error) => {
+                    Err(error)
+                        if matches!(
+                            self.state(extension),
+                            Some(LifecycleState::Active | LifecycleState::Suspended)
+                        ) =>
+                    {
                         self.fail_deferred_runtime(extension, error);
                         report.dropped_events = report.dropped_events.saturating_add(1);
                     }
+                    Ok(_) | Err(_) => {}
                 }
             }
             DeferredCall::Event(envelope) => {
+                if self.state(extension) != Some(LifecycleState::Active) {
+                    return;
+                }
                 let command_behaviors = self.command_behaviors_for_event(extension, &envelope);
                 let snapshot_state = snapshot_state_update(&envelope);
                 let adapter_update = match completed.result {
@@ -2924,6 +2933,87 @@ mod tests {
         unloaded: Arc<AtomicBool>,
     }
 
+    struct DeferredTestExtension {
+        generation: Option<GenerationId>,
+        pending: VecDeque<DeferredNativeUpdate>,
+        canceled: Arc<AtomicBool>,
+        unloaded: Arc<AtomicBool>,
+        fail_activation: bool,
+    }
+
+    impl NativeExtension for DeferredTestExtension {
+        fn subscriptions(&self) -> Vec<EventSubscription> {
+            vec![EventSubscription::Commands]
+        }
+
+        fn activate(
+            &mut self,
+            context: &ActivationContext,
+        ) -> Result<NativeUpdate, ExtensionError> {
+            self.generation = Some(context.generation);
+            self.pending.push_back(DeferredNativeUpdate {
+                generation: context.generation,
+                call: DeferredCall::Activation {
+                    cause: context.cause,
+                },
+                result: if self.fail_activation {
+                    Err(ExtensionError {
+                        code: ExtensionErrorCode::Internal,
+                        message: "background activation failed".into(),
+                        retryable: false,
+                    })
+                } else {
+                    Ok(NativeUpdate::default())
+                },
+            });
+            Ok(NativeUpdate::default())
+        }
+
+        fn handle_event(
+            &mut self,
+            envelope: &EventEnvelope,
+        ) -> Result<NativeUpdate, ExtensionError> {
+            let value = match &envelope.event {
+                ExtensionEvent::CommandInvoked { payload, .. } => payload.clone(),
+                _ => DataValue::Null,
+            };
+            self.pending.push_back(DeferredNativeUpdate {
+                generation: self.generation.expect("activation establishes generation"),
+                call: DeferredCall::Event(envelope.clone()),
+                result: Ok(NativeUpdate::with_state(BTreeMap::from([(
+                    "deferred".into(),
+                    value,
+                )]))),
+            });
+            Ok(NativeUpdate::default())
+        }
+
+        fn update_delivery(&self) -> UpdateDelivery {
+            UpdateDelivery::Deferred
+        }
+
+        fn drain_deferred_updates(&mut self, maximum: usize) -> Vec<DeferredNativeUpdate> {
+            (0..maximum)
+                .filter_map(|_| self.pending.pop_front())
+                .collect()
+        }
+
+        fn pending_deferred_work(&self) -> usize {
+            self.pending.len()
+        }
+
+        fn cancel_deferred_events(&mut self) {
+            self.canceled.store(true, Ordering::SeqCst);
+            self.pending
+                .retain(|update| !matches!(update.call, DeferredCall::Event(_)));
+        }
+
+        fn unload(&mut self) {
+            self.pending.clear();
+            self.unloaded.store(true, Ordering::SeqCst);
+        }
+    }
+
     impl NativeExtension for TestExtension {
         fn subscriptions(&self) -> Vec<EventSubscription> {
             vec![
@@ -3643,6 +3733,105 @@ mod tests {
             Some(DataValue::Record(settings))
                 if settings.get("mode") == Some(&DataValue::String("sandboxed".into()))
         ));
+    }
+
+    #[test]
+    fn deferred_adapters_apply_only_polled_results_and_cancel_document_work() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.deferred");
+        let mut package = native_manifest(extension.as_str());
+        add_command(&mut package);
+        let adapter = match &package.entrypoint {
+            ExtensionEntrypoint::NativeBuiltin { adapter, .. } => adapter.clone(),
+            _ => unreachable!("native test package has a native entrypoint"),
+        };
+        let canceled = Arc::new(AtomicBool::new(false));
+        let unloaded = Arc::new(AtomicBool::new(false));
+        let factory_canceled = Arc::clone(&canceled);
+        let factory_unloaded = Arc::clone(&unloaded);
+        host.register_native_adapter(NativeExtensionAdapter::new(adapter, move || {
+            Box::new(DeferredTestExtension {
+                generation: None,
+                pending: VecDeque::new(),
+                canceled: Arc::clone(&factory_canceled),
+                unloaded: Arc::clone(&factory_unloaded),
+                fail_activation: false,
+            }) as Box<dyn NativeExtension>
+        }));
+        host.install(package, PackageMetadata::bundled()).unwrap();
+        host.activate(&extension).unwrap();
+        assert!(host.pending_event_count() >= 1);
+        host.process_tick();
+
+        host.invoke_command(&command_for(&extension), DataValue::String("first".into()))
+            .unwrap();
+        let dispatch = host.process_tick();
+        assert_eq!(dispatch.processed_events, 1);
+        assert!(dispatch.effects.is_empty());
+        assert_eq!(dispatch.deferred_events, 1);
+        assert!(
+            host.extension_state(&extension)
+                .and_then(|state| state.get("deferred"))
+                .is_none(),
+            "the enqueue placeholder must never be mistaken for guest output"
+        );
+
+        let completion = host.process_tick();
+        assert_eq!(completion.deferred_events, 0);
+        assert_eq!(
+            host.extension_state(&extension)
+                .and_then(|state| state.get("deferred")),
+            Some(&DataValue::String("first".into()))
+        );
+
+        host.invoke_command(&command_for(&extension), DataValue::String("stale".into()))
+            .unwrap();
+        host.process_tick();
+        assert_eq!(host.pending_event_count(), 1);
+        host.invalidate_document_scope([]);
+        assert!(canceled.load(Ordering::SeqCst));
+        assert_eq!(host.pending_event_count(), 0);
+        host.process_tick();
+        assert_eq!(
+            host.extension_state(&extension)
+                .and_then(|state| state.get("deferred")),
+            Some(&DataValue::String("first".into())),
+            "a prior-document result must not cross the invalidation barrier"
+        );
+
+        host.unload(&extension).unwrap();
+        assert!(unloaded.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn deferred_activation_failure_isolated_on_the_next_host_tick() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.deferred-failure");
+        let package = native_manifest(extension.as_str());
+        let adapter = match &package.entrypoint {
+            ExtensionEntrypoint::NativeBuiltin { adapter, .. } => adapter.clone(),
+            _ => unreachable!("native test package has a native entrypoint"),
+        };
+        let unloaded = Arc::new(AtomicBool::new(false));
+        let factory_unloaded = Arc::clone(&unloaded);
+        host.register_native_adapter(NativeExtensionAdapter::new(adapter, move || {
+            Box::new(DeferredTestExtension {
+                generation: None,
+                pending: VecDeque::new(),
+                canceled: Arc::new(AtomicBool::new(false)),
+                unloaded: Arc::clone(&factory_unloaded),
+                fail_activation: true,
+            }) as Box<dyn NativeExtension>
+        }));
+        host.install(package, PackageMetadata::bundled()).unwrap();
+        host.activate(&extension)
+            .expect("background activation is accepted without executing it inline");
+        assert_eq!(host.state(&extension), Some(LifecycleState::Active));
+        let report = host.process_tick();
+        assert_eq!(report.dropped_events, 1);
+        assert_eq!(host.state(&extension), Some(LifecycleState::Failed));
+        assert!(unloaded.load(Ordering::SeqCst));
+        assert!(host.collect_contributions().commands.is_empty());
     }
 
     #[test]

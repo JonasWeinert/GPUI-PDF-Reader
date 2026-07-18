@@ -40,8 +40,8 @@ impl Default for WasmRuntimeLimits {
             maximum_input_bytes: 256 * 1024,
             maximum_output_bytes: 512 * 1024,
             maximum_effects_per_event: 32,
-            maximum_pending_events: 128,
-            maximum_pending_results: 128,
+            maximum_pending_events: 64,
+            maximum_pending_results: 16,
             // Fuel is the normal deterministic ceiling. The short epoch
             // deadline is an independent wall-clock backstop for instructions
             // whose cost varies across hardware; an extension event must not
@@ -96,6 +96,22 @@ impl WasmRuntimeLimits {
                 "input and output limits cannot exceed the per-memory limit",
             ));
         }
+        const MAXIMUM_TRANSPORT_MAILBOX_BYTES: usize = 64 * 1024 * 1024;
+        let retained_transport_bytes = self
+            .maximum_pending_events
+            .checked_add(1)
+            .and_then(|events| events.checked_mul(self.maximum_input_bytes))
+            .and_then(|events| {
+                self.maximum_pending_results
+                    .checked_mul(self.maximum_output_bytes)
+                    .and_then(|results| events.checked_add(results))
+            })
+            .ok_or_else(|| configuration("transport mailbox byte budget overflowed"))?;
+        if retained_transport_bytes > MAXIMUM_TRANSPORT_MAILBOX_BYTES {
+            return Err(configuration(format!(
+                "transport mailboxes may retain at most {MAXIMUM_TRANSPORT_MAILBOX_BYTES} bytes"
+            )));
+        }
         Ok(())
     }
 
@@ -131,6 +147,18 @@ mod tests {
         let limits = WasmRuntimeLimits {
             maximum_output_bytes: 2,
             maximum_memory_bytes: 1,
+            ..WasmRuntimeLimits::default()
+        };
+        assert_eq!(
+            limits.validate().unwrap_err().code,
+            WasmDiagnosticCode::InvalidConfiguration
+        );
+    }
+
+    #[test]
+    fn rejects_unbounded_host_side_transport_mailboxes() {
+        let limits = WasmRuntimeLimits {
+            maximum_pending_events: 1_000_000,
             ..WasmRuntimeLimits::default()
         };
         assert_eq!(

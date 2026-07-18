@@ -13,8 +13,8 @@ use std::{
 };
 
 use key_extension_api::{
-    EventEnvelope, EventSubscription, ExtensionError, ExtensionErrorCode, ExtensionEvent,
-    ExtensionUpdate, GenerationId,
+    CapabilityScope, DataValue, EventEnvelope, EventSource, EventSubscription, ExtensionError,
+    ExtensionErrorCode, ExtensionEvent, ExtensionUpdate, GenerationId, LifecycleEvent,
 };
 use key_extension_host::{
     ActivationContext, DeferredCall, DeferredNativeUpdate, NativeExtension, NativeUpdate,
@@ -41,6 +41,7 @@ impl WasmWorkerExtension {
         let shared = Arc::new(SharedMailbox::new(
             runtime.limits().maximum_pending_events,
             runtime.limits().maximum_pending_results,
+            runtime.limits().maximum_input_bytes,
         ));
         let worker_shared = Arc::clone(&shared);
         thread::Builder::new()
@@ -68,6 +69,17 @@ impl WasmWorkerExtension {
         }
         let lifecycle = mailbox.lifecycle;
         let work = mailbox.work;
+        let retained_bytes = retained_event_bytes(&event);
+        if retained_bytes > mailbox.maximum_input_bytes {
+            return Err(ExtensionError {
+                code: ExtensionErrorCode::QuotaExceeded,
+                message: format!(
+                    "WebAssembly event requires approximately {retained_bytes} bytes; input limit is {} bytes",
+                    mailbox.maximum_input_bytes
+                ),
+                retryable: false,
+            });
+        }
         let command = WorkerCommand::Event {
             lifecycle,
             work,
@@ -78,13 +90,10 @@ impl WasmWorkerExtension {
         };
 
         if let Some(key) = command.coalescing_key()
-            && let Some(existing) = mailbox.commands.iter_mut().rev().find(|pending| {
-                pending.lifecycle() == lifecycle
-                    && pending.work() == Some(work)
-                    && pending.coalescing_key().as_ref() == Some(&key)
-            })
+            && let Some(index) = trailing_command_match(&mailbox.commands, lifecycle, work, &key)
         {
-            *existing = command;
+            mailbox.commands.remove(index);
+            mailbox.commands.push_back(command);
             self.shared.ready.notify_one();
             return Ok(());
         }
@@ -218,6 +227,9 @@ impl NativeExtension for WasmWorkerExtension {
 
     fn pending_deferred_work(&self) -> usize {
         let mailbox = self.shared.lock();
+        if !mailbox.worker_alive {
+            return 0;
+        }
         mailbox
             .commands
             .len()
@@ -275,7 +287,11 @@ struct SharedMailbox {
 }
 
 impl SharedMailbox {
-    fn new(maximum_pending_events: usize, maximum_pending_results: usize) -> Self {
+    fn new(
+        maximum_pending_events: usize,
+        maximum_pending_results: usize,
+        maximum_input_bytes: usize,
+    ) -> Self {
         Self {
             state: Mutex::new(MailboxState {
                 lifecycle: 0,
@@ -285,7 +301,9 @@ impl SharedMailbox {
                 in_flight: 0,
                 maximum_pending_events,
                 maximum_pending_results,
+                maximum_input_bytes,
                 closed: false,
+                worker_alive: true,
             }),
             ready: Condvar::new(),
         }
@@ -306,7 +324,9 @@ struct MailboxState {
     in_flight: usize,
     maximum_pending_events: usize,
     maximum_pending_results: usize,
+    maximum_input_bytes: usize,
     closed: bool,
+    worker_alive: bool,
 }
 
 enum WorkerCommand {
@@ -357,13 +377,7 @@ impl WorkerCommand {
         let Self::Event { event, .. } = self else {
             return None;
         };
-        match &event.event {
-            ExtensionEvent::SnapshotChanged { snapshot, .. } => {
-                Some(CoalescingKey::Snapshot(*snapshot))
-            }
-            ExtensionEvent::CapabilitiesChanged { .. } => Some(CoalescingKey::Capabilities),
-            _ => None,
-        }
+        event_coalescing_key(&event.event)
     }
 }
 
@@ -371,6 +385,36 @@ impl WorkerCommand {
 enum CoalescingKey {
     Snapshot(key_extension_api::SnapshotKind),
     Capabilities,
+}
+
+fn event_coalescing_key(event: &ExtensionEvent) -> Option<CoalescingKey> {
+    match event {
+        ExtensionEvent::SnapshotChanged { snapshot, .. } => {
+            Some(CoalescingKey::Snapshot(*snapshot))
+        }
+        ExtensionEvent::CapabilitiesChanged { .. } => Some(CoalescingKey::Capabilities),
+        _ => None,
+    }
+}
+
+fn trailing_command_match(
+    commands: &VecDeque<WorkerCommand>,
+    lifecycle: u64,
+    work: u64,
+    key: &CoalescingKey,
+) -> Option<usize> {
+    commands
+        .iter()
+        .enumerate()
+        .rev()
+        .take_while(|(_, command)| {
+            command.lifecycle() == lifecycle
+                && command.work() == Some(work)
+                && command.coalescing_key().is_some()
+        })
+        .find_map(|(index, command)| {
+            (command.coalescing_key().as_ref() == Some(key)).then_some(index)
+        })
 }
 
 struct WorkerResult {
@@ -399,29 +443,9 @@ fn worker_loop(runtime: WasmRuntime, component_bytes: Arc<[u8]>, shared: Arc<Sha
         };
         let exits = matches!(command, WorkerCommand::Unload { .. });
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            execute_worker_command(&runtime, &component_bytes, &mut instance, command)
+            execute_worker_command(&runtime, &component_bytes, &mut instance, &command)
         }))
-        .unwrap_or_else(|_| {
-            Some(WorkerResult {
-                lifecycle: current_lifecycle(&shared),
-                work: None,
-                update: DeferredNativeUpdate {
-                    generation: GenerationId(0),
-                    call: DeferredCall::Activation {
-                        cause: key_extension_api::CauseContext {
-                            id: key_extension_api::CauseId::new(0, 0),
-                            parent: None,
-                            depth: 0,
-                        },
-                    },
-                    result: Err(ExtensionError {
-                        code: ExtensionErrorCode::Internal,
-                        message: "WebAssembly component worker panicked".into(),
-                        retryable: false,
-                    }),
-                },
-            })
-        });
+        .unwrap_or_else(|_| panic_result(&command));
 
         {
             let mut mailbox = shared.lock();
@@ -434,13 +458,18 @@ fn worker_loop(runtime: WasmRuntime, component_bytes: Arc<[u8]>, shared: Arc<Sha
             break;
         }
     }
+    let mut mailbox = shared.lock();
+    mailbox.worker_alive = false;
+    mailbox.commands.clear();
+    mailbox.in_flight = 0;
+    shared.ready.notify_all();
 }
 
 fn execute_worker_command(
     runtime: &WasmRuntime,
     component_bytes: &[u8],
     instance: &mut Option<crate::WasmExtensionInstance>,
-    command: WorkerCommand,
+    command: &WorkerCommand,
 ) -> Option<WorkerResult> {
     match command {
         WorkerCommand::Activate {
@@ -462,10 +491,10 @@ fn execute_worker_command(
                 })
                 .map_err(extension_error_from_diagnostic);
             Some(WorkerResult {
-                lifecycle,
+                lifecycle: *lifecycle,
                 work: None,
                 update: DeferredNativeUpdate {
-                    generation: host_generation,
+                    generation: *host_generation,
                     call: DeferredCall::Activation {
                         cause: context.cause,
                     },
@@ -483,16 +512,16 @@ fn execute_worker_command(
                 || Err(unavailable("WebAssembly component has not activated")),
                 |loaded| {
                     loaded
-                        .dispatch(&event)
+                        .dispatch(event)
                         .map_err(extension_error_from_diagnostic)
                 },
             );
             Some(WorkerResult {
-                lifecycle,
-                work: Some(work),
+                lifecycle: *lifecycle,
+                work: Some(*work),
                 update: DeferredNativeUpdate {
-                    generation: host_generation,
-                    call: DeferredCall::Event(event),
+                    generation: *host_generation,
+                    call: DeferredCall::Event(event.clone()),
                     result,
                 },
             })
@@ -518,10 +547,10 @@ fn execute_worker_command(
                 },
             );
             Some(WorkerResult {
-                lifecycle,
+                lifecycle: *lifecycle,
                 work: None,
                 update: DeferredNativeUpdate {
-                    generation: host_generation,
+                    generation: *host_generation,
                     call: DeferredCall::Resume {
                         cause: context.cause,
                     },
@@ -540,6 +569,14 @@ fn execute_worker_command(
 
 fn retain_worker_result(shared: &SharedMailbox, result: WorkerResult) {
     let mut mailbox = shared.lock();
+    if let Some(key) = result.coalescing_key()
+        && let Some(index) = trailing_result_match(&mailbox.results, &result, &key)
+    {
+        mailbox.results.remove(index);
+        mailbox.results.push_back(result);
+        shared.ready.notify_all();
+        return;
+    }
     while mailbox.results.len() >= mailbox.maximum_pending_results
         && result.lifecycle == mailbox.lifecycle
         && result.work.is_none_or(|work| work == mailbox.work)
@@ -552,15 +589,210 @@ fn retain_worker_result(shared: &SharedMailbox, result: WorkerResult) {
     }
     if result.lifecycle == mailbox.lifecycle
         && result.work.is_none_or(|work| work == mailbox.work)
-        && (!mailbox.closed || matches!(result.update.call, DeferredCall::Activation { .. }))
+        && !mailbox.closed
     {
         mailbox.results.push_back(result);
     }
     shared.ready.notify_all();
 }
 
-fn current_lifecycle(shared: &SharedMailbox) -> u64 {
-    shared.lock().lifecycle
+fn trailing_result_match(
+    results: &VecDeque<WorkerResult>,
+    incoming: &WorkerResult,
+    key: &CoalescingKey,
+) -> Option<usize> {
+    results
+        .iter()
+        .enumerate()
+        .rev()
+        .take_while(|(_, result)| {
+            result.lifecycle == incoming.lifecycle
+                && result.work == incoming.work
+                && result.coalescing_key().is_some()
+        })
+        .find_map(|(index, result)| {
+            (result.coalescing_key().as_ref() == Some(key)).then_some(index)
+        })
+}
+
+impl WorkerResult {
+    fn coalescing_key(&self) -> Option<CoalescingKey> {
+        if !matches!(&self.update.result, Ok(update) if update.effects.is_empty()) {
+            // Once a guest emitted an effect, the host must either arbitrate it
+            // or return its completion. Only state-only latest-wins updates
+            // may be replaced after execution.
+            return None;
+        }
+        let DeferredCall::Event(event) = &self.update.call else {
+            return None;
+        };
+        event_coalescing_key(&event.event)
+    }
+}
+
+fn panic_result(command: &WorkerCommand) -> Option<WorkerResult> {
+    let error = Err(ExtensionError {
+        code: ExtensionErrorCode::Internal,
+        message: "WebAssembly component worker panicked".into(),
+        retryable: false,
+    });
+    match command {
+        WorkerCommand::Activate {
+            lifecycle,
+            host_generation,
+            context,
+        } => Some(WorkerResult {
+            lifecycle: *lifecycle,
+            work: None,
+            update: DeferredNativeUpdate {
+                generation: *host_generation,
+                call: DeferredCall::Activation {
+                    cause: context.cause,
+                },
+                result: error,
+            },
+        }),
+        WorkerCommand::Event {
+            lifecycle,
+            work,
+            host_generation,
+            event,
+        } => Some(WorkerResult {
+            lifecycle: *lifecycle,
+            work: Some(*work),
+            update: DeferredNativeUpdate {
+                generation: *host_generation,
+                call: DeferredCall::Event(event.clone()),
+                result: error,
+            },
+        }),
+        WorkerCommand::Resume {
+            lifecycle,
+            host_generation,
+            context,
+        } => Some(WorkerResult {
+            lifecycle: *lifecycle,
+            work: None,
+            update: DeferredNativeUpdate {
+                generation: *host_generation,
+                call: DeferredCall::Resume {
+                    cause: context.cause,
+                },
+                result: error,
+            },
+        }),
+        WorkerCommand::Suspend { .. } | WorkerCommand::Unload { .. } => None,
+    }
+}
+
+/// Conservative, allocation-free upper estimate for the JSON transport input.
+/// JSON escaping can expand one UTF-8 byte to six ASCII bytes, so arbitrary
+/// strings use that multiplier. The fixed allowance covers tags, field names,
+/// numeric formatting, causes, and punctuation. This preflight keeps a single
+/// enormous but structurally valid `DataValue` from being cloned into the
+/// bounded worker mailbox only to be rejected after serialization.
+fn retained_event_bytes(envelope: &EventEnvelope) -> usize {
+    let mut bytes = 512usize;
+    if let EventSource::Extension(extension) = &envelope.source {
+        bytes = bytes.saturating_add(extension.as_str().len());
+    }
+    match &envelope.event {
+        ExtensionEvent::Lifecycle { event } => match event {
+            LifecycleEvent::Suspended { reason } => {
+                bytes = bytes.saturating_add(escaped_string_bound(reason));
+            }
+            LifecycleEvent::SettingsChanged { keys } => {
+                for key in keys {
+                    bytes = bytes
+                        .saturating_add(16)
+                        .saturating_add(escaped_string_bound(key));
+                }
+            }
+            LifecycleEvent::Installed
+            | LifecycleEvent::Validated
+            | LifecycleEvent::Activated
+            | LifecycleEvent::ApplicationReady
+            | LifecycleEvent::DocumentOpening { .. }
+            | LifecycleEvent::DocumentOpened { .. }
+            | LifecycleEvent::DocumentClosing { .. }
+            | LifecycleEvent::DocumentClosed { .. }
+            | LifecycleEvent::Resumed
+            | LifecycleEvent::Upgrading { .. }
+            | LifecycleEvent::Unloading => {}
+        },
+        ExtensionEvent::CommandInvoked { command, payload } => {
+            bytes = bytes
+                .saturating_add(command.as_str().len())
+                .saturating_add(retained_value_bytes(payload));
+        }
+        ExtensionEvent::CapabilitiesChanged { snapshot } => {
+            for grant in &snapshot.granted {
+                bytes = bytes
+                    .saturating_add(256)
+                    .saturating_add(grant.extension.as_str().len())
+                    .saturating_add(grant.capability.as_str().len())
+                    .saturating_add(match &grant.scope {
+                        CapabilityScope::Domains(domains) => {
+                            domains.iter().fold(0usize, |total, domain| {
+                                total.saturating_add(16).saturating_add(domain.0.len())
+                            })
+                        }
+                        CapabilityScope::Application
+                        | CapabilityScope::ActiveDocument
+                        | CapabilityScope::DocumentSet
+                        | CapabilityScope::NamespacedStorage(_) => 32,
+                    });
+            }
+            for capability in &snapshot.missing_optional {
+                bytes = bytes
+                    .saturating_add(64)
+                    .saturating_add(capability.as_str().len());
+            }
+        }
+        ExtensionEvent::SnapshotChanged { value, .. } => {
+            bytes = bytes.saturating_add(retained_value_bytes(value));
+        }
+        ExtensionEvent::Custom { event, payload } => {
+            bytes = bytes
+                .saturating_add(event.as_str().len())
+                .saturating_add(retained_value_bytes(payload));
+        }
+        ExtensionEvent::EffectCompleted { effect, result } => {
+            bytes = bytes.saturating_add(effect.as_str().len());
+            bytes = bytes.saturating_add(match result {
+                Ok(value) => retained_value_bytes(value),
+                Err(error) => escaped_string_bound(&error.message).saturating_add(64),
+            });
+        }
+        ExtensionEvent::TaskCancelled { task, reason } => {
+            bytes = bytes
+                .saturating_add(task.as_str().len())
+                .saturating_add(escaped_string_bound(reason));
+        }
+    }
+    bytes
+}
+
+fn retained_value_bytes(value: &DataValue) -> usize {
+    const NODE_OVERHEAD: usize = 64;
+    match value {
+        DataValue::String(value) => NODE_OVERHEAD.saturating_add(escaped_string_bound(value)),
+        DataValue::List(values) => values.iter().fold(NODE_OVERHEAD, |total, value| {
+            total.saturating_add(retained_value_bytes(value))
+        }),
+        DataValue::Record(values) => values.iter().fold(NODE_OVERHEAD, |total, (key, value)| {
+            total
+                .saturating_add(escaped_string_bound(key))
+                .saturating_add(retained_value_bytes(value))
+        }),
+        DataValue::Null | DataValue::Boolean(_) | DataValue::Integer(_) | DataValue::Number(_) => {
+            NODE_OVERHEAD
+        }
+    }
+}
+
+fn escaped_string_bound(value: &str) -> usize {
+    value.len().saturating_mul(6).saturating_add(2)
 }
 
 fn unavailable(message: impl Into<String>) -> ExtensionError {
@@ -576,8 +808,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use key_extension_api::{
-        CapabilitySnapshot, CauseContext, CauseId, DataValue, EventSource, ExtensionEvent,
-        ExtensionId, GenerationId, SnapshotKind,
+        CapabilitySnapshot, CauseContext, CauseId, DataValue, EffectId, EffectRequest, EventSource,
+        ExtensionEffect, ExtensionEvent, ExtensionId, GenerationId, NotificationTone, SnapshotKind,
     };
 
     use super::*;
@@ -622,6 +854,43 @@ mod tests {
         )
     }
 
+    fn spinning_transport_component() -> Arc<[u8]> {
+        Arc::from(
+            wat::parse_str(
+                r#"
+                (component
+                    (core module $guest
+                        (memory (export "memory") 1)
+                        (global $heap (mut i32) (i32.const 16))
+                        (func (export "cabi_realloc")
+                            (param i32 i32 i32 i32) (result i32)
+                            global.get $heap
+                            global.get $heap
+                            local.get 3
+                            i32.add
+                            global.set $heap)
+                        (func (export "activate"))
+                        (func (export "deactivate"))
+                        (func (export "handle-event")
+                            (param i32 i32) (result i32)
+                            (loop $forever br $forever)
+                            i32.const 0))
+                    (core instance $guest (instantiate $guest))
+                    (func $activate (canon lift (core func $guest "activate")))
+                    (func $deactivate (canon lift (core func $guest "deactivate")))
+                    (func $handle-event (param "event-json" (list u8)) (result (list u8))
+                        (canon lift (core func $guest "handle-event")
+                            (memory $guest "memory")
+                            (realloc (func $guest "cabi_realloc"))))
+                    (export "activate" (func $activate))
+                    (export "deactivate" (func $deactivate))
+                    (export "handle-event" (func $handle-event)))
+                "#,
+            )
+            .unwrap(),
+        )
+    }
+
     fn context() -> ActivationContext {
         ActivationContext {
             extension: ExtensionId::parse("org.example.worker").unwrap(),
@@ -647,6 +916,140 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "worker did not settle before timeout"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn event(sequence: u64, kind: ExtensionEvent) -> EventEnvelope {
+        EventEnvelope {
+            cause: context().cause,
+            source: EventSource::Host,
+            sequence,
+            event: kind,
+        }
+    }
+
+    fn queued_event(sequence: u64, kind: ExtensionEvent) -> WorkerCommand {
+        WorkerCommand::Event {
+            lifecycle: 1,
+            work: 1,
+            host_generation: context().generation,
+            event: event(sequence, kind),
+        }
+    }
+
+    #[test]
+    fn coalescing_moves_latest_input_forward_without_crossing_event_barriers() {
+        let viewport = |sequence| {
+            queued_event(
+                sequence,
+                ExtensionEvent::SnapshotChanged {
+                    snapshot: SnapshotKind::Viewport,
+                    value: DataValue::Integer(i64::try_from(sequence).unwrap()),
+                },
+            )
+        };
+        let selection = queued_event(
+            2,
+            ExtensionEvent::SnapshotChanged {
+                snapshot: SnapshotKind::Selection,
+                value: DataValue::Null,
+            },
+        );
+        let mut commands = VecDeque::from([viewport(1), selection]);
+        let latest = viewport(3);
+        let key = latest.coalescing_key().unwrap();
+        let index = trailing_command_match(&commands, 1, 1, &key).unwrap();
+        commands.remove(index);
+        commands.push_back(latest);
+        let sequences = commands
+            .iter()
+            .filter_map(|command| match command {
+                WorkerCommand::Event { event, .. } => Some(event.sequence),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![2, 3]);
+
+        commands.push_back(queued_event(
+            4,
+            ExtensionEvent::Lifecycle {
+                event: key_extension_api::LifecycleEvent::ApplicationReady,
+            },
+        ));
+        let after_barrier = viewport(5);
+        assert_eq!(
+            trailing_command_match(&commands, 1, 1, &after_barrier.coalescing_key().unwrap()),
+            None,
+            "a newer snapshot cannot be moved ahead of an intervening command/lifecycle event"
+        );
+    }
+
+    #[test]
+    fn completed_events_with_effects_are_never_coalesced_away() {
+        let envelope = event(
+            1,
+            ExtensionEvent::SnapshotChanged {
+                snapshot: SnapshotKind::Viewport,
+                value: DataValue::Null,
+            },
+        );
+        let result = WorkerResult {
+            lifecycle: 1,
+            work: Some(1),
+            update: DeferredNativeUpdate {
+                generation: context().generation,
+                call: DeferredCall::Event(envelope.clone()),
+                result: Ok(NativeUpdate::with_effects(vec![EffectRequest {
+                    id: EffectId::parse("org.example.worker/notify").unwrap(),
+                    cause: envelope.cause,
+                    effect: ExtensionEffect::Notify {
+                        message: "ready".into(),
+                        tone: NotificationTone::Success,
+                    },
+                }])),
+            },
+        };
+        assert_eq!(result.coalescing_key(), None);
+    }
+
+    #[test]
+    fn retained_event_estimate_bounds_json_and_rejects_before_queueing() {
+        let envelope = event(
+            1,
+            ExtensionEvent::Custom {
+                event: key_extension_api::NamespacedId::parse("org.example.worker/sample").unwrap(),
+                payload: DataValue::Record(std::collections::BTreeMap::from([(
+                    "content".into(),
+                    DataValue::String("\0\n\"\\ sample".repeat(200)),
+                )])),
+            },
+        );
+        let encoded = serde_json::to_vec(&envelope).unwrap();
+        assert!(retained_event_bytes(&envelope) >= encoded.len());
+
+        let runtime = WasmRuntime::new(WasmRuntimeLimits {
+            maximum_input_bytes: 4 * 1024,
+            ..WasmRuntimeLimits::default()
+        })
+        .unwrap();
+        let mut extension = WasmWorkerExtension::spawn(runtime, transport_component(), vec![])
+            .expect("worker starts");
+        extension.activate(&context()).unwrap();
+        let pending_before = extension.pending_deferred_work();
+        let error = extension.handle_event(&envelope).unwrap_err();
+        assert_eq!(error.code, ExtensionErrorCode::QuotaExceeded);
+        assert_eq!(extension.pending_deferred_work(), pending_before);
+        extension.unload();
     }
 
     #[test]
@@ -683,28 +1086,156 @@ mod tests {
         let mut extension = WasmWorkerExtension::spawn(runtime, transport_component(), vec![])
             .expect("worker starts");
         extension.activate(&context()).unwrap();
+        let activation = wait_for(&mut extension, 1);
+        assert!(activation[0].result.is_ok());
         for sequence in 1..=20 {
             extension
-                .handle_event(&EventEnvelope {
-                    cause: context().cause,
-                    source: EventSource::Host,
+                .handle_event(&event(
                     sequence,
-                    event: ExtensionEvent::SnapshotChanged {
+                    ExtensionEvent::SnapshotChanged {
                         snapshot: SnapshotKind::Viewport,
                         value: DataValue::Integer(i64::try_from(sequence).unwrap()),
                     },
-                })
+                ))
                 .unwrap();
         }
-        assert!(extension.pending_deferred_work() <= 3);
+        wait_until(|| {
+            let mailbox = extension.shared.lock();
+            mailbox.commands.is_empty() && mailbox.in_flight == 0
+        });
+        let snapshots = extension.drain_deferred_updates(32);
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "completed snapshots are latest-wins too"
+        );
+        assert!(matches!(
+            &snapshots[0].call,
+            DeferredCall::Event(EventEnvelope { sequence: 20, .. })
+        ));
+
+        extension
+            .handle_event(&event(
+                21,
+                ExtensionEvent::SnapshotChanged {
+                    snapshot: SnapshotKind::Viewport,
+                    value: DataValue::Integer(21),
+                },
+            ))
+            .unwrap();
         extension.cancel_deferred_events();
-        let _ = wait_for(&mut extension, 4);
+        wait_until(|| extension.pending_deferred_work() == 0);
+        assert!(extension.drain_deferred_updates(32).is_empty());
+        extension.unload();
+    }
+
+    #[test]
+    fn invalid_component_failure_is_deferred_from_activation() {
+        let runtime = WasmRuntime::new(WasmRuntimeLimits::default()).unwrap();
+        let mut extension =
+            WasmWorkerExtension::spawn(runtime, Arc::<[u8]>::from(&b"not a component"[..]), vec![])
+                .expect("worker starts before validation");
         assert!(
-            extension
-                .drain_deferred_updates(32)
-                .into_iter()
-                .all(|update| !matches!(update.call, DeferredCall::Event(_)))
+            extension.activate(&context()).is_ok(),
+            "activation callback only enqueues immutable work"
+        );
+        let completed = wait_for(&mut extension, 1);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].result.as_ref().unwrap_err().code,
+            ExtensionErrorCode::InvalidRequest
         );
         extension.unload();
+    }
+
+    #[test]
+    fn trapping_guest_is_contained_as_a_deferred_error() {
+        let runtime = WasmRuntime::new(WasmRuntimeLimits {
+            fuel_per_invocation: 10_000,
+            epoch_ticks_per_invocation: 1_000,
+            epoch_tick_interval: Duration::from_secs(1),
+            ..WasmRuntimeLimits::default()
+        })
+        .unwrap();
+        let mut extension =
+            WasmWorkerExtension::spawn(runtime, spinning_transport_component(), vec![])
+                .expect("worker starts");
+        extension.activate(&context()).unwrap();
+        assert!(wait_for(&mut extension, 1)[0].result.is_ok());
+        extension
+            .handle_event(&event(
+                1,
+                ExtensionEvent::Lifecycle {
+                    event: key_extension_api::LifecycleEvent::ApplicationReady,
+                },
+            ))
+            .unwrap();
+        let completed = wait_for(&mut extension, 1);
+        let error = completed[0].result.as_ref().unwrap_err();
+        assert_eq!(error.code, ExtensionErrorCode::QuotaExceeded);
+        assert!(error.message.contains("FuelExhausted"));
+        extension.unload();
+    }
+
+    #[test]
+    fn event_mailbox_is_bounded_without_blocking_the_caller() {
+        let runtime = WasmRuntime::new(WasmRuntimeLimits {
+            maximum_pending_events: 2,
+            fuel_per_invocation: u64::MAX,
+            epoch_ticks_per_invocation: 50,
+            epoch_tick_interval: Duration::from_millis(2),
+            ..WasmRuntimeLimits::default()
+        })
+        .unwrap();
+        let mut extension =
+            WasmWorkerExtension::spawn(runtime, spinning_transport_component(), vec![])
+                .expect("worker starts");
+        extension.activate(&context()).unwrap();
+        assert!(wait_for(&mut extension, 1)[0].result.is_ok());
+        let lifecycle = || ExtensionEvent::Lifecycle {
+            event: key_extension_api::LifecycleEvent::ApplicationReady,
+        };
+        extension.handle_event(&event(1, lifecycle())).unwrap();
+        wait_until(|| extension.shared.lock().in_flight == 1);
+        extension.handle_event(&event(2, lifecycle())).unwrap();
+        extension.handle_event(&event(3, lifecycle())).unwrap();
+        let error = extension.handle_event(&event(4, lifecycle())).unwrap_err();
+        assert_eq!(error.code, ExtensionErrorCode::QuotaExceeded);
+        extension.cancel_deferred_events();
+        extension.unload();
+    }
+
+    #[test]
+    fn unload_is_non_blocking_and_worker_releases_eventually() {
+        let runtime = WasmRuntime::new(WasmRuntimeLimits {
+            fuel_per_invocation: u64::MAX,
+            epoch_ticks_per_invocation: 50,
+            epoch_tick_interval: Duration::from_millis(2),
+            ..WasmRuntimeLimits::default()
+        })
+        .unwrap();
+        let mut extension =
+            WasmWorkerExtension::spawn(runtime, spinning_transport_component(), vec![])
+                .expect("worker starts");
+        extension.activate(&context()).unwrap();
+        assert!(wait_for(&mut extension, 1)[0].result.is_ok());
+        extension
+            .handle_event(&event(
+                1,
+                ExtensionEvent::Lifecycle {
+                    event: key_extension_api::LifecycleEvent::ApplicationReady,
+                },
+            ))
+            .unwrap();
+        wait_until(|| extension.shared.lock().in_flight == 1);
+        let started = Instant::now();
+        extension.unload();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "unload must only revoke the mailbox, not join guest execution"
+        );
+        wait_until(|| !extension.shared.lock().worker_alive);
+        assert_eq!(extension.pending_deferred_work(), 0);
+        assert!(extension.drain_deferred_updates(32).is_empty());
     }
 }
