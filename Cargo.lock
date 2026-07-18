@@ -1891,6 +1891,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -2523,7 +2524,12 @@ dependencies = [
  "gpui-component-assets",
  "image",
  "key-editor-core",
+ "key-extension-api",
+ "key-extension-gpui",
+ "key-extension-host",
  "key-pdf-core",
+ "key-pdf-runtime",
+ "key-pdfium",
  "objc2-app-kit",
  "open",
  "pdfium-render",
@@ -3307,6 +3313,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "key-extension-gpui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "key-extension-api",
+ "key-extension-host",
+]
+
+[[package]]
 name = "key-extension-host"
 version = "0.1.0"
 dependencies = [
@@ -3314,10 +3330,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "key-extension-package"
+version = "0.1.0"
+dependencies = [
+ "key-extension-api",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "toml 0.8.23",
+ "zip",
+]
+
+[[package]]
 name = "key-extension-wasm"
 version = "0.1.0"
 dependencies = [
  "key-extension-api",
+ "key-extension-host",
  "serde_json",
  "wasmtime",
  "wat",
@@ -6607,6 +6636,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8483,6 +8518,25 @@ dependencies = [
  "quote",
  "syn 2.0.118",
 ]
+
+[[package]]
+name = "zip"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79b32dd4ad3aca14ae109f8cce0495ac1c57f6f4f00ad459a40e582f89440d97"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "typed-path",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3be3d40e40a133f9c916ee3f9f4fa2d9d63435b5fbe1bfc6d9dae0aa0ada1513"
 
 [[package]]
 name = "zmij"

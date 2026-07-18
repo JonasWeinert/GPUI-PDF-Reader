@@ -12,6 +12,7 @@ wasmtime-runtime = ["dep:serde_json", "dep:wasmtime"]
 
 [dependencies]
 key-extension-api = { path = "../key-extension-api" }
+key-extension-host = { path = "../key-extension-host" }
 serde_json = { version = "1.0.150", optional = true }
 wasmtime = { version = "=45.0.1", default-features = false, optional = true, features = [
     "anyhow",

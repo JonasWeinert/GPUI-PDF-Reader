@@ -9,11 +9,15 @@ mod config;
 mod diagnostic;
 
 #[cfg(feature = "wasmtime-runtime")]
+mod host_adapter;
+#[cfg(feature = "wasmtime-runtime")]
 mod runtime;
 
 pub use config::*;
 pub use diagnostic::*;
 
+#[cfg(feature = "wasmtime-runtime")]
+pub use host_adapter::*;
 #[cfg(feature = "wasmtime-runtime")]
 pub use runtime::*;
 

@@ -1,0 +1,21 @@
+[package]
+name = "key-extension-package"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.88"
+license.workspace = true
+description = "Secure .keyext package loading for Key extensions"
+
+[dependencies]
+key-extension-api = { path = "../key-extension-api" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+zip.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

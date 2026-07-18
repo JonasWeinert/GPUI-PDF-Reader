@@ -3,17 +3,16 @@ members = [
     "apps/gpui-pdf-reader",
     "crates/key-editor-core",
     "crates/key-extension-api",
+    "crates/key-extension-gpui",
     "crates/key-extension-host",
+    "crates/key-extension-package",
     "crates/key-extension-wasm",
     "crates/key-pdf-core",
     "crates/key-pdf-runtime",
     "crates/key-pdfium",
 ]
 default-members = ["apps/gpui-pdf-reader"]
-exclude = [
-    "crates/key-extension-gpui",
-    "crates/key-extension-package",
-]
+exclude = []
 resolver = "3"
 
 [workspace.package]
@@ -29,9 +28,11 @@ reqwest = { package = "zed-reqwest", version = "=0.12.15-zed", default-features 
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha2 = "0.10.9"
 tempfile = "3.24.0"
 toml = "0.8.23"
 url = "2.5.8"
+zip = { version = "8.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [patch.crates-io]
 pdfium-render = { path = "vendor/pdfium-render-tile" }

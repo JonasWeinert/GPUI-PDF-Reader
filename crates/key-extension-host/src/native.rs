@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use key_extension_api::{
     CapabilitySnapshot, CauseContext, EffectRequest, EventEnvelope, EventSubscription,
-    ExtensionError, ExtensionId, GenerationId, NativeAdapterId,
+    ExtensionEntrypoint, ExtensionError, ExtensionId, GenerationId, NativeAdapterId,
 };
 
 #[derive(Clone, Debug)]
@@ -86,5 +86,60 @@ impl NativeExtensionAdapter {
 
     pub(crate) fn instantiate(&self) -> Box<dyn NativeExtension> {
         self.factory.create()
+    }
+}
+
+/// Host-supplied factory for one already-validated WebAssembly package.
+///
+/// The package manifest can select a component path, but it cannot register
+/// this adapter or provide native code. The installer must associate verified
+/// component bytes with the matching extension ID before activation.
+pub trait WasmExtensionFactory: Send + Sync {
+    fn create(
+        &self,
+        entrypoint: &ExtensionEntrypoint,
+    ) -> Result<Box<dyn NativeExtension>, ExtensionError>;
+}
+
+impl<F> WasmExtensionFactory for F
+where
+    F: Fn(&ExtensionEntrypoint) -> Result<Box<dyn NativeExtension>, ExtensionError> + Send + Sync,
+{
+    fn create(
+        &self,
+        entrypoint: &ExtensionEntrypoint,
+    ) -> Result<Box<dyn NativeExtension>, ExtensionError> {
+        self(entrypoint)
+    }
+}
+
+/// Runtime adapter registered for exactly one installed extension. This keeps
+/// Wasmtime and component bytes outside the runtime-neutral host crate while
+/// giving native and sandboxed instances the same semantic lifecycle.
+#[derive(Clone)]
+pub struct WasmExtensionAdapter {
+    extension: ExtensionId,
+    factory: Arc<dyn WasmExtensionFactory>,
+}
+
+impl WasmExtensionAdapter {
+    #[must_use]
+    pub fn new(extension: ExtensionId, factory: impl WasmExtensionFactory + 'static) -> Self {
+        Self {
+            extension,
+            factory: Arc::new(factory),
+        }
+    }
+
+    #[must_use]
+    pub fn extension(&self) -> &ExtensionId {
+        &self.extension
+    }
+
+    pub(crate) fn instantiate(
+        &self,
+        entrypoint: &ExtensionEntrypoint,
+    ) -> Result<Box<dyn NativeExtension>, ExtensionError> {
+        self.factory.create(entrypoint)
     }
 }

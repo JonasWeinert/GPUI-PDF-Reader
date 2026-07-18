@@ -17,7 +17,7 @@ use key_extension_api::{
 use crate::{
     ActivationContext, DiagnosticCode, DiagnosticLog, DiagnosticSeverity, HostDiagnostic,
     NativeExtension, NativeExtensionAdapter, NativeUpdate, PackageMetadata, PackageRecord,
-    PackageRegistry, RegistryError,
+    PackageRegistry, RegistryError, WasmExtensionAdapter,
 };
 
 #[derive(Clone, Debug)]
@@ -285,6 +285,7 @@ pub struct ExtensionHost {
     config: HostConfig,
     registry: PackageRegistry,
     adapters: BTreeMap<key_extension_api::NativeAdapterId, NativeExtensionAdapter>,
+    wasm_adapters: BTreeMap<ExtensionId, WasmExtensionAdapter>,
     runtimes: BTreeMap<ExtensionId, ActiveRuntime>,
     host_capabilities: BTreeMap<CapabilityId, ExtensionVersion>,
     permission_decisions: BTreeMap<ExtensionId, Vec<PermissionEntry>>,
@@ -306,6 +307,7 @@ impl ExtensionHost {
             config,
             registry,
             adapters: BTreeMap::new(),
+            wasm_adapters: BTreeMap::new(),
             runtimes: BTreeMap::new(),
             host_capabilities: BTreeMap::new(),
             permission_decisions: BTreeMap::new(),
@@ -392,6 +394,17 @@ impl ExtensionHost {
 
     pub fn register_native_adapter(&mut self, adapter: NativeExtensionAdapter) {
         self.adapters.insert(adapter.id().clone(), adapter);
+    }
+
+    /// Associates verified component bytes/runtime state with one package.
+    /// Registration alone grants no capability and performs no guest work.
+    pub fn register_wasm_adapter(&mut self, adapter: WasmExtensionAdapter) {
+        self.wasm_adapters
+            .insert(adapter.extension().clone(), adapter);
+    }
+
+    pub fn remove_wasm_adapter(&mut self, extension: &ExtensionId) {
+        self.wasm_adapters.remove(extension);
     }
 
     pub fn register_host_capability(&mut self, id: CapabilityId, version: ExtensionVersion) {
@@ -520,13 +533,44 @@ impl ExtensionHost {
                     }
                 }
             }
-            ExtensionEntrypoint::WasmComponent { .. } => {
-                self.fail_activation(
-                    extension,
-                    DiagnosticCode::UnsupportedEntrypoint,
-                    "no WebAssembly adapter is installed in this host",
-                );
-                return Err(HostError::UnsupportedEntrypoint(extension.clone()));
+            entrypoint @ ExtensionEntrypoint::WasmComponent { .. } => {
+                let Some(adapter) = self.wasm_adapters.get(extension).cloned() else {
+                    self.fail_activation(
+                        extension,
+                        DiagnosticCode::UnsupportedEntrypoint,
+                        "no WebAssembly adapter is installed for this package",
+                    );
+                    return Err(HostError::UnsupportedEntrypoint(extension.clone()));
+                };
+                let mut instance = match adapter.instantiate(entrypoint) {
+                    Ok(instance) => instance,
+                    Err(error) => {
+                        self.fail_activation(
+                            extension,
+                            DiagnosticCode::ActivationFailed,
+                            error.message.clone(),
+                        );
+                        return Err(HostError::ExtensionFailed {
+                            extension: extension.clone(),
+                            error,
+                        });
+                    }
+                };
+                let subscriptions = instance.subscriptions();
+                match instance.activate(&context) {
+                    Ok(update) => (Some(instance), subscriptions, update),
+                    Err(error) => {
+                        self.fail_activation(
+                            extension,
+                            DiagnosticCode::ActivationFailed,
+                            error.message.clone(),
+                        );
+                        return Err(HostError::ExtensionFailed {
+                            extension: extension.clone(),
+                            error,
+                        });
+                    }
+                }
             }
         };
 
@@ -2040,6 +2084,17 @@ mod tests {
         )
     }
 
+    fn wasm_manifest(extension: &str) -> ExtensionManifest {
+        manifest(
+            extension,
+            ExtensionEntrypoint::WasmComponent {
+                component: key_extension_api::PackagePath::parse("component.wasm").unwrap(),
+                world: "key:extension-runtime/extension@0.1.0".into(),
+                ui: None,
+            },
+        )
+    }
+
     #[derive(Clone, Copy)]
     enum Behavior {
         None,
@@ -2205,6 +2260,39 @@ mod tests {
         );
         let activation = host.activate(&extension).unwrap();
         assert_eq!(activation.capabilities.granted.len(), 1);
+        assert_eq!(host.state(&extension), Some(LifecycleState::Active));
+    }
+
+    #[test]
+    fn wasm_packages_require_an_explicit_package_scoped_adapter() {
+        let mut host = ExtensionHost::new(HostConfig::default());
+        let extension = id("org.example.wasm");
+        let package = wasm_manifest(extension.as_str());
+        host.install(package, PackageMetadata::bundled()).unwrap();
+        assert_eq!(
+            host.activate(&extension),
+            Err(HostError::UnsupportedEntrypoint(extension.clone()))
+        );
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_factory = events.clone();
+        let extension_for_factory = extension.clone();
+        host.register_wasm_adapter(WasmExtensionAdapter::new(
+            extension.clone(),
+            move |entrypoint: &ExtensionEntrypoint| {
+                assert!(matches!(
+                    entrypoint,
+                    ExtensionEntrypoint::WasmComponent { .. }
+                ));
+                Ok(Box::new(TestExtension {
+                    extension: extension_for_factory.clone(),
+                    behavior: Behavior::None,
+                    events: events_for_factory.clone(),
+                    unloaded: Arc::default(),
+                }) as Box<dyn NativeExtension>)
+            },
+        ));
+        host.activate(&extension).unwrap();
         assert_eq!(host.state(&extension), Some(LifecycleState::Active));
     }
 
