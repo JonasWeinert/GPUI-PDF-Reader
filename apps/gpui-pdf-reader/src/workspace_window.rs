@@ -1,7 +1,7 @@
 //! GPUI window shell shared by document and host-owned workspace views.
 
 use crate::application_host::{
-    ApplicationHost, activate_workspace_view, open_pdf_from, open_settings_window,
+    ApplicationHost, activate_workspace_view, open_pdf_from_window, open_settings_window,
     set_resource_mode,
 };
 use crate::reader::PdfReader;
@@ -183,8 +183,8 @@ impl WorkspaceWindow {
                 if let Ok(Ok(Some(paths))) = prompt.await
                     && let Some(path) = paths.into_iter().next()
                 {
-                    let _ = cx.update(|_, cx| {
-                        if let Err(error) = open_pdf_from(host, source, path, cx) {
+                    let _ = cx.update(|window, cx| {
+                        if let Err(error) = open_pdf_from_window(host, source, path, window, cx) {
                             weak.update(cx, |workspace, cx| {
                                 workspace.warning = Some(error.into());
                                 cx.notify();

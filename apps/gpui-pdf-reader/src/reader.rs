@@ -1007,10 +1007,10 @@ impl PdfReader {
                 if let Ok(Ok(Some(paths))) = prompt.await
                     && let Some(path) = paths.into_iter().next()
                 {
-                    let _ = cx.update(|_, cx| {
-                        if let Err(error) =
-                            crate::application_host::open_pdf_from(host, source, path, cx)
-                        {
+                    let _ = cx.update(|window, cx| {
+                        if let Err(error) = crate::application_host::open_pdf_from_window(
+                            host, source, path, window, cx,
+                        ) {
                             weak.update(cx, |reader, cx| {
                                 reader.warning = Some(error.into());
                                 cx.notify();

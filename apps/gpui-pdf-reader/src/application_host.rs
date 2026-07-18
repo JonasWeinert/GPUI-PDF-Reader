@@ -8,8 +8,8 @@ use crate::workspace_window::WorkspaceWindow;
 #[cfg(target_os = "macos")]
 use gpui::TitlebarOptions;
 use gpui::{
-    AnyWindowHandle, App, Bounds, Entity, Point, SharedString, WindowBounds, WindowHandle,
-    WindowOptions, px, size,
+    AnyWindowHandle, App, Bounds, Context, Entity, Point, SharedString, Window, WindowBounds,
+    WindowHandle, WindowOptions, px, size,
 };
 #[cfg(feature = "scholarly-network")]
 use key_reference::{ReferenceDocumentScope, ReferenceExecutor};
@@ -448,24 +448,56 @@ pub(crate) fn open_pdf_window(
     Ok(handle)
 }
 
-pub(crate) fn open_pdf_from(
+/// Opens a picker result through the live root of the source window. GPUI has
+/// removed that window from `App::windows` while an async window callback runs,
+/// so re-entering its stored handle here would fail with `window not found`.
+pub(crate) fn open_pdf_from_window(
     host: Entity<ApplicationHost>,
     source: WindowId,
     path: PathBuf,
+    window: &mut Window,
     cx: &mut App,
-) -> Result<WindowHandle<WorkspaceWindow>, String> {
+) -> Result<(), String> {
+    let workspace = window
+        .root::<WorkspaceWindow>()
+        .flatten()
+        .ok_or_else(|| "source window has an unexpected root type".to_owned())?;
+    workspace.update(cx, |workspace, cx| {
+        open_pdf_from_workspace(host, source, path, workspace, window, cx)
+    })
+}
+
+fn open_pdf_from_workspace(
+    host: Entity<ApplicationHost>,
+    source: WindowId,
+    path: PathBuf,
+    workspace: &mut WorkspaceWindow,
+    window: &mut Window,
+    cx: &mut Context<WorkspaceWindow>,
+) -> Result<(), String> {
     let path = normalize_path(&path);
-    if let Some(existing) = host.read(cx).existing_pdf_window(&path)
-        && let Some(existing) = existing.downcast::<WorkspaceWindow>()
-    {
+    if let Some(existing_id) = host.read(cx).paths.get(&path).copied() {
+        if existing_id == source {
+            window.activate_window();
+            return Ok(());
+        }
+        let existing = host
+            .read(cx)
+            .windows
+            .get(&existing_id)
+            .map(|record| record.handle)
+            .ok_or_else(|| "existing PDF window is no longer registered".to_owned())?;
+        let Some(existing) = existing.downcast::<WorkspaceWindow>() else {
+            return Err("existing PDF window has an unexpected root type".to_owned());
+        };
         existing
             .update(cx, |_, window, _| window.activate_window())
             .map_err(|error| error.to_string())?;
-        return Ok(existing);
+        return Ok(());
     }
 
     if host.read(cx).empty_pdf_window(source) {
-        let (item, view, handle) = {
+        let (item, view) = {
             let host_ref = host.read(cx);
             let record = host_ref
                 .windows
@@ -495,16 +527,9 @@ pub(crate) fn open_pdf_from(
                 title: item.title.clone(),
                 capabilities: item.capabilities.clone(),
             };
-            (item, view, record.handle)
+            (item, view)
         };
-        let handle = handle
-            .downcast::<WorkspaceWindow>()
-            .ok_or_else(|| "source window has an unexpected root type".to_owned())?;
-        handle
-            .update(cx, |workspace, window, cx| {
-                workspace.open_pdf(path.clone(), item.clone(), view, window, cx)
-            })
-            .map_err(|error| error.to_string())?;
+        workspace.open_pdf(path.clone(), item.clone(), view, window, cx);
         host.update(cx, |host, _| {
             if let Some(record) = host.windows.get_mut(&source) {
                 record.descriptor.title = item.title.clone();
@@ -512,10 +537,10 @@ pub(crate) fn open_pdf_from(
             }
             host.paths.insert(path, source);
         });
-        return Ok(handle);
+        return Ok(());
     }
 
-    open_pdf_window(host, Some(path), cx)
+    open_pdf_window(host, Some(path), cx).map(|_| ())
 }
 
 pub(crate) fn open_settings_window(
