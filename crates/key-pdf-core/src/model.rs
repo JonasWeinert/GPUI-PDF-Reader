@@ -361,6 +361,41 @@ impl TextLayer {
             visit,
         )
     }
+
+    /// Returns continuous rectangular selection runs for the visible part of
+    /// an inclusive text range. Glyphs are restored to source order after the
+    /// spatial query, then every glyph on the same visual line is unioned.
+    /// This deliberately bridges whitespace characters that have no PDF
+    /// bounds while preserving line breaks as separate rectangles.
+    pub fn visible_selection_runs(
+        &self,
+        page_rect: Rect,
+        viewport: Rect,
+        range: RangeInclusive<usize>,
+        maximum_glyphs: usize,
+    ) -> Vec<Rect> {
+        if maximum_glyphs == 0 {
+            return Vec::new();
+        }
+        let mut glyphs = Vec::new();
+        self.for_each_visible_in_range_while(page_rect, viewport, range, |index, rect| {
+            glyphs.push((index, rect));
+            glyphs.len() < maximum_glyphs
+        });
+        glyphs.sort_unstable_by_key(|(index, _)| *index);
+
+        let mut runs: Vec<Rect> = Vec::new();
+        for (_, glyph) in glyphs {
+            if let Some(current) = runs.last_mut()
+                && selection_rects_share_line(*current, glyph)
+            {
+                *current = union_rects(*current, glyph);
+            } else {
+                runs.push(glyph);
+            }
+        }
+        runs
+    }
 }
 
 impl From<Vec<TextChar>> for TextLayer {
@@ -681,6 +716,25 @@ fn text_highlight_bounds(rect: Rect) -> Rect {
         width: rect.width.max(1.5),
         height: rect.height.max(3.0),
         ..rect
+    }
+}
+
+fn selection_rects_share_line(left: Rect, right: Rect) -> bool {
+    let smaller_height = left.height.min(right.height).max(0.0);
+    let larger_height = left.height.max(right.height).max(0.0);
+    let vertical_overlap = left.bottom().min(right.bottom()) - left.y.max(right.y);
+    let center_distance = ((left.y + left.bottom()) - (right.y + right.bottom())).abs() * 0.5;
+    vertical_overlap >= smaller_height * 0.5 || center_distance <= (larger_height * 0.3).max(2.0)
+}
+
+fn union_rects(left: Rect, right: Rect) -> Rect {
+    let x = left.x.min(right.x);
+    let y = left.y.min(right.y);
+    Rect {
+        x,
+        y,
+        width: left.right().max(right.right()) - x,
+        height: left.bottom().max(right.bottom()) - y,
     }
 }
 
@@ -1297,6 +1351,47 @@ mod tests {
 
         assert!(!exhausted);
         assert_eq!(visits, 7);
+    }
+
+    #[test]
+    fn visible_selection_runs_bridge_spaces_but_preserve_line_breaks() {
+        let layer = TextLayer::new(vec![
+            bounded_char('a', 0.10, 0.10, 0.14, 0.12),
+            TextChar {
+                value: ' ',
+                bounds: None,
+            },
+            bounded_char('b', 0.18, 0.10, 0.22, 0.12),
+            bounded_char('c', 0.10, 0.20, 0.14, 0.22),
+        ]);
+        let page = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1_000.0,
+            height: 1_000.0,
+        };
+
+        let runs = layer.visible_selection_runs(page, page, 0..=3, 100);
+        assert_eq!(runs.len(), 2);
+        for (run, expected) in runs.iter().zip([
+            Rect {
+                x: 100.0,
+                y: 100.0,
+                width: 120.0,
+                height: 20.0,
+            },
+            Rect {
+                x: 100.0,
+                y: 200.0,
+                width: 40.0,
+                height: 20.0,
+            },
+        ]) {
+            assert!((run.x - expected.x).abs() < 0.001);
+            assert!((run.y - expected.y).abs() < 0.001);
+            assert!((run.width - expected.width).abs() < 0.001);
+            assert!((run.height - expected.height).abs() < 0.001);
+        }
     }
 
     fn linear_hit_test(

@@ -101,7 +101,7 @@ use key_pdf_gpui::{
     plan_visible_tiles as viewport_plan_visible_tiles,
 };
 use key_workspace_core::{ActivityLevel, ResourceAllocation, ResourceAmount, ViewId, WindowId};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -143,11 +143,11 @@ use search::{SearchState, search_list_rows};
 #[cfg(test)]
 use toc::{
     ResolvedTocDestination, TOC_BREADCRUMB_MAX_LABEL_CHARACTERS, TOC_CARD_MIN_HEIGHT,
-    TOC_STACK_MARGIN, active_toc_index, end_truncate, resolve_toc_destination,
-    toc_breadcrumb_entries, toc_callout_height, toc_callout_width, toc_cascade_amount,
-    toc_display_breadcrumbs, toc_stack_geometry, toc_title_match,
+    TOC_STACK_MARGIN, end_truncate, resolve_toc_destination, toc_breadcrumb_entries,
+    toc_callout_height, toc_callout_width, toc_cascade_amount, toc_display_breadcrumbs,
+    toc_stack_geometry, toc_title_match,
 };
-use toc::{advance_toc_hover_state, toc_hover_state_is_animating};
+use toc::{active_toc_index, advance_toc_hover_state, toc_hover_state_is_animating};
 use ui::{ChromeButtonStyle, chrome_button, empty_state, error_banner, icon_label};
 
 const TOOLBAR_HEIGHT: f32 = 52.0;
@@ -334,10 +334,29 @@ fn pdf_capability_extension_error(error: PdfExtensionError) -> ExtensionError {
 #[derive(Debug)]
 struct DocumentState {
     path: PathBuf,
+    title: Option<String>,
     pages: Vec<PageSize>,
     toc: Vec<TocEntry>,
     links: Vec<PdfLink>,
     scientific_references: Vec<ScientificReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReaderTabHoverDetail {
+    pub title: Option<String>,
+    pub section: Option<String>,
+    pub current_page: usize,
+    pub page_count: usize,
+    pub status: SharedString,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReaderTransferSnapshot {
+    zoom: f32,
+    fit_width: bool,
+    scroll: Offset,
+    view_mode: ReaderView,
+    pdf_dark_mode_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -675,6 +694,7 @@ pub struct PdfReader {
     scroll_target: Offset,
     viewport_width: f32,
     viewport_height: f32,
+    canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     selection: Option<TextSelection>,
     selecting: bool,
     pending_annotation_click: Option<AnnotationId>,
@@ -745,6 +765,7 @@ pub struct PdfReader {
     idle_cache_trimmed: bool,
     idle_cache_trim_revision: u64,
     idle_cache_trim_task: Option<Task<()>>,
+    pending_transfer_snapshot: Option<ReaderTransferSnapshot>,
 }
 
 impl PdfReader {
@@ -888,6 +909,7 @@ impl PdfReader {
                 scroll_target: Offset::default(),
                 viewport_width: 1.0,
                 viewport_height: 1.0,
+                canvas_bounds: Rc::new(Cell::new(None)),
                 selection: None,
                 selecting: false,
                 pending_annotation_click: None,
@@ -969,6 +991,7 @@ impl PdfReader {
                 idle_cache_trimmed: false,
                 idle_cache_trim_revision: 0,
                 idle_cache_trim_task: None,
+                pending_transfer_snapshot: None,
             }
         });
 
@@ -1355,6 +1378,7 @@ impl PdfReader {
             WorkerEvent::Opened {
                 generation,
                 path,
+                title,
                 pages,
                 toc,
                 links,
@@ -1401,6 +1425,7 @@ impl PdfReader {
                 }
                 self.document = Some(DocumentState {
                     path: path.clone(),
+                    title,
                     pages: pages.clone(),
                     toc,
                     links,
@@ -1449,7 +1474,25 @@ impl PdfReader {
                 self.pending_link_click = None;
                 self.pending_link_navigation = None;
                 self.status = ReaderStatus::Ready;
-                self.viewport.fit_width();
+                if let Some(snapshot) = self.pending_transfer_snapshot.take() {
+                    self.view_mode = snapshot.view_mode;
+                    self.pdf_dark_mode_enabled = snapshot.pdf_dark_mode_enabled;
+                    if snapshot.fit_width {
+                        self.viewport.fit_width();
+                    } else {
+                        self.viewport.disable_fit_width();
+                        self.viewport.zoom_at(
+                            snapshot.zoom,
+                            ViewportPoint::new(
+                                self.viewport_width * 0.5,
+                                self.viewport_height * 0.5,
+                            ),
+                        );
+                    }
+                    self.viewport.set_scroll(snapshot.scroll);
+                } else {
+                    self.viewport.fit_width();
+                }
                 self.sync_viewport_snapshot();
                 self.publish_pdf_selection();
                 self.request_visible_tiles(window);
@@ -3350,6 +3393,47 @@ impl PdfReader {
         format!("Page {current_page} of {page_count}").into()
     }
 
+    pub(crate) fn tab_hover_detail(&self) -> ReaderTabHoverDetail {
+        let status = self.status_text();
+        let Some(document) = self.document.as_ref() else {
+            return ReaderTabHoverDetail {
+                title: None,
+                section: None,
+                current_page: 0,
+                page_count: 0,
+                status,
+            };
+        };
+        let current_page = self
+            .layout()
+            .map(|layout| layout.current_page(self.scroll.y, self.viewport_height))
+            .unwrap_or(0)
+            .min(document.pages.len().saturating_sub(1));
+        ReaderTabHoverDetail {
+            title: document.title.clone(),
+            section: active_toc_index(&document.toc, current_page)
+                .and_then(|index| document.toc.get(index))
+                .map(|entry| entry.title.clone()),
+            current_page: current_page + 1,
+            page_count: document.pages.len(),
+            status,
+        }
+    }
+
+    pub(crate) fn transfer_snapshot(&self) -> ReaderTransferSnapshot {
+        ReaderTransferSnapshot {
+            zoom: self.zoom,
+            fit_width: self.fit_width,
+            scroll: self.scroll,
+            view_mode: self.view_mode,
+            pdf_dark_mode_enabled: self.pdf_dark_mode_enabled,
+        }
+    }
+
+    pub(crate) fn restore_after_transfer(&mut self, snapshot: ReaderTransferSnapshot) {
+        self.pending_transfer_snapshot = Some(snapshot);
+    }
+
     fn content_top(&self) -> f32 {
         self.reader_toolbar_height()
             + if matches!(self.status, ReaderStatus::Error(_)) {
@@ -3364,6 +3448,23 @@ impl PdfReader {
             ReaderView::Classic => TOOLBAR_HEIGHT,
             ReaderView::Fluid => 0.0,
         }
+    }
+
+    fn effective_canvas_bounds(&self) -> Bounds<Pixels> {
+        self.canvas_bounds.get().unwrap_or_else(|| {
+            Bounds::new(
+                point(px(0.0), px(self.content_top())),
+                size(px(self.viewport_width), px(self.viewport_height)),
+            )
+        })
+    }
+
+    fn window_to_canvas(&self, position: Point<Pixels>) -> Offset {
+        window_point_to_canvas(self.effective_canvas_bounds(), position)
+    }
+
+    fn canvas_to_window(&self, position: Offset) -> Point<Pixels> {
+        canvas_point_to_window(self.effective_canvas_bounds(), position)
     }
 
     fn request_visible_tiles(&mut self, _window: &Window) {
@@ -3873,14 +3974,15 @@ impl PdfReader {
     ) {
         self.navigation_focus.cancel();
         self.sidebar_anchor = None;
-        let raw_x = f32::from(window_position.x);
-        let raw_y = f32::from(window_position.y);
+        let local = self.window_to_canvas(window_position);
+        let raw_x = local.x;
+        let raw_y = local.y;
         if self.document.is_none() || !zoom.is_finite() || !raw_x.is_finite() || !raw_y.is_finite()
         {
             return;
         }
         let local_x = raw_x.clamp(0.0, self.viewport_width);
-        let local_y = (raw_y - self.content_top()).clamp(0.0, self.viewport_height);
+        let local_y = raw_y.clamp(0.0, self.viewport_height);
         let disposition = self
             .viewport
             .zoom_at(zoom, ViewportPoint::new(local_x, local_y));
@@ -3951,10 +4053,10 @@ impl PdfReader {
     }
 
     fn viewport_center(&self) -> Point<Pixels> {
-        point(
-            px(self.viewport_width * 0.5),
-            px(self.content_top() + self.viewport_height * 0.5),
-        )
+        self.canvas_to_window(Offset {
+            x: self.viewport_width * 0.5,
+            y: self.viewport_height * 0.5,
+        })
     }
 
     fn scroll_up(&mut self, _: &ScrollUp, window: &mut Window, cx: &mut Context<Self>) {
@@ -4111,7 +4213,7 @@ impl PdfReader {
                 }
                 selection.focus = position;
             }
-            let local_y = f32::from(event.position.y) - self.content_top();
+            let local_y = self.window_to_canvas(event.position).y;
             if local_y < 28.0 {
                 self.scroll_by(0.0, -28.0, true, window, cx);
             } else if local_y > self.viewport_height - 28.0 {
@@ -4183,8 +4285,9 @@ impl PdfReader {
 
     fn hit_test_text(&self, position: Point<Pixels>, nearest: bool) -> Option<TextPosition> {
         let layout = self.layout()?;
-        let x = self.scroll.x + f32::from(position.x);
-        let y = self.scroll.y + f32::from(position.y) - self.content_top();
+        let local = self.window_to_canvas(position);
+        let x = self.scroll.x + local.x;
+        let y = self.scroll.y + local.y;
         let page = layout.page_at_content_point(x, y).or_else(|| {
             nearest.then(|| {
                 layout
@@ -4840,6 +4943,20 @@ struct PaintSnapshot {
     active_annotation: Option<AnnotationId>,
     active_search: Option<SearchMatchId>,
     navigation_focus: Option<NavigationFocusFrame>,
+}
+
+fn window_point_to_canvas(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Offset {
+    Offset {
+        x: f32::from(position.x - bounds.origin.x),
+        y: f32::from(position.y - bounds.origin.y),
+    }
+}
+
+fn canvas_point_to_window(bounds: Bounds<Pixels>, position: Offset) -> Point<Pixels> {
+    point(
+        bounds.origin.x + px(position.x),
+        bounds.origin.y + px(position.y),
+    )
 }
 
 fn normalized_bounds_in_page(page: Rect, bounds: TextBounds) -> Rect {

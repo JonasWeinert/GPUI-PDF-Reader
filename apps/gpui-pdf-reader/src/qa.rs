@@ -42,6 +42,7 @@ struct QaConfig {
     extension_scenario: Option<String>,
     expected_window_count: Option<usize>,
     expected_tab_count: Option<usize>,
+    tab_drag_scenario: Option<String>,
     resource_trace: bool,
     resource_sample_interval: Duration,
     resource_stress: bool,
@@ -95,6 +96,7 @@ impl QaConfig {
             extension_scenario: std::env::var("GPUI_PDF_READER_QA_EXTENSION_SCENARIO").ok(),
             expected_window_count: optional_value("GPUI_PDF_READER_QA_WINDOW_COUNT"),
             expected_tab_count: optional_value("GPUI_PDF_READER_QA_TAB_COUNT"),
+            tab_drag_scenario: std::env::var("GPUI_PDF_READER_QA_TAB_DRAG_SCENARIO").ok(),
             resource_trace: flag("GPUI_PDF_READER_QA_RESOURCE_TRACE"),
             resource_sample_interval: Duration::from_millis(
                 optional_value::<u64>("GPUI_PDF_READER_QA_RESOURCE_SAMPLE_MS")
@@ -133,6 +135,7 @@ impl QaConfig {
             || self.extension_scenario.is_some()
             || self.expected_window_count.is_some()
             || self.expected_tab_count.is_some()
+            || self.tab_drag_scenario.is_some()
             || self.resource_trace
             || self.resource_stress
             || self.progressive_open
@@ -358,6 +361,153 @@ pub fn install(
                         eprintln!(
                             "GPUI_PDF_READER_QA_TABS tabs={actual} switched={expected} settled={settled} windows={windows}"
                         );
+                    }
+
+                    if let Some(scenario) = config.tab_drag_scenario.as_deref() {
+                        match scenario {
+                            "reorder" => {
+                                let outcome = cx.update(|window, cx| {
+                                    let workspace = window
+                                        .root::<WorkspaceWindow>()
+                                        .flatten()
+                                        .ok_or_else(|| "tab reorder root is unavailable".to_owned())?;
+                                    let before = workspace.read(cx).qa_tab_view_ids();
+                                    if before.len() < 3 {
+                                        return Err("tab reorder requires at least three tabs".to_owned());
+                                    }
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.qa_reorder_tab(0, before.len(), cx)
+                                    });
+                                    let after = workspace.read(cx).qa_tab_view_ids();
+                                    let mut expected = before[1..].to_vec();
+                                    expected.push(before[0]);
+                                    if after != expected {
+                                        return Err(format!(
+                                            "tab reorder mismatch: before={before:?} after={after:?}"
+                                        ));
+                                    }
+                                    Ok(after.len())
+                                });
+                                match outcome {
+                                    Ok(Ok(tabs)) => eprintln!(
+                                        "GPUI_PDF_READER_QA_TAB_DRAG scenario=reorder tabs={tabs}"
+                                    ),
+                                    Ok(Err(message)) => {
+                                        fail_and_quit(cx, &message);
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        fail_and_quit(cx, &format!("tab reorder failed: {error}"));
+                                        return;
+                                    }
+                                }
+                            }
+                            "transfer" => {
+                                let current_window = cx
+                                    .update(|window, cx| {
+                                        window
+                                            .root::<WorkspaceWindow>()
+                                            .flatten()
+                                            .map(|workspace| workspace.read(cx).qa_window_and_view().0)
+                                    })
+                                    .ok()
+                                    .flatten();
+                                let handles = cx
+                                    .update(|_, cx| {
+                                        cx.windows()
+                                            .into_iter()
+                                            .filter_map(|handle| {
+                                                handle.downcast::<WorkspaceWindow>()
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                if handles.len() != 2 {
+                                    fail_and_quit(
+                                        cx,
+                                        &format!(
+                                            "tab transfer requires two windows, found {}",
+                                            handles.len()
+                                        ),
+                                    );
+                                    return;
+                                }
+                                let Some(current_window) = current_window else {
+                                    fail_and_quit(cx, "tab transfer current window is unavailable");
+                                    return;
+                                };
+                                let target = handles.iter().copied().find(|handle| {
+                                    handle
+                                        .update(cx, |workspace, _, _| workspace.qa_window_and_view().0)
+                                        .is_ok_and(|window| window == current_window)
+                                });
+                                let source = handles.iter().copied().find(|handle| {
+                                    handle
+                                        .update(cx, |workspace, _, _| workspace.qa_window_and_view().0)
+                                        .is_ok_and(|window| window != current_window)
+                                });
+                                let (Some(source), Some(target)) = (source, target) else {
+                                    fail_and_quit(cx, "tab transfer could not distinguish source and target windows");
+                                    return;
+                                };
+                                let source_identity = source.update(cx, |workspace, _, _| {
+                                    workspace.qa_window_and_view()
+                                });
+                                let Ok((source_window, source_view)) = source_identity else {
+                                    fail_and_quit(cx, "tab transfer source disappeared");
+                                    return;
+                                };
+                                if target
+                                    .update(cx, |workspace, window, cx| {
+                                        let insertion = workspace.qa_tab_count();
+                                        workspace.qa_transfer_tab_from(
+                                            source_window,
+                                            source_view,
+                                            insertion,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .is_err()
+                                {
+                                    fail_and_quit(cx, "tab transfer target disappeared");
+                                    return;
+                                }
+                                let deadline = Instant::now() + config.timeout;
+                                loop {
+                                    let state = target.update(cx, |workspace, _, cx| {
+                                        let tabs = workspace.qa_tab_count();
+                                        let settled = workspace
+                                            .reader()
+                                            .is_some_and(|reader| {
+                                                reader.read(cx).qa_viewport_is_settled()
+                                            });
+                                        (tabs, settled)
+                                    });
+                                    let windows = cx.update(|_, cx| cx.windows().len()).unwrap_or(0);
+                                    if matches!(state, Ok((2, true))) && windows == 1 {
+                                        eprintln!(
+                                            "GPUI_PDF_READER_QA_TAB_DRAG scenario=transfer tabs=2 windows=1 settled=1"
+                                        );
+                                        break;
+                                    }
+                                    if Instant::now() >= deadline {
+                                        fail_and_quit(
+                                            cx,
+                                            &format!(
+                                                "tab transfer did not settle: state={state:?} windows={windows}"
+                                            ),
+                                        );
+                                        return;
+                                    }
+                                    cx.background_executor().timer(POLL_INTERVAL).await;
+                                }
+                            }
+                            other => {
+                                fail_and_quit(cx, &format!("unknown tab drag scenario: {other}"));
+                                return;
+                            }
+                        }
                     }
 
                     if config.resource_stress {
@@ -1193,6 +1343,7 @@ mod tests {
             extension_scenario: None,
             expected_window_count: None,
             expected_tab_count: None,
+            tab_drag_scenario: None,
             resource_trace: false,
             resource_sample_interval: Duration::from_millis(DEFAULT_RESOURCE_SAMPLE_MS),
             resource_stress: false,

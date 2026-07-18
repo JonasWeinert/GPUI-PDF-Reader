@@ -486,6 +486,7 @@ fn accept_supervisor_event(
                 .send(WorkerEvent::Opened {
                     generation,
                     path,
+                    title: descriptor.title().map(str::to_owned),
                     pages: descriptor.pages().to_vec(),
                     toc: descriptor.table_of_contents().to_vec(),
                     links: descriptor.links().to_vec(),

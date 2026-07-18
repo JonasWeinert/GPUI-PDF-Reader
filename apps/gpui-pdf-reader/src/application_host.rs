@@ -481,6 +481,57 @@ pub(crate) fn remove_workspace_view(
     apply_resource_targets(targets, cx);
 }
 
+pub(crate) fn workspace_window_handle(
+    host: &Entity<ApplicationHost>,
+    window: WindowId,
+    cx: &App,
+) -> Option<WindowHandle<WorkspaceWindow>> {
+    host.read(cx)
+        .windows
+        .get(&window)
+        .and_then(|record| record.handle.downcast::<WorkspaceWindow>())
+}
+
+pub(crate) fn transfer_workspace_view_registration(
+    host: Entity<ApplicationHost>,
+    source: WindowId,
+    target: WindowId,
+    view: &WorkspaceViewDescriptor,
+    cx: &mut App,
+) {
+    if source == target {
+        return;
+    }
+    host.update(cx, |host, _| {
+        let item = host
+            .windows
+            .get_mut(&source)
+            .and_then(|record| record.views.remove(&view.id))
+            .flatten();
+        if let Some(source_record) = host.windows.get_mut(&source)
+            && source_record.descriptor.active_view == Some(view.id)
+        {
+            source_record.descriptor.active_view = None;
+        }
+        if let Some(target_record) = host.windows.get_mut(&target) {
+            target_record.views.insert(view.id, item);
+            target_record.descriptor.active_view = Some(view.id);
+            target_record.descriptor.title = view.title.clone();
+        }
+        for (window, candidate) in host.paths.values_mut() {
+            if *candidate == view.id {
+                *window = target;
+            }
+        }
+        if host
+            .settings_view
+            .is_some_and(|(_, candidate)| candidate == view.id)
+        {
+            host.settings_view = Some((target, view.id));
+        }
+    });
+}
+
 pub(crate) fn idle_workspace_view(host: Entity<ApplicationHost>, view: ViewId, cx: &mut App) {
     let targets = host.update(cx, |host, _| {
         if host.active_view == Some(view) {

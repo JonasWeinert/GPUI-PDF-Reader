@@ -7,6 +7,16 @@ use crate::annotations::{AnnotationStore, DocumentKey, JsonSidecarStore};
 use gpui_component::{ThemeColor, ThemeMode};
 
 #[test]
+fn pdf_pointer_mapping_uses_the_measured_canvas_origin() {
+    let bounds = Bounds::new(point(px(120.0), px(104.0)), size(px(900.0), px(700.0)));
+    let window_position = point(px(386.0), px(412.0));
+
+    let local = window_point_to_canvas(bounds, window_position);
+    assert_eq!(local, Offset { x: 266.0, y: 308.0 });
+    assert_eq!(canvas_point_to_window(bounds, local), window_position);
+}
+
+#[test]
 fn resource_cache_limits_scale_and_suspend_without_hidden_minimums() {
     assert_eq!(
         resource_cache_limits(ActivityLevel::Suspended, ResourceAmount::default()),

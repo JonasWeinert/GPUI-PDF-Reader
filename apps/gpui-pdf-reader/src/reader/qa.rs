@@ -406,10 +406,10 @@ impl PdfReader {
         };
         if let Some(page_rect) = self.layout().and_then(|layout| layout.page_rect(page)) {
             let bounds = normalized_bounds_in_page(page_rect, bounds);
-            self.set_link_card_pointer_immediate(point(
-                px(bounds.x + bounds.width * 0.5 - self.scroll.x),
-                px(bounds.y + bounds.height * 0.5 - self.scroll.y + self.content_top()),
-            ));
+            self.set_link_card_pointer_immediate(self.canvas_to_window(Offset {
+                x: bounds.x + bounds.width * 0.5 - self.scroll.x,
+                y: bounds.y + bounds.height * 0.5 - self.scroll.y,
+            }));
         }
         self.hovered_link = Some(id);
         self.show_link_preview(id, window, cx);
@@ -469,10 +469,10 @@ impl PdfReader {
         }) && let Some(page_rect) = self.layout().and_then(|layout| layout.page_rect(page))
         {
             let bounds = normalized_bounds_in_page(page_rect, bounds);
-            self.set_link_card_pointer_immediate(point(
-                px(bounds.x + bounds.width * 0.5 - self.scroll.x),
-                px(bounds.y + bounds.height * 0.5 - self.scroll.y + self.content_top()),
-            ));
+            self.set_link_card_pointer_immediate(self.canvas_to_window(Offset {
+                x: bounds.x + bounds.width * 0.5 - self.scroll.x,
+                y: bounds.y + bounds.height * 0.5 - self.scroll.y,
+            }));
         }
         self.hovered_reference = Some(ordinal);
         self.show_reference_preview(ordinal, window, cx);
@@ -1486,13 +1486,10 @@ impl PdfReader {
                     .and_then(|text| text.get(start.index))
                     .and_then(|character| character.bounds)
                     .ok_or_else(|| "Classic hit-test character has no bounds".to_owned())?;
-                let pointer = point(
-                    px(page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x),
-                    px(self.content_top()
-                        + page.y
-                        + (bounds.top + bounds.bottom) * page.height * 0.5
-                        - self.scroll.y),
-                );
+                let pointer = self.canvas_to_window(Offset {
+                    x: page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x,
+                    y: page.y + (bounds.top + bounds.bottom) * page.height * 0.5 - self.scroll.y,
+                });
                 self.active_annotation = None;
                 self.on_mouse_down(
                     &MouseDownEvent {
@@ -1545,7 +1542,7 @@ impl PdfReader {
                     // Middle-button panning used to cancel the same frame
                     // chain through a separate input branch. Press/release is
                     // enough to prove the slide remains scheduled.
-                    let pointer = point(px(100.0), px(self.content_top() + 100.0));
+                    let pointer = self.canvas_to_window(Offset { x: 100.0, y: 100.0 });
                     self.on_mouse_down(
                         &MouseDownEvent {
                             button: MouseButton::Middle,
@@ -1804,13 +1801,10 @@ impl PdfReader {
                     .and_then(|text| text.get(start.index))
                     .and_then(|character| character.bounds)
                     .ok_or_else(|| "Fluid hit-test character has no bounds".to_owned())?;
-                let pointer = point(
-                    px(page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x),
-                    px(self.content_top()
-                        + page.y
-                        + (bounds.top + bounds.bottom) * page.height * 0.5
-                        - self.scroll.y),
-                );
+                let pointer = self.canvas_to_window(Offset {
+                    x: page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x,
+                    y: page.y + (bounds.top + bounds.bottom) * page.height * 0.5 - self.scroll.y,
+                });
                 self.active_annotation = None;
                 self.on_mouse_down(
                     &MouseDownEvent {

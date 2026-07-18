@@ -72,6 +72,7 @@ pub enum WorkerEvent {
     Opened {
         generation: u64,
         path: PathBuf,
+        title: Option<String>,
         pages: Vec<PageSize>,
         toc: Vec<TocEntry>,
         links: Vec<DocumentLink>,

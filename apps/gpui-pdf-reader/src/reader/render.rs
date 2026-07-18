@@ -184,33 +184,33 @@ impl PaintPageOverlayState {
             && !self.selection_budget.exhausted()
             && let Some(range) = selection.indices_on_page(page.page_index, chars.len())
         {
-            // Dense text pages are indexed once on the worker. Paint only
-            // selected glyphs that intersect this frame's viewport, and clip
-            // malformed PDF geometry to the physical page.
+            // Query only visible selected glyphs, then coalesce each visual
+            // line into one rectangle. This bridges spaces without PDFium
+            // bounds and avoids the fragmented word-by-word selection look.
+            let selection_runs = chars.visible_selection_runs(
+                rect,
+                content_viewport,
+                range,
+                MAX_VISIBLE_SELECTION_QUADS,
+            );
             window.with_content_mask(
                 Some(ContentMask {
                     bounds: page_bounds,
                 }),
                 |window| {
-                    chars.for_each_visible_in_range_while(
-                        rect,
-                        content_viewport,
-                        range,
-                        |_, highlight| {
-                            if !self.selection_budget.take() {
-                                return false;
-                            }
-                            window.paint_quad(quad(
-                                content_rect_to_bounds(bounds, highlight, scroll),
-                                px(1.0),
-                                palette.selection,
-                                px(0.0),
-                                gpui::transparent_black(),
-                                Default::default(),
-                            ));
-                            !self.selection_budget.exhausted()
-                        },
-                    );
+                    for highlight in selection_runs {
+                        if !self.selection_budget.take() {
+                            break;
+                        }
+                        window.paint_quad(quad(
+                            content_rect_to_bounds(bounds, highlight, scroll),
+                            px(1.0),
+                            palette.selection,
+                            px(0.0),
+                            gpui::transparent_black(),
+                            Default::default(),
+                        ));
+                    }
                 },
             );
         }
@@ -226,7 +226,10 @@ impl PaintPageOverlayState {
 }
 
 impl PdfReader {
-    fn document_canvas(mut snapshot: PaintSnapshot) -> impl IntoElement {
+    fn document_canvas(
+        mut snapshot: PaintSnapshot,
+        canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    ) -> impl IntoElement {
         snapshot.canvas.pages.sort_by_key(|page| {
             let has_active_annotation = page
                 .overlay
@@ -254,6 +257,7 @@ impl PdfReader {
             navigation_focus,
         );
         pdf_canvas(canvas, move |page, window| {
+            canvas_bounds.set(Some(page.canvas_bounds));
             overlay_state.paint_page(page, window);
         })
         .size_full()
@@ -613,7 +617,7 @@ impl Render for PdfReader {
                 .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
-                .child(Self::document_canvas(snapshot))
+                .child(Self::document_canvas(snapshot, self.canvas_bounds.clone()))
                 .children(toc_navigation)
                 .into_any_element()
         } else {

@@ -1,11 +1,13 @@
 use gpui::{
-    AnyElement, App, ClickEvent, FontWeight, IntoElement, RenderOnce, ScrollHandle, SharedString,
-    Window, WindowControlArea, div, linear_color_stop, linear_gradient, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, ClickEvent, Context, FontWeight, IntoElement, Pixels,
+    Point, Render, RenderOnce, ScrollHandle, SharedString, Window, WindowControlArea, div,
+    ease_in_out, linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::{Icon, IconName};
 use std::rc::Rc;
+use std::time::Duration;
 
-use crate::ThemeTokens;
+use crate::{HoverCardShell, ThemeTokens};
 
 pub const TAB_BAR_HEIGHT: f32 = 52.0;
 pub const TAB_HOVER_CARD_WIDTH: f32 = 282.0;
@@ -38,11 +40,14 @@ pub fn tab_hover_card_x(
 pub type TabIndexAction = Rc<dyn Fn(usize, &ClickEvent, &mut Window, &mut App)>;
 pub type TabBarAction = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 pub type TabHoverAction = Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>;
+pub type TabDropAction = Rc<dyn Fn(&TabDragPayload, usize, &mut Window, &mut App)>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TabPresentation {
     pub title: SharedString,
     pub detail: SharedString,
+    pub drag: Option<TabDragPayload>,
+    pub recently_moved: bool,
 }
 
 impl TabPresentation {
@@ -51,6 +56,38 @@ impl TabPresentation {
         Self {
             title: title.into(),
             detail: detail.into(),
+            drag: None,
+            recently_moved: false,
+        }
+    }
+
+    #[must_use]
+    pub fn draggable(mut self, payload: TabDragPayload) -> Self {
+        self.drag = Some(payload);
+        self
+    }
+
+    #[must_use]
+    pub fn recently_moved(mut self, recently_moved: bool) -> Self {
+        self.recently_moved = recently_moved;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TabDragPayload {
+    pub source_window: u64,
+    pub view: u64,
+    pub title: SharedString,
+}
+
+impl TabDragPayload {
+    #[must_use]
+    pub fn new(source_window: u64, view: u64, title: impl Into<SharedString>) -> Self {
+        Self {
+            source_window,
+            view,
+            title: title.into(),
         }
     }
 }
@@ -72,6 +109,7 @@ pub struct TabStrip {
     on_sidebar: TabBarAction,
     on_search: TabBarAction,
     on_new: TabBarAction,
+    on_drop: Option<TabDropAction>,
 }
 
 impl TabStrip {
@@ -99,6 +137,7 @@ impl TabStrip {
             on_sidebar,
             on_search,
             on_new,
+            on_drop: None,
         }
     }
 
@@ -107,18 +146,34 @@ impl TabStrip {
         self.on_close = Some(action);
         self
     }
+
+    #[must_use]
+    pub fn on_drop(mut self, action: TabDropAction) -> Self {
+        self.on_drop = Some(action);
+        self
+    }
 }
 
 impl RenderOnce for TabStrip {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let tokens = self.tokens;
         let fade_width = px(42.0);
         let tab_count = self.tabs.len();
+        let available_tab_width =
+            (f32::from(window.viewport_size().width) - TAB_BAR_LEADING_INSET - 96.0 - 52.0)
+                .max(148.0);
+        let tabs_overflow = tab_count as f32 * 148.0 + 8.0 > available_tab_width;
+        let preferred_tab_width = (tab_count as f32 * 260.0 + 8.0).min(available_tab_width);
+        let drop_at_end = self.on_drop.clone();
         let tabs = self.tabs.into_iter().enumerate().map(|(index, tab)| {
             let active = index == self.active;
+            let show_separator = !active && index + 1 < tab_count && index + 1 != self.active;
             let activate = self.on_activate.clone();
             let hover = self.on_hover.clone();
             let close = self.on_close.clone();
+            let drop = self.on_drop.clone();
+            let drag = tab.drag.clone();
+            let recently_moved = tab.recently_moved;
             div()
                 .id(("workspace-tab", index))
                 .relative()
@@ -138,12 +193,12 @@ impl RenderOnce for TabStrip {
                 .border_color(if active {
                     tokens.surface.border.opacity(0.72)
                 } else {
-                    tokens.surface.border.opacity(0.42)
+                    tokens.surface.muted
                 })
                 .bg(if active {
                     tokens.surface.background
                 } else {
-                    tokens.surface.overlay
+                    tokens.surface.muted
                 })
                 .text_color(if active {
                     tokens.content.primary
@@ -200,7 +255,7 @@ impl RenderOnce for TabStrip {
                             .child(Icon::new(IconName::Close).size(px(13.0))),
                     )
                 })
-                .when(!active, |tab| {
+                .when(show_separator, |tab| {
                     tab.child(
                         div()
                             .absolute()
@@ -210,6 +265,39 @@ impl RenderOnce for TabStrip {
                             .w(px(1.0))
                             .bg(tokens.surface.border.opacity(0.5)),
                     )
+                })
+                .when(recently_moved, |tab| {
+                    tab.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .rounded_t_xl()
+                            .bg(tokens.action.accent_soft)
+                            .with_animation(
+                                "recently-moved-tab",
+                                Animation::new(Duration::from_millis(260)).with_easing(ease_in_out),
+                                |pulse, delta| pulse.opacity(1.0 - delta),
+                            ),
+                    )
+                })
+                .when_some(drag, |tab, drag| {
+                    let preview_tokens = tokens;
+                    tab.cursor_move()
+                        .on_drag(drag, move |drag, position, _, cx| {
+                            cx.new(|_| TabDragPreview {
+                                tokens: preview_tokens,
+                                title: drag.title.clone(),
+                                position,
+                            })
+                        })
+                })
+                .when_some(drop, |tab, drop| {
+                    tab.drag_over::<TabDragPayload>(move |style, _, _, _| {
+                        style.border_l_2().border_color(tokens.action.accent)
+                    })
+                    .on_drop(move |drag: &TabDragPayload, window, cx| {
+                        drop(drag, index, window, cx);
+                    })
                 })
         });
 
@@ -262,7 +350,10 @@ impl RenderOnce for TabStrip {
                     .relative()
                     .h_full()
                     .min_w_0()
-                    .flex_1()
+                    .when(tabs_overflow, |rail| rail.flex_1())
+                    .when(!tabs_overflow, |rail| {
+                        rail.w(px(preferred_tab_width)).flex_none()
+                    })
                     .overflow_hidden()
                     .bg(tokens.surface.muted)
                     .child(
@@ -273,9 +364,27 @@ impl RenderOnce for TabStrip {
                             .flex()
                             .overflow_x_scroll()
                             .track_scroll(&self.scroll)
-                            .children(tabs),
+                            .children(tabs)
+                            .child(
+                                div()
+                                    .id("workspace-tab-drop-end")
+                                    .h_full()
+                                    .w(px(8.0))
+                                    .flex_none()
+                                    .when_some(drop_at_end, |target, drop| {
+                                        target
+                                            .drag_over::<TabDragPayload>(move |style, _, _, _| {
+                                                style
+                                                    .border_l_2()
+                                                    .border_color(tokens.action.accent)
+                                            })
+                                            .on_drop(move |drag: &TabDragPayload, window, cx| {
+                                                drop(drag, tab_count, window, cx);
+                                            })
+                                    }),
+                            ),
                     )
-                    .when(tab_count > 1, |strip| {
+                    .when(tabs_overflow, |strip| {
                         strip
                             .child(
                                 div()
@@ -319,6 +428,52 @@ impl RenderOnce for TabStrip {
                         new_tab,
                     )),
             )
+            .when(!tabs_overflow, |bar| bar.child(div().h_full().flex_1()))
+    }
+}
+
+struct TabDragPreview {
+    tokens: ThemeTokens,
+    title: SharedString,
+    position: Point<Pixels>,
+}
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .pl(self.position.x - px(110.0))
+            .pt(self.position.y - px(20.0))
+            .child(
+                div()
+                    .w(px(220.0))
+                    .h(px(40.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .overflow_hidden()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(self.tokens.surface.border)
+                    .shadow_lg()
+                    .bg(self.tokens.surface.background)
+                    .text_color(self.tokens.content.primary)
+                    .child(
+                        Icon::new(IconName::File)
+                            .size(px(14.0))
+                            .text_color(self.tokens.action.accent),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(self.title.clone()),
+                    ),
+            )
     }
 }
 
@@ -327,119 +482,125 @@ impl RenderOnce for TabStrip {
 pub struct TabHoverCard {
     tokens: ThemeTokens,
     title: SharedString,
-    detail: SharedString,
-    status: Option<SharedString>,
+    leading: Option<AnyElement>,
+    subtitle: Option<SharedString>,
+    body: Option<AnyElement>,
+    footer: Option<AnyElement>,
 }
 
 impl TabHoverCard {
     #[must_use]
-    pub fn new(
-        tokens: ThemeTokens,
-        title: impl Into<SharedString>,
-        detail: impl Into<SharedString>,
-    ) -> Self {
+    pub fn new(tokens: ThemeTokens, title: impl Into<SharedString>) -> Self {
         Self {
             tokens,
             title: title.into(),
-            detail: detail.into(),
-            status: None,
+            leading: None,
+            subtitle: None,
+            body: None,
+            footer: None,
         }
     }
 
     #[must_use]
-    pub fn status(mut self, status: impl Into<SharedString>) -> Self {
-        self.status = Some(status.into());
+    pub fn leading(mut self, leading: impl IntoElement) -> Self {
+        self.leading = Some(leading.into_any_element());
+        self
+    }
+
+    #[must_use]
+    pub fn subtitle(mut self, subtitle: impl Into<SharedString>) -> Self {
+        self.subtitle = Some(subtitle.into());
+        self
+    }
+
+    #[must_use]
+    pub fn body(mut self, body: impl IntoElement) -> Self {
+        self.body = Some(body.into_any_element());
+        self
+    }
+
+    #[must_use]
+    pub fn footer(mut self, footer: impl IntoElement) -> Self {
+        self.footer = Some(footer.into_any_element());
         self
     }
 }
 
 impl RenderOnce for TabHoverCard {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        div()
-            .occlude()
-            .w(px(TAB_HOVER_CARD_WIDTH))
-            .overflow_hidden()
-            .rounded_xl()
-            .border_1()
-            .border_color(self.tokens.content.primary.opacity(0.12))
-            .shadow_lg()
-            .bg(self.tokens.surface.background)
-            .text_color(self.tokens.content.primary)
+        let title_character_count = self.title.chars().count();
+        let title_distance = ((title_character_count.saturating_sub(31)) as f32 * 7.2).max(0.0);
+        let title: AnyElement = if title_distance > 0.0 {
+            div()
+                .absolute()
+                .left_0()
+                .whitespace_nowrap()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(self.title)
+                .with_animation(
+                    "tab-hover-title-marquee",
+                    Animation::new(Duration::from_secs_f32(
+                        (title_distance / 22.0).max(4.5) * 2.0,
+                    ))
+                    .repeat()
+                    .with_easing(ease_in_out),
+                    move |title, delta| {
+                        let travel = if delta <= 0.5 {
+                            delta * 2.0
+                        } else {
+                            (1.0 - delta) * 2.0
+                        };
+                        title.ml(px(-title_distance * travel))
+                    },
+                )
+                .into_any_element()
+        } else {
+            div()
+                .absolute()
+                .left_0()
+                .whitespace_nowrap()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(self.title)
+                .into_any_element()
+        };
+        let header = div()
+            .p_3()
             .flex()
-            .flex_col()
+            .items_center()
+            .gap_3()
+            .children(self.leading)
             .child(
                 div()
-                    .p_3()
+                    .min_w_0()
+                    .flex_1()
                     .flex()
-                    .items_center()
-                    .gap_3()
+                    .flex_col()
+                    .gap_1()
                     .child(
                         div()
-                            .size(px(32.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_lg()
-                            .bg(self.tokens.action.accent_soft)
-                            .text_color(self.tokens.action.accent)
-                            .child(Icon::new(IconName::File).size(px(15.0))),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(self.title),
-                            )
-                            .when_some(self.status, |content, status| {
-                                content.child(
-                                    div()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .text_xs()
-                                        .text_color(self.tokens.content.secondary)
-                                        .child(status),
-                                )
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .h(px(1.0))
-                    .mx_3()
-                    .bg(self.tokens.surface.border.opacity(0.7)),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(self.tokens.content.tertiary)
-                    .child(Icon::new(IconName::Folder).size(px(13.0)))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
+                            .relative()
+                            .h(px(18.0))
                             .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(self.detail),
-                    ),
-            )
+                            .text_sm()
+                            .child(title),
+                    )
+                    .when_some(self.subtitle, |content, subtitle| {
+                        content.child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_xs()
+                                .text_color(self.tokens.content.secondary)
+                                .child(subtitle),
+                        )
+                    }),
+            );
+
+        HoverCardShell::new(self.tokens, px(TAB_HOVER_CARD_WIDTH))
+            .section(header)
+            .when_some(self.body, |card, body| card.section(body))
+            .when_some(self.footer, |card, footer| card.section(footer))
     }
 }
 

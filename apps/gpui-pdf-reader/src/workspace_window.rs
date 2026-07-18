@@ -3,6 +3,7 @@
 use crate::application_host::{
     ApplicationHost, activate_workspace_view, idle_workspace_view, open_pdf_from_window,
     open_settings_window, remove_workspace_view, select_workspace_tab, set_resource_mode,
+    transfer_workspace_view_registration, workspace_window_handle,
 };
 use crate::reader::PdfReader;
 use crate::text_field::{TextField, TextFieldEvent};
@@ -13,9 +14,9 @@ use gpui::{
 };
 use gpui_component::{Icon, IconName, Theme};
 use key_ui_gpui::{
-    TAB_BAR_HEIGHT, TAB_HOVER_CARD_WIDTH, TabBarAction, TabHoverCard, TabIndexAction,
-    TabPresentation, TabSearchPopover, TabStrip, ThemeTokens, tab_hover_card_x,
-    tab_search_popover_x,
+    TAB_BAR_HEIGHT, TAB_HOVER_CARD_WIDTH, TabBarAction, TabDragPayload, TabDropAction,
+    TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover, TabStrip, ThemeTokens,
+    tab_hover_card_x, tab_search_popover_x,
 };
 use key_workspace_core::{
     DockPanel, ItemKind, ResourceAllocation, ResourceMode, ViewId, WorkspaceItemDescriptor,
@@ -23,6 +24,7 @@ use key_workspace_core::{
 };
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 enum WorkspaceContent {
     Pdf(Entity<PdfReader>),
@@ -51,6 +53,82 @@ impl WorkspaceTab {
             WorkspaceContent::Settings => "Application settings".into(),
         }
     }
+
+    fn hover_title(&self, cx: &App) -> SharedString {
+        match &self.content {
+            WorkspaceContent::Pdf(reader) => reader
+                .read(cx)
+                .tab_hover_detail()
+                .title
+                .filter(|title| !title.trim().is_empty())
+                .map_or_else(|| self.view.title.clone().into(), Into::into),
+            WorkspaceContent::Settings => self.view.title.clone().into(),
+        }
+    }
+
+    fn hover_status(&self, cx: &App) -> SharedString {
+        match &self.content {
+            WorkspaceContent::Pdf(reader) => {
+                let detail = reader.read(cx).tab_hover_detail();
+                if detail.page_count == 0 {
+                    return detail.status;
+                }
+                let page = format!("p {}/{}", detail.current_page, detail.page_count);
+                detail.section.map_or_else(
+                    || page.clone().into(),
+                    |section| format!("{}, {page}", end_truncate(&section, 34)).into(),
+                )
+            }
+            WorkspaceContent::Settings => "Application settings".into(),
+        }
+    }
+
+    fn hover_source_detail(&self) -> SharedString {
+        start_truncate(self.source_detail().as_ref(), 34).into()
+    }
+
+    fn hover_card(&self, tokens: ThemeTokens, cx: &App) -> TabHoverCard {
+        let icon = match &self.content {
+            WorkspaceContent::Pdf(_) => IconName::File,
+            WorkspaceContent::Settings => IconName::Settings,
+        };
+        let card = TabHoverCard::new(tokens, self.hover_title(cx)).leading(
+            div()
+                .size(px(32.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .bg(tokens.action.accent_soft)
+                .text_color(tokens.action.accent)
+                .child(Icon::new(icon).size(px(15.0))),
+        );
+
+        match &self.content {
+            WorkspaceContent::Pdf(_) => card.subtitle(self.hover_status(cx)).footer(
+                div()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(tokens.content.tertiary)
+                    .child(Icon::new(IconName::Folder).size(px(13.0)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(self.hover_source_detail()),
+                    ),
+            ),
+            WorkspaceContent::Settings => card.subtitle("Application settings"),
+        }
+    }
 }
 
 /// Window-scoped chrome and placement owner. Document views own their local
@@ -67,6 +145,7 @@ pub(crate) struct WorkspaceWindow {
     tab_search_field: Entity<TextField>,
     focus_handle: FocusHandle,
     warning: Option<SharedString>,
+    recently_moved_tab: Option<ViewId>,
 }
 
 impl WorkspaceWindow {
@@ -131,6 +210,7 @@ impl WorkspaceWindow {
                 tab_search_field,
                 focus_handle,
                 warning: None,
+                recently_moved_tab: None,
             }
         });
         Self::observe_activation(&entity, window, cx);
@@ -196,6 +276,7 @@ impl WorkspaceWindow {
                 tab_search_field,
                 focus_handle,
                 warning: None,
+                recently_moved_tab: None,
             }
         });
         Self::observe_activation(&entity, window, cx);
@@ -286,6 +367,16 @@ impl WorkspaceWindow {
     }
 
     #[cfg(debug_assertions)]
+    pub(crate) fn qa_window_and_view(&self) -> (key_workspace_core::WindowId, ViewId) {
+        (self.descriptor.id, self.active_view().id)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn qa_tab_view_ids(&self) -> Vec<ViewId> {
+        self.tabs.iter().map(|tab| tab.view.id).collect()
+    }
+
+    #[cfg(debug_assertions)]
     pub(crate) fn qa_activate_tab(
         &mut self,
         index: usize,
@@ -293,6 +384,35 @@ impl WorkspaceWindow {
         cx: &mut Context<Self>,
     ) {
         self.activate_tab_index(index, window, cx);
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn qa_reorder_tab(
+        &mut self,
+        source: usize,
+        insertion: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self.tabs.get(source).map(|tab| tab.view.id) {
+            self.reorder_tab(view, insertion, cx);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn qa_transfer_tab_from(
+        &mut self,
+        source: key_workspace_core::WindowId,
+        view: ViewId,
+        insertion: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_tab_drop(
+            &TabDragPayload::new(source.get(), view.get(), "QA transfer"),
+            insertion,
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn open_pdf(
@@ -444,6 +564,150 @@ impl WorkspaceWindow {
         self.finish_tab_activation(window, cx);
     }
 
+    fn handle_tab_drop(
+        &mut self,
+        drag: &TabDragPayload,
+        insertion: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source_window = key_workspace_core::WindowId::from_raw(drag.source_window);
+        let view = ViewId::from_raw(drag.view);
+        if source_window == self.descriptor.id {
+            self.reorder_tab(view, insertion, cx);
+            return;
+        }
+        let Some(source_handle) = workspace_window_handle(&self.host, source_window, cx) else {
+            self.warning = Some("The source window is no longer available".into());
+            cx.notify();
+            return;
+        };
+        let transferred = source_handle
+            .update(cx, |source, source_window, cx| {
+                source.take_tab_for_transfer(view, source_window, cx)
+            })
+            .ok()
+            .flatten();
+        let Some((mut tab, source_became_empty)) = transferred else {
+            self.warning = Some("This tab could not be moved".into());
+            cx.notify();
+            return;
+        };
+        transfer_workspace_view_registration(
+            self.host.clone(),
+            source_window,
+            self.descriptor.id,
+            &tab.view,
+            cx,
+        );
+        self.rebuild_transferred_content(&mut tab, window, cx);
+        let insertion = insertion.min(self.tabs.len());
+        let view = tab.view.id;
+        self.tabs.insert(insertion, tab);
+        self.active_tab = insertion;
+        self.mark_tab_moved(view, cx);
+        self.tab_scroll.scroll_to_item(insertion);
+        self.finish_tab_activation(window, cx);
+        if source_became_empty {
+            source_handle
+                .update(cx, |_, source_window, _| source_window.remove_window())
+                .ok();
+        }
+    }
+
+    fn reorder_tab(&mut self, view: ViewId, insertion: usize, cx: &mut Context<Self>) {
+        let Some(source) = self.tabs.iter().position(|tab| tab.view.id == view) else {
+            return;
+        };
+        let destination = reorder_destination(self.tabs.len(), source, insertion);
+        if source == destination {
+            return;
+        }
+        let active_view = self.active_view().id;
+        let tab = self.tabs.remove(source);
+        self.tabs.insert(destination, tab);
+        self.active_tab = self
+            .tabs
+            .iter()
+            .position(|tab| tab.view.id == active_view)
+            .expect("the active tab remains present after reordering");
+        self.mark_tab_moved(view, cx);
+        self.tab_scroll.scroll_to_item(destination);
+        self.hovered_tab = None;
+        cx.notify();
+    }
+
+    fn mark_tab_moved(&mut self, view: ViewId, cx: &mut Context<Self>) {
+        self.recently_moved_tab = Some(view);
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(280))
+                .await;
+            weak.update(cx, |workspace, cx| {
+                if workspace.recently_moved_tab == Some(view) {
+                    workspace.recently_moved_tab = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn take_tab_for_transfer(
+        &mut self,
+        view: ViewId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(WorkspaceTab, bool)> {
+        let index = self.tabs.iter().position(|tab| tab.view.id == view)?;
+        if let WorkspaceContent::Pdf(reader) = &self.tabs[index].content
+            && reader.read(cx).tab_close_requires_confirmation()
+        {
+            self.warning =
+                Some("Finish or discard the open comment draft before moving this tab.".into());
+            cx.notify();
+            return None;
+        }
+        let previous_count = self.tabs.len();
+        let removed = self.tabs.remove(index);
+        self.hovered_tab = None;
+        let became_empty = self.tabs.is_empty();
+        if !became_empty {
+            self.active_tab = active_index_after_close(previous_count, self.active_tab, index)
+                .expect("moving one of several tabs leaves an active tab");
+            self.finish_tab_activation(window, cx);
+        }
+        Some((removed, became_empty))
+    }
+
+    fn rebuild_transferred_content(
+        &self,
+        tab: &mut WorkspaceTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let WorkspaceContent::Pdf(source_reader) = &tab.content else {
+            return;
+        };
+        let snapshot = source_reader.read(cx).transfer_snapshot();
+        source_reader.update(cx, |reader, _| reader.prepare_tab_close());
+        let path = tab.item.as_ref().and_then(|item| match &item.source {
+            key_workspace_core::ItemSource::File(path) => Some(path.clone()),
+            _ => None,
+        });
+        let reader = PdfReader::new(
+            path,
+            self.host.clone(),
+            self.descriptor.id,
+            tab.view.id,
+            window,
+            cx,
+        );
+        reader.update(cx, |reader, _| reader.restore_after_transfer(snapshot));
+        tab.content = WorkspaceContent::Pdf(reader);
+    }
+
     fn activate_first_tab_search_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.filtered_tab_indices().into_iter().next() {
             self.activate_tab_index(index, window, cx);
@@ -503,7 +767,15 @@ impl WorkspaceWindow {
         let tabs = self
             .tabs
             .iter()
-            .map(|tab| TabPresentation::new(tab.view.title.clone(), tab.state_detail(cx)))
+            .map(|tab| {
+                TabPresentation::new(tab.view.title.clone(), tab.state_detail(cx))
+                    .draggable(TabDragPayload::new(
+                        self.descriptor.id.get(),
+                        tab.view.id.get(),
+                        tab.view.title.clone(),
+                    ))
+                    .recently_moved(self.recently_moved_tab == Some(tab.view.id))
+            })
             .collect();
         let weak = cx.weak_entity();
         let activate_weak = weak.clone();
@@ -542,6 +814,14 @@ impl WorkspaceWindow {
                 })
                 .ok();
         });
+        let drop_weak = weak.clone();
+        let drop: TabDropAction = Rc::new(move |drag, insertion, window, cx| {
+            drop_weak
+                .update(cx, |workspace, cx| {
+                    workspace.handle_tab_drop(drag, insertion, window, cx)
+                })
+                .ok();
+        });
         let new_weak = weak;
         let new_tab: TabBarAction = Rc::new(move |_, window, cx| {
             new_weak
@@ -560,6 +840,7 @@ impl WorkspaceWindow {
             new_tab,
         )
         .on_close(close)
+        .on_drop(drop)
         .into_any_element()
     }
 
@@ -683,10 +964,7 @@ impl WorkspaceWindow {
                 .absolute()
                 .top(px(TAB_BAR_HEIGHT + 8.0))
                 .left(px(x))
-                .child(
-                    TabHoverCard::new(tokens, tab.view.title.clone(), tab.source_detail())
-                        .status(tab.state_detail(cx)),
-                )
+                .child(tab.hover_card(tokens, cx))
                 .into_any_element(),
         )
     }
@@ -868,6 +1146,38 @@ fn active_index_after_close(tab_count: usize, active: usize, closed: usize) -> O
     })
 }
 
+fn reorder_destination(tab_count: usize, source: usize, insertion: usize) -> usize {
+    if tab_count == 0 || source >= tab_count {
+        return 0;
+    }
+    let insertion = insertion.min(tab_count);
+    if insertion > source {
+        insertion.saturating_sub(1).min(tab_count - 1)
+    } else {
+        insertion.min(tab_count - 1)
+    }
+}
+
+fn end_truncate(text: &str, maximum_characters: usize) -> String {
+    if text.chars().count() <= maximum_characters || maximum_characters < 2 {
+        return text.to_owned();
+    }
+    let kept = maximum_characters - 1;
+    let mut value = text.chars().take(kept).collect::<String>();
+    value.push('…');
+    value
+}
+
+fn start_truncate(text: &str, maximum_characters: usize) -> String {
+    let count = text.chars().count();
+    if count <= maximum_characters || maximum_characters < 2 {
+        return text.to_owned();
+    }
+    let kept = maximum_characters - 1;
+    let suffix = text.chars().skip(count - kept).collect::<String>();
+    format!("…{suffix}")
+}
+
 impl Focusable for WorkspaceWindow {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.active_tab().content {
@@ -937,7 +1247,10 @@ impl Render for WorkspaceWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_index_after_close, tab_matches_query};
+    use super::{
+        active_index_after_close, end_truncate, reorder_destination, start_truncate,
+        tab_matches_query,
+    };
 
     #[test]
     fn tab_search_matches_titles_and_paths_case_insensitively() {
@@ -962,5 +1275,20 @@ mod tests {
         assert_eq!(active_index_after_close(4, 3, 3), Some(2));
         assert_eq!(active_index_after_close(1, 0, 0), None);
         assert_eq!(active_index_after_close(3, 4, 0), None);
+    }
+
+    #[test]
+    fn tab_reordering_accounts_for_removal_before_insertion() {
+        assert_eq!(reorder_destination(4, 0, 4), 3);
+        assert_eq!(reorder_destination(4, 3, 0), 0);
+        assert_eq!(reorder_destination(4, 1, 2), 1);
+        assert_eq!(reorder_destination(4, 1, 3), 2);
+    }
+
+    #[test]
+    fn hover_text_truncation_preserves_the_useful_edge() {
+        assert_eq!(end_truncate("abcdefgh", 5), "abcd…");
+        assert_eq!(start_truncate("/one/two/file.pdf", 9), "…file.pdf");
+        assert_eq!(start_truncate("short", 9), "short");
     }
 }
