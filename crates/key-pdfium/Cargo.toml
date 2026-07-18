@@ -1,0 +1,15 @@
+[package]
+name = "key-pdfium"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Thread-affine PDFium adapter for the Key PDF runtime"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+key-pdf-core = { path = "../key-pdf-core" }
+key-pdf-runtime = { path = "../key-pdf-runtime" }
+pdfium-render.workspace = true
+url.workspace = true
