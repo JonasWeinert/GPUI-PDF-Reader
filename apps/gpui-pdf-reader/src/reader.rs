@@ -1029,6 +1029,13 @@ impl PdfReader {
                 ) {
                     self.record_pdf_capability_error("document snapshot", error);
                 }
+                if let Err(error) = self
+                    .extensions
+                    .begin_document_storage(path.clone(), pages.len())
+                {
+                    self.warning =
+                        Some(format!("Extension document storage is unavailable: {error}").into());
+                }
                 self.link_preview_session = match LinkPreviewSession::new() {
                     Ok(session) => Some(session),
                     Err(error) => {

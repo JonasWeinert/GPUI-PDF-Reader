@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
 };
@@ -37,6 +38,7 @@ use key_extension_host::{
 #[cfg(feature = "installable-extensions")]
 use key_extension_package::PackageSourceKind;
 use key_pdf_extension_api::{PDF_EXTENSION_API_VERSION, PdfCapability};
+use key_sidecar_store::{DocumentKey, JsonExtensionStorage, extension_document_namespace};
 
 use crate::extension_assets::ExtensionAssetStore;
 #[cfg(feature = "installable-extensions")]
@@ -63,6 +65,7 @@ const THEME_MENU: &str = "com.jonasweinert.gpuipdf.theme/view-theme-menu";
 pub struct ReaderExtensions {
     host: ExtensionHost,
     services: HostServiceRouter,
+    extension_storage: Option<Arc<JsonExtensionStorage>>,
     theme_command: CommandId,
     pdf_capabilities: Arc<PdfCapabilityBridge>,
     extension_assets: Arc<ExtensionAssetStore>,
@@ -138,7 +141,8 @@ impl ReaderExtensions {
         host.activate(&extension)?;
 
         #[cfg(feature = "installable-extensions")]
-        let (packages, registry, restoration_failures, startup_error) = if restore_installables {
+        let (packages, registry, restoration_failures, mut startup_error) = if restore_installables
+        {
             restore_installable_extensions(&mut host, &extension_assets, safe_mode)
         } else {
             match InstallableExtensionManager::new() {
@@ -151,10 +155,21 @@ impl ReaderExtensions {
                 ),
             }
         };
+        let (services, extension_storage, storage_error) = extension_services(restore_installables);
+        #[cfg(feature = "installable-extensions")]
+        if let Some(storage_error) = storage_error {
+            startup_error = Some(match startup_error {
+                Some(existing) => format!("{existing}\n{storage_error}"),
+                None => storage_error,
+            });
+        }
+        #[cfg(not(feature = "installable-extensions"))]
+        let _ = storage_error;
 
         Ok(Self {
             host,
-            services: HostServiceRouter::default(),
+            services,
+            extension_storage,
             theme_command,
             pdf_capabilities,
             extension_assets,
@@ -193,9 +208,11 @@ impl ReaderExtensions {
         };
         let mut host = ExtensionHost::new(config);
         register_pdf_capabilities(&mut host);
+        let (services, extension_storage, _) = extension_services(true);
         Self {
             host,
-            services: HostServiceRouter::default(),
+            services,
+            extension_storage,
             theme_command: theme_command_id(),
             pdf_capabilities: Arc::new(PdfCapabilityBridge::default()),
             extension_assets,
@@ -235,6 +252,20 @@ impl ReaderExtensions {
             .retain(|(kind, _)| !DOCUMENT_SNAPSHOTS.contains(kind));
         self.host.invalidate_document_scope(DOCUMENT_SNAPSHOTS);
         self.services.cancel_all();
+        if let Some(storage) = &self.extension_storage {
+            let _ = storage.select_document(None);
+        }
+    }
+
+    pub fn begin_document_storage(&self, path: PathBuf, page_count: usize) -> Result<(), String> {
+        let Some(storage) = &self.extension_storage else {
+            return Ok(());
+        };
+        let document =
+            DocumentKey::from_pdf(path, page_count).map_err(|error| error.to_string())?;
+        storage
+            .select_document(Some(extension_document_namespace(&document)))
+            .map_err(|error| error.message)
     }
 
     /// Routes storage and task effects through host-owned semantic services.
@@ -995,6 +1026,40 @@ fn separator(id: &str) -> MenuItem {
         order: MenuItemOrder::default(),
         visible: BooleanSource::Constant(true),
         kind: MenuItemKind::Separator,
+    }
+}
+
+fn extension_services(
+    persistent: bool,
+) -> (
+    HostServiceRouter,
+    Option<Arc<JsonExtensionStorage>>,
+    Option<String>,
+) {
+    if !persistent {
+        return (HostServiceRouter::default(), None, None);
+    }
+    #[cfg(not(feature = "installable-extensions"))]
+    {
+        return (HostServiceRouter::default(), None, None);
+    }
+    #[cfg(feature = "installable-extensions")]
+    match default_app_data_root() {
+        Ok(root) => {
+            let storage = Arc::new(JsonExtensionStorage::new(root.join("extension-storage")));
+            (
+                HostServiceRouter::new(storage.clone(), 16),
+                Some(storage),
+                None,
+            )
+        }
+        Err(error) => (
+            HostServiceRouter::default(),
+            None,
+            Some(format!(
+                "Durable extension storage is unavailable; this session uses memory only: {error}"
+            )),
+        ),
     }
 }
 

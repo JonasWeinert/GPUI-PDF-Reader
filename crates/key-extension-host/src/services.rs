@@ -111,6 +111,8 @@ pub trait ExtensionStorage: Send + Sync + 'static {
     fn delete(&self, extension: &ExtensionId, area: StorageArea, key: &str) -> EffectResult;
 
     fn clear_area(&self, extension: &ExtensionId, area: StorageArea);
+
+    fn clear_all(&self, area: StorageArea);
 }
 
 /// In-memory reference store used by embedders that do not inject persistence.
@@ -191,6 +193,13 @@ impl ExtensionStorage for MemoryExtensionStorage {
         if let Ok(mut values) = self.values.lock() {
             let area = area_key(area);
             values.retain(|(owner, stored_area, _), _| owner != extension || *stored_area != area);
+        }
+    }
+
+    fn clear_all(&self, area: StorageArea) {
+        if let Ok(mut values) = self.values.lock() {
+            let area = area_key(area);
+            values.retain(|(_, stored_area, _), _| *stored_area != area);
         }
     }
 }
@@ -399,6 +408,7 @@ impl HostServiceRouter {
             active.cancellation.cancel();
         }
         self.active_tasks.clear();
+        self.storage.clear_all(StorageArea::EphemeralCache);
     }
 
     #[must_use]
