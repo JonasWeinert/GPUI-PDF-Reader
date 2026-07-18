@@ -8,11 +8,13 @@
 mod ids;
 mod layout;
 mod model;
+mod resource_registry;
 mod resources;
 mod scheduler;
 
 pub use ids::*;
 pub use layout::*;
 pub use model::*;
+pub use resource_registry::*;
 pub use resources::*;
 pub use scheduler::*;
