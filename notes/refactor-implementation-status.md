@@ -68,6 +68,12 @@
 - The deterministic quality path passes the full workspace all-target suite,
   strict Clippy, the minimal feature build, dependency-boundary audit, 788-record
   license audit, and the isolated PDFium tiled-render parity test.
+- The post-refactor native macOS E2E suite passes 15 real GPUI launches: three
+  rapid zoom/debounce cases, Classic feature creation and reload, Fluid feature
+  creation and reload, four theme/PDF-appearance cases, TOC hover/navigation,
+  internal-link navigation, link preview, and scientific-reference inference.
+  Every case reached its exact quiet Ready state without a QA error, panic, or
+  GPU/Metal fault.
 - Installable third-party packages remain local/development distribution. A
   public store, signing trust service, notarization, and automatic update system
   are not implied by the development signature fixture.
