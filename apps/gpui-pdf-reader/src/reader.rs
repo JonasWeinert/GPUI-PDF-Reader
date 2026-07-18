@@ -4,6 +4,7 @@ use crate::annotations::{
     TextRange,
 };
 use crate::app_extensions::ReaderExtensions;
+use crate::application_host::ApplicationHost;
 use crate::backend::{
     PdfWorker, PreviewSpec, RenderAppearance, RenderColor, TileRequest, WorkerEvent,
 };
@@ -99,16 +100,19 @@ use key_pdf_gpui::{
     inflate_tile_rect as viewport_inflate_tile_rect,
     plan_visible_tiles as viewport_plan_visible_tiles,
 };
+use key_workspace_core::{ActivityLevel, ResourceAllocation, ResourceAmount, ViewId, WindowId};
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod annotation_io;
 mod comments;
 mod extensions;
 #[cfg(debug_assertions)]
-mod qa;
+pub(crate) mod qa;
 mod references;
 mod render;
 mod search;
@@ -117,7 +121,7 @@ mod tests;
 mod toc;
 mod ui;
 
-use annotation_io::{AnnotationIo, AnnotationIoEvent, AnnotationIoOperation};
+use annotation_io::{AnnotationIo, AnnotationIoEvent, AnnotationIoEvents, AnnotationIoOperation};
 use key_ui_gpui::UnitTransition;
 #[cfg(debug_assertions)]
 use qa::{QaExtensionPhase, QaFeaturePhase, QaFluidPhase};
@@ -139,16 +143,17 @@ use search::{SearchState, search_list_rows};
 #[cfg(test)]
 use toc::{
     ResolvedTocDestination, TOC_BREADCRUMB_MAX_LABEL_CHARACTERS, TOC_CARD_MIN_HEIGHT,
-    TOC_STACK_MARGIN, active_toc_index, end_truncate, resolve_toc_destination,
-    toc_breadcrumb_entries, toc_callout_height, toc_callout_width, toc_cascade_amount,
-    toc_display_breadcrumbs, toc_stack_geometry, toc_title_match,
+    TOC_STACK_MARGIN, end_truncate, resolve_toc_destination, toc_breadcrumb_entries,
+    toc_callout_height, toc_callout_width, toc_cascade_amount, toc_display_breadcrumbs,
+    toc_stack_geometry, toc_title_match,
 };
-use toc::{advance_toc_hover_state, toc_hover_state_is_animating};
+use toc::{active_toc_index, advance_toc_hover_state, toc_hover_state_is_animating};
 use ui::{ChromeButtonStyle, chrome_button, empty_state, error_banner, icon_label};
 
 const TOOLBAR_HEIGHT: f32 = 52.0;
 const ERROR_BAR_HEIGHT: f32 = 34.0;
 const MAX_COPY_TEXT_BYTES: usize = 64 * 1024 * 1024;
+const RESOURCE_MIB: u64 = 1024 * 1024;
 const MAX_VISIBLE_SEARCH_HIGHLIGHT_RUNS: usize = 4_000;
 const MAX_VISIBLE_ANNOTATION_QUADS: usize = 8_000;
 const MAX_VISIBLE_SELECTION_QUADS: usize = 8_000;
@@ -169,6 +174,75 @@ const LINK_CARD_GAP: f32 = 8.0;
 const LINK_HOVER_HANDOFF_DELAY: Duration = Duration::from_millis(180);
 const LINK_HOVER_CLOSE_DELAY: Duration = Duration::from_millis(320);
 const LINK_HOVER_STABILITY_RADIUS: f32 = 3.0;
+const RESOURCE_HIBERNATE_DELAY: Duration = Duration::from_millis(900);
+const DEFAULT_IDLE_CACHE_TRIM_DELAY: Duration = Duration::from_millis(900);
+
+fn configured_idle_cache_retention() -> (usize, Duration) {
+    #[cfg(debug_assertions)]
+    {
+        let percent = std::env::var("GPUI_PDF_READER_QA_CACHE_RETENTION_PERCENT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(100)
+            .clamp(1, 100);
+        let delay = std::env::var("GPUI_PDF_READER_QA_CACHE_TRIM_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_IDLE_CACHE_TRIM_DELAY);
+        (percent, delay)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        (100, DEFAULT_IDLE_CACHE_TRIM_DELAY)
+    }
+}
+
+fn retained_cache_limit(base: usize, percent: usize) -> usize {
+    base.saturating_mul(percent).div_ceil(100)
+}
+
+fn resource_cache_limits(activity: ActivityLevel, amount: ResourceAmount) -> (usize, usize, usize) {
+    if activity == ActivityLevel::Suspended
+        || activity == ActivityLevel::BackgroundCold
+        || (amount.gpu_memory_bytes == 0 && amount.cpu_memory_bytes == 0)
+    {
+        return (0, 0, 0);
+    }
+
+    // Every RenderImage retains its BGRA frame after GPUI uploads the same
+    // pixels into the window's GPU atlas. Charge both resident copies instead
+    // of treating the raw frame as the complete tile cost.
+    let raw_tile_budget = amount.gpu_memory_bytes / 2;
+    let activity_cap = match activity {
+        ActivityLevel::ForegroundInteractive => 96 * RESOURCE_MIB as usize,
+        ActivityLevel::ForegroundIdle => 48 * RESOURCE_MIB as usize,
+        ActivityLevel::BackgroundWarm => 32 * RESOURCE_MIB as usize,
+        ActivityLevel::BackgroundCold | ActivityLevel::Suspended => 0,
+    };
+    let cache_bytes = usize::try_from(raw_tile_budget)
+        .unwrap_or(usize::MAX)
+        .min(activity_cap);
+    let tiles = if cache_bytes == 0 {
+        0
+    } else {
+        (cache_bytes / (4 * 1024 * 1024)).clamp(2, 128)
+    };
+    let text_page_cap = match activity {
+        ActivityLevel::ForegroundInteractive => 48,
+        ActivityLevel::ForegroundIdle => 24,
+        ActivityLevel::BackgroundWarm => 8,
+        ActivityLevel::BackgroundCold | ActivityLevel::Suspended => 0,
+    };
+    let text_pages = if amount.cpu_memory_bytes == 0 || text_page_cap == 0 {
+        0
+    } else {
+        usize::try_from(amount.cpu_memory_bytes / (4 * RESOURCE_MIB))
+            .unwrap_or(128)
+            .clamp(2, text_page_cap)
+    };
+    (cache_bytes, tiles, text_pages)
+}
 const LINK_CARD_MOVE_DEBOUNCE: Duration = Duration::from_millis(45);
 const DOI_COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(1_100);
 
@@ -191,11 +265,6 @@ fn render_appearance_from_theme(theme: &Theme, pdf_dark_mode_enabled: bool) -> R
         foreground: to_render_color(theme.foreground),
     }
 }
-
-#[cfg(target_os = "macos")]
-const TITLEBAR_CONTROL_INSET: f32 = 76.0;
-#[cfg(not(target_os = "macos"))]
-const TITLEBAR_CONTROL_INSET: f32 = 0.0;
 
 type Offset = ScrollOffset;
 
@@ -265,10 +334,29 @@ fn pdf_capability_extension_error(error: PdfExtensionError) -> ExtensionError {
 #[derive(Debug)]
 struct DocumentState {
     path: PathBuf,
+    title: Option<String>,
     pages: Vec<PageSize>,
     toc: Vec<TocEntry>,
     links: Vec<PdfLink>,
     scientific_references: Vec<ScientificReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReaderTabHoverDetail {
+    pub title: Option<String>,
+    pub section: Option<String>,
+    pub current_page: usize,
+    pub page_count: usize,
+    pub status: SharedString,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReaderTransferSnapshot {
+    zoom: f32,
+    fit_width: bool,
+    scroll: Offset,
+    view_mode: ReaderView,
+    pdf_dark_mode_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -515,7 +603,11 @@ enum ReaderStatus {
 }
 
 pub struct PdfReader {
-    extensions: ReaderExtensions,
+    _application_host: Entity<ApplicationHost>,
+    workspace_window_id: WindowId,
+    workspace_view_id: ViewId,
+    extensions: Rc<RefCell<ReaderExtensions>>,
+    pdf_capabilities: Arc<PdfCapabilityBridge>,
     extension_contribution: Option<ExtensionContributionPane>,
     extension_ui_panel: RevealState,
     #[cfg(feature = "installable-extensions")]
@@ -602,6 +694,7 @@ pub struct PdfReader {
     scroll_target: Offset,
     viewport_width: f32,
     viewport_height: f32,
+    canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     selection: Option<TextSelection>,
     selecting: bool,
     pending_annotation_click: Option<AnnotationId>,
@@ -659,22 +752,53 @@ pub struct PdfReader {
     zoom_render_revision: u64,
     render_debounce_until: Option<Instant>,
     zoom_render_task: Option<Task<()>>,
+    resource_allocation: ResourceAllocation,
+    max_cache_bytes: usize,
+    max_cached_tiles: usize,
+    max_cached_text_pages: usize,
+    allow_prefetch: bool,
+    resource_hibernate_revision: u64,
+    resource_hibernate_task: Option<Task<()>>,
+    worker_hibernated: bool,
+    idle_cache_retention_percent: usize,
+    idle_cache_trim_delay: Duration,
+    idle_cache_trimmed: bool,
+    idle_cache_trim_revision: u64,
+    idle_cache_trim_task: Option<Task<()>>,
+    pending_transfer_snapshot: Option<ReaderTransferSnapshot>,
 }
 
 impl PdfReader {
     pub fn new(
         initial_path: Option<PathBuf>,
-        extensions: ReaderExtensions,
+        application_host: Entity<ApplicationHost>,
+        workspace_window_id: WindowId,
+        workspace_view_id: ViewId,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        let (worker, events) = PdfWorker::start();
-        let (annotation_io, annotation_events) = AnnotationIo::start();
-        let (link_preview_fetcher, link_preview_events) = LinkPreviewFetcher::new();
-        let (scholarly_fetcher, scholarly_events) = ScholarlyFetcher::new();
+        let (worker, events) = PdfWorker::start(application_host.read(cx).pdf_engine());
+        let annotation_service = application_host.read(cx).annotation_service();
+        let (annotation_io, annotation_events) = AnnotationIo::attach(&annotation_service);
+        #[cfg(feature = "scholarly-network")]
+        let ((link_preview_fetcher, link_preview_events), (scholarly_fetcher, scholarly_events)) = {
+            let scope = application_host.read(cx).reference_document_scope();
+            (
+                LinkPreviewFetcher::with_scope(scope.clone()),
+                ScholarlyFetcher::with_scope(scope),
+            )
+        };
+        #[cfg(not(feature = "scholarly-network"))]
+        let ((link_preview_fetcher, link_preview_events), (scholarly_fetcher, scholarly_events)) =
+            (LinkPreviewFetcher::new(), ScholarlyFetcher::new());
+        let extensions = application_host.read(cx).extensions();
+        let (idle_cache_retention_percent, idle_cache_trim_delay) =
+            configured_idle_cache_retention();
         let extension_warning = extensions
+            .borrow()
             .startup_error()
             .map(|message| SharedString::from(message.to_owned()));
+        let pdf_capabilities = Arc::new(PdfCapabilityBridge::default());
         let search_field =
             cx.new(|cx| TextField::new(cx, "Search document", MAX_SEARCH_QUERY_BYTES));
         let search_field_for_reader = search_field.clone();
@@ -694,7 +818,11 @@ impl PdfReader {
             )
             .detach();
             Self {
+                _application_host: application_host,
+                workspace_window_id,
+                workspace_view_id,
                 extensions,
+                pdf_capabilities,
                 extension_contribution: None,
                 extension_ui_panel: RevealState::default(),
                 #[cfg(feature = "installable-extensions")]
@@ -781,6 +909,7 @@ impl PdfReader {
                 scroll_target: Offset::default(),
                 viewport_width: 1.0,
                 viewport_height: 1.0,
+                canvas_bounds: Rc::new(Cell::new(None)),
                 selection: None,
                 selecting: false,
                 pending_annotation_click: None,
@@ -838,6 +967,31 @@ impl PdfReader {
                 zoom_render_revision: 0,
                 render_debounce_until: None,
                 zoom_render_task: None,
+                resource_allocation: ResourceAllocation {
+                    id: key_workspace_core::ResourceParticipantId::from_raw(
+                        workspace_view_id.get(),
+                    ),
+                    activity: ActivityLevel::ForegroundInteractive,
+                    amount: ResourceAmount {
+                        cpu_memory_bytes: MAX_CACHE_BYTES as u64,
+                        gpu_memory_bytes: MAX_CACHE_BYTES as u64,
+                        worker_slots: 2,
+                        network_slots: 2,
+                    },
+                },
+                max_cache_bytes: MAX_CACHE_BYTES,
+                max_cached_tiles: MAX_CACHED_TILES,
+                max_cached_text_pages: MAX_CACHED_TEXT_PAGES,
+                allow_prefetch: true,
+                resource_hibernate_revision: 0,
+                resource_hibernate_task: None,
+                worker_hibernated: false,
+                idle_cache_retention_percent,
+                idle_cache_trim_delay,
+                idle_cache_trimmed: false,
+                idle_cache_trim_revision: 0,
+                idle_cache_trim_task: None,
+                pending_transfer_snapshot: None,
             }
         });
 
@@ -848,7 +1002,8 @@ impl PdfReader {
         Self::listen_for_native_pinch(&entity, window, cx);
         entity.update(cx, |_, cx| {
             cx.observe_window_appearance(window, |reader, window, cx| {
-                if reader.theme_preference == ThemePreference::System {
+                if reader._application_host.read(cx).theme_selection().0 == ThemePreference::System
+                {
                     Theme::sync_system_appearance(Some(window), cx);
                     reader.update_render_appearance(window, cx);
                 }
@@ -871,24 +1026,212 @@ impl PdfReader {
         self.focus_handle.clone()
     }
 
+    pub(crate) fn apply_resource_allocation(
+        &mut self,
+        allocation: ResourceAllocation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.resource_allocation == allocation {
+            return;
+        }
+        self.resource_allocation = allocation;
+        let (max_cache_bytes, max_cached_tiles, max_cached_text_pages) =
+            resource_cache_limits(allocation.activity, allocation.amount);
+        self.max_cache_bytes = max_cache_bytes;
+        self.max_cached_tiles = max_cached_tiles;
+        self.max_cached_text_pages = max_cached_text_pages;
+        self.mark_cache_active();
+        self.allow_prefetch = matches!(
+            allocation.activity,
+            ActivityLevel::ForegroundIdle | ActivityLevel::ForegroundInteractive
+        ) && allocation.amount.worker_slots > 0;
+
+        let background_enabled = matches!(
+            allocation.activity,
+            ActivityLevel::ForegroundIdle
+                | ActivityLevel::ForegroundInteractive
+                | ActivityLevel::BackgroundWarm
+        );
+        let _ = self
+            .worker
+            .set_background_enabled(self.generation, background_enabled);
+
+        if matches!(
+            allocation.activity,
+            ActivityLevel::Suspended | ActivityLevel::BackgroundCold
+        ) {
+            if matches!(self.status, ReaderStatus::Ready) {
+                let _ = self.worker.render_viewport(
+                    self.generation,
+                    self.render_appearance,
+                    &[],
+                    0,
+                    &[],
+                );
+            }
+            self.pending.clear();
+            self.text_pending.clear();
+            self.render_viewport.clear();
+            self.text_viewport.clear();
+            self.page_text.clear();
+            self.idle_cache_trim_task = None;
+            self.drop_all_images(window, cx);
+            if allocation.activity == ActivityLevel::Suspended {
+                self.schedule_resource_hibernation(window, cx);
+            } else {
+                self.cancel_resource_hibernation();
+            }
+        } else {
+            self.cancel_resource_hibernation();
+            if self.worker_hibernated {
+                if !self.worker.resume(self.generation) {
+                    self.status = ReaderStatus::Error("The PDF renderer is unavailable".into());
+                    cx.notify();
+                    return;
+                }
+                self.worker_hibernated = false;
+            }
+            self.evict_distant_tiles(window, cx);
+            self.evict_distant_text();
+            // This also replaces foreground prefetch demand with a visible-only
+            // demand when the document becomes BackgroundWarm.
+            self.request_visible_tiles(window);
+        }
+        cx.notify();
+    }
+
+    fn cancel_resource_hibernation(&mut self) {
+        self.resource_hibernate_revision = self.resource_hibernate_revision.wrapping_add(1);
+        self.resource_hibernate_task = None;
+    }
+
+    fn mark_cache_active(&mut self) {
+        if self.idle_cache_retention_percent >= 100 {
+            return;
+        }
+        self.idle_cache_trimmed = false;
+        self.idle_cache_trim_revision = self.idle_cache_trim_revision.wrapping_add(1);
+        self.idle_cache_trim_task = None;
+    }
+
+    fn effective_tile_cache_limits(&self) -> (usize, usize) {
+        if !self.idle_cache_trimmed {
+            return (self.max_cache_bytes, self.max_cached_tiles);
+        }
+        (
+            retained_cache_limit(self.max_cache_bytes, self.idle_cache_retention_percent),
+            retained_cache_limit(self.max_cached_tiles, self.idle_cache_retention_percent),
+        )
+    }
+
+    fn schedule_idle_cache_trim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.idle_cache_retention_percent >= 100
+            || self.idle_cache_trimmed
+            || self.idle_cache_trim_task.is_some()
+            || matches!(
+                self.resource_allocation.activity,
+                ActivityLevel::BackgroundCold | ActivityLevel::Suspended
+            )
+        {
+            return;
+        }
+        self.idle_cache_trim_revision = self.idle_cache_trim_revision.wrapping_add(1);
+        let revision = self.idle_cache_trim_revision;
+        let delay = self.idle_cache_trim_delay;
+        let weak = cx.weak_entity();
+        self.idle_cache_trim_task = Some(window.spawn(cx, async move |cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = cx.update(|window, cx| {
+                weak.update(cx, |reader, cx| {
+                    if reader.idle_cache_trim_revision != revision {
+                        return;
+                    }
+                    reader.idle_cache_trim_task = None;
+                    if !reader.pending.is_empty() {
+                        reader.schedule_idle_cache_trim(window, cx);
+                        return;
+                    }
+                    reader.idle_cache_trimmed = true;
+                    reader.evict_distant_tiles(window, cx);
+                    cx.notify();
+                })
+                .ok();
+            });
+        }));
+    }
+
+    fn schedule_resource_hibernation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.worker_hibernated {
+            return;
+        }
+        self.resource_hibernate_revision = self.resource_hibernate_revision.wrapping_add(1);
+        let revision = self.resource_hibernate_revision;
+        let weak = cx.weak_entity();
+        self.resource_hibernate_task = Some(window.spawn(cx, async move |cx| {
+            cx.background_executor()
+                .timer(RESOURCE_HIBERNATE_DELAY)
+                .await;
+            let _ = cx.update(|_, cx| {
+                weak.update(cx, |reader, cx| {
+                    if reader.resource_hibernate_revision != revision
+                        || reader.resource_allocation.activity != ActivityLevel::Suspended
+                        || reader.worker_hibernated
+                    {
+                        return;
+                    }
+                    if reader.worker.hibernate(reader.generation) {
+                        reader.worker_hibernated = true;
+                    }
+                    reader.resource_hibernate_task = None;
+                    cx.notify();
+                })
+                .ok();
+            });
+        }));
+    }
+
+    fn open_dialog(&mut self, _: &OpenDocument, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open PDF".into()),
+        });
+        let weak = cx.weak_entity();
+        let host = self._application_host.clone();
+        let source = self.workspace_window_id;
+        window
+            .spawn(cx, async move |cx| {
+                if let Ok(Ok(Some(paths))) = prompt.await
+                    && let Some(path) = paths.into_iter().next()
+                {
+                    let _ = cx.update(|window, cx| {
+                        if let Err(error) = crate::application_host::open_pdf_from_window(
+                            host, source, path, window, cx,
+                        ) {
+                            weak.update(cx, |reader, cx| {
+                                reader.warning = Some(error.into());
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    });
+                }
+            })
+            .detach();
+    }
+
     fn listen_for_worker_events(
         entity: &Entity<Self>,
-        events: mpsc::Receiver<WorkerEvent>,
+        events: flume::Receiver<WorkerEvent>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let events = Arc::new(Mutex::new(events));
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
-                loop {
-                    let events = events.clone();
-                    let receive = async_cx
-                        .background_executor()
-                        .spawn(async move { events.lock().unwrap().recv() });
-                    let Ok(event) = receive.await else {
-                        break;
-                    };
+                while let Ok(event) = events.recv_async().await {
                     let _ = async_cx.update(|window, cx| {
                         weak.update(cx, |reader, cx| {
                             reader.handle_worker_event(event, window, cx)
@@ -902,22 +1245,14 @@ impl PdfReader {
 
     fn listen_for_annotation_events(
         entity: &Entity<Self>,
-        events: mpsc::Receiver<AnnotationIoEvent>,
+        events: AnnotationIoEvents,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let events = Arc::new(Mutex::new(events));
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
-                loop {
-                    let events = events.clone();
-                    let receive = async_cx
-                        .background_executor()
-                        .spawn(async move { events.lock().unwrap().recv() });
-                    let Ok(event) = receive.await else {
-                        break;
-                    };
+                while let Ok(event) = events.recv_async().await {
                     let _ = async_cx.update(|window, cx| {
                         weak.update(cx, |reader, cx| {
                             reader.handle_annotation_event(event, window, cx)
@@ -931,22 +1266,14 @@ impl PdfReader {
 
     fn listen_for_link_preview_events(
         entity: &Entity<Self>,
-        events: mpsc::Receiver<LinkPreviewEvent>,
+        events: flume::Receiver<LinkPreviewEvent>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let events = Arc::new(Mutex::new(events));
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
-                loop {
-                    let events = events.clone();
-                    let receive = async_cx
-                        .background_executor()
-                        .spawn(async move { events.lock().unwrap().recv() });
-                    let Ok(event) = receive.await else {
-                        break;
-                    };
+                while let Ok(event) = events.recv_async().await {
                     let _ = async_cx.update(|_, cx| {
                         weak.update(cx, |reader, cx| {
                             if event.generation() != reader.generation {
@@ -968,22 +1295,14 @@ impl PdfReader {
 
     fn listen_for_scholarly_events(
         entity: &Entity<Self>,
-        events: mpsc::Receiver<ScholarlyEvent>,
+        events: flume::Receiver<ScholarlyEvent>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let events = Arc::new(Mutex::new(events));
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
-                loop {
-                    let events = events.clone();
-                    let receive = async_cx
-                        .background_executor()
-                        .spawn(async move { events.lock().unwrap().recv() });
-                    let Ok(event) = receive.await else {
-                        break;
-                    };
+                while let Ok(event) = events.recv_async().await {
                     let _ = async_cx.update(|window, cx| {
                         weak.update(cx, |reader, cx| {
                             if event.generation() == reader.generation
@@ -1009,21 +1328,24 @@ impl PdfReader {
     }
 
     fn listen_for_native_pinch(entity: &Entity<Self>, window: &mut Window, cx: &mut App) {
-        let receiver = Arc::new(Mutex::new(crate::native_gestures::install_pinch_monitor()));
+        let receiver = crate::native_gestures::subscribe_pinch_monitor();
         let weak = entity.downgrade();
         window
             .spawn(cx, async move |async_cx| {
-                loop {
-                    let receiver = receiver.clone();
-                    let receive = async_cx
-                        .background_executor()
-                        .spawn(async move { receiver.lock().unwrap().recv() });
-                    let Ok(pinch) = receive.await else {
-                        break;
-                    };
+                while let Ok(pinch) = receiver.recv_async().await {
                     let _ = async_cx.update(|window, cx| {
+                        if !window.is_window_active() {
+                            return;
+                        }
                         let window_height = f32::from(window.viewport_size().height);
                         weak.update(cx, |reader, cx| {
+                            if !reader
+                                ._application_host
+                                .read(cx)
+                                .is_active_view(reader.workspace_view_id)
+                            {
+                                return;
+                            }
                             let position = point(px(pinch.x), px(window_height - pinch.cocoa_y));
                             reader.zoom_at(reader.zoom * (1.0 + pinch.delta), position, window, cx);
                         })
@@ -1046,9 +1368,17 @@ impl PdfReader {
                     self.status = ReaderStatus::Empty;
                 }
             }
+            WorkerEvent::Resumed { generation } if generation == self.generation => {
+                self.render_viewport.clear();
+                self.text_viewport.clear();
+                self.pending.clear();
+                self.text_pending.clear();
+                self.request_visible_tiles(window);
+            }
             WorkerEvent::Opened {
                 generation,
                 path,
+                title,
                 pages,
                 toc,
                 links,
@@ -1066,9 +1396,11 @@ impl PdfReader {
                 ) {
                     self.record_pdf_capability_error("document snapshot", error);
                 }
-                if let Err(error) = self
-                    .extensions
-                    .begin_document_storage(path.clone(), pages.len())
+                if window.is_window_active()
+                    && let Err(error) = self
+                        .extensions
+                        .borrow()
+                        .begin_document_storage(path.clone(), pages.len())
                 {
                     self.warning =
                         Some(format!("Extension document storage is unavailable: {error}").into());
@@ -1093,6 +1425,7 @@ impl PdfReader {
                 }
                 self.document = Some(DocumentState {
                     path: path.clone(),
+                    title,
                     pages: pages.clone(),
                     toc,
                     links,
@@ -1141,14 +1474,27 @@ impl PdfReader {
                 self.pending_link_click = None;
                 self.pending_link_navigation = None;
                 self.status = ReaderStatus::Ready;
-                self.viewport.fit_width();
+                if let Some(snapshot) = self.pending_transfer_snapshot.take() {
+                    self.view_mode = snapshot.view_mode;
+                    self.pdf_dark_mode_enabled = snapshot.pdf_dark_mode_enabled;
+                    if snapshot.fit_width {
+                        self.viewport.fit_width();
+                    } else {
+                        self.viewport.disable_fit_width();
+                        self.viewport.zoom_at(
+                            snapshot.zoom,
+                            ViewportPoint::new(
+                                self.viewport_width * 0.5,
+                                self.viewport_height * 0.5,
+                            ),
+                        );
+                    }
+                    self.viewport.set_scroll(snapshot.scroll);
+                } else {
+                    self.viewport.fit_width();
+                }
                 self.sync_viewport_snapshot();
                 self.publish_pdf_selection();
-                let title = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("PDF");
-                window.set_window_title(&format!("{title} — GPUI PDF Reader"));
                 self.request_visible_tiles(window);
             }
             WorkerEvent::TileRendered {
@@ -1163,6 +1509,7 @@ impl PdfReader {
             } if generation == self.generation && appearance == self.render_appearance => {
                 let page = key.page;
                 self.pending.remove(&key);
+                self.mark_cache_active();
 
                 let expected_len = width
                     .checked_mul(height)
@@ -1507,28 +1854,6 @@ impl PdfReader {
         cx.notify();
     }
 
-    fn open_dialog(&mut self, _: &OpenDocument, window: &mut Window, cx: &mut Context<Self>) {
-        let prompt = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Open PDF".into()),
-        });
-        let weak = cx.weak_entity();
-        window
-            .spawn(cx, async move |cx| {
-                if let Ok(Ok(Some(paths))) = prompt.await
-                    && let Some(path) = paths.into_iter().next()
-                {
-                    let _ = cx.update(|window, cx| {
-                        weak.update(cx, |reader, cx| reader.open_path(path, window, cx))
-                            .ok();
-                    });
-                }
-            })
-            .detach();
-    }
-
     #[cfg(feature = "installable-extensions")]
     fn install_extension_dialog(
         &mut self,
@@ -1618,7 +1943,7 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let preview = match self.extensions.preview_package(&path) {
+        let preview = match self.extensions.borrow().preview_package(&path) {
             Ok(preview) => preview,
             Err(error) => {
                 self.warning = Some(format!("Could not review extension: {error}").into());
@@ -1649,7 +1974,11 @@ impl PdfReader {
         } else {
             "Installed"
         };
-        let mut report = match self.extensions.install_reviewed_package(&path, &preview) {
+        let mut report = match self
+            .extensions
+            .borrow_mut()
+            .install_reviewed_package(&path, &preview)
+        {
             Ok(report) => report,
             Err(error) => {
                 self.warning = Some(format!("Could not install extension: {error}").into());
@@ -1658,13 +1987,17 @@ impl PdfReader {
             }
         };
         if matches!(report.activation, PackageActivation::AwaitingPermissions(_)) {
-            report = match self.extensions.approve_package(&report.extension) {
+            let approval = self
+                .extensions
+                .borrow_mut()
+                .approve_package(&report.extension);
+            report = match approval {
                 Ok(report) => report,
                 Err(error) => {
                     self.warning =
                         Some(format!("Could not enable {}: {error}", preview.name).into());
                     self.refresh_extension_manager_state();
-                    crate::rebuild_application_menus(&mut self.extensions, cx);
+                    crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
                     cx.notify();
                     return;
                 }
@@ -1685,7 +2018,7 @@ impl PdfReader {
             PackageActivation::Active => {
                 self.warning = Some(format!("{verb} {} {}", report.name, report.version).into());
                 self.refresh_extension_manager_state();
-                crate::rebuild_application_menus(&mut self.extensions, cx);
+                crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
                 self.schedule_extension_snapshot_sync(window, cx);
             }
             PackageActivation::Activating => {
@@ -1708,7 +2041,7 @@ impl PdfReader {
                     .into(),
                 );
                 self.refresh_extension_manager_state();
-                crate::rebuild_application_menus(&mut self.extensions, cx);
+                crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
             }
             PackageActivation::AwaitingPermissions(permissions) => {
                 self.warning = Some(
@@ -1950,11 +2283,15 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.extensions.set_package_setting(&extension, &key, value) {
+        let setting_result = self
+            .extensions
+            .borrow_mut()
+            .set_package_setting(&extension, &key, value);
+        match setting_result {
             Ok(effects) => {
                 self.execute_extension_effects(effects, window, cx);
                 self.refresh_extension_manager_state();
-                if self.extensions.has_pending_extension_work() {
+                if self.extensions.borrow().has_pending_extension_work() {
                     self.schedule_extension_snapshot_sync(window, cx);
                 }
                 self.warning = Some("Extension setting saved".into());
@@ -1973,7 +2310,8 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.extensions.enable_package(&extension) {
+        let enable_result = self.extensions.borrow_mut().enable_package(&extension);
+        match enable_result {
             Ok(report) => self.handle_package_report(report, "Enabled", window, cx),
             Err(error) => {
                 self.warning = Some(format!("Could not enable extension: {error}").into());
@@ -1990,7 +2328,8 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.extensions.disable_package(&extension) {
+        let disable_result = self.extensions.borrow_mut().disable_package(&extension);
+        match disable_result {
             Ok(()) => {
                 if self
                     .extension_contribution
@@ -2002,7 +2341,7 @@ impl PdfReader {
                 }
                 self.warning = Some("Extension disabled".into());
                 self.refresh_extension_manager_state();
-                crate::rebuild_application_menus(&mut self.extensions, cx);
+                crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
             }
             Err(error) => {
                 self.warning = Some(format!("Could not disable extension: {error}").into());
@@ -2026,10 +2365,11 @@ impl PdfReader {
         } else {
             PermissionDecision::Denied
         };
-        match self
-            .extensions
-            .set_package_permission(&extension, &permission, decision)
-        {
+        let permission_result =
+            self.extensions
+                .borrow_mut()
+                .set_package_permission(&extension, &permission, decision);
+        match permission_result {
             Ok(()) => {
                 self.warning = Some(
                     if grant {
@@ -2040,7 +2380,7 @@ impl PdfReader {
                     .into(),
                 );
                 self.refresh_extension_manager_state();
-                crate::rebuild_application_menus(&mut self.extensions, cx);
+                crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
                 self.refresh_active_extension_view(window, cx);
                 self.schedule_extension_snapshot_sync(window, cx);
             }
@@ -2076,7 +2416,9 @@ impl PdfReader {
                 }
                 let _ = cx.update(|window, cx| {
                     weak.update(cx, |reader, cx| {
-                        match reader.extensions.remove_package(&extension) {
+                        let remove_result =
+                            reader.extensions.borrow_mut().remove_package(&extension);
+                        match remove_result {
                             Ok(()) => {
                                 if reader
                                     .extension_contribution
@@ -2095,7 +2437,10 @@ impl PdfReader {
                                 ) {
                                     reader.show_extension_manager_overview(window, cx);
                                 }
-                                crate::rebuild_application_menus(&mut reader.extensions, cx);
+                                crate::rebuild_application_menus(
+                                    &mut reader.extensions.borrow_mut(),
+                                    cx,
+                                );
                             }
                             Err(error) => {
                                 reader.warning =
@@ -2111,7 +2456,7 @@ impl PdfReader {
             .detach();
     }
 
-    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.comment_draft_needs_confirmation() {
             self.confirm_discard_comment(DraftDiscardAction::Open(path), window, cx);
             return;
@@ -2158,7 +2503,9 @@ impl PdfReader {
 
     fn begin_open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_open = None;
-        self.extensions.invalidate_document_scope();
+        if window.is_window_active() {
+            self.extensions.borrow_mut().invalidate_document_scope();
+        }
         self.generation = self.generation.wrapping_add(1);
         self.close_pdf_capability_generation();
         self.link_preview_fetcher.begin_document(self.generation);
@@ -2279,7 +2626,7 @@ impl PdfReader {
     }
 
     fn pdf_capabilities(&self) -> Arc<PdfCapabilityBridge> {
-        self.extensions.pdf_capabilities()
+        self.pdf_capabilities.clone()
     }
 
     fn close_pdf_capability_generation(&mut self) {
@@ -2370,8 +2717,9 @@ impl PdfReader {
         let size = window.viewport_size();
         let full_width = f32::from(size.width).max(1.0);
         let width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
-        let error_height = self.content_top() - TOOLBAR_HEIGHT;
-        let height = (f32::from(size.height) - TOOLBAR_HEIGHT - error_height).max(1.0);
+        let toolbar_height = self.reader_toolbar_height();
+        let error_height = self.content_top() - toolbar_height;
+        let height = (f32::from(size.height) - toolbar_height - error_height).max(1.0);
         let right_occlusion = if self.view_mode == ReaderView::Fluid {
             fluid_sidebar_extent(width, self.sidebar.progress)
                 + reference_panel_extent(width, self.reference_panel.value())
@@ -2487,8 +2835,9 @@ impl PdfReader {
 
     #[cfg(feature = "installable-extensions")]
     fn refresh_extension_manager_state(&mut self) {
-        self.extension_packages = self.extensions.installed_packages();
-        self.extension_commands = self.extensions.installed_commands();
+        let mut extensions = self.extensions.borrow_mut();
+        self.extension_packages = extensions.installed_packages();
+        self.extension_commands = extensions.installed_commands();
     }
 
     fn refresh_active_extension_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2499,7 +2848,7 @@ impl PdfReader {
         else {
             return;
         };
-        let Some(owned) = self.extensions.contribution_view(&id) else {
+        let Some(owned) = self.extensions.borrow_mut().contribution_view(&id) else {
             self.extension_ui_panel.set_target(0.0);
             self.start_animation(window, cx);
             return;
@@ -2521,7 +2870,7 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> EffectResult {
-        let Some(owned) = self.extensions.contribution_view(contribution) else {
+        let Some(owned) = self.extensions.borrow_mut().contribution_view(contribution) else {
             return Err(ExtensionError {
                 code: ExtensionErrorCode::NotFound,
                 message: "the contribution is no longer active".into(),
@@ -2668,12 +3017,16 @@ impl PdfReader {
     /// Executes bounded host ticks from event/animation callbacks, never from
     /// `Render`. High-frequency navigation is coalesced by snapshot equality.
     fn flush_extension_snapshots(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let completions = self.extensions.poll_service_completions(32);
+        if !self.extension_view_is_active(cx) {
+            return;
+        }
+        let completions = self.extensions.borrow_mut().poll_service_completions(32);
         for completion in completions {
-            match self
+            let completion_result = self
                 .extensions
-                .complete_effect(&completion.effect, completion.result)
-            {
+                .borrow_mut()
+                .complete_effect(&completion.effect, completion.result);
+            match completion_result {
                 Ok(report) if !report.effects.is_empty() => {
                     self.execute_extension_effects(report.effects, window, cx);
                 }
@@ -2684,10 +3037,9 @@ impl PdfReader {
                 }
             }
         }
-        let report = match self
-            .extensions
-            .publish_snapshots(self.extension_snapshot_values())
-        {
+        let snapshots = self.extension_snapshot_values();
+        let snapshot_result = self.extensions.borrow_mut().publish_snapshots(snapshots);
+        let report = match snapshot_result {
             Ok(report) => report,
             Err(error) => {
                 self.warning = Some(format!("Extension snapshot failed: {error}").into());
@@ -2696,11 +3048,11 @@ impl PdfReader {
         };
         #[cfg(feature = "installable-extensions")]
         {
-            let activation_updates = self.extensions.settle_package_activations();
+            let activation_updates = self.extensions.borrow_mut().settle_package_activations();
             if let Some(update) = activation_updates.last() {
                 self.warning = Some(update.message.clone().into());
                 self.refresh_extension_manager_state();
-                crate::rebuild_application_menus(&mut self.extensions, cx);
+                crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
             }
         }
         self.refresh_active_extension_view(window, cx);
@@ -2708,14 +3060,17 @@ impl PdfReader {
             self.execute_extension_effects(report.effects, window, cx);
         }
         if report.deferred_events > 0
-            || self.extensions.has_pending_service_work()
-            || self.extensions.has_pending_extension_work()
+            || self.extensions.borrow().has_pending_service_work()
+            || self.extensions.borrow().has_pending_extension_work()
         {
             self.schedule_extension_snapshot_sync(window, cx);
         }
     }
 
     fn schedule_extension_snapshot_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.extension_view_is_active(cx) {
+            return;
+        }
         if !self.extension_snapshot_dispatch.request() {
             return;
         }
@@ -2735,6 +3090,32 @@ impl PdfReader {
         }));
     }
 
+    pub(crate) fn activate_extension_scope(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (preference, selected) = self._application_host.read(cx).theme_selection();
+        self.theme_preference = preference;
+        self.selected_theme = selected;
+        self.update_render_appearance(window, cx);
+        self.extensions.borrow_mut().invalidate_document_scope();
+        if let Some(document) = &self.document
+            && let Err(error) = self
+                .extensions
+                .borrow()
+                .begin_document_storage(document.path.clone(), document.pages.len())
+        {
+            self.warning =
+                Some(format!("Extension document storage is unavailable: {error}").into());
+        }
+        self.extension_snapshot_dispatch = ExtensionSnapshotDispatch::default();
+        self.schedule_extension_snapshot_sync(window, cx);
+        cx.notify();
+    }
+
+    fn extension_view_is_active(&self, cx: &App) -> bool {
+        self._application_host
+            .read(cx)
+            .is_active_view(self.workspace_view_id)
+    }
+
     fn apply_theme_selection(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_theme = theme::apply_selection(name, window, cx);
         self.theme_preference = if self.selected_theme.is_some() {
@@ -2742,6 +3123,9 @@ impl PdfReader {
         } else {
             ThemePreference::System
         };
+        self._application_host.update(cx, |host, _| {
+            host.set_theme_selection(self.theme_preference, self.selected_theme.clone())
+        });
         self.update_render_appearance(window, cx);
     }
 
@@ -2751,14 +3135,16 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let effects = match self
+        let command_result = self
             .extensions
-            .invoke_command(&action.command, action.payload.clone())
-        {
+            .borrow_mut()
+            .invoke_command(&action.command, action.payload.clone());
+        let effects = match command_result {
             Ok(effects) => effects,
             Err(error) => {
                 let detail = self
                     .extensions
+                    .borrow()
                     .latest_diagnostic_message()
                     .unwrap_or_else(|| error.to_string());
                 self.warning = Some(format!("Extension command failed: {detail}").into());
@@ -2767,14 +3153,14 @@ impl PdfReader {
             }
         };
         self.execute_extension_effects(effects, window, cx);
-        if self.extensions.has_pending_service_work()
-            || self.extensions.has_pending_extension_work()
+        if self.extensions.borrow().has_pending_service_work()
+            || self.extensions.borrow().has_pending_extension_work()
         {
             self.schedule_extension_snapshot_sync(window, cx);
         }
         #[cfg(feature = "installable-extensions")]
         self.refresh_extension_manager_state();
-        crate::rebuild_application_menus(&mut self.extensions, cx);
+        crate::rebuild_application_menus(&mut self.extensions.borrow_mut(), cx);
     }
 
     fn execute_extension_effects(
@@ -2793,7 +3179,11 @@ impl PdfReader {
                 break;
             }
             completed += 1;
-            let result = match self.extensions.dispatch_service_effect(&effect) {
+            let dispatch = self
+                .extensions
+                .borrow_mut()
+                .dispatch_service_effect(&effect);
+            let result = match dispatch {
                 ServiceDispatch::Immediate(result) => result,
                 ServiceDispatch::Deferred => {
                     self.schedule_extension_snapshot_sync(window, cx);
@@ -2801,7 +3191,11 @@ impl PdfReader {
                 }
                 ServiceDispatch::Unsupported => self.execute_extension_effect(&effect, window, cx),
             };
-            match self.extensions.complete_effect(&effect, result) {
+            let completion = self
+                .extensions
+                .borrow_mut()
+                .complete_effect(&effect, result);
+            match completion {
                 Ok(report) => {
                     pending.extend(report.effects);
                     self.refresh_active_extension_view(window, cx);
@@ -2971,8 +3365,77 @@ impl PdfReader {
         false
     }
 
+    pub(crate) fn tab_close_requires_confirmation(&self) -> bool {
+        self.comment_draft_needs_confirmation()
+    }
+
+    pub(crate) fn prepare_tab_close(&mut self) {
+        self.close_pdf_capability_generation();
+    }
+
+    pub(crate) fn tab_detail(&self) -> SharedString {
+        let status = self.status_text();
+        if !matches!(status.as_ref(), "Ready" | "Open a PDF to begin") {
+            return status;
+        }
+        let page_count = self
+            .document
+            .as_ref()
+            .map(|document| document.pages.len())
+            .unwrap_or(0);
+        if page_count == 0 {
+            return status;
+        }
+        let current_page = self
+            .layout()
+            .map(|layout| layout.current_page(self.scroll.y, self.viewport_height) + 1)
+            .unwrap_or(1);
+        format!("Page {current_page} of {page_count}").into()
+    }
+
+    pub(crate) fn tab_hover_detail(&self) -> ReaderTabHoverDetail {
+        let status = self.status_text();
+        let Some(document) = self.document.as_ref() else {
+            return ReaderTabHoverDetail {
+                title: None,
+                section: None,
+                current_page: 0,
+                page_count: 0,
+                status,
+            };
+        };
+        let current_page = self
+            .layout()
+            .map(|layout| layout.current_page(self.scroll.y, self.viewport_height))
+            .unwrap_or(0)
+            .min(document.pages.len().saturating_sub(1));
+        ReaderTabHoverDetail {
+            title: document.title.clone(),
+            section: active_toc_index(&document.toc, current_page)
+                .and_then(|index| document.toc.get(index))
+                .map(|entry| entry.title.clone()),
+            current_page: current_page + 1,
+            page_count: document.pages.len(),
+            status,
+        }
+    }
+
+    pub(crate) fn transfer_snapshot(&self) -> ReaderTransferSnapshot {
+        ReaderTransferSnapshot {
+            zoom: self.zoom,
+            fit_width: self.fit_width,
+            scroll: self.scroll,
+            view_mode: self.view_mode,
+            pdf_dark_mode_enabled: self.pdf_dark_mode_enabled,
+        }
+    }
+
+    pub(crate) fn restore_after_transfer(&mut self, snapshot: ReaderTransferSnapshot) {
+        self.pending_transfer_snapshot = Some(snapshot);
+    }
+
     fn content_top(&self) -> f32 {
-        TOOLBAR_HEIGHT
+        self.reader_toolbar_height()
             + if matches!(self.status, ReaderStatus::Error(_)) {
                 ERROR_BAR_HEIGHT
             } else {
@@ -2980,10 +3443,42 @@ impl PdfReader {
             }
     }
 
+    fn reader_toolbar_height(&self) -> f32 {
+        match self.view_mode {
+            ReaderView::Classic => TOOLBAR_HEIGHT,
+            ReaderView::Fluid => 0.0,
+        }
+    }
+
+    fn effective_canvas_bounds(&self) -> Bounds<Pixels> {
+        self.canvas_bounds.get().unwrap_or_else(|| {
+            Bounds::new(
+                point(px(0.0), px(self.content_top())),
+                size(px(self.viewport_width), px(self.viewport_height)),
+            )
+        })
+    }
+
+    fn window_to_canvas(&self, position: Point<Pixels>) -> Offset {
+        window_point_to_canvas(self.effective_canvas_bounds(), position)
+    }
+
+    fn canvas_to_window(&self, position: Offset) -> Point<Pixels> {
+        canvas_point_to_window(self.effective_canvas_bounds(), position)
+    }
+
     fn request_visible_tiles(&mut self, _window: &Window) {
         // While a replacement document is opening, `self.document` still describes
         // the previous PDF. Never pair that stale layout with the new generation.
         if !matches!(self.status, ReaderStatus::Ready) {
+            return;
+        }
+        if self.worker_hibernated
+            || matches!(
+                self.resource_allocation.activity,
+                ActivityLevel::BackgroundCold | ActivityLevel::Suspended
+            )
+        {
             return;
         }
         if self
@@ -2999,18 +3494,25 @@ impl PdfReader {
         // `update_viewport()` has already synchronized the window scale. The
         // shared controller therefore owns both visibility and tile priority.
         let plan = self.viewport.plan_tiles();
-        let planned = &plan.tiles;
+        let planned = plan
+            .tiles
+            .iter()
+            .filter(|tile| self.allow_prefetch || tile.tier == DemandTier::Visible)
+            .copied()
+            .collect::<Vec<_>>();
+        let planned = &planned;
         let mut viewport: Vec<_> = planned
             .iter()
             .map(|tile| (tile.request.key, tile.tier))
             .collect();
         viewport.sort_by_key(|(key, tier)| (*tier, *key));
-        let text_viewport = plan.text_pages(MAX_CACHED_TEXT_PAGES);
+        let text_viewport = plan.text_pages(self.max_cached_text_pages);
 
         // Completion does not change these full desired signatures. That
         // matters: re-sending shrinking lists after every result can race the
         // worker and reinsert work it has just finished.
         if viewport != self.render_viewport || text_viewport != self.text_viewport {
+            self.mark_cache_active();
             let demand: Vec<_> = planned
                 .iter()
                 .filter_map(|tile| {
@@ -3133,8 +3635,10 @@ impl PdfReader {
             .values()
             .map(|tile| tile.byte_len)
             .sum::<usize>();
-        if self.rendered.len() <= MAX_CACHED_TILES && cached_bytes <= MAX_CACHE_BYTES {
+        let (max_cache_bytes, max_cached_tiles) = self.effective_tile_cache_limits();
+        if self.rendered.len() <= max_cached_tiles && cached_bytes <= max_cache_bytes {
             Self::retire_images(retired, window, cx);
+            self.schedule_idle_cache_trim(window, cx);
             return;
         }
         let protected: HashSet<_> = self
@@ -3166,7 +3670,7 @@ impl PdfReader {
             )
         });
         for key in candidates {
-            if self.rendered.len() <= MAX_CACHED_TILES && cached_bytes <= MAX_CACHE_BYTES {
+            if self.rendered.len() <= max_cached_tiles && cached_bytes <= max_cache_bytes {
                 break;
             }
             if let Some(cache) = self.rendered.remove(&key) {
@@ -3175,10 +3679,11 @@ impl PdfReader {
             }
         }
         Self::retire_images(retired, window, cx);
+        self.schedule_idle_cache_trim(window, cx);
     }
 
     fn evict_distant_text(&mut self) {
-        if self.page_text.len() <= MAX_CACHED_TEXT_PAGES {
+        if self.page_text.len() <= self.max_cached_text_pages {
             return;
         }
         let current_page = self
@@ -3208,7 +3713,7 @@ impl PdfReader {
         });
         candidates.sort_by_key(|page| std::cmp::Reverse(page.abs_diff(current_page)));
         for page in candidates {
-            if self.page_text.len() <= MAX_CACHED_TEXT_PAGES {
+            if self.page_text.len() <= self.max_cached_text_pages {
                 break;
             }
             self.page_text.remove(&page);
@@ -3469,14 +3974,15 @@ impl PdfReader {
     ) {
         self.navigation_focus.cancel();
         self.sidebar_anchor = None;
-        let raw_x = f32::from(window_position.x);
-        let raw_y = f32::from(window_position.y);
+        let local = self.window_to_canvas(window_position);
+        let raw_x = local.x;
+        let raw_y = local.y;
         if self.document.is_none() || !zoom.is_finite() || !raw_x.is_finite() || !raw_y.is_finite()
         {
             return;
         }
         let local_x = raw_x.clamp(0.0, self.viewport_width);
-        let local_y = (raw_y - self.content_top()).clamp(0.0, self.viewport_height);
+        let local_y = raw_y.clamp(0.0, self.viewport_height);
         let disposition = self
             .viewport
             .zoom_at(zoom, ViewportPoint::new(local_x, local_y));
@@ -3547,10 +4053,10 @@ impl PdfReader {
     }
 
     fn viewport_center(&self) -> Point<Pixels> {
-        point(
-            px(self.viewport_width * 0.5),
-            px(self.content_top() + self.viewport_height * 0.5),
-        )
+        self.canvas_to_window(Offset {
+            x: self.viewport_width * 0.5,
+            y: self.viewport_height * 0.5,
+        })
     }
 
     fn scroll_up(&mut self, _: &ScrollUp, window: &mut Window, cx: &mut Context<Self>) {
@@ -3707,7 +4213,7 @@ impl PdfReader {
                 }
                 selection.focus = position;
             }
-            let local_y = f32::from(event.position.y) - self.content_top();
+            let local_y = self.window_to_canvas(event.position).y;
             if local_y < 28.0 {
                 self.scroll_by(0.0, -28.0, true, window, cx);
             } else if local_y > self.viewport_height - 28.0 {
@@ -3779,8 +4285,9 @@ impl PdfReader {
 
     fn hit_test_text(&self, position: Point<Pixels>, nearest: bool) -> Option<TextPosition> {
         let layout = self.layout()?;
-        let x = self.scroll.x + f32::from(position.x);
-        let y = self.scroll.y + f32::from(position.y) - self.content_top();
+        let local = self.window_to_canvas(position);
+        let x = self.scroll.x + local.x;
+        let y = self.scroll.y + local.y;
         let page = layout.page_at_content_point(x, y).or_else(|| {
             nearest.then(|| {
                 layout
@@ -4436,6 +4943,20 @@ struct PaintSnapshot {
     active_annotation: Option<AnnotationId>,
     active_search: Option<SearchMatchId>,
     navigation_focus: Option<NavigationFocusFrame>,
+}
+
+fn window_point_to_canvas(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Offset {
+    Offset {
+        x: f32::from(position.x - bounds.origin.x),
+        y: f32::from(position.y - bounds.origin.y),
+    }
+}
+
+fn canvas_point_to_window(bounds: Bounds<Pixels>, position: Offset) -> Point<Pixels> {
+    point(
+        bounds.origin.x + px(position.x),
+        bounds.origin.y + px(position.y),
+    )
 }
 
 fn normalized_bounds_in_page(page: Rect, bounds: TextBounds) -> Rect {

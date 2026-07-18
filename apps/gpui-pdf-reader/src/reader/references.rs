@@ -72,8 +72,9 @@ impl PdfReader {
     pub(super) fn hit_test_link(&self, position: Point<Pixels>) -> Option<usize> {
         let layout = self.layout()?;
         let document = self.document.as_ref()?;
-        let x = self.scroll.x + f32::from(position.x);
-        let y = self.scroll.y + f32::from(position.y) - self.content_top();
+        let local = self.window_to_canvas(position);
+        let x = self.scroll.x + local.x;
+        let y = self.scroll.y + local.y;
         let page = layout.page_at_content_point(x, y)?;
         let page_rect = layout.page_rect(page)?;
         document
@@ -93,8 +94,9 @@ impl PdfReader {
         }
         let layout = self.layout()?;
         let document = self.document.as_ref()?;
-        let x = self.scroll.x + f32::from(position.x);
-        let y = self.scroll.y + f32::from(position.y) - self.content_top();
+        let local = self.window_to_canvas(position);
+        let x = self.scroll.x + local.x;
+        let y = self.scroll.y + local.y;
         let page = layout.page_at_content_point(x, y)?;
         let page_rect = layout.page_rect(page)?;
         document
@@ -784,10 +786,7 @@ impl PdfReader {
     }
 
     pub(super) fn link_pointer_in_viewport(&self, position: Point<Pixels>) -> Offset {
-        Offset {
-            x: f32::from(position.x),
-            y: f32::from(position.y) - self.content_top(),
-        }
+        self.window_to_canvas(position)
     }
 
     pub(super) fn set_link_card_pointer_immediate(&mut self, position: Point<Pixels>) {
@@ -2069,7 +2068,9 @@ impl PdfReader {
                 .id("reference-details-panel")
                 .block_mouse_except_scroll()
                 .absolute()
-                .top(px(TOOLBAR_HEIGHT + FLUID_PANEL_VERTICAL_MARGIN))
+                .top(px(
+                    self.reader_toolbar_height() + FLUID_PANEL_VERTICAL_MARGIN
+                ))
                 .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
                 .right(px(right))
                 .w(px(panel_width))

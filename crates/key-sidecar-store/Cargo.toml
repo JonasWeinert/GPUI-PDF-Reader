@@ -9,6 +9,7 @@ description = "Reusable atomic annotation sidecar storage for Key applications"
 path = "src/lib.rs"
 
 [dependencies]
+flume = "0.11.1"
 key-extension-api = { path = "../key-extension-api" }
 key-extension-host = { path = "../key-extension-host" }
 key-pdf-core = { path = "../key-pdf-core" }

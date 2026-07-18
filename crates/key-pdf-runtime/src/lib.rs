@@ -13,6 +13,7 @@ mod demand;
 mod engine;
 mod scheduler;
 mod session;
+mod supervisor;
 
 pub use cache::{CachePolicy, CachePolicyError};
 pub use cancellation::{CancellationSource, CancellationToken, Cancelled};
@@ -33,4 +34,9 @@ pub use scheduler::{
 pub use session::{
     AllocationError, DocumentGeneration, DocumentSession, DocumentSessionManager, RequestId,
     ResourceHandle, ResourceId, SessionError,
+};
+pub use supervisor::{
+    DocumentClient, EngineSupervisor, SupervisorDocumentId, SupervisorEvent, SupervisorEvents,
+    SupervisorPolicy, SupervisorPolicyError, SupervisorRouteError, SupervisorSendError, WorkClass,
+    start_engine_supervisor,
 };

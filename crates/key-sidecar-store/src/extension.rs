@@ -6,7 +6,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -26,39 +26,83 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Default)]
 struct ExtensionStorageState {
     document: Option<String>,
+}
+
+#[derive(Default)]
+struct SharedExtensionStorageState {
     ephemeral: BTreeMap<(ExtensionId, String), DataValue>,
+}
+
+struct SharedExtensionStorage {
+    root: PathBuf,
+    state: Mutex<SharedExtensionStorageState>,
+    io_lock: Mutex<()>,
 }
 
 /// Persistent namespaced extension storage selected by the standalone app.
 /// Settings live in app data, document values are keyed by immutable document
 /// identity, and ephemeral values never touch disk.
 pub struct JsonExtensionStorage {
-    root: PathBuf,
+    shared: Arc<SharedExtensionStorage>,
     state: Mutex<ExtensionStorageState>,
-    io_lock: Mutex<()>,
+}
+
+/// Immutable storage context for one document.
+///
+/// Unlike [`JsonExtensionStorage::select_document`], a scope cannot be retargeted
+/// by another window while an extension storage operation is in flight. Clones
+/// share settings, ephemeral values and serialized disk I/O, while document
+/// values remain pinned to this scope's namespace.
+#[derive(Clone)]
+pub struct JsonExtensionStorageScope {
+    shared: Arc<SharedExtensionStorage>,
+    document: Option<String>,
 }
 
 impl JsonExtensionStorage {
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
         Self {
-            root,
+            shared: Arc::new(SharedExtensionStorage {
+                root,
+                state: Mutex::new(SharedExtensionStorageState::default()),
+                io_lock: Mutex::new(()),
+            }),
             state: Mutex::new(ExtensionStorageState::default()),
-            io_lock: Mutex::new(()),
+        }
+    }
+
+    /// Returns a storage context permanently bound to `document`.
+    ///
+    /// Multi-window hosts should give each document service router its own
+    /// scope instead of mutating the legacy selected-document cursor.
+    pub fn document_scope(
+        &self,
+        document: impl Into<String>,
+    ) -> Result<JsonExtensionStorageScope, ExtensionError> {
+        let document = document.into();
+        validate_document_namespace(&document)?;
+        Ok(JsonExtensionStorageScope {
+            shared: self.shared.clone(),
+            document: Some(document),
+        })
+    }
+
+    /// Returns an application-level context. Settings and ephemeral cache are
+    /// available; document storage fails closed until a document scope is used.
+    #[must_use]
+    pub fn application_scope(&self) -> JsonExtensionStorageScope {
+        JsonExtensionStorageScope {
+            shared: self.shared.clone(),
+            document: None,
         }
     }
 
     /// Selects the document namespace used by subsequent document-area calls.
     /// `None` makes document storage unavailable until another PDF opens.
     pub fn select_document(&self, document: Option<String>) -> Result<(), ExtensionError> {
-        if document.as_ref().is_some_and(|value| {
-            value.is_empty()
-                || value.len() > 128
-                || !value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        }) {
-            return Err(invalid("document storage namespace is invalid"));
+        if let Some(document) = document.as_deref() {
+            validate_document_namespace(document)?;
         }
         self.state
             .lock()
@@ -67,22 +111,37 @@ impl JsonExtensionStorage {
         Ok(())
     }
 
-    fn path(&self, extension: &ExtensionId, area: StorageArea) -> Result<PathBuf, ExtensionError> {
+    fn selected_document(&self) -> Result<Option<String>, ExtensionError> {
+        self.state
+            .lock()
+            .map_err(|_| internal("extension storage lock is poisoned"))
+            .map(|state| state.document.clone())
+    }
+}
+
+impl JsonExtensionStorageScope {
+    #[must_use]
+    pub fn document_namespace(&self) -> Option<&str> {
+        self.document.as_deref()
+    }
+}
+
+impl SharedExtensionStorage {
+    fn path(
+        &self,
+        document: Option<&str>,
+        extension: &ExtensionId,
+        area: StorageArea,
+    ) -> Result<PathBuf, ExtensionError> {
         let owner = extension.as_str();
         match area {
             StorageArea::Settings => Ok(self.root.join("settings").join(format!("{owner}.json"))),
             StorageArea::Document => {
-                let document = self
-                    .state
-                    .lock()
-                    .map_err(|_| internal("extension storage lock is poisoned"))?
-                    .document
-                    .clone()
-                    .ok_or_else(|| ExtensionError {
-                        code: ExtensionErrorCode::StaleResource,
-                        message: "no active document storage namespace".into(),
-                        retryable: false,
-                    })?;
+                let document = document.ok_or_else(|| ExtensionError {
+                    code: ExtensionErrorCode::StaleResource,
+                    message: "no active document storage namespace".into(),
+                    retryable: false,
+                })?;
                 Ok(self
                     .root
                     .join("documents")
@@ -145,9 +204,121 @@ impl JsonExtensionStorage {
     }
 }
 
+fn validate_document_namespace(document: &str) -> Result<(), ExtensionError> {
+    if document.is_empty()
+        || document.len() > 128
+        || !document
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Err(invalid("document storage namespace is invalid"))
+    } else {
+        Ok(())
+    }
+}
+
 impl ExtensionStorage for JsonExtensionStorage {
     fn get(
         &self,
+        extension: &ExtensionId,
+        area: StorageArea,
+        key: &str,
+    ) -> Result<DataValue, ExtensionError> {
+        self.shared
+            .get(self.selected_document()?.as_deref(), extension, area, key)
+    }
+
+    fn put(
+        &self,
+        extension: &ExtensionId,
+        area: StorageArea,
+        key: &str,
+        value: DataValue,
+        quota_bytes: u64,
+    ) -> Result<DataValue, ExtensionError> {
+        self.shared.put(
+            self.selected_document()?.as_deref(),
+            extension,
+            area,
+            key,
+            value,
+            quota_bytes,
+        )
+    }
+
+    fn delete(
+        &self,
+        extension: &ExtensionId,
+        area: StorageArea,
+        key: &str,
+    ) -> Result<DataValue, ExtensionError> {
+        self.shared
+            .delete(self.selected_document()?.as_deref(), extension, area, key)
+    }
+
+    fn clear_area(&self, extension: &ExtensionId, area: StorageArea) {
+        let document = self.selected_document().ok().flatten();
+        self.shared.clear_area(document.as_deref(), extension, area);
+    }
+
+    fn clear_all(&self, area: StorageArea) {
+        self.shared.clear_all(area);
+    }
+}
+
+impl ExtensionStorage for JsonExtensionStorageScope {
+    fn get(
+        &self,
+        extension: &ExtensionId,
+        area: StorageArea,
+        key: &str,
+    ) -> Result<DataValue, ExtensionError> {
+        self.shared
+            .get(self.document.as_deref(), extension, area, key)
+    }
+
+    fn put(
+        &self,
+        extension: &ExtensionId,
+        area: StorageArea,
+        key: &str,
+        value: DataValue,
+        quota_bytes: u64,
+    ) -> Result<DataValue, ExtensionError> {
+        self.shared.put(
+            self.document.as_deref(),
+            extension,
+            area,
+            key,
+            value,
+            quota_bytes,
+        )
+    }
+
+    fn delete(
+        &self,
+        extension: &ExtensionId,
+        area: StorageArea,
+        key: &str,
+    ) -> Result<DataValue, ExtensionError> {
+        self.shared
+            .delete(self.document.as_deref(), extension, area, key)
+    }
+
+    fn clear_area(&self, extension: &ExtensionId, area: StorageArea) {
+        self.shared
+            .clear_area(self.document.as_deref(), extension, area);
+    }
+
+    fn clear_all(&self, area: StorageArea) {
+        self.shared.clear_all(area);
+    }
+}
+
+impl SharedExtensionStorage {
+    fn get(
+        &self,
+        document: Option<&str>,
         extension: &ExtensionId,
         area: StorageArea,
         key: &str,
@@ -168,7 +339,7 @@ impl ExtensionStorage for JsonExtensionStorage {
             .lock()
             .map_err(|_| internal("extension storage I/O lock is poisoned"))?;
         Ok(self
-            .load(&self.path(extension, area)?)?
+            .load(&self.path(document, extension, area)?)?
             .get(key)
             .cloned()
             .unwrap_or(DataValue::Null))
@@ -176,6 +347,7 @@ impl ExtensionStorage for JsonExtensionStorage {
 
     fn put(
         &self,
+        document: Option<&str>,
         extension: &ExtensionId,
         area: StorageArea,
         key: &str,
@@ -207,7 +379,7 @@ impl ExtensionStorage for JsonExtensionStorage {
             .io_lock
             .lock()
             .map_err(|_| internal("extension storage I/O lock is poisoned"))?;
-        let path = self.path(extension, area)?;
+        let path = self.path(document, extension, area)?;
         let mut values = self.load(&path)?;
         values.insert(key.to_owned(), value);
         self.save(&path, values, quota_bytes)?;
@@ -216,6 +388,7 @@ impl ExtensionStorage for JsonExtensionStorage {
 
     fn delete(
         &self,
+        document: Option<&str>,
         extension: &ExtensionId,
         area: StorageArea,
         key: &str,
@@ -233,7 +406,7 @@ impl ExtensionStorage for JsonExtensionStorage {
             .io_lock
             .lock()
             .map_err(|_| internal("extension storage I/O lock is poisoned"))?;
-        let path = self.path(extension, area)?;
+        let path = self.path(document, extension, area)?;
         let mut values = self.load(&path)?;
         values.remove(key);
         // Deletion can only reduce authority; keep the existing file limit as
@@ -242,14 +415,14 @@ impl ExtensionStorage for JsonExtensionStorage {
         Ok(DataValue::Null)
     }
 
-    fn clear_area(&self, extension: &ExtensionId, area: StorageArea) {
+    fn clear_area(&self, document: Option<&str>, extension: &ExtensionId, area: StorageArea) {
         if area == StorageArea::EphemeralCache {
             if let Ok(mut state) = self.state.lock() {
                 state.ephemeral.retain(|(owner, _), _| owner != extension);
             }
             return;
         }
-        if let Ok(path) = self.path(extension, area) {
+        if let Ok(path) = self.path(document, extension, area) {
             let _guard = self.io_lock.lock();
             let _ = fs::remove_file(path);
         }
@@ -392,7 +565,11 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> ExtensionError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use key_extension_host::ExtensionStorage;
 
@@ -470,6 +647,126 @@ mod tests {
                 .get(&extension, StorageArea::EphemeralCache, "preview")
                 .unwrap(),
             DataValue::Null
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn immutable_document_scopes_remain_isolated_under_concurrent_window_io() {
+        let root = temporary_root();
+        let store = JsonExtensionStorage::new(root.clone());
+        let first = store.document_scope("document-one").unwrap();
+        let second = store.document_scope("document-two").unwrap();
+        let extension = ExtensionId::parse("org.example.concurrent").unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let first_thread = {
+            let barrier = barrier.clone();
+            let extension = extension.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                for position in 0..32 {
+                    first
+                        .put(
+                            &extension,
+                            StorageArea::Document,
+                            "position",
+                            DataValue::Integer(position),
+                            4096,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        first
+                            .get(&extension, StorageArea::Document, "position")
+                            .unwrap(),
+                        DataValue::Integer(position)
+                    );
+                }
+            })
+        };
+        let second_thread = {
+            let barrier = barrier.clone();
+            let extension = extension.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                for position in 100..132 {
+                    second
+                        .put(
+                            &extension,
+                            StorageArea::Document,
+                            "position",
+                            DataValue::Integer(position),
+                            4096,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        second
+                            .get(&extension, StorageArea::Document, "position")
+                            .unwrap(),
+                        DataValue::Integer(position)
+                    );
+                }
+            })
+        };
+
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+        let first = store.document_scope("document-one").unwrap();
+        let second = store.document_scope("document-two").unwrap();
+        assert_eq!(
+            first
+                .get(&extension, StorageArea::Document, "position")
+                .unwrap(),
+            DataValue::Integer(31)
+        );
+        assert_eq!(
+            second
+                .get(&extension, StorageArea::Document, "position")
+                .unwrap(),
+            DataValue::Integer(131)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retargeting_legacy_cursor_cannot_retarget_an_immutable_scope() {
+        let root = temporary_root();
+        let store = JsonExtensionStorage::new(root.clone());
+        let extension = ExtensionId::parse("org.example.scope").unwrap();
+        let fixed = store.document_scope("fixed-document").unwrap();
+
+        store
+            .select_document(Some("other-document".into()))
+            .unwrap();
+        fixed
+            .put(
+                &extension,
+                StorageArea::Document,
+                "selection",
+                DataValue::Integer(7),
+                4096,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get(&extension, StorageArea::Document, "selection")
+                .unwrap(),
+            DataValue::Null
+        );
+        assert_eq!(
+            fixed
+                .get(&extension, StorageArea::Document, "selection")
+                .unwrap(),
+            DataValue::Integer(7)
+        );
+
+        let application = store.application_scope();
+        assert_eq!(
+            application
+                .get(&extension, StorageArea::Document, "selection")
+                .unwrap_err()
+                .code,
+            ExtensionErrorCode::StaleResource
         );
         fs::remove_dir_all(root).unwrap();
     }

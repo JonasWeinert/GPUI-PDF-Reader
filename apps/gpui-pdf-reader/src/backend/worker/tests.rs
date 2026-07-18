@@ -4,22 +4,22 @@ use std::time::Instant;
 
 fn empty_worker_state(generation: u64) -> WorkerState {
     WorkerState {
-        runtime: PdfRuntime::new(
-            PdfiumEngine::new(PdfiumLibraryConfig::new(Vec::<PathBuf>::new())),
-            CachePolicy::default(),
-        ),
         generation: Some(generation),
-        document_cancellation: CancellationSource::new(),
-        automatic_text_cancellation: CancellationSource::new(),
-        explicit_text_cancellation: CancellationSource::new(),
-        text_cache: HashMap::new(),
-        automatic_text_needs_quiet: false,
+        path: None,
+        session: None,
         page_count: 3,
-        search: None,
+        text_cache: HashMap::new(),
         latest_search_revision: None,
+        search: None,
         scientific: None,
-        renders: RenderQueues::new(),
-        previews: LatestWinsQueue::new(1),
+        visible_text: None,
+        pending_renders: HashMap::new(),
+        pending_preview: HashMap::new(),
+        pending_text: HashMap::new(),
+        background_enabled: true,
+        hibernated: false,
+        resume_pending: false,
+        has_opened: false,
     }
 }
 
@@ -35,6 +35,7 @@ fn search_job(generation: u64, revision: u64) -> SearchJob {
         skipped_pages: 0,
         truncated: false,
         cancellation: CancellationSource::new(),
+        waiting: false,
     }
 }
 
@@ -229,11 +230,11 @@ fn no_match_page_emits_no_empty_result_event() {
     else {
         panic!("search unexpectedly cancelled");
     };
-    let (events, received) = mpsc::sync_channel(1);
+    let (events, received) = flume::bounded(1);
     assert!(send_search_page_results(&events, 7, 4, results));
     assert!(matches!(
         received.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
+        Err(flume::TryRecvError::Empty)
     ));
 }
 
@@ -244,7 +245,8 @@ fn worker_maps_runtime_open_render_text_preview_and_search_events() {
         .join("tests/fixtures/interaction.pdf");
     assert!(fixture.is_file());
 
-    let (worker, events) = PdfWorker::start();
+    let supervisor = start_pdf_engine_supervisor().unwrap();
+    let (worker, events) = PdfWorker::start(supervisor);
     assert!(matches!(
         events.recv_timeout(Duration::from_secs(5)).unwrap(),
         WorkerEvent::Ready
@@ -409,4 +411,20 @@ fn worker_maps_runtime_open_render_text_preview_and_search_events() {
             _ => {}
         }
     }
+}
+
+#[test]
+fn dropping_last_worker_handle_stops_document_adapter() {
+    let supervisor = start_pdf_engine_supervisor().unwrap();
+    let (worker, events) = PdfWorker::start(supervisor);
+    assert!(matches!(
+        events.recv_timeout(Duration::from_secs(5)).unwrap(),
+        WorkerEvent::Ready
+    ));
+
+    drop(worker);
+    assert!(matches!(
+        events.recv_timeout(Duration::from_secs(2)),
+        Err(flume::RecvTimeoutError::Disconnected)
+    ));
 }

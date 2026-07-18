@@ -16,6 +16,7 @@ members = [
     "crates/key-safe-http",
     "crates/key-sidecar-store",
     "crates/key-ui-gpui",
+    "crates/key-workspace-core",
     "extensions/key-reference",
     "extensions/key-pdf-toc",
 ]

@@ -11,7 +11,7 @@ use key_pdf_runtime::{
     CancellationToken, DocumentDescriptor, EngineCapabilities, EngineDocument, PdfEngine,
     PixelFormat, PreviewDemand, RasterImage, RenderDemand, TextDemand,
 };
-use pdfium_render::prelude::{PdfDocument, Pdfium, PdfiumError};
+use pdfium_render::prelude::{PdfDocument, PdfDocumentMetadataTagType, Pdfium, PdfiumError};
 use std::{
     collections::HashMap,
     fmt,
@@ -301,9 +301,14 @@ impl PdfEngine for PdfiumEngine {
         cancellation
             .checkpoint()
             .map_err(|_| PdfiumEngineError::Cancelled)?;
+        let title = document
+            .metadata()
+            .get(PdfDocumentMetadataTagType::Title)
+            .map(|tag| tag.value().trim().to_owned())
+            .filter(|title| !title.is_empty());
         Ok(PdfiumEngineDocument {
             document,
-            descriptor: DocumentDescriptor::new(pages, table_of_contents, links),
+            descriptor: DocumentDescriptor::new(pages, table_of_contents, links).with_title(title),
             partial_text: HashMap::new(),
             owner: self.owner,
             not_send: self.not_send.clone(),

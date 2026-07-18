@@ -2,16 +2,14 @@
 
 use crate::detect_doi;
 use crate::link_preview::fetch_public_json;
-use key_safe_http::{CancellationSource, CancellationToken};
+use crate::{ReferenceDocumentScope, ReferenceExecutor};
+use key_safe_http::CancellationToken;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::sync::Arc;
 use url::Url;
 
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
-const MAX_CONCURRENT_FETCHES: usize = 3;
 const MAX_REFERENCE_CHARS: usize = 2_000;
 const MAX_ABSTRACT_CHARS: usize = 8_000;
 const MAX_AUTHORS: usize = 12;
@@ -113,29 +111,43 @@ impl ScholarlyEvent {
 }
 
 pub struct ScholarlyFetcher {
-    events: mpsc::Sender<ScholarlyEvent>,
-    generation: Arc<AtomicU64>,
-    active_fetches: Arc<AtomicUsize>,
-    cancellation: Arc<Mutex<CancellationSource>>,
+    events: flume::Sender<ScholarlyEvent>,
+    scope: ReferenceDocumentScope,
     provider: Arc<dyn ScholarlyMetadataProvider>,
 }
 
 impl ScholarlyFetcher {
-    pub fn new() -> (Self, mpsc::Receiver<ScholarlyEvent>) {
-        Self::with_provider(Arc::new(NetworkScholarlyMetadataProvider))
+    pub fn new() -> (Self, flume::Receiver<ScholarlyEvent>) {
+        Self::with_executor(ReferenceExecutor::global())
+    }
+
+    pub fn with_executor(executor: ReferenceExecutor) -> (Self, flume::Receiver<ScholarlyEvent>) {
+        Self::with_provider_and_scope(
+            Arc::new(NetworkScholarlyMetadataProvider),
+            executor.document_scope(),
+        )
+    }
+
+    pub fn with_scope(scope: ReferenceDocumentScope) -> (Self, flume::Receiver<ScholarlyEvent>) {
+        Self::with_provider_and_scope(Arc::new(NetworkScholarlyMetadataProvider), scope)
     }
 
     /// Creates a fetcher around a deterministic or host-supplied provider.
     pub fn with_provider(
         provider: Arc<dyn ScholarlyMetadataProvider>,
-    ) -> (Self, mpsc::Receiver<ScholarlyEvent>) {
-        let (events, receiver) = mpsc::channel();
+    ) -> (Self, flume::Receiver<ScholarlyEvent>) {
+        Self::with_provider_and_scope(provider, ReferenceExecutor::global().document_scope())
+    }
+
+    pub fn with_provider_and_scope(
+        provider: Arc<dyn ScholarlyMetadataProvider>,
+        scope: ReferenceDocumentScope,
+    ) -> (Self, flume::Receiver<ScholarlyEvent>) {
+        let (events, receiver) = flume::unbounded();
         (
             Self {
                 events,
-                generation: Arc::new(AtomicU64::new(0)),
-                active_fetches: Arc::new(AtomicUsize::new(0)),
-                cancellation: Arc::new(Mutex::new(CancellationSource::new())),
+                scope,
                 provider,
             },
             receiver,
@@ -143,68 +155,27 @@ impl ScholarlyFetcher {
     }
 
     pub fn begin_document(&self, generation: u64) {
-        let mut cancellation = self
-            .cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cancellation.cancel();
-        *cancellation = CancellationSource::new();
-        self.generation.store(generation, Ordering::Release);
+        self.scope.begin_generation(generation);
     }
 
     fn fetch(&self, generation: u64, key: String, reference: String) -> bool {
-        if self.generation.load(Ordering::Acquire) != generation {
-            return false;
-        }
-        if self
-            .active_fetches
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_FETCHES).then_some(active + 1)
-            })
-            .is_err()
-        {
+        if !self.scope.is_current(generation) {
             return false;
         }
         let events = self.events.clone();
-        let active_generation = self.generation.clone();
-        let active_fetches = self.active_fetches.clone();
-        let cancellation = self
-            .cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .token();
         let provider = Arc::clone(&self.provider);
-        let spawned = thread::Builder::new()
-            .name("scholarly-metadata-fetch".into())
-            .spawn(move || {
-                let _guard = ActiveFetchGuard(active_fetches);
-                if active_generation.load(Ordering::Acquire) != generation {
-                    return;
-                }
-                let result = provider
-                    .fetch(&reference, &cancellation)
-                    .map_err(|error| concise_error(&error));
-                if active_generation.load(Ordering::Acquire) == generation {
-                    let _ = events.send(ScholarlyEvent::Fetched {
-                        generation,
-                        key,
-                        result,
-                    });
-                }
-            });
-        if spawned.is_err() {
-            self.active_fetches.fetch_sub(1, Ordering::AcqRel);
-            return false;
-        }
-        true
-    }
-}
-
-struct ActiveFetchGuard(Arc<AtomicUsize>);
-
-impl Drop for ActiveFetchGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.scope.execute(generation, move |cancellation| {
+            let result = provider
+                .fetch(&reference, &cancellation)
+                .map_err(|error| concise_error(&error));
+            if !cancellation.is_cancelled() {
+                let _ = events.send(ScholarlyEvent::Fetched {
+                    generation,
+                    key,
+                    result,
+                });
+            }
+        })
     }
 }
 
@@ -260,6 +231,11 @@ impl ScholarlySession {
                 Some(generation)
             }
         }
+    }
+
+    /// Purges document-owned in-memory metadata when its item closes.
+    pub fn purge(&mut self) {
+        self.entries.clear();
     }
 }
 

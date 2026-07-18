@@ -7,6 +7,70 @@ use crate::annotations::{AnnotationStore, DocumentKey, JsonSidecarStore};
 use gpui_component::{ThemeColor, ThemeMode};
 
 #[test]
+fn pdf_pointer_mapping_uses_the_measured_canvas_origin() {
+    let bounds = Bounds::new(point(px(120.0), px(104.0)), size(px(900.0), px(700.0)));
+    let window_position = point(px(386.0), px(412.0));
+
+    let local = window_point_to_canvas(bounds, window_position);
+    assert_eq!(local, Offset { x: 266.0, y: 308.0 });
+    assert_eq!(canvas_point_to_window(bounds, local), window_position);
+}
+
+#[test]
+fn resource_cache_limits_scale_and_suspend_without_hidden_minimums() {
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::Suspended, ResourceAmount::default()),
+        (0, 0, 0)
+    );
+    let saver_amount = ResourceAmount {
+        cpu_memory_bytes: 24 * RESOURCE_MIB,
+        gpu_memory_bytes: 16 * RESOURCE_MIB,
+        worker_slots: 0,
+        network_slots: 0,
+    };
+    let performance_amount = ResourceAmount {
+        cpu_memory_bytes: 192 * RESOURCE_MIB,
+        gpu_memory_bytes: 128 * RESOURCE_MIB,
+        worker_slots: 2,
+        network_slots: 2,
+    };
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::ForegroundInteractive, saver_amount),
+        (8 * RESOURCE_MIB as usize, 2, 6)
+    );
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::ForegroundInteractive, performance_amount),
+        (64 * RESOURCE_MIB as usize, 16, 48)
+    );
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::ForegroundIdle, performance_amount),
+        (48 * RESOURCE_MIB as usize, 12, 24)
+    );
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::BackgroundWarm, performance_amount),
+        (32 * RESOURCE_MIB as usize, 8, 8)
+    );
+    assert_eq!(
+        resource_cache_limits(ActivityLevel::BackgroundCold, performance_amount),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn idle_cache_retention_scales_without_rounding_small_nonzero_limits_to_zero() {
+    assert_eq!(
+        retained_cache_limit(64 * RESOURCE_MIB as usize, 50),
+        32 * RESOURCE_MIB as usize
+    );
+    assert_eq!(
+        retained_cache_limit(64 * RESOURCE_MIB as usize, 10),
+        6_710_887
+    );
+    assert_eq!(retained_cache_limit(1, 10), 1);
+    assert_eq!(retained_cache_limit(0, 10), 0);
+}
+
+#[test]
 fn extension_statistics_count_known_text_without_copying_it_into_snapshots() {
     let text = TextLayer::new(
         "one  two\nthree"

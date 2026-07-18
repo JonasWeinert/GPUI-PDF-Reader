@@ -17,6 +17,7 @@ pub struct EngineCapabilities {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocumentDescriptor {
+    title: Option<Arc<str>>,
     pages: Arc<[PageSize]>,
     table_of_contents: Arc<[TocEntry]>,
     links: Arc<[PdfLink]>,
@@ -29,10 +30,20 @@ impl DocumentDescriptor {
         links: Vec<PdfLink>,
     ) -> Self {
         Self {
+            title: None,
             pages: pages.into(),
             table_of_contents: table_of_contents.into(),
             links: links.into(),
         }
+    }
+
+    pub fn with_title(mut self, title: Option<String>) -> Self {
+        self.title = title.map(Into::into);
+        self
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     pub fn pages(&self) -> &[PageSize] {
@@ -260,6 +271,7 @@ impl std::error::Error for EngineOutputError {}
 #[derive(Debug)]
 pub enum RuntimeFailure<E> {
     Engine(E),
+    Session(SessionError),
     Demand(DemandError),
     Allocation(AllocationError),
     NoDocument,
@@ -272,6 +284,7 @@ impl<E: fmt::Display> fmt::Display for RuntimeFailure<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Engine(error) => error.fmt(formatter),
+            Self::Session(error) => error.fmt(formatter),
             Self::Demand(error) => error.fmt(formatter),
             Self::Allocation(error) => error.fmt(formatter),
             Self::NoDocument => formatter.write_str("no PDF document is open"),
@@ -912,6 +925,15 @@ mod tests {
             DocumentEvent::Opened { descriptor, .. } if descriptor.page_count() == 2
         ));
         runtime.session().unwrap()
+    }
+
+    #[test]
+    fn document_descriptor_preserves_optional_metadata_title() {
+        let untitled = DocumentDescriptor::new(Vec::new(), Vec::new(), Vec::new());
+        assert_eq!(untitled.title(), None);
+
+        let titled = untitled.with_title(Some("A useful document title".to_owned()));
+        assert_eq!(titled.title(), Some("A useful document title"));
     }
 
     #[test]

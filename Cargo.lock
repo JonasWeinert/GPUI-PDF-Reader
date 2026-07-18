@@ -2519,6 +2519,7 @@ name = "gpui-pdf-reader"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "flume",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
@@ -2538,7 +2539,10 @@ dependencies = [
  "key-reference",
  "key-sidecar-store",
  "key-ui-gpui",
+ "key-workspace-core",
+ "mach2",
  "objc2-app-kit",
+ "objc2-foundation",
  "open",
  "serde",
  "serde_json",
@@ -3433,6 +3437,7 @@ dependencies = [
 name = "key-reference"
 version = "0.1.0"
 dependencies = [
+ "flume",
  "image",
  "key-safe-http",
  "serde_json",
@@ -3452,6 +3457,7 @@ dependencies = [
 name = "key-sidecar-store"
 version = "0.1.0"
 dependencies = [
+ "flume",
  "key-extension-api",
  "key-extension-host",
  "key-pdf-core",
@@ -3466,6 +3472,13 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "gpui-component",
+]
+
+[[package]]
+name = "key-workspace-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

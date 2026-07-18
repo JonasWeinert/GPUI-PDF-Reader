@@ -479,6 +479,8 @@ impl BladeRenderer {
             self.surface_config.size = gpu_size;
             self.gpu
                 .reconfigure_surface(&mut self.surface, self.surface_config);
+            #[cfg(target_os = "macos")]
+            self.layer().set_maximum_drawable_count(2);
             self.gpu.destroy_texture(self.path_intermediate_texture);
             self.gpu
                 .destroy_texture_view(self.path_intermediate_texture_view);
@@ -517,6 +519,8 @@ impl BladeRenderer {
             self.surface_config.transparent = transparent;
             self.gpu
                 .reconfigure_surface(&mut self.surface, self.surface_config);
+            #[cfg(target_os = "macos")]
+            self.layer().set_maximum_drawable_count(2);
             self.pipelines.destroy(&self.gpu);
             self.pipelines = BladePipelines::new(
                 &self.gpu,

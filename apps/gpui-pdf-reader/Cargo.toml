@@ -16,6 +16,7 @@ installable-extensions = ["dep:key-extension-package", "dep:key-extension-wasm"]
 scholarly-network = ["dep:key-reference"]
 
 [dependencies]
+flume = "0.11.1"
 image.workspace = true
 key-editor-gpui = { path = "../../crates/key-editor-gpui" }
 key-extension-api = { path = "../../crates/key-extension-api" }
@@ -32,6 +33,7 @@ key-pdfium = { path = "../../crates/key-pdfium" }
 key-reference = { path = "../../extensions/key-reference", optional = true }
 key-sidecar-store = { path = "../../crates/key-sidecar-store" }
 key-ui-gpui = { path = "../../crates/key-ui-gpui" }
+key-workspace-core = { path = "../../crates/key-workspace-core" }
 open.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -40,7 +42,9 @@ url.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "0.6.2", default-features = false, features = ["std"] }
+mach2 = "0.4.3"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSEvent"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSProcessInfo"] }
 gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
 gpui-component = "=0.5.1"
 gpui-component-assets = "=0.5.1"

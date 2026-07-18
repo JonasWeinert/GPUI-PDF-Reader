@@ -4,16 +4,23 @@
 //! enabled. The environment protocol stays app-specific while `PdfReader`
 //! exposes the narrow instrumentation hooks used by the native E2E scripts.
 
+use crate::application_host::{ApplicationHost, open_pdf_window};
 use crate::reader::PdfReader;
-use gpui::{App, Keystroke, Point, WindowHandle};
+use crate::reader::qa::QaReaderResourceSnapshot;
+use crate::workspace_window::WorkspaceWindow;
+use gpui::{App, AsyncWindowContext, Entity, Keystroke, Point, Window, WindowHandle};
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const DEFAULT_INTERVAL_MS: u64 = 180;
 const DEFAULT_TIMEOUT_MS: u64 = 20_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STABLE_VIEWPORT_DURATION: Duration = Duration::from_millis(250);
+const DEFAULT_RESOURCE_SAMPLE_MS: u64 = 100;
 
 struct QaConfig {
     keystrokes: Vec<Keystroke>,
@@ -33,6 +40,18 @@ struct QaConfig {
     toc_callout_hold: bool,
     reference_details: bool,
     extension_scenario: Option<String>,
+    expected_window_count: Option<usize>,
+    expected_tab_count: Option<usize>,
+    tab_drag_scenario: Option<String>,
+    resource_trace: bool,
+    resource_sample_interval: Duration,
+    resource_stress: bool,
+    progressive_open: bool,
+    resource_chaos: bool,
+    chaos_rounds: usize,
+    chaos_actions_per_window: usize,
+    chaos_seed: u64,
+    render_dwell: Duration,
 }
 
 impl QaConfig {
@@ -75,6 +94,26 @@ impl QaConfig {
             toc_callout_hold: flag("GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD"),
             reference_details: flag("GPUI_PDF_READER_QA_REFERENCE_DETAILS"),
             extension_scenario: std::env::var("GPUI_PDF_READER_QA_EXTENSION_SCENARIO").ok(),
+            expected_window_count: optional_value("GPUI_PDF_READER_QA_WINDOW_COUNT"),
+            expected_tab_count: optional_value("GPUI_PDF_READER_QA_TAB_COUNT"),
+            tab_drag_scenario: std::env::var("GPUI_PDF_READER_QA_TAB_DRAG_SCENARIO").ok(),
+            resource_trace: flag("GPUI_PDF_READER_QA_RESOURCE_TRACE"),
+            resource_sample_interval: Duration::from_millis(
+                optional_value::<u64>("GPUI_PDF_READER_QA_RESOURCE_SAMPLE_MS")
+                    .unwrap_or(DEFAULT_RESOURCE_SAMPLE_MS)
+                    .clamp(20, 5_000),
+            ),
+            resource_stress: flag("GPUI_PDF_READER_QA_RESOURCE_STRESS"),
+            progressive_open: flag("GPUI_PDF_READER_QA_PROGRESSIVE_OPEN"),
+            resource_chaos: flag("GPUI_PDF_READER_QA_RESOURCE_CHAOS"),
+            chaos_rounds: optional_value("GPUI_PDF_READER_QA_CHAOS_ROUNDS").unwrap_or(2),
+            chaos_actions_per_window: optional_value("GPUI_PDF_READER_QA_CHAOS_ACTIONS_PER_WINDOW")
+                .unwrap_or(4),
+            chaos_seed: optional_value("GPUI_PDF_READER_QA_CHAOS_SEED")
+                .unwrap_or(0x6b65_792d_7064_6621),
+            render_dwell: Duration::from_millis(
+                optional_value("GPUI_PDF_READER_QA_RENDER_DWELL_MS").unwrap_or(320),
+            ),
         }
     }
 
@@ -94,6 +133,13 @@ impl QaConfig {
             || self.toc_callout_hold
             || self.reference_details
             || self.extension_scenario.is_some()
+            || self.expected_window_count.is_some()
+            || self.expected_tab_count.is_some()
+            || self.tab_drag_scenario.is_some()
+            || self.resource_trace
+            || self.resource_stress
+            || self.progressive_open
+            || self.resource_chaos
     }
 
     fn has_navigation_setup(&self) -> bool {
@@ -132,22 +178,33 @@ where
 }
 
 /// Installs the opt-in native QA driver for a reader window.
-pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
+pub fn install(
+    window: WindowHandle<WorkspaceWindow>,
+    application_host: Entity<ApplicationHost>,
+    deferred_paths: Vec<PathBuf>,
+    cx: &mut App,
+) {
     apply_initial_overrides(window, cx);
     let config = QaConfig::from_environment();
     if !config.requested() {
         return;
     }
 
+    let resource_trace = config.resource_trace.then(QaResourceTrace::new);
+    if let Some(trace) = resource_trace.clone() {
+        install_resource_sampler(window, trace, config.resource_sample_interval, cx);
+    }
+
     window
         .update(cx, |_, window, cx| {
             window
                 .spawn(cx, async move |cx| {
+                    trace_marker(&resource_trace, "startup", "begin", cx);
                     let startup_deadline = Instant::now() + config.timeout;
                     loop {
                         let ready = cx
                             .update(|window, cx| {
-                                window.root::<PdfReader>().flatten().is_some_and(|reader| {
+                                reader_entity(window, cx).is_some_and(|reader| {
                                     reader.read(cx).qa_viewport_is_settled()
                                 })
                             })
@@ -161,11 +218,490 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         }
                         cx.background_executor().timer(POLL_INTERVAL).await;
                     }
+                    trace_marker(&resource_trace, "startup", "settled", cx);
+
+                    if config.progressive_open {
+                        trace_marker(&resource_trace, "progressive-open-1", "settled", cx);
+                        for (index, path) in deferred_paths.into_iter().enumerate() {
+                            let count = index + 2;
+                            let operation = format!("progressive-open-{count}");
+                            trace_marker(&resource_trace, &operation, "before", cx);
+                            let opened = cx.update(|_, cx| {
+                                open_pdf_window(application_host.clone(), Some(path), cx)
+                            });
+                            let handle = match opened {
+                                Ok(Ok(handle)) => handle,
+                                Ok(Err(error)) => {
+                                    fail_and_quit(
+                                        cx,
+                                        &format!("progressive PDF open failed: {error}"),
+                                    );
+                                    return;
+                                }
+                                Err(error) => {
+                                    fail_and_quit(
+                                        cx,
+                                        &format!("progressive window update failed: {error}"),
+                                    );
+                                    return;
+                                }
+                            };
+                            if let Err(error) = wait_for_reader_settled(
+                                handle,
+                                config.timeout,
+                                config.render_dwell,
+                                cx,
+                            )
+                            .await
+                            {
+                                fail_and_quit(cx, &error);
+                                return;
+                            }
+                            trace_marker(&resource_trace, &operation, "settled", cx);
+                        }
+                    }
+
+                    if let Some(expected) = config.expected_window_count {
+                        let deadline = Instant::now() + config.timeout;
+                        loop {
+                            let (windows, pdf_views, settled) = cx
+                                .update(|window, cx| workspace_window_counts(window, cx))
+                                .unwrap_or_default();
+                            if windows == expected
+                                && pdf_views == expected
+                                && settled == expected
+                            {
+                                eprintln!(
+                                    "GPUI_PDF_READER_QA_WINDOWS windows={windows} pdf_views={pdf_views} settled={settled}"
+                                );
+                                break;
+                            }
+                            if windows > expected {
+                                fail_and_quit(
+                                    cx,
+                                    &format!(
+                                        "expected {expected} workspace windows, found {windows}"
+                                    ),
+                                );
+                                return;
+                            }
+                            if Instant::now() >= deadline {
+                                fail_and_quit(
+                                    cx,
+                                    &format!(
+                                        "multi-window startup did not settle: expected={expected} windows={windows} pdf_views={pdf_views} settled={settled}"
+                                    ),
+                                );
+                                return;
+                            }
+                            cx.background_executor().timer(POLL_INTERVAL).await;
+                        }
+                    }
+
+                    if let Some(expected) = config.expected_tab_count {
+                        let actual = cx
+                            .update(|window, cx| {
+                                window
+                                    .root::<WorkspaceWindow>()
+                                    .flatten()
+                                    .map_or(0, |workspace| workspace.read(cx).qa_tab_count())
+                            })
+                            .unwrap_or(0);
+                        if actual != expected {
+                            fail_and_quit(
+                                cx,
+                                &format!("expected {expected} workspace tabs, found {actual}"),
+                            );
+                            return;
+                        }
+                        let mut settled = 0;
+                        for index in 0..expected {
+                            let activated = cx
+                                .update(|window, cx| {
+                                    let Some(workspace) = window
+                                        .root::<WorkspaceWindow>()
+                                        .flatten()
+                                    else {
+                                        return false;
+                                    };
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.qa_activate_tab(index, window, cx)
+                                    });
+                                    true
+                                })
+                                .unwrap_or(false);
+                            if !activated {
+                                fail_and_quit(cx, "tab QA could not access the workspace root");
+                                return;
+                            }
+                            let deadline = Instant::now() + config.timeout;
+                            loop {
+                                let ready = cx
+                                    .update(|window, cx| {
+                                        reader_entity(window, cx).is_some_and(|reader| {
+                                            reader.read(cx).qa_viewport_is_settled()
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                if ready {
+                                    settled += 1;
+                                    break;
+                                }
+                                if Instant::now() >= deadline {
+                                    fail_and_quit(
+                                        cx,
+                                        &format!("tab {index} did not settle after activation"),
+                                    );
+                                    return;
+                                }
+                                cx.background_executor().timer(POLL_INTERVAL).await;
+                            }
+                        }
+                        let windows = cx.update(|_, cx| cx.windows().len()).unwrap_or(0);
+                        eprintln!(
+                            "GPUI_PDF_READER_QA_TABS tabs={actual} switched={expected} settled={settled} windows={windows}"
+                        );
+                    }
+
+                    if let Some(scenario) = config.tab_drag_scenario.as_deref() {
+                        match scenario {
+                            "reorder" => {
+                                let outcome = cx.update(|window, cx| {
+                                    let workspace = window
+                                        .root::<WorkspaceWindow>()
+                                        .flatten()
+                                        .ok_or_else(|| "tab reorder root is unavailable".to_owned())?;
+                                    let before = workspace.read(cx).qa_tab_view_ids();
+                                    if before.len() < 3 {
+                                        return Err("tab reorder requires at least three tabs".to_owned());
+                                    }
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.qa_reorder_tab(0, before.len(), cx)
+                                    });
+                                    let after = workspace.read(cx).qa_tab_view_ids();
+                                    let mut expected = before[1..].to_vec();
+                                    expected.push(before[0]);
+                                    if after != expected {
+                                        return Err(format!(
+                                            "tab reorder mismatch: before={before:?} after={after:?}"
+                                        ));
+                                    }
+                                    Ok(after.len())
+                                });
+                                match outcome {
+                                    Ok(Ok(tabs)) => eprintln!(
+                                        "GPUI_PDF_READER_QA_TAB_DRAG scenario=reorder tabs={tabs}"
+                                    ),
+                                    Ok(Err(message)) => {
+                                        fail_and_quit(cx, &message);
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        fail_and_quit(cx, &format!("tab reorder failed: {error}"));
+                                        return;
+                                    }
+                                }
+                            }
+                            "transfer" => {
+                                let current_window = cx
+                                    .update(|window, cx| {
+                                        window
+                                            .root::<WorkspaceWindow>()
+                                            .flatten()
+                                            .map(|workspace| workspace.read(cx).qa_window_and_view().0)
+                                    })
+                                    .ok()
+                                    .flatten();
+                                let handles = cx
+                                    .update(|_, cx| {
+                                        cx.windows()
+                                            .into_iter()
+                                            .filter_map(|handle| {
+                                                handle.downcast::<WorkspaceWindow>()
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                if handles.len() != 2 {
+                                    fail_and_quit(
+                                        cx,
+                                        &format!(
+                                            "tab transfer requires two windows, found {}",
+                                            handles.len()
+                                        ),
+                                    );
+                                    return;
+                                }
+                                let Some(current_window) = current_window else {
+                                    fail_and_quit(cx, "tab transfer current window is unavailable");
+                                    return;
+                                };
+                                let target = handles.iter().copied().find(|handle| {
+                                    handle
+                                        .update(cx, |workspace, _, _| workspace.qa_window_and_view().0)
+                                        .is_ok_and(|window| window == current_window)
+                                });
+                                let source = handles.iter().copied().find(|handle| {
+                                    handle
+                                        .update(cx, |workspace, _, _| workspace.qa_window_and_view().0)
+                                        .is_ok_and(|window| window != current_window)
+                                });
+                                let (Some(source), Some(target)) = (source, target) else {
+                                    fail_and_quit(cx, "tab transfer could not distinguish source and target windows");
+                                    return;
+                                };
+                                let source_identity = source.update(cx, |workspace, _, _| {
+                                    workspace.qa_window_and_view()
+                                });
+                                let Ok((source_window, source_view)) = source_identity else {
+                                    fail_and_quit(cx, "tab transfer source disappeared");
+                                    return;
+                                };
+                                if target
+                                    .update(cx, |workspace, window, cx| {
+                                        let insertion = workspace.qa_tab_count();
+                                        workspace.qa_transfer_tab_from(
+                                            source_window,
+                                            source_view,
+                                            insertion,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .is_err()
+                                {
+                                    fail_and_quit(cx, "tab transfer target disappeared");
+                                    return;
+                                }
+                                let deadline = Instant::now() + config.timeout;
+                                loop {
+                                    let state = target.update(cx, |workspace, _, cx| {
+                                        let tabs = workspace.qa_tab_count();
+                                        let settled = workspace
+                                            .reader()
+                                            .is_some_and(|reader| {
+                                                reader.read(cx).qa_viewport_is_settled()
+                                            });
+                                        (tabs, settled)
+                                    });
+                                    let windows = cx.update(|_, cx| cx.windows().len()).unwrap_or(0);
+                                    if matches!(state, Ok((2, true))) && windows == 1 {
+                                        eprintln!(
+                                            "GPUI_PDF_READER_QA_TAB_DRAG scenario=transfer tabs=2 windows=1 settled=1"
+                                        );
+                                        break;
+                                    }
+                                    if Instant::now() >= deadline {
+                                        fail_and_quit(
+                                            cx,
+                                            &format!(
+                                                "tab transfer did not settle: state={state:?} windows={windows}"
+                                            ),
+                                        );
+                                        return;
+                                    }
+                                    cx.background_executor().timer(POLL_INTERVAL).await;
+                                }
+                            }
+                            other => {
+                                fail_and_quit(cx, &format!("unknown tab drag scenario: {other}"));
+                                return;
+                            }
+                        }
+                    }
+
+                    if config.resource_stress {
+                        trace_marker(&resource_trace, "resource-stress", "before", cx);
+                        let handles = cx
+                            .update(|_, cx| {
+                                cx.windows()
+                                    .into_iter()
+                                    .filter_map(|handle| handle.downcast::<WorkspaceWindow>())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        for (window_index, handle) in handles.into_iter().enumerate() {
+                            for (wheel_index, delta) in
+                                [80.0_f32; 8].into_iter().chain([-80.0_f32; 4]).enumerate()
+                            {
+                                let operation = format!(
+                                    "stress-{window_index}-wheel-{wheel_index}-delta-{delta}"
+                                );
+                                trace_marker(&resource_trace, &operation, "before", cx);
+                                let outcome = handle.update(cx, |workspace, window, cx| {
+                                    window.activate_window();
+                                    let Some(reader) = workspace.reader() else {
+                                        return Err("resource stress reader is unavailable".to_owned());
+                                    };
+                                    let viewport = window.viewport_size();
+                                    let position =
+                                        Point::new(viewport.width / 2.0, viewport.height / 2.0);
+                                    reader.update(cx, |reader, cx| {
+                                        reader.qa_command_wheel(delta, position, window, cx)
+                                    });
+                                    Ok(())
+                                });
+                                match outcome {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(message)) => {
+                                        fail_and_quit(
+                                            cx,
+                                            &format!("resource stress failed: {message}"),
+                                        );
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        fail_and_quit(
+                                            cx,
+                                            &format!("resource stress window failed: {error}"),
+                                        );
+                                        return;
+                                    }
+                                }
+                                cx.background_executor().timer(config.interval).await;
+                                trace_marker(&resource_trace, &operation, "after", cx);
+                            }
+                        }
+
+                        let settle_deadline = Instant::now() + config.timeout;
+                        loop {
+                            let (_, pdf_views, settled) = cx
+                                .update(|window, cx| workspace_window_counts(window, cx))
+                                .unwrap_or_default();
+                            if pdf_views > 0 && settled == pdf_views {
+                                break;
+                            }
+                            if Instant::now() >= settle_deadline {
+                                fail_and_quit(cx, "resource stress did not settle every PDF view");
+                                return;
+                            }
+                            cx.background_executor().timer(POLL_INTERVAL).await;
+                        }
+                        trace_marker(&resource_trace, "resource-stress", "settled", cx);
+                    }
+
+                    if config.resource_chaos {
+                        trace_marker(&resource_trace, "resource-chaos", "before", cx);
+                        let mut handles = cx
+                            .update(|_, cx| {
+                                cx.windows()
+                                    .into_iter()
+                                    .filter_map(|handle| handle.downcast::<WorkspaceWindow>())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let mut random = QaRandom::new(config.chaos_seed);
+                        for round in 0..config.chaos_rounds {
+                            random.shuffle(&mut handles);
+                            for (window_index, handle) in handles.iter().copied().enumerate() {
+                                let operation = format!("chaos-{round}-window-{window_index}");
+                                trace_marker(&resource_trace, &operation, "activate", cx);
+                                if handle
+                                    .update(cx, |_, window, _| window.activate_window())
+                                    .is_err()
+                                {
+                                    fail_and_quit(cx, "chaos activation lost a workspace window");
+                                    return;
+                                }
+                                if let Err(error) = wait_for_reader_settled(
+                                    handle,
+                                    config.timeout,
+                                    config.render_dwell,
+                                    cx,
+                                )
+                                .await
+                                {
+                                    fail_and_quit(cx, &error);
+                                    return;
+                                }
+
+                                for action in 0..config.chaos_actions_per_window {
+                                    let kind = random.next_usize(5);
+                                    let magnitude = 120.0 + random.next_usize(5) as f32 * 70.0;
+                                    let signed = if random.next_usize(2) == 0 {
+                                        magnitude
+                                    } else {
+                                        -magnitude
+                                    };
+                                    let action_name = match kind {
+                                        0 => "zoom",
+                                        1 => "scroll-y",
+                                        2 => "scroll-x",
+                                        3 => "scroll-diagonal",
+                                        _ => "zoom-reverse",
+                                    };
+                                    let marker = format!(
+                                        "{operation}-action-{action}-{action_name}-{signed}"
+                                    );
+                                    trace_marker(&resource_trace, &marker, "before", cx);
+                                    let outcome = handle.update(cx, |workspace, window, cx| {
+                                        let reader = workspace.reader().ok_or_else(|| {
+                                            "chaos reader is unavailable".to_owned()
+                                        })?;
+                                        let viewport = window.viewport_size();
+                                        let x = viewport.width
+                                            * (0.2 + random.next_usize(61) as f32 / 100.0);
+                                        let y = viewport.height
+                                            * (0.2 + random.next_usize(61) as f32 / 100.0);
+                                        let position = Point::new(x, y);
+                                        reader.update(cx, |reader, cx| match kind {
+                                            0 => reader.qa_wheel(
+                                                0.0, signed, true, position, window, cx,
+                                            ),
+                                            1 => reader.qa_wheel(
+                                                0.0, signed, false, position, window, cx,
+                                            ),
+                                            2 => reader.qa_wheel(
+                                                signed, 0.0, false, position, window, cx,
+                                            ),
+                                            3 => reader.qa_wheel(
+                                                signed * 0.45,
+                                                signed,
+                                                false,
+                                                position,
+                                                window,
+                                                cx,
+                                            ),
+                                            _ => reader.qa_wheel(
+                                                0.0, -signed, true, position, window, cx,
+                                            ),
+                                        });
+                                        Ok::<_, String>(())
+                                    });
+                                    if !matches!(outcome, Ok(Ok(()))) {
+                                        fail_and_quit(cx, "chaos input failed");
+                                        return;
+                                    }
+                                    if let Err(error) = wait_for_reader_settled(
+                                        handle,
+                                        config.timeout,
+                                        config.render_dwell,
+                                        cx,
+                                    )
+                                    .await
+                                    {
+                                        fail_and_quit(cx, &error);
+                                        return;
+                                    }
+                                    trace_marker(&resource_trace, &marker, "settled", cx);
+                                }
+                            }
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1_500))
+                            .await;
+                        if let Err(error) = wait_for_all_resources_settled(config.timeout, cx).await
+                        {
+                            fail_and_quit(cx, &error);
+                            return;
+                        }
+                        trace_marker(&resource_trace, "resource-chaos", "settled", cx);
+                    }
 
                     if config.has_navigation_setup() {
                         let outcome = cx
                             .update(|window, cx| {
-                                let Some(Some(reader)) = window.root::<PdfReader>() else {
+                                let Some(reader) = reader_entity(window, cx) else {
                                     return Err("TOC QA reader is unavailable".to_owned());
                                 };
                                 reader.update(cx, |reader, cx| {
@@ -214,7 +750,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         loop {
                             let outcome = cx
                                 .update(|window, cx| {
-                                    let Some(Some(reader)) = window.root::<PdfReader>() else {
+                                    let Some(reader) = reader_entity(window, cx) else {
                                         return Err(
                                             "reference details reader is unavailable".to_owned()
                                         );
@@ -249,7 +785,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         loop {
                             let outcome = cx
                                 .update(|window, cx| {
-                                    let Some(Some(reader)) = window.root::<PdfReader>() else {
+                                    let Some(reader) = reader_entity(window, cx) else {
                                         return Ok(false);
                                     };
                                     reader.update(cx, |reader, cx| {
@@ -291,7 +827,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         loop {
                             let outcome = cx
                                 .update(|window, cx| {
-                                    let Some(Some(reader)) = window.root::<PdfReader>() else {
+                                    let Some(reader) = reader_entity(window, cx) else {
                                         return Ok(false);
                                     };
                                     reader.update(cx, |reader, cx| {
@@ -317,7 +853,7 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                             }
                             if Instant::now() >= deadline {
                                 let _ = cx.update(|window, cx| {
-                                    if let Some(Some(reader)) = window.root::<PdfReader>() {
+                                    if let Some(reader) = reader_entity(window, cx) {
                                         eprintln!(
                                             "GPUI_PDF_READER_QA_EXTENSION_TIMEOUT {}",
                                             reader.read(cx).qa_report()
@@ -336,24 +872,32 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         }
                     }
 
-                    for keystroke in config.keystrokes {
+                    for (index, keystroke) in config.keystrokes.into_iter().enumerate() {
+                        let operation =
+                            trace_operation_label("key", index, &format!("{keystroke:?}"));
+                        trace_marker(&resource_trace, &operation, "before", cx);
                         let _ = cx.update(|window, cx| {
                             window.dispatch_keystroke(keystroke, cx);
                         });
                         cx.background_executor().timer(config.interval).await;
+                        trace_marker(&resource_trace, &operation, "after", cx);
                     }
-                    for delta_y in config.wheel_deltas {
+                    for (index, delta_y) in config.wheel_deltas.into_iter().enumerate() {
+                        let operation =
+                            trace_operation_label("wheel", index, &delta_y.to_string());
+                        trace_marker(&resource_trace, &operation, "before", cx);
                         let _ = cx.update(|window, cx| {
                             let viewport = window.viewport_size();
                             let position =
                                 Point::new(viewport.width / 2.0, viewport.height / 2.0);
-                            if let Some(Some(reader)) = window.root::<PdfReader>() {
+                            if let Some(reader) = reader_entity(window, cx) {
                                 reader.update(cx, |reader, cx| {
                                     reader.qa_command_wheel(delta_y, position, window, cx);
                                 });
                             }
                         });
                         cx.background_executor().timer(config.interval).await;
+                        trace_marker(&resource_trace, &operation, "after", cx);
                     }
 
                     if config.report || config.exit_after_report {
@@ -362,8 +906,13 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                         loop {
                             let settled = cx
                                 .update(|window, cx| {
-                                    window.root::<PdfReader>().flatten().is_some_and(|reader| {
-                                        reader.read(cx).qa_viewport_is_settled()
+                                    reader_entity(window, cx).is_some_and(|reader| {
+                                        let reader = reader.read(cx);
+                                        if config.progressive_open || config.resource_chaos {
+                                            reader.qa_resource_is_settled()
+                                        } else {
+                                            reader.qa_viewport_is_settled()
+                                        }
                                     })
                                 })
                                 .unwrap_or(false);
@@ -382,9 +931,10 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
                             }
                             cx.background_executor().timer(POLL_INTERVAL).await;
                         }
+                        trace_marker(&resource_trace, "viewport", "settled", cx);
                         let _ = cx.update(|window, cx| {
                             if config.report
-                                && let Some(Some(reader)) = window.root::<PdfReader>()
+                                && let Some(reader) = reader_entity(window, cx)
                             {
                                 eprintln!("{}", reader.read(cx).qa_report());
                             }
@@ -399,21 +949,27 @@ pub fn install(window: WindowHandle<PdfReader>, cx: &mut App) {
         .ok();
 }
 
-fn apply_initial_overrides(window: WindowHandle<PdfReader>, cx: &mut App) {
+fn apply_initial_overrides(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
     if flag("GPUI_PDF_READER_QA_FLUID_VIEW") {
         window
-            .update(cx, |reader, window, cx| {
-                reader.qa_use_fluid_view(window, cx);
+            .update(cx, |workspace, window, cx| {
+                if let Some(reader) = workspace.reader() {
+                    reader.update(cx, |reader, cx| reader.qa_use_fluid_view(window, cx));
+                }
             })
             .ok();
     }
     if let Ok(theme_name) = std::env::var("GPUI_PDF_READER_QA_THEME") {
         window
-            .update(cx, |reader, window, cx| {
-                assert!(
-                    reader.qa_select_theme(&theme_name, window, cx),
-                    "unknown GPUI_PDF_READER_QA_THEME: {theme_name}"
-                );
+            .update(cx, |workspace, window, cx| {
+                if let Some(reader) = workspace.reader() {
+                    reader.update(cx, |reader, cx| {
+                        assert!(
+                            reader.qa_select_theme(&theme_name, window, cx),
+                            "unknown GPUI_PDF_READER_QA_THEME: {theme_name}"
+                        );
+                    });
+                }
             })
             .ok();
     }
@@ -424,10 +980,335 @@ fn apply_initial_overrides(window: WindowHandle<PdfReader>, cx: &mut App) {
             _ => panic!("invalid GPUI_PDF_READER_QA_PDF_DARK: {value}"),
         };
         window
-            .update(cx, |reader, window, cx| {
-                reader.qa_set_pdf_dark_mode(enabled, window, cx);
+            .update(cx, |workspace, window, cx| {
+                if let Some(reader) = workspace.reader() {
+                    reader.update(cx, |reader, cx| {
+                        reader.qa_set_pdf_dark_mode(enabled, window, cx)
+                    });
+                }
             })
             .ok();
+    }
+}
+
+fn reader_entity(window: &Window, cx: &App) -> Option<Entity<PdfReader>> {
+    window
+        .root::<WorkspaceWindow>()
+        .flatten()
+        .and_then(|workspace| workspace.read(cx).reader())
+}
+
+fn workspace_window_counts(current: &Window, cx: &App) -> (usize, usize, usize) {
+    let windows = cx.windows();
+    let current_handle = current.window_handle();
+    let mut pdf_views = 0;
+    let mut settled = 0;
+    for handle in &windows {
+        if *handle == current_handle {
+            let Some(workspace) = current.root::<WorkspaceWindow>().flatten() else {
+                continue;
+            };
+            for reader in workspace.read(cx).readers() {
+                pdf_views += 1;
+                settled += usize::from(reader.read(cx).qa_resource_is_settled());
+            }
+            continue;
+        }
+        let Some(handle) = handle.downcast::<WorkspaceWindow>() else {
+            continue;
+        };
+        let Ok(workspace) = handle.read(cx) else {
+            continue;
+        };
+        for reader in workspace.readers() {
+            pdf_views += 1;
+            settled += usize::from(reader.read(cx).qa_resource_is_settled());
+        }
+    }
+    (windows.len(), pdf_views, settled)
+}
+
+#[derive(Clone)]
+struct QaResourceTrace {
+    started: Instant,
+    sequence: Arc<AtomicU64>,
+    system: key_workspace_core::SystemResources,
+}
+
+impl QaResourceTrace {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            sequence: Arc::new(AtomicU64::new(0)),
+            system: crate::system_resources::detect(),
+        }
+    }
+
+    fn emit(&self, operation: &str, phase: &str, window: &Window, cx: &App) {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let elapsed_us = self.started.elapsed().as_micros();
+        let allocator = crate::qa_resources::allocator_snapshot();
+        let process = crate::qa_resources::process_memory_snapshot().unwrap_or_default();
+        let views = workspace_resource_totals(window, cx);
+        eprintln!(
+            "GPUI_PDF_READER_QA_RESOURCE seq={sequence} elapsed_us={elapsed_us} operation={operation} phase={phase} physical_memory={} low_power={} virtual={} resident={} resident_peak={} footprint={} footprint_peak={} alloc_live={} alloc_peak={} alloc_calls={} dealloc_calls={} realloc_calls={} allocated_bytes={} deallocated_bytes={} views={} interactive={} idle={} warm={} cold={} suspended={} allocation_cpu={} allocation_gpu={} allocation_workers={} tile_bytes={} tile_resident_estimate={} tile_limit={} tile_base_limit={} tiles={} pending_tiles={} text_pages={} trimmed_views={} hibernated_views={} retention_percent={}",
+            self.system.physical_memory_bytes,
+            u8::from(self.system.low_power_mode),
+            process.virtual_bytes,
+            process.resident_bytes,
+            process.peak_resident_bytes,
+            process.physical_footprint_bytes,
+            process.peak_physical_footprint_bytes,
+            allocator.live_bytes,
+            allocator.peak_live_bytes,
+            allocator.alloc_calls,
+            allocator.dealloc_calls,
+            allocator.realloc_calls,
+            allocator.allocated_bytes,
+            allocator.deallocated_bytes,
+            views.views,
+            views.interactive,
+            views.idle,
+            views.warm,
+            views.cold,
+            views.suspended,
+            views.allocated_cpu_bytes,
+            views.allocated_gpu_bytes,
+            views.allocated_workers,
+            views.cached_tile_bytes,
+            views.estimated_tile_resident_bytes,
+            views.tile_cache_limit_bytes,
+            views.base_tile_cache_limit_bytes,
+            views.cached_tiles,
+            views.pending_tiles,
+            views.cached_text_pages,
+            views.trimmed_views,
+            views.hibernated_views,
+            views.cache_retention_percent,
+        );
+    }
+}
+
+fn install_resource_sampler(
+    window: WindowHandle<WorkspaceWindow>,
+    trace: QaResourceTrace,
+    interval: Duration,
+    cx: &mut App,
+) {
+    window
+        .update(cx, |_, window, cx| {
+            window
+                .spawn(cx, async move |cx| {
+                    loop {
+                        let sampled = cx
+                            .update(|window, cx| trace.emit("timeline", "sample", window, cx))
+                            .is_ok();
+                        if !sampled {
+                            break;
+                        }
+                        cx.background_executor().timer(interval).await;
+                    }
+                })
+                .detach();
+        })
+        .ok();
+}
+
+fn trace_marker(
+    trace: &Option<QaResourceTrace>,
+    operation: &str,
+    phase: &str,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let _ = cx.update(|window, cx| trace.emit(operation, phase, window, cx));
+}
+
+fn trace_operation_label(kind: &str, index: usize, detail: &str) -> String {
+    let detail = detail
+        .chars()
+        .take(80)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{kind}-{index}-{detail}")
+}
+
+#[derive(Default)]
+struct QaWorkspaceResourceTotals {
+    views: u64,
+    interactive: u64,
+    idle: u64,
+    warm: u64,
+    cold: u64,
+    suspended: u64,
+    allocated_cpu_bytes: u64,
+    allocated_gpu_bytes: u64,
+    allocated_workers: u64,
+    cached_tile_bytes: u64,
+    estimated_tile_resident_bytes: u64,
+    tile_cache_limit_bytes: u64,
+    base_tile_cache_limit_bytes: u64,
+    cached_tiles: u64,
+    pending_tiles: u64,
+    cached_text_pages: u64,
+    trimmed_views: u64,
+    hibernated_views: u64,
+    cache_retention_percent: u64,
+}
+
+impl QaWorkspaceResourceTotals {
+    fn add(&mut self, snapshot: QaReaderResourceSnapshot) {
+        use key_workspace_core::ActivityLevel;
+        self.views += 1;
+        match snapshot.activity {
+            ActivityLevel::ForegroundInteractive => self.interactive += 1,
+            ActivityLevel::ForegroundIdle => self.idle += 1,
+            ActivityLevel::BackgroundWarm => self.warm += 1,
+            ActivityLevel::BackgroundCold => self.cold += 1,
+            ActivityLevel::Suspended => self.suspended += 1,
+        }
+        self.allocated_cpu_bytes = self
+            .allocated_cpu_bytes
+            .saturating_add(snapshot.allocated_cpu_bytes);
+        self.allocated_gpu_bytes = self
+            .allocated_gpu_bytes
+            .saturating_add(snapshot.allocated_gpu_bytes);
+        self.allocated_workers = self
+            .allocated_workers
+            .saturating_add(snapshot.allocated_workers);
+        self.cached_tile_bytes = self
+            .cached_tile_bytes
+            .saturating_add(snapshot.cached_tile_bytes);
+        self.estimated_tile_resident_bytes = self
+            .estimated_tile_resident_bytes
+            .saturating_add(snapshot.estimated_tile_resident_bytes);
+        self.tile_cache_limit_bytes = self
+            .tile_cache_limit_bytes
+            .saturating_add(snapshot.tile_cache_limit_bytes);
+        self.base_tile_cache_limit_bytes = self
+            .base_tile_cache_limit_bytes
+            .saturating_add(snapshot.base_tile_cache_limit_bytes);
+        self.cached_tiles = self.cached_tiles.saturating_add(snapshot.cached_tiles);
+        self.pending_tiles = self.pending_tiles.saturating_add(snapshot.pending_tiles);
+        self.cached_text_pages = self
+            .cached_text_pages
+            .saturating_add(snapshot.cached_text_pages);
+        self.trimmed_views += u64::from(snapshot.cache_trimmed);
+        self.hibernated_views += u64::from(snapshot.worker_hibernated);
+        self.cache_retention_percent = self
+            .cache_retention_percent
+            .max(snapshot.cache_retention_percent);
+    }
+}
+
+fn workspace_resource_totals(current: &Window, cx: &App) -> QaWorkspaceResourceTotals {
+    let mut totals = QaWorkspaceResourceTotals::default();
+    let current_handle = current.window_handle();
+    for handle in cx.windows() {
+        if handle == current_handle {
+            if let Some(reader) = reader_entity(current, cx) {
+                totals.add(reader.read(cx).qa_resource_snapshot());
+            }
+            continue;
+        }
+        let Some(handle) = handle.downcast::<WorkspaceWindow>() else {
+            continue;
+        };
+        let Ok(workspace) = handle.read(cx) else {
+            continue;
+        };
+        let Some(reader) = workspace.reader() else {
+            continue;
+        };
+        totals.add(reader.read(cx).qa_resource_snapshot());
+    }
+    totals
+}
+
+async fn wait_for_reader_settled(
+    handle: WindowHandle<WorkspaceWindow>,
+    timeout: Duration,
+    dwell: Duration,
+    cx: &mut AsyncWindowContext,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut stable_since = None;
+    loop {
+        let settled = handle
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .reader()
+                    .is_some_and(|reader| reader.read(cx).qa_viewport_is_settled())
+            })
+            .unwrap_or(false);
+        if settled {
+            let since = stable_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= dwell {
+                return Ok(());
+            }
+        } else {
+            stable_since = None;
+        }
+        if Instant::now() >= deadline {
+            return Err("PDF viewport did not settle during progressive resource QA".to_owned());
+        }
+        cx.background_executor().timer(POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_all_resources_settled(
+    timeout: Duration,
+    cx: &mut AsyncWindowContext,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (windows, pdf_views, settled) = cx
+            .update(|window, cx| workspace_window_counts(window, cx))
+            .unwrap_or_default();
+        if windows > 0 && pdf_views > 0 && settled == pdf_views {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "resource settlement timed out: windows={windows} pdf_views={pdf_views} settled={settled}"
+            ));
+        }
+        cx.background_executor().timer(POLL_INTERVAL).await;
+    }
+}
+
+struct QaRandom(u64);
+
+impl QaRandom {
+    fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0
+    }
+
+    fn next_usize(&mut self, upper: usize) -> usize {
+        debug_assert!(upper > 0);
+        (self.next() % upper as u64) as usize
+    }
+
+    fn shuffle<T>(&mut self, values: &mut [T]) {
+        for index in (1..values.len()).rev() {
+            values.swap(index, self.next_usize(index + 1));
+        }
     }
 }
 
@@ -460,9 +1341,31 @@ mod tests {
             toc_callout_hold: false,
             reference_details: false,
             extension_scenario: None,
+            expected_window_count: None,
+            expected_tab_count: None,
+            tab_drag_scenario: None,
+            resource_trace: false,
+            resource_sample_interval: Duration::from_millis(DEFAULT_RESOURCE_SAMPLE_MS),
+            resource_stress: false,
+            progressive_open: false,
+            resource_chaos: false,
+            chaos_rounds: 2,
+            chaos_actions_per_window: 4,
+            chaos_seed: 1,
+            render_dwell: Duration::from_millis(320),
         };
 
         assert!(!config.requested());
         assert!(!config.has_navigation_setup());
+    }
+
+    #[test]
+    fn chaos_randomization_is_deterministic_and_bounded() {
+        let mut first = QaRandom::new(42);
+        let mut second = QaRandom::new(42);
+        let first_values = (0..32).map(|_| first.next_usize(7)).collect::<Vec<_>>();
+        let second_values = (0..32).map(|_| second.next_usize(7)).collect::<Vec<_>>();
+        assert_eq!(first_values, second_values);
+        assert!(first_values.iter().all(|value| *value < 7));
     }
 }

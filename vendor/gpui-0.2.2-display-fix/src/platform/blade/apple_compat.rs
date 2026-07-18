@@ -42,7 +42,7 @@ pub unsafe fn new_renderer(
         }
     }
 
-    BladeRenderer::new(
+    let renderer = BladeRenderer::new(
         &context.inner,
         &RawWindow {
             view: native_view as *mut _,
@@ -56,5 +56,10 @@ pub unsafe fn new_renderer(
             transparent,
         },
     )
-    .unwrap()
+    .unwrap();
+    // GPUI never keeps more than one frame in flight here. Two drawables are
+    // sufficient for smooth presentation and avoid retaining a third full
+    // Retina IOSurface for every open window.
+    renderer.layer().set_maximum_drawable_count(2);
+    renderer
 }

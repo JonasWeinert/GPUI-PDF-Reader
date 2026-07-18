@@ -1,5 +1,6 @@
 mod annotations;
 mod app_extensions;
+mod application_host;
 mod backend;
 mod document_jump;
 mod extension_assets;
@@ -21,6 +22,8 @@ mod navigation_focus;
 mod pdf_capability_bridge;
 #[cfg(debug_assertions)]
 mod qa;
+#[cfg(debug_assertions)]
+mod qa_resources;
 mod reader;
 #[cfg(feature = "scholarly-network")]
 mod scholarly;
@@ -29,15 +32,12 @@ mod scholarly;
 mod scholarly;
 mod scientific;
 mod search;
+mod system_resources;
 mod text_field;
 mod theme;
+mod workspace_window;
 
-#[cfg(target_os = "macos")]
-use gpui::TitlebarOptions;
-use gpui::{
-    App, Application, Bounds, KeyBinding, Menu, MenuItem, Point, WindowBounds, WindowOptions,
-    actions, px, size,
-};
+use gpui::{App, AppContext, Application, KeyBinding, Menu, MenuItem, actions};
 use markdown_editor::{
     CommentBackspace, CommentCancel, CommentDelete, CommentDown, CommentEnd, CommentHome,
     CommentLeft, CommentNewline, CommentRight, CommentSave, CommentSelectDown, CommentSelectLeft,
@@ -90,12 +90,16 @@ actions!(
         NextSearchResult,
         PreviousSearchResult,
         FluidView,
+        OpenSettings,
         Quit,
     ]
 );
 
 fn main() {
-    let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
+    let initial_paths = std::env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
 
     let extension_assets = Arc::new(extension_assets::ExtensionAssetStore::default());
     let application = Application::new().with_assets(extension_assets::ReaderAssetSource::new(
@@ -118,47 +122,46 @@ fn main() {
             )
         });
         rebuild_application_menus(&mut extensions, cx);
-        let bounds = Bounds {
-            origin: Point::new(px(120.0), px(80.0)),
-            size: size(px(1180.0), px(820.0)),
-        };
-        let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            // The side panel needs room for both its editor/list and a usable
-            // document viewport. Prevent a focused editor from becoming
-            // invisible in an impossibly narrow window.
-            window_min_size: Some(size(px(700.0), px(480.0))),
-            focus: true,
-            ..Default::default()
-        };
-        #[cfg(target_os = "macos")]
-        let window_options = WindowOptions {
-            // GPUI owns the chrome so the toolbar and macOS traffic lights read
-            // as one continuous titlebar. Other platforms retain their native
-            // decorations until their platform-specific chrome is developed.
-            titlebar: Some(TitlebarOptions {
-                title: None,
-                appears_transparent: true,
-                traffic_light_position: Some(Point::new(px(14.0), px(18.0))),
-            }),
-            ..window_options
-        };
-        let window = cx
-            .open_window(window_options, move |window, cx| {
-                reader::PdfReader::new(initial_path.clone(), extensions, window, cx)
-            })
-            .expect("failed to open the GPUI PDF Reader window");
+        let application_host = cx.new(|_| application_host::ApplicationHost::new(extensions));
+        let progressive_qa = cfg!(debug_assertions)
+            && std::env::var_os("GPUI_PDF_READER_QA_PROGRESSIVE_OPEN").is_some();
+        let separate_window_qa = cfg!(debug_assertions)
+            && std::env::var_os("GPUI_PDF_READER_QA_SEPARATE_WINDOWS").is_some();
+        let mut initial_paths = initial_paths.into_iter();
+        let window =
+            application_host::open_pdf_window(application_host.clone(), initial_paths.next(), cx)
+                .expect("failed to open the GPUI PDF Reader window");
+        let mut deferred_paths = Vec::new();
+        for path in initial_paths {
+            if progressive_qa {
+                deferred_paths.push(path);
+            } else if separate_window_qa {
+                application_host::open_pdf_window(application_host.clone(), Some(path), cx)
+                    .expect("failed to open an additional GPUI PDF Reader window");
+            } else {
+                application_host::open_pdf_tab(application_host.clone(), window, path, cx)
+                    .expect("failed to open an additional GPUI PDF Reader tab");
+            }
+        }
 
         window
-            .update(cx, |reader, window, cx| {
-                window.focus(&reader.focus_handle(cx));
+            .update(cx, |workspace, window, cx| {
+                workspace.focus_content(window, cx);
             })
             .ok();
 
         // Native QA remains debug-only and is isolated from application startup.
         #[cfg(debug_assertions)]
-        qa::install(window, cx);
-        cx.on_window_closed(|cx| cx.quit()).detach();
+        qa::install(window, application_host.clone(), deferred_paths, cx);
+        let host_for_close = application_host.clone();
+        cx.on_window_closed(move |cx| {
+            let open = cx.windows();
+            application_host::prune_workspace_windows(host_for_close.clone(), &open, cx);
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.activate(true);
     });
 }
@@ -189,7 +192,10 @@ pub(crate) fn rebuild_application_menus(
         MenuItem::separator(),
         MenuItem::action("Comments", ToggleComments),
     ]);
-    let mut file_items = vec![MenuItem::action("Open…", OpenDocument)];
+    let mut file_items = vec![
+        MenuItem::action("Open…", OpenDocument),
+        MenuItem::action("Settings…", OpenSettings),
+    ];
     #[cfg(feature = "installable-extensions")]
     file_items.extend([
         MenuItem::separator(),
@@ -271,6 +277,7 @@ pub(crate) fn rebuild_application_menus(
 fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenDocument, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-=", ZoomIn, None),
         KeyBinding::new("cmd-+", ZoomIn, None),
         KeyBinding::new("cmd--", ZoomOut, None),

@@ -184,33 +184,33 @@ impl PaintPageOverlayState {
             && !self.selection_budget.exhausted()
             && let Some(range) = selection.indices_on_page(page.page_index, chars.len())
         {
-            // Dense text pages are indexed once on the worker. Paint only
-            // selected glyphs that intersect this frame's viewport, and clip
-            // malformed PDF geometry to the physical page.
+            // Query only visible selected glyphs, then coalesce each visual
+            // line into one rectangle. This bridges spaces without PDFium
+            // bounds and avoids the fragmented word-by-word selection look.
+            let selection_runs = chars.visible_selection_runs(
+                rect,
+                content_viewport,
+                range,
+                MAX_VISIBLE_SELECTION_QUADS,
+            );
             window.with_content_mask(
                 Some(ContentMask {
                     bounds: page_bounds,
                 }),
                 |window| {
-                    chars.for_each_visible_in_range_while(
-                        rect,
-                        content_viewport,
-                        range,
-                        |_, highlight| {
-                            if !self.selection_budget.take() {
-                                return false;
-                            }
-                            window.paint_quad(quad(
-                                content_rect_to_bounds(bounds, highlight, scroll),
-                                px(1.0),
-                                palette.selection,
-                                px(0.0),
-                                gpui::transparent_black(),
-                                Default::default(),
-                            ));
-                            !self.selection_budget.exhausted()
-                        },
-                    );
+                    for highlight in selection_runs {
+                        if !self.selection_budget.take() {
+                            break;
+                        }
+                        window.paint_quad(quad(
+                            content_rect_to_bounds(bounds, highlight, scroll),
+                            px(1.0),
+                            palette.selection,
+                            px(0.0),
+                            gpui::transparent_black(),
+                            Default::default(),
+                        ));
+                    }
                 },
             );
         }
@@ -226,7 +226,10 @@ impl PaintPageOverlayState {
 }
 
 impl PdfReader {
-    fn document_canvas(mut snapshot: PaintSnapshot) -> impl IntoElement {
+    fn document_canvas(
+        mut snapshot: PaintSnapshot,
+        canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    ) -> impl IntoElement {
         snapshot.canvas.pages.sort_by_key(|page| {
             let has_active_annotation = page
                 .overlay
@@ -254,6 +257,7 @@ impl PdfReader {
             navigation_focus,
         );
         pdf_canvas(canvas, move |page, window| {
+            canvas_bounds.set(Some(page.canvas_bounds));
             overlay_state.paint_page(page, window);
         })
         .size_full()
@@ -287,18 +291,7 @@ impl Render for PdfReader {
             .as_ref()
             .map(|document| document.pages.len())
             .unwrap_or(0);
-        let current_page = self
-            .layout()
-            .map(|layout| layout.current_page(self.scroll.y, self.viewport_height) + 1)
-            .unwrap_or(0);
-        let filename: SharedString = self
-            .document
-            .as_ref()
-            .and_then(|document| document.path.file_name())
-            .map(|name| name.to_string_lossy().into_owned().into())
-            .unwrap_or_else(|| "GPUI PDF Reader".into());
         let zoom_label: SharedString = format!("{}%", (self.zoom * 100.0).round() as u32).into();
-        let status_text = self.status_text();
         let document_open = page_count > 0;
         let (zoom_out_enabled, zoom_in_enabled) = zoom_controls_enabled(document_open, self.zoom);
         let editor_open = self.comment_editor.is_some();
@@ -315,8 +308,6 @@ impl Render for PdfReader {
         let search_selected = self.sidebar.panel == SidePanel::Search && self.sidebar.target > 0.5;
         let comments_selected =
             self.sidebar.panel == SidePanel::Comments && self.sidebar.target > 0.5;
-        let show_status = !matches!(status_text.as_ref(), "Ready" | "Open a PDF to begin");
-
         let classic_toolbar = div()
             .h(px(TOOLBAR_HEIGHT))
             .flex_none()
@@ -329,13 +320,6 @@ impl Render for PdfReader {
             .border_b_1()
             .border_color(palette.separator)
             .text_color(palette.text)
-            .child(
-                div()
-                    .h_full()
-                    .w(px(TITLEBAR_CONTROL_INSET))
-                    .flex_none()
-                    .window_control_area(WindowControlArea::Drag),
-            )
             .child(Self::chrome_button(
                 palette,
                 "open-document",
@@ -410,49 +394,7 @@ impl Render for PdfReader {
                     .flex_1()
                     .min_w(px(0.0))
                     .h_full()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .window_control_area(WindowControlArea::Drag)
-                    .when(!compact_toolbar, |title| {
-                        title.child(
-                            div()
-                                .min_w(px(0.0))
-                                .max_w(px(260.0))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(filename.clone()),
-                        )
-                    })
-                    .when(document_open && !very_compact_toolbar, |title| {
-                        title.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_full()
-                                .bg(palette.control_hover)
-                                .text_xs()
-                                .text_color(palette.text_secondary)
-                                .child(format!("{current_page} / {page_count}")),
-                        )
-                    })
-                    .when(show_status, |title| {
-                        title.child(
-                            div()
-                                .max_w(px(180.0))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_xs()
-                                .text_color(palette.text_secondary)
-                                .child(status_text.clone()),
-                        )
-                    }),
+                    .window_control_area(WindowControlArea::Drag),
             )
             .when(show_annotation_tools, |toolbar| {
                 toolbar.child(
@@ -556,93 +498,9 @@ impl Render for PdfReader {
                 },
             );
 
-        let fluid_toolbar = div()
-            .h(px(TOOLBAR_HEIGHT))
-            .flex_none()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .bg(palette.chrome)
-            .border_b_1()
-            .border_color(palette.separator)
-            .text_color(palette.text)
-            .child(
-                div()
-                    .h_full()
-                    .w(px(TITLEBAR_CONTROL_INSET))
-                    .flex_none()
-                    .window_control_area(WindowControlArea::Drag),
-            )
-            .child(Self::chrome_button(
-                palette,
-                "fluid-open-document",
-                "Open…",
-                ChromeButtonStyle::Ghost,
-                true,
-                cx.listener(|reader, _, window, cx| reader.open_dialog(&OpenDocument, window, cx)),
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .window_control_area(WindowControlArea::Drag)
-                    .child(
-                        div()
-                            .max_w(px(320.0))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(filename.clone()),
-                    )
-                    .when(document_open, |title| {
-                        title.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_full()
-                                .bg(palette.control_hover)
-                                .text_xs()
-                                .text_color(palette.text_secondary)
-                                .child(format!("{current_page} / {page_count}")),
-                        )
-                    })
-                    .when(show_status && !compact_toolbar, |title| {
-                        title.child(
-                            div()
-                                .max_w(px(180.0))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_xs()
-                                .text_color(palette.text_secondary)
-                                .child(status_text.clone()),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_full()
-                    .bg(palette.accent_soft)
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(palette.accent)
-                    .child("Fluid"),
-            );
-
         let toolbar = match self.view_mode {
-            ReaderView::Classic => classic_toolbar.into_any_element(),
-            ReaderView::Fluid => fluid_toolbar.into_any_element(),
+            ReaderView::Classic => Some(classic_toolbar.into_any_element()),
+            ReaderView::Fluid => None,
         };
         let toc_navigation = self.render_toc_navigation(palette, cx);
         let link_preview = self.render_link_preview_card(palette, cx);
@@ -759,7 +617,7 @@ impl Render for PdfReader {
                 .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
-                .child(Self::document_canvas(snapshot))
+                .child(Self::document_canvas(snapshot, self.canvas_bounds.clone()))
                 .children(toc_navigation)
                 .into_any_element()
         } else {
@@ -974,7 +832,6 @@ impl Render for PdfReader {
             .flex()
             .flex_col()
             .bg(palette.canvas)
-            .on_action(cx.listener(Self::open_dialog))
             .on_action(cx.listener(Self::install_extension_dialog))
             .on_action(cx.listener(Self::manage_extensions))
             .on_action(cx.listener(Self::open_extension_details_action))
@@ -1005,7 +862,7 @@ impl Render for PdfReader {
             .on_action(cx.listener(Self::use_fluid_view))
             .on_action(cx.listener(Self::invoke_extension_command))
             .on_action(cx.listener(Self::quit_application))
-            .child(toolbar)
+            .children(toolbar)
             .children(error_bar)
             .child(workspace)
             .children(extension_ui_panel)
