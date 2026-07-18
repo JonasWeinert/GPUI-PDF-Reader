@@ -4,12 +4,31 @@
 //! caching, and scholarly-provider orchestration. It is independent of GPUI,
 //! PDFium, and application state: a host opts into the crate at compile time,
 //! then owns its fetchers and per-document sessions.
+//!
+//! A multi-window host should own one [`ReferenceExecutor`], then create one
+//! [`ReferenceDocumentScope`] per open document and pass that same scope to
+//! both adapters:
+//!
+//! ```
+//! use key_reference::{LinkPreviewFetcher, ReferenceExecutor, ScholarlyFetcher};
+//!
+//! let executor = ReferenceExecutor::global();
+//! let document = executor.document_scope();
+//! let (links, _link_events) = LinkPreviewFetcher::with_scope(document.clone());
+//! let (scholarly, _scholarly_events) = ScholarlyFetcher::with_scope(document);
+//! links.begin_document(12);
+//! scholarly.begin_document(12);
+//! ```
 
 #![forbid(unsafe_code)]
 
+mod executor;
 mod link_preview;
 mod scholarly;
 
+pub use executor::{
+    ReferenceDocumentScope, ReferenceExecutor, ReferenceExecutorConfig, ReferenceExecutorSnapshot,
+};
 pub use link_preview::{
     LinkPreviewEvent, LinkPreviewFetcher, LinkPreviewSession, WebsitePreview,
     WebsitePreviewProvider, WebsitePreviewState,

@@ -1,10 +1,11 @@
 //! Bounded website metadata and share-image previews.
 
+use crate::{ReferenceDocumentScope, ReferenceExecutor};
 use image::{ImageFormat, ImageReader, codecs::webp::WebPDecoder};
 use key_safe_http::{
-    CancellationSource, CancellationToken, ContentTypePolicy, ContentTypeRule, DocumentCache,
-    DocumentCacheEntry, DocumentCacheLimits, ExactHostAllowlist, HttpLimits, HttpPolicy,
-    HttpRequest, RateLimit, SafeHttpClient, SchemePolicy,
+    CancellationToken, ContentTypePolicy, ContentTypeRule, DocumentCache, DocumentCacheEntry,
+    DocumentCacheLimits, ExactHostAllowlist, HttpLimits, HttpPolicy, HttpRequest, RateLimit,
+    SafeHttpClient, SchemePolicy,
 };
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -12,9 +13,7 @@ use std::io::Cursor;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use url::Url;
 
@@ -22,7 +21,6 @@ const MAX_HTML_BYTES: usize = 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 4_096;
 const MAX_IMAGE_PIXELS: u64 = 16_000_000;
-const MAX_CONCURRENT_FETCHES: usize = 4;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -89,15 +87,28 @@ impl LinkPreviewEvent {
 
 pub struct LinkPreviewFetcher {
     events: mpsc::Sender<LinkPreviewEvent>,
-    generation: Arc<AtomicU64>,
-    active_fetches: Arc<AtomicUsize>,
-    cancellation: Arc<Mutex<CancellationSource>>,
+    scope: ReferenceDocumentScope,
     provider: Arc<dyn WebsitePreviewProvider>,
 }
 
 impl LinkPreviewFetcher {
     pub fn new() -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
-        Self::with_provider(Arc::new(NetworkWebsitePreviewProvider))
+        Self::with_executor(ReferenceExecutor::global())
+    }
+
+    /// Uses a host-owned process service while creating an independent
+    /// document scope for this compatibility adapter.
+    pub fn with_executor(executor: ReferenceExecutor) -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
+        Self::with_provider_and_scope(
+            Arc::new(NetworkWebsitePreviewProvider),
+            executor.document_scope(),
+        )
+    }
+
+    /// Uses a scope shared with other document services such as scholarly
+    /// metadata, giving the host one cancellation lifetime per open PDF.
+    pub fn with_scope(scope: ReferenceDocumentScope) -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
+        Self::with_provider_and_scope(Arc::new(NetworkWebsitePreviewProvider), scope)
     }
 
     /// Creates an orchestrator around a deterministic or host-supplied
@@ -105,13 +116,18 @@ impl LinkPreviewFetcher {
     pub fn with_provider(
         provider: Arc<dyn WebsitePreviewProvider>,
     ) -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
+        Self::with_provider_and_scope(provider, ReferenceExecutor::global().document_scope())
+    }
+
+    pub fn with_provider_and_scope(
+        provider: Arc<dyn WebsitePreviewProvider>,
+        scope: ReferenceDocumentScope,
+    ) -> (Self, mpsc::Receiver<LinkPreviewEvent>) {
         let (events, receiver) = mpsc::channel();
         (
             Self {
                 events,
-                generation: Arc::new(AtomicU64::new(0)),
-                active_fetches: Arc::new(AtomicUsize::new(0)),
-                cancellation: Arc::new(Mutex::new(CancellationSource::new())),
+                scope,
                 provider,
             },
             receiver,
@@ -119,71 +135,28 @@ impl LinkPreviewFetcher {
     }
 
     pub fn begin_document(&self, generation: u64) {
-        let mut cancellation = self
-            .cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cancellation.cancel();
-        *cancellation = CancellationSource::new();
-        // Publish the generation only after its fresh token is installed, so
-        // concurrent callers can never start new work with the old token.
-        self.generation.store(generation, Ordering::Release);
+        self.scope.begin_generation(generation);
     }
 
     fn fetch(&self, generation: u64, url: String, cache: Arc<DocumentCache>) -> bool {
-        if self.generation.load(Ordering::Acquire) != generation {
+        if !self.scope.is_current(generation) {
             return false;
         }
-        if self
-            .active_fetches
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_CONCURRENT_FETCHES).then_some(active + 1)
-            })
-            .is_err()
-        {
-            return false;
-        }
-
+        self.scope.register_cache(&cache);
         let events = self.events.clone();
-        let active_generation = self.generation.clone();
-        let active_fetches = self.active_fetches.clone();
-        let cancellation = self
-            .cancellation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .token();
         let provider = Arc::clone(&self.provider);
-        let spawned = thread::Builder::new()
-            .name("link-preview-fetch".to_owned())
-            .spawn(move || {
-                let _guard = ActiveFetchGuard(active_fetches);
-                if active_generation.load(Ordering::Acquire) != generation {
-                    return;
-                }
-                let result = provider
-                    .fetch(&url, &cache, &cancellation)
-                    .map_err(|error| concise_error(&error));
-                if active_generation.load(Ordering::Acquire) == generation {
-                    let _ = events.send(LinkPreviewEvent::WebsiteFetched {
-                        generation,
-                        url,
-                        result,
-                    });
-                }
-            });
-        if spawned.is_err() {
-            self.active_fetches.fetch_sub(1, Ordering::AcqRel);
-            return false;
-        }
-        true
-    }
-}
-
-struct ActiveFetchGuard(Arc<AtomicUsize>);
-
-impl Drop for ActiveFetchGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.scope.execute(generation, move |cancellation| {
+            let result = provider
+                .fetch(&url, &cache, &cancellation)
+                .map_err(|error| concise_error(&error));
+            if !cancellation.is_cancelled() {
+                let _ = events.send(LinkPreviewEvent::WebsiteFetched {
+                    generation,
+                    url,
+                    result,
+                });
+            }
+        })
     }
 }
 
@@ -243,6 +216,12 @@ impl LinkPreviewSession {
                 Some(generation)
             }
         }
+    }
+
+    /// Clears in-memory states and removes every ephemeral preview file now.
+    pub fn purge(&mut self) {
+        self.websites.clear();
+        self.cache.purge();
     }
 
     #[cfg(test)]
@@ -654,7 +633,7 @@ fn concise_error(error: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     const PNG_1X1: &[u8] = &[
