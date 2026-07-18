@@ -14,13 +14,19 @@ struct PaintPageOverlayState {
 }
 
 impl PaintPageOverlayState {
-    fn new(snapshot: &PaintSnapshot) -> Self {
+    fn new(
+        palette: ReaderPalette,
+        selection: Option<TextSelection>,
+        active_annotation: Option<AnnotationId>,
+        active_search: Option<SearchMatchId>,
+        navigation_focus: Option<NavigationFocusFrame>,
+    ) -> Self {
         Self {
-            palette: snapshot.palette,
-            selection: snapshot.selection,
-            active_annotation: snapshot.active_annotation,
-            active_search: snapshot.active_search,
-            navigation_focus: snapshot.navigation_focus.clone(),
+            palette,
+            selection,
+            active_annotation,
+            active_search,
+            navigation_focus,
             annotation_budget: PaintBudget::new(MAX_VISIBLE_ANNOTATION_QUADS),
             search_budget: PaintBudget::new(MAX_VISIBLE_SEARCH_HIGHLIGHT_RUNS),
             selection_budget: PaintBudget::new(MAX_VISIBLE_SELECTION_QUADS),
@@ -232,8 +238,22 @@ impl PdfReader {
                 .is_some_and(|active| active.page == page.page_index);
             !(has_active_annotation || has_active_search)
         });
-        let mut overlay_state = PaintPageOverlayState::new(&snapshot);
-        pdf_canvas(snapshot.canvas, move |page, window| {
+        let PaintSnapshot {
+            palette,
+            canvas,
+            selection,
+            active_annotation,
+            active_search,
+            navigation_focus,
+        } = snapshot;
+        let mut overlay_state = PaintPageOverlayState::new(
+            palette,
+            selection,
+            active_annotation,
+            active_search,
+            navigation_focus,
+        );
+        pdf_canvas(canvas, move |page, window| {
             overlay_state.paint_page(page, window);
         })
         .size_full()

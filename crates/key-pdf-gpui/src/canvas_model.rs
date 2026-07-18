@@ -206,11 +206,14 @@ pub fn pdf_canvas_scrollbars(metrics: PdfCanvasMetrics) -> PdfCanvasScrollbars {
             .max(38.0)
             .min(metrics.viewport_height);
         let travel = (metrics.viewport_height - thumb_height - 8.0).max(0.0);
-        let y = 4.0 + travel * (metrics.scroll.y / max_y).clamp(0.0, 1.0);
+        let inset = 4.0_f32.min((metrics.viewport_height - thumb_height).max(0.0));
+        let y = inset + travel * (metrics.scroll.y / max_y).clamp(0.0, 1.0);
+        let thickness = 5.0_f32.min(metrics.viewport_width);
+        let trailing_inset = 3.0_f32.min((metrics.viewport_width - thickness).max(0.0));
         Rect {
-            x: metrics.viewport_width - 8.0,
+            x: metrics.viewport_width - thickness - trailing_inset,
             y,
-            width: 5.0,
+            width: thickness,
             height: thumb_height,
         }
     });
@@ -222,12 +225,15 @@ pub fn pdf_canvas_scrollbars(metrics: PdfCanvasMetrics) -> PdfCanvasScrollbars {
             .max(38.0)
             .min(metrics.viewport_width);
         let travel = (metrics.viewport_width - thumb_width - 12.0).max(0.0);
-        let x = 4.0 + travel * (metrics.scroll.x / metrics.max_scroll_x).clamp(0.0, 1.0);
+        let inset = 4.0_f32.min((metrics.viewport_width - thumb_width).max(0.0));
+        let x = inset + travel * (metrics.scroll.x / metrics.max_scroll_x).clamp(0.0, 1.0);
+        let thickness = 5.0_f32.min(metrics.viewport_height);
+        let trailing_inset = 3.0_f32.min((metrics.viewport_height - thickness).max(0.0));
         Rect {
             x,
-            y: metrics.viewport_height - 8.0,
+            y: metrics.viewport_height - thickness - trailing_inset,
             width: thumb_width,
-            height: 5.0,
+            height: thickness,
         }
     });
 
@@ -367,5 +373,22 @@ mod tests {
         assert_eq!(horizontal.y, 792.0);
         assert_eq!(horizontal.height, 5.0);
         assert!(horizontal.x >= 4.0 && horizontal.right() <= 1_000.0);
+    }
+
+    #[test]
+    fn scrollbar_geometry_stays_inside_tiny_embedded_viewports() {
+        let bars = pdf_canvas_scrollbars(PdfCanvasMetrics::new(
+            ScrollOffset::new(100.0, 100.0),
+            1.0,
+            1.0,
+            100.0,
+            100.0,
+        ));
+        let vertical = bars.vertical.unwrap();
+        let horizontal = bars.horizontal.unwrap();
+        assert!(vertical.x >= 0.0 && vertical.y >= 0.0);
+        assert!(vertical.right() <= 1.0 && vertical.bottom() <= 1.0);
+        assert!(horizontal.x >= 0.0 && horizontal.y >= 0.0);
+        assert!(horizontal.right() <= 1.0 && horizontal.bottom() <= 1.0);
     }
 }

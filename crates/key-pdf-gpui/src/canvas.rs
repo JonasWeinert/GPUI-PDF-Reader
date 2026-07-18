@@ -221,6 +221,13 @@ fn paint_pdf_canvas<O>(
             }
             let render_bounds = content_rect_to_bounds(bounds, tile.render_rect, metrics.scroll);
             let core_bounds = content_rect_to_bounds(bounds, tile.core_rect, metrics.scroll);
+            if !core_bounds.intersects(&page_bounds) || !core_bounds.intersects(&bounds) {
+                continue;
+            }
+            // A tile's bleed is useful for PDFium glyph culling, but neither
+            // malformed host geometry nor that bleed may paint outside the
+            // physical page or the component viewport.
+            let core_bounds = core_bounds.intersect(&page_bounds).intersect(&bounds);
             window.with_content_mask(
                 Some(ContentMask {
                     bounds: core_bounds,
