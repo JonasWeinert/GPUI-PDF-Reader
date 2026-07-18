@@ -162,7 +162,7 @@ impl ExtensionStorage for MemoryExtensionStorage {
             .sum::<usize>();
         let previous_bytes = values
             .get(&(extension.clone(), namespace.1, key.to_owned()))
-            .map_or(0, data_value_size);
+            .map_or(0, |value| key.len().saturating_add(data_value_size(value)));
         let next_bytes = current_bytes
             .saturating_sub(previous_bytes)
             .saturating_add(key.len())
@@ -531,6 +531,19 @@ mod tests {
         assert_eq!(
             router.dispatch(&get, 32),
             ServiceDispatch::Immediate(Ok(DataValue::String("blue".into())))
+        );
+        let replace = effect(
+            "replace",
+            ExtensionEffect::StoragePut {
+                area: StorageArea::Settings,
+                key: "accent".into(),
+                value: DataValue::String("x".repeat(20)),
+            },
+        );
+        assert_eq!(
+            router.dispatch(&replace, 26),
+            ServiceDispatch::Immediate(Ok(DataValue::Null)),
+            "replacing a key must subtract its complete prior entry"
         );
         let oversized = effect(
             "oversized",
