@@ -134,8 +134,22 @@ system library lookup path.
 
 For local redistribution, place `libpdfium.dylib` beside the executable or in
 `GPUI PDF Reader.app/Contents/Resources` and retain all project and dependency
-notices. App bundling, signing, notarization, and automatic updates have not
-been implemented yet.
+notices. A local, unsigned application bundle can be assembled after either
+release build:
+
+```sh
+sh scripts/package-macos-app.sh standard target/release/gpui-pdf-reader
+# Or, after the --no-default-features build:
+sh scripts/package-macos-app.sh minimal target/release/gpui-pdf-reader
+```
+
+The assembler places the executable, PDFium, theme provenance/assets, and a
+feature-selected dependency inventory with retained notices in
+`target/dist/<bundle>/GPUI PDF Reader.app`, then checks the runtime PDFium path,
+Mach-O architectures, and dynamic-library assumptions. Run
+`sh scripts/test-macos-bundle.sh` for a fast assembly smoke test without a full
+reader build. Signing, notarization, and automatic updates have not been
+implemented yet.
 
 ## Controls
 
@@ -311,4 +325,6 @@ and exact Rust dependency versions are locked in `Cargo.lock`.
 
 `THIRD_PARTY_NOTICES.md` is an inventory and policy record, not a replacement
 for the complete dependency license bundle required when distributing a
-binary.
+binary. The app-bundle assembler generates a standard- or minimal-specific
+Rust dependency inventory, retains package-level notice files available in the
+resolved sources, and includes the complete native PDFium and theme notices.

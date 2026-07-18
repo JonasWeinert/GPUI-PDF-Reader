@@ -7,8 +7,8 @@ Keep them with redistributed source and binary bundles.
 ## Rust dependency graph
 
 The default standard `aarch64-apple-darwin` normal/build graph currently
-contains 752 unique package records; the minimal `--no-default-features` graph
-contains 675. The repository guard currently checks 787 unique host and
+contains 576 unique package records; the minimal `--no-default-features` graph
+contains 524. The repository guard currently checks 787 unique host and
 cross-target normal/build/dev records across the workspace. Every selected
 record has an MIT, Apache-2.0, or more-permissive license choice:
 BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, CC0-1.0, MIT-0, Unlicense,
@@ -106,3 +106,16 @@ sh scripts/audit-licenses.sh x86_64-apple-darwin
 The script is a guard against missing metadata and prohibited license-family
 identifiers. Final release review must still inspect compound `OR` expressions,
 bundled native code, copyright notices, and the generated distribution bundle.
+
+Generate the distribution inventory and retained notices for a supported app
+configuration with:
+
+```sh
+python3 scripts/generate-bundle-notices.py standard /tmp/gpui-pdf-notices
+python3 scripts/generate-bundle-notices.py minimal /tmp/gpui-pdf-notices-minimal
+```
+
+The macOS app assembler runs this automatically. Each output is derived from
+the locked normal/build graph for the selected feature set, applies the same
+explicit permissive SPDX policy, copies every package-level notice file present
+in the resolved source, and retains the complete PDFium and theme notice trees.

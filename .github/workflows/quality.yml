@@ -42,5 +42,9 @@ jobs:
         run: rustup update stable --no-self-update
       - name: Build standard reader
         run: cargo build --locked --release -p gpui-pdf-reader
+      - name: Assemble and verify standard app bundle
+        run: sh scripts/package-macos-app.sh standard target/release/gpui-pdf-reader
       - name: Build minimal reader
         run: cargo build --locked --release -p gpui-pdf-reader --no-default-features
+      - name: Assemble and verify minimal app bundle
+        run: sh scripts/package-macos-app.sh minimal target/release/gpui-pdf-reader
