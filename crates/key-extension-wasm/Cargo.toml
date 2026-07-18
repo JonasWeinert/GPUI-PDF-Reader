@@ -1,0 +1,31 @@
+[package]
+name = "key-extension-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+description = "Sandboxed WebAssembly Component Model adapter for Key extensions"
+
+[features]
+default = ["wasmtime-runtime"]
+wasmtime-runtime = ["dep:serde_json", "dep:wasmtime"]
+
+[dependencies]
+key-extension-api = { path = "../key-extension-api" }
+serde_json = { version = "1.0.150", optional = true }
+wasmtime = { version = "=45.0.1", default-features = false, optional = true, features = [
+    "anyhow",
+    "component-model",
+    "cranelift",
+    "runtime",
+    "std",
+] }
+
+[dev-dependencies]
+wat = { version = "1.253.0", default-features = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

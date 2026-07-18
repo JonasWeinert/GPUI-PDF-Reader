@@ -4,6 +4,7 @@ members = [
     "crates/key-editor-core",
     "crates/key-extension-api",
     "crates/key-extension-host",
+    "crates/key-extension-wasm",
     "crates/key-pdf-core",
     "crates/key-pdf-runtime",
 ]
@@ -11,7 +12,6 @@ default-members = ["apps/gpui-pdf-reader"]
 exclude = [
     "crates/key-extension-gpui",
     "crates/key-extension-package",
-    "crates/key-extension-wasm",
     "crates/key-pdfium",
 ]
 resolver = "3"
