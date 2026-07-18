@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod annotations;
 pub mod document_jump;
 pub mod link_resolution;
 pub mod model;
@@ -14,6 +15,10 @@ pub mod navigation_focus;
 pub mod scientific;
 pub mod search;
 
+pub use annotations::{
+    Annotation, AnnotationError, AnnotationId, AnnotationSet, HighlightColor, MAX_COMMENT_BYTES,
+    MAX_TEXT_CHARACTER_INDEX, RestoredAnnotation, TextRange,
+};
 pub use document_jump::{DocumentJump, ResolvedDocumentJump};
 pub use link_resolution::{ResolvedInternalLink, link_source_text, resolve_internal_link};
 pub use model::{

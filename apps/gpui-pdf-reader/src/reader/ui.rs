@@ -1,14 +1,7 @@
 use crate::theme::ReaderPalette;
 use gpui::{App, ClickEvent, FontWeight, IntoElement, SharedString, Window, div, prelude::*, px};
 use gpui_component::{Icon, IconName};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ChromeButtonStyle {
-    Ghost,
-    Floating,
-    Selected,
-    Primary,
-}
+pub(super) use key_ui_gpui::ChromeButtonStyle;
 
 /// Shared button chrome used by classic, fluid, and floating reader controls.
 pub(super) fn chrome_button(
@@ -19,71 +12,11 @@ pub(super) fn chrome_button(
     enabled: bool,
     handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let (background, border, text, hover, pressed) = match style {
-        ChromeButtonStyle::Ghost => (
-            palette.chrome,
-            palette.chrome,
-            palette.text_secondary,
-            palette.control_hover,
-            palette.control_pressed,
-        ),
-        ChromeButtonStyle::Floating => (
-            palette.surface,
-            palette.surface,
-            palette.text_secondary,
-            palette.control_hover,
-            palette.control_pressed,
-        ),
-        ChromeButtonStyle::Selected => (
-            palette.accent_soft,
-            palette.accent_border,
-            palette.accent,
-            palette.accent_soft_hover,
-            palette.control_pressed,
-        ),
-        ChromeButtonStyle::Primary => (
-            palette.accent,
-            palette.accent,
-            palette.accent_foreground,
-            palette.accent_hover,
-            palette.accent_active,
-        ),
-    };
-    div()
-        .id(id)
-        .h(px(32.0))
-        .min_w(px(32.0))
-        .px_3()
-        .flex()
-        .items_center()
-        .justify_center()
-        .overflow_hidden()
-        .rounded_md()
-        .border_1()
-        .border_color(border)
-        .bg(background)
-        .text_color(text)
-        .text_sm()
-        .font_weight(FontWeight::MEDIUM)
-        .when(enabled, |button| {
-            button
-                .cursor_pointer()
-                .hover(move |button| button.bg(hover))
-                .active(move |button| button.bg(pressed))
-                .on_click(handler)
-        })
-        .when(!enabled, |button| button.opacity(0.42))
-        .child(label)
+    key_ui_gpui::chrome_button(palette.ui, id, label, style, enabled, handler)
 }
 
 pub(super) fn icon_label(icon: IconName, label: impl IntoElement) -> gpui::AnyElement {
-    div()
-        .flex()
-        .items_center()
-        .gap_1()
-        .child(Icon::new(icon))
-        .child(label)
-        .into_any_element()
+    key_ui_gpui::icon_label(icon, label).into_any_element()
 }
 
 /// Consistent centered empty state for side panels.

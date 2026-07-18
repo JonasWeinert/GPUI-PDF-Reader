@@ -11,13 +11,15 @@ path = "src/main.rs"
 
 [dependencies]
 image.workspace = true
-key-editor-core = { path = "../../crates/key-editor-core" }
+key-editor-gpui = { path = "../../crates/key-editor-gpui" }
 key-extension-api = { path = "../../crates/key-extension-api" }
 key-extension-gpui = { path = "../../crates/key-extension-gpui" }
 key-extension-host = { path = "../../crates/key-extension-host" }
 key-pdf-core = { path = "../../crates/key-pdf-core" }
 key-pdf-runtime = { path = "../../crates/key-pdf-runtime" }
 key-pdfium = { path = "../../crates/key-pdfium" }
+key-sidecar-store = { path = "../../crates/key-sidecar-store" }
+key-ui-gpui = { path = "../../crates/key-ui-gpui" }
 open.workspace = true
 reqwest.workspace = true
 serde.workspace = true

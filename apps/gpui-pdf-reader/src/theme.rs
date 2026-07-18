@@ -1,5 +1,6 @@
 use gpui::{App, Hsla, Rgba, SharedString, Window};
 use gpui_component::{Theme, ThemeConfig, ThemeRegistry, ThemeSet};
+use key_ui_gpui::ThemeTokens;
 use std::{rc::Rc, sync::LazyLock};
 
 const BUNDLED_THEMES_JSON: &str = include_str!("../../../assets/themes/gpui-component.json");
@@ -81,6 +82,7 @@ pub fn pdf_paper_border(theme: &Theme, forced_dark: bool) -> Hsla {
 /// active gpui-component theme; alpha changes preserve that theme's hue.
 #[derive(Clone, Copy, Debug)]
 pub struct ReaderPalette {
+    pub ui: ThemeTokens,
     pub chrome: Hsla,
     pub surface: Hsla,
     pub surface_subtle: Hsla,
@@ -92,8 +94,6 @@ pub struct ReaderPalette {
     pub text_secondary: Hsla,
     pub text_tertiary: Hsla,
     pub accent: Hsla,
-    pub accent_hover: Hsla,
-    pub accent_active: Hsla,
     pub accent_soft: Hsla,
     pub accent_soft_hover: Hsla,
     pub accent_border: Hsla,
@@ -116,36 +116,36 @@ pub struct ReaderPalette {
 
 impl ReaderPalette {
     pub fn from_theme(theme: &Theme) -> Self {
+        let ui = ThemeTokens::from_theme(theme);
         Self {
-            chrome: theme.title_bar,
-            surface: theme.background,
-            surface_subtle: theme.muted,
-            control: theme.secondary,
-            control_hover: theme.secondary_hover,
-            control_pressed: theme.secondary_active,
-            separator: theme.border,
-            text: theme.foreground,
-            text_secondary: theme.secondary_foreground,
-            text_tertiary: theme.muted_foreground,
-            accent: theme.primary,
-            accent_hover: theme.primary_hover,
-            accent_active: theme.primary_active,
-            accent_soft: theme.accent,
-            accent_soft_hover: theme.list_hover,
-            accent_border: theme.list_active_border,
-            accent_foreground: theme.primary_foreground,
-            error: theme.danger,
-            error_soft: theme.danger.opacity(0.12),
-            canvas: theme.tiles,
-            canvas_empty: theme.sidebar,
-            overlay: theme.overlay,
-            selection: theme.selection,
+            ui,
+            chrome: ui.surface.chrome,
+            surface: ui.surface.background,
+            surface_subtle: ui.surface.muted,
+            control: ui.action.control,
+            control_hover: ui.action.control_hover,
+            control_pressed: ui.action.control_pressed,
+            separator: ui.surface.border,
+            text: ui.content.primary,
+            text_secondary: ui.content.secondary,
+            text_tertiary: ui.content.tertiary,
+            accent: ui.action.accent,
+            accent_soft: ui.action.accent_soft,
+            accent_soft_hover: ui.action.accent_soft_hover,
+            accent_border: ui.action.accent_border,
+            accent_foreground: ui.content.on_accent,
+            error: ui.status.danger,
+            error_soft: ui.status.danger_soft,
+            canvas: ui.surface.canvas,
+            canvas_empty: ui.surface.sidebar,
+            overlay: ui.surface.overlay,
+            selection: ui.selection,
             yellow: theme.yellow,
             green: theme.green,
             blue: theme.blue,
             pink: theme.magenta,
             purple: theme.chart_4,
-            warning: theme.warning,
+            warning: ui.status.warning,
             paper: pdf_paper_color(theme, theme.is_dark()),
             paper_border: pdf_paper_border(theme, theme.is_dark()),
         }

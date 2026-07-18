@@ -36,6 +36,11 @@ use text_field::{
     FieldSelectLeft, FieldSelectRight, FieldSubmit,
 };
 
+pub use key_editor_gpui::{
+    MarkdownCopy as EditCopy, MarkdownCut as EditCut, MarkdownPaste as EditPaste,
+    MarkdownSelectAll as EditSelectAll,
+};
+
 const READER_NAVIGATION_CONTEXT: &str = "PdfReader && !TextField && !MarkdownEditor";
 
 actions!(
@@ -48,10 +53,6 @@ actions!(
         FitWidth,
         CopySelection,
         SelectAll,
-        EditCopy,
-        EditCut,
-        EditPaste,
-        EditSelectAll,
         ScrollUp,
         ScrollDown,
         ScrollLeft,

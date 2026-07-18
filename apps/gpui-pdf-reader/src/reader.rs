@@ -1,6 +1,6 @@
 use crate::annotations::{
-    AnnotationId, AnnotationSet, DocumentIdentity, HighlightColor, MAX_TEXT_CHARACTER_INDEX,
-    TextRange, load_sidecar, save_sidecar,
+    AnnotationId, AnnotationSet, AnnotationStore, DocumentIdentity, DocumentKey, HighlightColor,
+    JsonSidecarStore, MAX_TEXT_CHARACTER_INDEX, TextRange,
 };
 use crate::app_extensions::ReaderExtensions;
 use crate::backend::{
@@ -12,7 +12,9 @@ use crate::link_preview::{
     LinkPreviewEvent, LinkPreviewFetcher, LinkPreviewSession, WebsitePreviewState,
 };
 use crate::link_resolution::{ResolvedInternalLink, link_source_text, resolve_internal_link};
-use crate::markdown_editor::{MarkdownEditor, MarkdownEditorEvent, RichTextBuffer};
+use crate::markdown_editor::{
+    MarkdownEditor, MarkdownEditorConfig, MarkdownEditorEvent, RichTextBuffer,
+};
 #[cfg(test)]
 use crate::model::TextChar;
 use crate::model::{
@@ -63,18 +65,16 @@ use key_extension_api::{
 use key_extension_gpui::InvokeExtensionCommand;
 use key_extension_host::ArbitratedEffect;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod animation;
 mod comments;
 mod ui;
 
-use animation::UnitTransition;
 use comments::{CommentEditorPresentation, CommentEmptyPresentation};
+use key_ui_gpui::UnitTransition;
 use ui::{ChromeButtonStyle, chrome_button, empty_state, error_banner, icon_label};
 
 const TOOLBAR_HEIGHT: f32 = 52.0;
@@ -706,13 +706,11 @@ impl SidebarState {
     }
 
     fn advance(&mut self, dt: f32) {
-        let mut transition = UnitTransition {
-            progress: self.progress,
-            target: self.target,
-        };
+        let mut transition = UnitTransition::new(self.progress);
+        transition.set_target(self.target);
         transition.advance(dt);
-        self.progress = transition.progress;
-        self.target = transition.target;
+        self.progress = transition.value();
+        self.target = transition.target();
     }
 
     fn available_width(self, full_width: f32) -> f32 {
@@ -750,13 +748,11 @@ impl CommentPaneState {
     }
 
     fn advance(&mut self, dt: f32) {
-        let mut transition = UnitTransition {
-            progress: self.progress,
-            target: self.target,
-        };
+        let mut transition = UnitTransition::new(self.progress);
+        transition.set_target(self.target);
         transition.advance_with_response(dt, 24.0);
-        self.progress = transition.progress;
-        self.target = transition.target;
+        self.progress = transition.value();
+        self.target = transition.target();
     }
 }
 
@@ -891,21 +887,18 @@ impl AnnotationIo {
                             generation,
                             path,
                             page_count,
-                        } => match DocumentIdentity::from_pdf(&path, page_count).and_then(
-                            |identity| {
-                                load_sidecar(&path, &identity)
-                                    .map(|annotations| (identity, annotations))
-                            },
-                        ) {
+                        } => match DocumentKey::from_pdf(path.clone(), page_count).and_then(|key| {
+                            JsonSidecarStore
+                                .load(&key)
+                                .map(|annotations| (key.identity().clone(), annotations))
+                        }) {
                             Ok((identity, annotations)) => {
                                 // A load is an ordering boundary for the sole
                                 // current document; older generations can no
                                 // longer save and must not accumulate paths.
                                 observed_disk_revisions.clear();
-                                observed_disk_revisions.insert(
-                                    (generation, path.clone()),
-                                    annotations.revision(),
-                                );
+                                observed_disk_revisions
+                                    .insert((generation, path.clone()), annotations.revision());
                                 let _ = event_tx.send(AnnotationIoEvent::Loaded {
                                     generation,
                                     identity,
@@ -959,48 +952,19 @@ impl AnnotationIo {
                                 .get(&revision_key)
                                 .copied()
                                 .unwrap_or(expected_disk_revision);
-                            let save_result: Result<(), String> = (|| {
-                                // Serialize the compare-and-replace section
-                                // across app processes. The lock is advisory,
-                                // crash-safe, and attached to the PDF itself,
-                                // so no stale lock file is left beside it.
-                                let pdf_lock = File::open(&path)
-                                    .map_err(|error| format!("could not lock PDF: {error}"))?;
-                                pdf_lock.lock().map_err(|error| {
-                                    format!("could not lock PDF for annotation save: {error}")
-                                })?;
-                                let current_identity =
-                                    DocumentIdentity::from_pdf(&path, identity.page_count())
-                                        .map_err(|error| error.to_string())?;
-                                if current_identity != identity {
-                                    return Err(
-                                        crate::annotations::AnnotationError::DocumentIdentityMismatch {
-                                            expected: identity.clone(),
-                                            found: current_identity,
-                                        }
-                                        .to_string(),
-                                    );
-                                }
-
-                                let disk_revision = load_sidecar(&path, &identity)
-                                    .map_err(|error| error.to_string())?
-                                    .revision();
-                                if disk_revision != expected_disk_revision {
-                                    return Err(format!(
-                                        "annotation sidecar changed on disk (expected revision {expected_disk_revision}, found revision {disk_revision}); reload the PDF before saving"
-                                    ));
-                                }
-
-                                save_sidecar(&path, &identity, &annotations)
-                                    .map(|_| ())
-                                    .map_err(|error| error.to_string())
-                            })();
+                            let document = DocumentKey::new(path.clone(), identity);
+                            let save_result = JsonSidecarStore.compare_and_save(
+                                &document,
+                                expected_disk_revision,
+                                &annotations,
+                            );
                             match save_result {
-                                Ok(_) => {
-                                    observed_disk_revisions.insert(revision_key, revision);
+                                Ok(receipt) => {
+                                    observed_disk_revisions
+                                        .insert(revision_key, receipt.saved_revision);
                                     let _ = event_tx.send(AnnotationIoEvent::Saved {
                                         generation,
-                                        revision,
+                                        revision: receipt.saved_revision,
                                     });
                                 }
                                 Err(error) => {
@@ -1312,17 +1276,11 @@ impl PdfReader {
                 scholarly_session: ScholarlySession::default(),
                 reference_details: None,
                 reference_details_group: Vec::new(),
-                reference_details_transition: RevealState {
-                    progress: 1.0,
-                    target: 1.0,
-                },
+                reference_details_transition: RevealState::visible(),
                 reference_details_direction: 1.0,
                 reference_panel: RevealState::default(),
                 reference_citation_expansion: RevealState::default(),
-                reference_summary_transition: RevealState {
-                    progress: 1.0,
-                    target: 1.0,
-                },
+                reference_summary_transition: RevealState::visible(),
                 reference_summary_tab: ReferenceSummaryTab::Tldr,
                 reference_summary_previous_tab: ReferenceSummaryTab::Tldr,
                 doi_copy_started: None,
@@ -1618,8 +1576,8 @@ impl PdfReader {
             self.scroll.y,
             self.sidebar.progress,
             self.sidebar.target,
-            self.reference_panel.progress,
-            self.reference_panel.target,
+            self.reference_panel.value(),
+            self.reference_panel.target(),
             self.comment_pane.progress,
             self.comment_pane.target,
             u8::from(self.comment_editor.is_some()),
@@ -1835,7 +1793,7 @@ impl PdfReader {
             Some(ScholarlyMetadataState::Ready(_)) => {
                 self.open_reference_details(reference, window, cx);
                 if std::env::var_os("GPUI_PDF_READER_QA_REFERENCE_DETAILS_EXPANDED").is_some() {
-                    self.reference_citation_expansion.target = 1.0;
+                    self.reference_citation_expansion.set_target(1.0);
                     self.start_animation(window, cx);
                 }
                 Ok(true)
@@ -2827,7 +2785,7 @@ impl PdfReader {
                                         Some(ScholarlyMetadataState::Ready(_))
                                     )
                                 }) {
-                                    reader.link_card_expansion.target = 1.0;
+                                    reader.link_card_expansion.set_target(1.0);
                                     reader.start_animation(window, cx);
                                 }
                                 cx.notify();
@@ -2931,17 +2889,11 @@ impl PdfReader {
                     self.destination_preview_revision.wrapping_add(1);
                 self.reference_details = None;
                 self.reference_details_group.clear();
-                self.reference_details_transition = RevealState {
-                    progress: 1.0,
-                    target: 1.0,
-                };
+                self.reference_details_transition = RevealState::visible();
                 self.reference_details_direction = 1.0;
                 self.reference_panel = RevealState::default();
                 self.reference_citation_expansion = RevealState::default();
-                self.reference_summary_transition = RevealState {
-                    progress: 1.0,
-                    target: 1.0,
-                };
+                self.reference_summary_transition = RevealState::visible();
                 self.reference_summary_tab = ReferenceSummaryTab::Tldr;
                 self.reference_summary_previous_tab = ReferenceSummaryTab::Tldr;
                 self.doi_copy_started = None;
@@ -3385,17 +3337,11 @@ impl PdfReader {
         self.scholarly_session = ScholarlySession::default();
         self.reference_details = None;
         self.reference_details_group.clear();
-        self.reference_details_transition = RevealState {
-            progress: 1.0,
-            target: 1.0,
-        };
+        self.reference_details_transition = RevealState::visible();
         self.reference_details_direction = 1.0;
         self.reference_panel = RevealState::default();
         self.reference_citation_expansion = RevealState::default();
-        self.reference_summary_transition = RevealState {
-            progress: 1.0,
-            target: 1.0,
-        };
+        self.reference_summary_transition = RevealState::visible();
         self.reference_summary_tab = ReferenceSummaryTab::Tldr;
         self.reference_summary_previous_tab = ReferenceSummaryTab::Tldr;
         self.doi_copy_started = None;
@@ -3560,7 +3506,7 @@ impl PdfReader {
         match self.view_mode {
             ReaderView::Classic => {
                 self.sidebar.available_width(full_width)
-                    + reference_panel_extent(full_width, self.reference_panel.progress)
+                    + reference_panel_extent(full_width, self.reference_panel.value())
             }
             ReaderView::Fluid => 0.0,
         }
@@ -3569,7 +3515,7 @@ impl PdfReader {
     fn fluid_panel_occlusion(&self) -> f32 {
         if self.view_mode == ReaderView::Fluid {
             fluid_sidebar_extent(self.viewport_width, self.sidebar.progress)
-                + reference_panel_extent(self.viewport_width, self.reference_panel.progress)
+                + reference_panel_extent(self.viewport_width, self.reference_panel.value())
         } else {
             0.0
         }
@@ -3754,7 +3700,7 @@ impl PdfReader {
         // render-scale churn on every animation frame when Fit was last used.
         self.fit_width = false;
         self.scroll_target = self.scroll;
-        self.reference_panel.target = 0.0;
+        self.reference_panel.set_target(0.0);
         self.sidebar.toggle(panel);
         if search_was_open && (self.sidebar.panel != SidePanel::Search || self.sidebar.target < 0.5)
         {
@@ -4257,7 +4203,19 @@ impl PdfReader {
         if self.annotation_failed_revision.is_none() && !self.annotation_persistence_blocked {
             self.annotation_error = None;
         }
-        let editor = cx.new(|cx| MarkdownEditor::new(cx, buffer));
+        let editor_limit = buffer.max_markdown_bytes();
+        let editor = cx.new(move |cx| {
+            MarkdownEditor::new(
+                cx,
+                buffer,
+                MarkdownEditorConfig {
+                    placeholder: "Write a comment…".into(),
+                    max_markdown_bytes: editor_limit,
+                    ..MarkdownEditorConfig::default()
+                },
+            )
+            .expect("comment editor buffer and configured limits must match")
+        });
         cx.subscribe_in(
             &editor,
             window,
@@ -5001,7 +4959,7 @@ impl PdfReader {
         }
         if reference_was_animating {
             self.reference_panel.advance(dt);
-            if !self.reference_panel.is_animating() && self.reference_panel.target == 0.0 {
+            if !self.reference_panel.is_animating() && self.reference_panel.target() == 0.0 {
                 self.reference_details = None;
                 self.reference_details_group.clear();
             }
@@ -5660,13 +5618,10 @@ impl PdfReader {
         self.reference_details_group = group;
         self.reference_details = Some(reference);
         self.reset_reference_detail_content_state();
-        self.reference_details_transition = RevealState {
-            progress: 1.0,
-            target: 1.0,
-        };
+        self.reference_details_transition = RevealState::visible();
         self.reference_details_direction = 1.0;
         self.sidebar.target = 0.0;
-        self.reference_panel.target = 1.0;
+        self.reference_panel.set_target(1.0);
         self.dismiss_link_preview(window, cx);
         self.start_animation(window, cx);
         cx.notify();
@@ -5690,10 +5645,7 @@ impl PdfReader {
         self.reference_citation_expansion = RevealState::default();
         self.reference_summary_tab = preferred_summary;
         self.reference_summary_previous_tab = preferred_summary;
-        self.reference_summary_transition = RevealState {
-            progress: 1.0,
-            target: 1.0,
-        };
+        self.reference_summary_transition = RevealState::visible();
         self.doi_copy_started = None;
     }
 
@@ -5717,10 +5669,8 @@ impl PdfReader {
         let next_index = adjacent_group_index(current_index, navigable.len(), forward);
         self.reference_details = navigable.get(next_index).cloned();
         self.reference_details_direction = if forward { 1.0 } else { -1.0 };
-        self.reference_details_transition = RevealState {
-            progress: 0.0,
-            target: 1.0,
-        };
+        self.reference_details_transition = RevealState::hidden();
+        self.reference_details_transition.set_target(1.0);
         self.reset_reference_detail_content_state();
         self.start_animation(window, cx);
         cx.notify();
@@ -5753,7 +5703,7 @@ impl PdfReader {
         }
         self.fit_width = false;
         self.scroll_target = self.scroll;
-        self.reference_panel.target = 0.0;
+        self.reference_panel.set_target(0.0);
         self.start_animation(window, cx);
         cx.notify();
     }
@@ -6353,7 +6303,7 @@ impl PdfReader {
                         Some(ScholarlyMetadataState::Ready(_))
                     )
                 }) {
-                    self.link_card_expansion.target = 1.0;
+                    self.link_card_expansion.set_target(1.0);
                     self.start_animation(window, cx);
                 }
             }
@@ -6367,12 +6317,7 @@ impl PdfReader {
     }
 
     fn toggle_reference_citation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.reference_citation_expansion.target = if self.reference_citation_expansion.target > 0.5
-        {
-            0.0
-        } else {
-            1.0
-        };
+        self.reference_citation_expansion.toggle();
         self.start_animation(window, cx);
         cx.notify();
     }
@@ -6388,10 +6333,8 @@ impl PdfReader {
         }
         self.reference_summary_previous_tab = self.reference_summary_tab;
         self.reference_summary_tab = tab;
-        self.reference_summary_transition = RevealState {
-            progress: 0.0,
-            target: 1.0,
-        };
+        self.reference_summary_transition = RevealState::hidden();
+        self.reference_summary_transition.set_target(1.0);
         self.start_animation(window, cx);
         cx.notify();
     }
@@ -6433,7 +6376,7 @@ impl PdfReader {
                 Some(ScholarlyMetadataState::Ready(_))
             )
         }) {
-            self.link_card_expansion.target = 1.0;
+            self.link_card_expansion.set_target(1.0);
             self.start_animation(window, cx);
         }
         cx.notify();
@@ -7002,7 +6945,7 @@ impl PdfReader {
                 let anchor = normalized_bounds_in_page(page_rect, bounds);
                 let state = self.scholarly_session.state(&reference.text).cloned();
                 let desired_width =
-                    reference_preview_width(state.as_ref(), self.link_card_expansion.progress);
+                    reference_preview_width(state.as_ref(), self.link_card_expansion.value());
                 let content = self.render_reference_source_card(
                     target,
                     reference.text,
@@ -7014,7 +6957,7 @@ impl PdfReader {
                 (
                     anchor,
                     content,
-                    122.0 + self.link_card_expansion.progress * 104.0,
+                    122.0 + self.link_card_expansion.value() * 104.0,
                     desired_width,
                     card_accent,
                 )
@@ -7216,7 +7159,7 @@ impl PdfReader {
                             let state = self.scholarly_session.state(&reference.text).cloned();
                             let desired_width = reference_preview_width(
                                 state.as_ref(),
-                                self.link_card_expansion.progress,
+                                self.link_card_expansion.value(),
                             );
                             (
                                 anchor,
@@ -7228,7 +7171,7 @@ impl PdfReader {
                                     palette,
                                     cx,
                                 ),
-                                122.0 + self.link_card_expansion.progress * 104.0,
+                                122.0 + self.link_card_expansion.value() * 104.0,
                                 desired_width,
                                 card_accent,
                             )
@@ -7601,7 +7544,7 @@ impl PdfReader {
             Some(ScholarlyMetadataState::Ready(metadata)) => {
                 let details_reference = reference.clone();
                 let citation = compact_citation_line(&metadata);
-                let progress = self.link_card_expansion.progress;
+                let progress = self.link_card_expansion.value();
                 let details = div()
                     .min_w_0()
                     .child(
@@ -7755,7 +7698,7 @@ impl PdfReader {
         if panel_width <= 0.0 {
             return None;
         }
-        let progress = self.reference_panel.progress;
+        let progress = self.reference_panel.value();
         let right = 12.0 - (panel_width + 24.0) * (1.0 - progress);
         let navigable_details = self.navigable_reference_details_group();
         let detail_position = navigable_details
@@ -7763,7 +7706,7 @@ impl PdfReader {
             .position(|candidate| candidate == &reference)
             .unwrap_or(0);
         let detail_count = navigable_details.len().max(1);
-        let page_transition = self.reference_details_transition.progress;
+        let page_transition = self.reference_details_transition.value();
         let detail_offset =
             self.reference_details_direction * (1.0 - page_transition) * (panel_width - 2.0);
         let detail_opacity = (0.72 + page_transition * 0.28).clamp(0.0, 1.0);
@@ -8305,7 +8248,7 @@ impl PdfReader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let progress = self.reference_citation_expansion.progress;
+        let progress = self.reference_citation_expansion.value();
         let expanded_height = citation_expanded_height(authors, journal, metadata.doi.is_some());
         let compact = compact_reference_panel_citation(metadata);
         let compact_text =
@@ -8506,7 +8449,7 @@ impl PdfReader {
             window,
             cx,
         );
-        let transition = self.reference_summary_transition.progress;
+        let transition = self.reference_summary_transition.value();
         let switching = self.reference_summary_transition.is_animating()
             && self.reference_summary_previous_tab != current
             && summary_text(metadata, self.reference_summary_previous_tab).is_some();
@@ -11651,19 +11594,17 @@ mod tests {
 
     #[test]
     fn reusable_reveal_state_reverses_and_settles() {
-        let mut reveal = RevealState {
-            target: 1.0,
-            ..RevealState::default()
-        };
+        let mut reveal = RevealState::hidden();
+        reveal.set_target(1.0);
         for _ in 0..60 {
             reveal.advance(1.0 / 60.0);
         }
-        assert_eq!(reveal.progress, 1.0);
-        reveal.target = 0.0;
+        assert_eq!(reveal.value(), 1.0);
+        reveal.set_target(0.0);
         for _ in 0..60 {
             reveal.advance(1.0 / 60.0);
         }
-        assert_eq!(reveal.progress, 0.0);
+        assert_eq!(reveal.value(), 0.0);
     }
 
     #[test]
@@ -12622,7 +12563,8 @@ mod tests {
             }
         }
         assert!(matches!(revisions.as_slice(), [2] | [1, 2]));
-        assert_eq!(load_sidecar(&pdf, &identity).unwrap(), revision_two);
+        let document = DocumentKey::new(pdf.clone(), identity.clone());
+        assert_eq!(JsonSidecarStore.load(&document).unwrap(), revision_two);
     }
 
     #[test]
@@ -12710,24 +12652,7 @@ mod tests {
                 panic!("unexpected conflict shape: {message}")
             }
         }
-        assert_eq!(load_sidecar(&pdf, &identity).unwrap(), first_latest);
-    }
-
-    #[test]
-    fn pdf_file_lock_serializes_the_sidecar_compare_and_replace_section() {
-        let directory = TestDirectory::new("sidecar-file-lock");
-        let pdf = directory.path().join("document.pdf");
-        std::fs::write(&pdf, b"stable pdf bytes").unwrap();
-        let first = File::open(&pdf).unwrap();
-        let second = File::open(&pdf).unwrap();
-
-        first.lock().unwrap();
-        assert!(matches!(
-            second.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
-        first.unlock().unwrap();
-        second.lock().unwrap();
-        second.unlock().unwrap();
+        let document = DocumentKey::new(pdf, identity);
+        assert_eq!(JsonSidecarStore.load(&document).unwrap(), first_latest);
     }
 }

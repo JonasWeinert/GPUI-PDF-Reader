@@ -2523,13 +2523,15 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "image",
- "key-editor-core",
+ "key-editor-gpui",
  "key-extension-api",
  "key-extension-gpui",
  "key-extension-host",
  "key-pdf-core",
  "key-pdf-runtime",
  "key-pdfium",
+ "key-sidecar-store",
+ "key-ui-gpui",
  "objc2-app-kit",
  "open",
  "serde",
@@ -3302,6 +3304,15 @@ name = "key-editor-core"
 version = "0.1.0"
 
 [[package]]
+name = "key-editor-gpui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "key-editor-core",
+]
+
+[[package]]
 name = "key-extension-api"
 version = "0.1.0"
 dependencies = [
@@ -3373,6 +3384,23 @@ dependencies = [
  "key-pdf-runtime",
  "pdfium-render",
  "url",
+]
+
+[[package]]
+name = "key-sidecar-store"
+version = "0.1.0"
+dependencies = [
+ "key-pdf-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "key-ui-gpui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
 ]
 
 [[package]]
