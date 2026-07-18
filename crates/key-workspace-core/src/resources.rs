@@ -19,6 +19,8 @@ pub enum ActivityLevel {
     Suspended,
     BackgroundCold,
     BackgroundWarm,
+    /// Painted in the active top-level tab but not the keyboard/command target.
+    ForegroundVisible,
     ForegroundIdle,
     ForegroundInteractive,
 }
@@ -29,7 +31,8 @@ impl ActivityLevel {
             Self::Suspended => 0,
             Self::BackgroundCold => 1,
             Self::BackgroundWarm => 2,
-            Self::ForegroundIdle => 4,
+            Self::ForegroundVisible => 4,
+            Self::ForegroundIdle => 6,
             Self::ForegroundInteractive => 8,
         }
     }
@@ -403,6 +406,24 @@ mod tests {
             plan.allocations[1].amount.cpu_memory_bytes
                 > plan.allocations[0].amount.cpu_memory_bytes
         );
+    }
+
+    #[test]
+    fn visible_split_companion_beats_background_without_matching_active_view() {
+        let coordinator = ResourceCoordinator::new(ResourceMode::Saver, system(2, 2, false));
+        let participants = vec![
+            participant(1, ActivityLevel::BackgroundWarm),
+            participant(2, ActivityLevel::ForegroundVisible),
+            participant(3, ActivityLevel::ForegroundInteractive),
+        ];
+        let plan = coordinator.plan(&participants);
+        let memory = plan
+            .allocations
+            .iter()
+            .map(|allocation| allocation.amount.cpu_memory_bytes)
+            .collect::<Vec<_>>();
+        assert!(memory[1] > memory[0]);
+        assert!(memory[2] > memory[1]);
     }
 
     #[test]

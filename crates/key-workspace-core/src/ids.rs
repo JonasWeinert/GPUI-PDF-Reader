@@ -30,6 +30,7 @@ macro_rules! numeric_id {
 
 numeric_id!(WindowId);
 numeric_id!(ItemId);
+numeric_id!(TabId);
 numeric_id!(ViewId);
 numeric_id!(ResourceParticipantId);
 numeric_id!(WorkId);
@@ -88,6 +89,10 @@ impl IdGenerator {
         ItemId::from_raw(self.take())
     }
 
+    pub fn tab(&self) -> TabId {
+        TabId::from_raw(self.take())
+    }
+
     pub fn view(&self) -> ViewId {
         ViewId::from_raw(self.take())
     }
@@ -110,7 +115,8 @@ mod tests {
         let ids = IdGenerator::new(7);
         assert_eq!(ids.window().get(), 7);
         assert_eq!(ids.item().get(), 8);
-        assert_eq!(ids.view().get(), 9);
+        assert_eq!(ids.tab().get(), 9);
+        assert_eq!(ids.view().get(), 10);
     }
 
     #[test]
