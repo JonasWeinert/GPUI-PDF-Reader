@@ -1,0 +1,15 @@
+[package]
+name = "key-pdf-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Engine-independent PDF session, demand, scheduling, and cache coordination"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+key-pdf-core = { path = "../key-pdf-core" }
+
+[lints.rust]
+unsafe_code = "forbid"
