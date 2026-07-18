@@ -14,6 +14,8 @@ mod transition;
 pub use transition::UnitTransition;
 
 #[cfg(target_os = "macos")]
+mod context_bar;
+#[cfg(target_os = "macos")]
 mod controls;
 #[cfg(target_os = "macos")]
 mod hover_card;
@@ -25,6 +27,8 @@ mod tabs;
 mod theme;
 
 #[cfg(target_os = "macos")]
+pub use context_bar::{CONTEXT_BAR_HEIGHT, WorkspaceContextBar};
+#[cfg(target_os = "macos")]
 pub use controls::{ChromeButtonStyle, chrome_button, close_button, icon_button, icon_label};
 #[cfg(target_os = "macos")]
 pub use hover_card::HoverCardShell;
@@ -34,7 +38,7 @@ pub use panel::{PanelHeader, PanelShell, PanelShellStyle};
 pub use tabs::{
     TAB_BAR_HEIGHT, TAB_HOVER_CARD_WIDTH, TAB_SEARCH_POPOVER_WIDTH, TabBarAction, TabDragPayload,
     TabDropAction, TabHoverAction, TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover,
-    TabStrip, tab_hover_card_x, tab_search_popover_x,
+    TabSegmentAction, TabSegmentPresentation, TabStrip, tab_hover_card_x, tab_search_popover_x,
 };
 #[cfg(target_os = "macos")]
 pub use theme::{ActionTokens, ContentTokens, StatusTokens, SurfaceTokens, ThemeTokens};

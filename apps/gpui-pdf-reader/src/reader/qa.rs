@@ -1146,6 +1146,7 @@ impl PdfReader {
                     && self.worker_hibernated
             }
             ActivityLevel::BackgroundWarm
+            | ActivityLevel::ForegroundVisible
             | ActivityLevel::ForegroundIdle
             | ActivityLevel::ForegroundInteractive => self.qa_viewport_is_settled(),
         }

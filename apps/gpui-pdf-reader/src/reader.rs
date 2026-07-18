@@ -217,6 +217,7 @@ fn resource_cache_limits(activity: ActivityLevel, amount: ResourceAmount) -> (us
     let activity_cap = match activity {
         ActivityLevel::ForegroundInteractive => 96 * RESOURCE_MIB as usize,
         ActivityLevel::ForegroundIdle => 48 * RESOURCE_MIB as usize,
+        ActivityLevel::ForegroundVisible => 40 * RESOURCE_MIB as usize,
         ActivityLevel::BackgroundWarm => 32 * RESOURCE_MIB as usize,
         ActivityLevel::BackgroundCold | ActivityLevel::Suspended => 0,
     };
@@ -231,6 +232,7 @@ fn resource_cache_limits(activity: ActivityLevel, amount: ResourceAmount) -> (us
     let text_page_cap = match activity {
         ActivityLevel::ForegroundInteractive => 48,
         ActivityLevel::ForegroundIdle => 24,
+        ActivityLevel::ForegroundVisible => 16,
         ActivityLevel::BackgroundWarm => 8,
         ActivityLevel::BackgroundCold | ActivityLevel::Suspended => 0,
     };

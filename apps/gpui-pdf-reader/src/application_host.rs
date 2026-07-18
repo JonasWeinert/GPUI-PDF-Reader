@@ -17,7 +17,7 @@ use key_sidecar_store::AnnotationService;
 use key_workspace_core::{
     ActivityLevel, Capability, Generation, IdGenerator, ItemKind, ItemSource, ParticipantSnapshot,
     ResourceAllocation, ResourceAmount, ResourceCoordinator, ResourceMode, ResourceParticipantId,
-    ResourceProfile, ResourceRegistry, ViewId, WindowId, WorkspaceItemDescriptor,
+    ResourceProfile, ResourceRegistry, TabId, ViewId, WindowId, WorkspaceItemDescriptor,
     WorkspaceViewDescriptor, WorkspaceWindowDescriptor,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -43,6 +43,7 @@ pub(crate) struct ApplicationHost {
     paths: HashMap<PathBuf, (WindowId, ViewId)>,
     settings_view: Option<(WindowId, ViewId)>,
     active_view: Option<ViewId>,
+    visible_views: BTreeSet<ViewId>,
     view_mru: VecDeque<ViewId>,
     resources: ResourceCoordinator,
     resource_registry: ResourceRegistry,
@@ -64,6 +65,7 @@ impl ApplicationHost {
             paths: HashMap::new(),
             settings_view: None,
             active_view: None,
+            visible_views: BTreeSet::new(),
             view_mru: VecDeque::new(),
             resources: ResourceCoordinator::new(ResourceMode::Auto, system_resources::detect()),
             resource_registry: ResourceRegistry::default(),
@@ -110,9 +112,16 @@ impl ApplicationHost {
         self.selected_theme = selected;
     }
 
-    fn set_active_view(&mut self, view: ViewId) -> bool {
+    pub(crate) fn allocate_tab_id(&self) -> TabId {
+        self.ids.tab()
+    }
+
+    fn set_active_views(&mut self, view: ViewId, visible: &[ViewId]) -> bool {
         let changed = self.active_view != Some(view);
         self.active_view = Some(view);
+        self.visible_views.clear();
+        self.visible_views.extend(visible.iter().copied());
+        self.visible_views.insert(view);
         self.view_mru.retain(|candidate| *candidate != view);
         self.view_mru.push_front(view);
         self.refresh_activity_levels();
@@ -136,6 +145,8 @@ impl ApplicationHost {
             self.resource_registry.remove(participant_for(*view));
         }
         self.view_mru.retain(|view| !removed_views.contains(view));
+        self.visible_views
+            .retain(|view| !removed_views.contains(view));
         self.paths
             .retain(|_, (window, _)| self.windows.contains_key(window));
         if self.settings_view.is_some_and(|(window, view)| {
@@ -161,6 +172,8 @@ impl ApplicationHost {
         for (index, view) in self.view_mru.iter().copied().enumerate() {
             let activity = if Some(view) == self.active_view {
                 ActivityLevel::ForegroundInteractive
+            } else if self.visible_views.contains(&view) {
+                ActivityLevel::ForegroundVisible
             } else {
                 match index {
                     0 | 1 => ActivityLevel::BackgroundWarm,
@@ -424,28 +437,38 @@ pub(crate) fn activate_workspace_view(
     view: ViewId,
     cx: &mut App,
 ) -> bool {
+    activate_workspace_views(host, view, &[view], cx)
+}
+
+pub(crate) fn activate_workspace_views(
+    host: Entity<ApplicationHost>,
+    active: ViewId,
+    visible: &[ViewId],
+    cx: &mut App,
+) -> bool {
     let (changed, targets) = host.update(cx, |host, _| {
-        let changed = host.set_active_view(view);
+        let changed = host.set_active_views(active, visible);
         (changed, host.reconcile_resource_targets())
     });
     apply_resource_targets(targets, cx);
     changed
 }
 
-pub(crate) fn select_workspace_tab(
+pub(crate) fn select_workspace_tab_views(
     host: Entity<ApplicationHost>,
     window: WindowId,
-    view: ViewId,
+    active: ViewId,
+    visible: &[ViewId],
     title: String,
     cx: &mut App,
 ) -> bool {
     host.update(cx, |host, _| {
         if let Some(record) = host.windows.get_mut(&window) {
-            record.descriptor.active_view = Some(view);
+            record.descriptor.active_view = Some(active);
             record.descriptor.title = title;
         }
     });
-    activate_workspace_view(host, view, cx)
+    activate_workspace_views(host, active, visible, cx)
 }
 
 pub(crate) fn remove_workspace_view(
@@ -472,6 +495,7 @@ pub(crate) fn remove_workspace_view(
         }
         host.resource_registry.remove(participant_for(view));
         host.view_mru.retain(|candidate| *candidate != view);
+        host.visible_views.remove(&view);
         if host.active_view == Some(view) {
             host.active_view = next_active.as_ref().map(|(view, _)| *view);
         }

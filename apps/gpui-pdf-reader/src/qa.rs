@@ -43,6 +43,7 @@ struct QaConfig {
     expected_window_count: Option<usize>,
     expected_tab_count: Option<usize>,
     tab_drag_scenario: Option<String>,
+    split_view_scenario: bool,
     resource_trace: bool,
     resource_sample_interval: Duration,
     resource_stress: bool,
@@ -97,6 +98,7 @@ impl QaConfig {
             expected_window_count: optional_value("GPUI_PDF_READER_QA_WINDOW_COUNT"),
             expected_tab_count: optional_value("GPUI_PDF_READER_QA_TAB_COUNT"),
             tab_drag_scenario: std::env::var("GPUI_PDF_READER_QA_TAB_DRAG_SCENARIO").ok(),
+            split_view_scenario: flag("GPUI_PDF_READER_QA_SPLIT_VIEW_SCENARIO"),
             resource_trace: flag("GPUI_PDF_READER_QA_RESOURCE_TRACE"),
             resource_sample_interval: Duration::from_millis(
                 optional_value::<u64>("GPUI_PDF_READER_QA_RESOURCE_SAMPLE_MS")
@@ -136,6 +138,7 @@ impl QaConfig {
             || self.expected_window_count.is_some()
             || self.expected_tab_count.is_some()
             || self.tab_drag_scenario.is_some()
+            || self.split_view_scenario
             || self.resource_trace
             || self.resource_stress
             || self.progressive_open
@@ -505,6 +508,24 @@ pub fn install(
                             }
                             other => {
                                 fail_and_quit(cx, &format!("unknown tab drag scenario: {other}"));
+                                return;
+                            }
+                        }
+                    }
+
+                    if config.split_view_scenario {
+                        let handle = cx
+                            .update(|window, _| window.window_handle().downcast::<WorkspaceWindow>())
+                            .ok()
+                            .flatten();
+                        let Some(handle) = handle else {
+                            fail_and_quit(cx, "split-view QA could not access the workspace window");
+                            return;
+                        };
+                        match run_split_view_scenario(handle, config.timeout, cx).await {
+                            Ok(report) => eprintln!("GPUI_PDF_READER_QA_SPLIT {report}"),
+                            Err(error) => {
+                                fail_and_quit(cx, &error);
                                 return;
                             }
                         }
@@ -949,6 +970,184 @@ pub fn install(
         .ok();
 }
 
+async fn run_split_view_scenario(
+    handle: WindowHandle<WorkspaceWindow>,
+    timeout: Duration,
+    cx: &mut AsyncWindowContext,
+) -> Result<String, String> {
+    let before = handle
+        .update(cx, |workspace, window, cx| {
+            let before = workspace.qa_tab_view_ids();
+            if before.len() != 2 {
+                return Err(format!(
+                    "split-view QA requires exactly two tabs, found {}",
+                    before.len()
+                ));
+            }
+            workspace.qa_split_with_other_tab(window, cx);
+            Ok(before)
+        })
+        .map_err(|error| format!("split-view setup failed: {error}"))??;
+
+    let (first, second) = {
+        let (tabs, visible, active, split) = handle
+            .update(cx, |workspace, _, _| workspace.qa_split_state())
+            .map_err(|error| format!("split-view state unavailable: {error}"))?;
+        let Some((first, second, ratio)) = split else {
+            return Err("two tabs did not become one compound split tab".to_owned());
+        };
+        if tabs != 1 || visible.len() != 2 || !visible.contains(&active) {
+            return Err(format!(
+                "invalid compound state: tabs={tabs} visible={visible:?} active={active:?}"
+            ));
+        }
+        if (ratio - 0.5).abs() > f32::EPSILON {
+            return Err(format!("initial split ratio was {ratio}, expected 0.5"));
+        }
+        (first, second)
+    };
+
+    wait_for_split_resources(handle, timeout, cx).await?;
+    let initial_active = handle
+        .update(cx, |workspace, _, _| workspace.qa_split_state().2)
+        .map_err(|error| format!("split active view unavailable: {error}"))?;
+    let next_active = if initial_active == first {
+        second
+    } else {
+        first
+    };
+    handle
+        .update(cx, |workspace, window, cx| {
+            workspace.qa_activate_split_view(next_active, window, cx)
+        })
+        .map_err(|error| format!("split activation failed: {error}"))?;
+    wait_for_split_resources(handle, timeout, cx).await?;
+    let active_after = handle
+        .update(cx, |workspace, _, _| workspace.qa_split_state().2)
+        .map_err(|error| format!("split active view unavailable: {error}"))?;
+    if active_after != next_active {
+        return Err("click-equivalent split activation did not switch active view".to_owned());
+    }
+
+    handle
+        .update(cx, |workspace, _, cx| {
+            workspace.qa_set_split_ratio(0.35, cx)
+        })
+        .map_err(|error| format!("split resize failed: {error}"))?;
+    let resized = handle
+        .update(cx, |workspace, _, _| workspace.qa_split_state().3)
+        .map_err(|error| format!("resized split state unavailable: {error}"))?
+        .ok_or_else(|| "split disappeared during resize".to_owned())?;
+    if (resized.2 - 0.35).abs() > 0.001 {
+        return Err(format!("split resize produced ratio {}", resized.2));
+    }
+
+    handle
+        .update(cx, |workspace, window, cx| {
+            workspace.qa_swap_split(window, cx)
+        })
+        .map_err(|error| format!("split swap failed: {error}"))?;
+    let swapped = handle
+        .update(cx, |workspace, _, _| workspace.qa_split_state().3)
+        .map_err(|error| format!("swapped split state unavailable: {error}"))?
+        .ok_or_else(|| "split disappeared during swap".to_owned())?;
+    if swapped.0 != resized.1 || swapped.1 != resized.0 || (swapped.2 - 0.65).abs() > 0.001 {
+        return Err(format!("split swap produced unexpected state: {swapped:?}"));
+    }
+
+    handle
+        .update(cx, |workspace, window, cx| {
+            workspace.qa_separate_split(window, cx)
+        })
+        .map_err(|error| format!("split separation failed: {error}"))?;
+    let separated = handle
+        .update(cx, |workspace, _, _| workspace.qa_split_state())
+        .map_err(|error| format!("separated state unavailable: {error}"))?;
+    if separated.0 != 2 || separated.1.len() != 1 || separated.3.is_some() {
+        return Err(format!(
+            "split separation produced invalid state: {separated:?}"
+        ));
+    }
+
+    handle
+        .update(cx, |workspace, window, cx| {
+            workspace.qa_split_with_other_tab(window, cx)
+        })
+        .map_err(|error| format!("second split failed: {error}"))?;
+    let close_view = handle
+        .update(cx, |workspace, _, _| {
+            workspace.qa_split_state().3.map(|split| split.0)
+        })
+        .map_err(|error| format!("second split state unavailable: {error}"))?
+        .ok_or_else(|| "views did not recombine after separation".to_owned())?;
+    handle
+        .update(cx, |workspace, window, cx| {
+            workspace.qa_close_split_view(close_view, window, cx)
+        })
+        .map_err(|error| format!("split child close failed: {error}"))?;
+    let closed = handle
+        .update(cx, |workspace, _, _| workspace.qa_split_state())
+        .map_err(|error| format!("closed split state unavailable: {error}"))?;
+    if closed.0 != 1 || closed.1.len() != 1 || closed.3.is_some() {
+        return Err(format!(
+            "split child close produced invalid state: {closed:?}"
+        ));
+    }
+
+    Ok(format!(
+        "opened={} visible=2 switched=1 resized=1 swapped=1 separated=1 closed=1",
+        before.len()
+    ))
+}
+
+async fn wait_for_split_resources(
+    handle: WindowHandle<WorkspaceWindow>,
+    timeout: Duration,
+    cx: &mut AsyncWindowContext,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (readers, settled, interactive, visible) = handle
+            .update(cx, |workspace, _, cx| {
+                let readers = workspace.readers();
+                let settled = readers
+                    .iter()
+                    .filter(|reader| reader.read(cx).qa_viewport_is_settled())
+                    .count();
+                let activities = readers
+                    .iter()
+                    .map(|reader| reader.read(cx).qa_resource_snapshot().activity)
+                    .collect::<Vec<_>>();
+                (
+                    readers.len(),
+                    settled,
+                    activities
+                        .iter()
+                        .filter(|activity| {
+                            **activity == key_workspace_core::ActivityLevel::ForegroundInteractive
+                        })
+                        .count(),
+                    activities
+                        .iter()
+                        .filter(|activity| {
+                            **activity == key_workspace_core::ActivityLevel::ForegroundVisible
+                        })
+                        .count(),
+                )
+            })
+            .map_err(|error| format!("split resource state unavailable: {error}"))?;
+        if readers == 2 && settled == 2 && interactive == 1 && visible == 1 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "split resources did not settle: readers={readers} settled={settled} interactive={interactive} visible={visible}"
+            ));
+        }
+        cx.background_executor().timer(POLL_INTERVAL).await;
+    }
+}
+
 fn apply_initial_overrides(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
     if flag("GPUI_PDF_READER_QA_FLUID_VIEW") {
         window
@@ -1051,7 +1250,7 @@ impl QaResourceTrace {
         let process = crate::qa_resources::process_memory_snapshot().unwrap_or_default();
         let views = workspace_resource_totals(window, cx);
         eprintln!(
-            "GPUI_PDF_READER_QA_RESOURCE seq={sequence} elapsed_us={elapsed_us} operation={operation} phase={phase} physical_memory={} low_power={} virtual={} resident={} resident_peak={} footprint={} footprint_peak={} alloc_live={} alloc_peak={} alloc_calls={} dealloc_calls={} realloc_calls={} allocated_bytes={} deallocated_bytes={} views={} interactive={} idle={} warm={} cold={} suspended={} allocation_cpu={} allocation_gpu={} allocation_workers={} tile_bytes={} tile_resident_estimate={} tile_limit={} tile_base_limit={} tiles={} pending_tiles={} text_pages={} trimmed_views={} hibernated_views={} retention_percent={}",
+            "GPUI_PDF_READER_QA_RESOURCE seq={sequence} elapsed_us={elapsed_us} operation={operation} phase={phase} physical_memory={} low_power={} virtual={} resident={} resident_peak={} footprint={} footprint_peak={} alloc_live={} alloc_peak={} alloc_calls={} dealloc_calls={} realloc_calls={} allocated_bytes={} deallocated_bytes={} views={} interactive={} visible={} idle={} warm={} cold={} suspended={} allocation_cpu={} allocation_gpu={} allocation_workers={} tile_bytes={} tile_resident_estimate={} tile_limit={} tile_base_limit={} tiles={} pending_tiles={} text_pages={} trimmed_views={} hibernated_views={} retention_percent={}",
             self.system.physical_memory_bytes,
             u8::from(self.system.low_power_mode),
             process.virtual_bytes,
@@ -1068,6 +1267,7 @@ impl QaResourceTrace {
             allocator.deallocated_bytes,
             views.views,
             views.interactive,
+            views.visible,
             views.idle,
             views.warm,
             views.cold,
@@ -1145,6 +1345,7 @@ fn trace_operation_label(kind: &str, index: usize, detail: &str) -> String {
 struct QaWorkspaceResourceTotals {
     views: u64,
     interactive: u64,
+    visible: u64,
     idle: u64,
     warm: u64,
     cold: u64,
@@ -1170,6 +1371,7 @@ impl QaWorkspaceResourceTotals {
         self.views += 1;
         match snapshot.activity {
             ActivityLevel::ForegroundInteractive => self.interactive += 1,
+            ActivityLevel::ForegroundVisible => self.visible += 1,
             ActivityLevel::ForegroundIdle => self.idle += 1,
             ActivityLevel::BackgroundWarm => self.warm += 1,
             ActivityLevel::BackgroundCold => self.cold += 1,
@@ -1214,7 +1416,10 @@ fn workspace_resource_totals(current: &Window, cx: &App) -> QaWorkspaceResourceT
     let current_handle = current.window_handle();
     for handle in cx.windows() {
         if handle == current_handle {
-            if let Some(reader) = reader_entity(current, cx) {
+            let Some(workspace) = current.root::<WorkspaceWindow>().flatten() else {
+                continue;
+            };
+            for reader in workspace.read(cx).readers() {
                 totals.add(reader.read(cx).qa_resource_snapshot());
             }
             continue;
@@ -1225,10 +1430,9 @@ fn workspace_resource_totals(current: &Window, cx: &App) -> QaWorkspaceResourceT
         let Ok(workspace) = handle.read(cx) else {
             continue;
         };
-        let Some(reader) = workspace.reader() else {
-            continue;
-        };
-        totals.add(reader.read(cx).qa_resource_snapshot());
+        for reader in workspace.readers() {
+            totals.add(reader.read(cx).qa_resource_snapshot());
+        }
     }
     totals
 }
@@ -1344,6 +1548,7 @@ mod tests {
             expected_window_count: None,
             expected_tab_count: None,
             tab_drag_scenario: None,
+            split_view_scenario: false,
             resource_trace: false,
             resource_sample_interval: Duration::from_millis(DEFAULT_RESOURCE_SAMPLE_MS),
             resource_stress: false,

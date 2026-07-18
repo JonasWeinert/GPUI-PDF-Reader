@@ -38,27 +38,47 @@ pub fn tab_hover_card_x(
 }
 
 pub type TabIndexAction = Rc<dyn Fn(usize, &ClickEvent, &mut Window, &mut App)>;
+pub type TabSegmentAction = Rc<dyn Fn(usize, u64, &ClickEvent, &mut Window, &mut App)>;
 pub type TabBarAction = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 pub type TabHoverAction = Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>;
 pub type TabDropAction = Rc<dyn Fn(&TabDragPayload, usize, &mut Window, &mut App)>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TabPresentation {
+    pub view: u64,
     pub title: SharedString,
     pub detail: SharedString,
     pub drag: Option<TabDragPayload>,
     pub recently_moved: bool,
+    pub secondary: Option<TabSegmentPresentation>,
+    pub active_segment: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TabSegmentPresentation {
+    pub view: u64,
+    pub title: SharedString,
+    pub detail: SharedString,
 }
 
 impl TabPresentation {
     #[must_use]
     pub fn new(title: impl Into<SharedString>, detail: impl Into<SharedString>) -> Self {
         Self {
+            view: 0,
             title: title.into(),
             detail: detail.into(),
             drag: None,
             recently_moved: false,
+            secondary: None,
+            active_segment: 0,
         }
+    }
+
+    #[must_use]
+    pub fn view(mut self, view: u64) -> Self {
+        self.view = view;
+        self
     }
 
     #[must_use]
@@ -72,20 +92,39 @@ impl TabPresentation {
         self.recently_moved = recently_moved;
         self
     }
+
+    #[must_use]
+    pub fn split(
+        mut self,
+        view: u64,
+        title: impl Into<SharedString>,
+        detail: impl Into<SharedString>,
+        active_segment: usize,
+    ) -> Self {
+        self.secondary = Some(TabSegmentPresentation {
+            view,
+            title: title.into(),
+            detail: detail.into(),
+        });
+        self.active_segment = active_segment.min(1);
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TabDragPayload {
     pub source_window: u64,
+    pub tab: u64,
     pub view: u64,
     pub title: SharedString,
 }
 
 impl TabDragPayload {
     #[must_use]
-    pub fn new(source_window: u64, view: u64, title: impl Into<SharedString>) -> Self {
+    pub fn new(source_window: u64, tab: u64, view: u64, title: impl Into<SharedString>) -> Self {
         Self {
             source_window,
+            tab,
             view,
             title: title.into(),
         }
@@ -104,6 +143,7 @@ pub struct TabStrip {
     active: usize,
     scroll: ScrollHandle,
     on_activate: TabIndexAction,
+    on_activate_segment: Option<TabSegmentAction>,
     on_close: Option<TabIndexAction>,
     on_hover: TabHoverAction,
     on_sidebar: TabBarAction,
@@ -132,6 +172,7 @@ impl TabStrip {
             active,
             scroll,
             on_activate,
+            on_activate_segment: None,
             on_close: None,
             on_hover,
             on_sidebar,
@@ -148,6 +189,12 @@ impl TabStrip {
     }
 
     #[must_use]
+    pub fn on_activate_segment(mut self, action: TabSegmentAction) -> Self {
+        self.on_activate_segment = Some(action);
+        self
+    }
+
+    #[must_use]
     pub fn on_drop(mut self, action: TabDropAction) -> Self {
         self.on_drop = Some(action);
         self
@@ -159,30 +206,88 @@ impl RenderOnce for TabStrip {
         let tokens = self.tokens;
         let fade_width = px(42.0);
         let tab_count = self.tabs.len();
+        let tab_units = self
+            .tabs
+            .iter()
+            .map(|tab| if tab.secondary.is_some() { 1.65 } else { 1.0 })
+            .sum::<f32>();
         let available_tab_width =
             (f32::from(window.viewport_size().width) - TAB_BAR_LEADING_INSET - 96.0 - 52.0)
                 .max(148.0);
-        let tabs_overflow = tab_count as f32 * 148.0 + 8.0 > available_tab_width;
-        let preferred_tab_width = (tab_count as f32 * 260.0 + 8.0).min(available_tab_width);
+        let tabs_overflow = tab_units * 148.0 + 8.0 > available_tab_width;
+        let preferred_tab_width = (tab_units * 260.0 + 8.0).min(available_tab_width);
         let drop_at_end = self.on_drop.clone();
         let tabs = self.tabs.into_iter().enumerate().map(|(index, tab)| {
             let active = index == self.active;
             let show_separator = !active && index + 1 < tab_count && index + 1 != self.active;
             let activate = self.on_activate.clone();
+            let activate_segment = self.on_activate_segment.clone();
             let hover = self.on_hover.clone();
             let close = self.on_close.clone();
             let drop = self.on_drop.clone();
             let drag = tab.drag.clone();
             let recently_moved = tab.recently_moved;
+            let is_compound = tab.secondary.is_some();
+            let primary_title = tab.title;
+            let primary_view = tab.view;
+            let secondary = tab.secondary;
+            let active_segment = tab.active_segment;
+            let segment = |segment_index: usize,
+                           view: u64,
+                           title: SharedString,
+                           activate_segment: Option<TabSegmentAction>| {
+                div()
+                    .id(("workspace-tab-segment", index * 2 + segment_index))
+                    .min_w_0()
+                    .h(px(32.0))
+                    .px_2()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_lg()
+                    .bg(if active && active_segment == segment_index {
+                        tokens.action.accent_soft.opacity(0.76)
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .when_some(activate_segment, |segment, action| {
+                        segment.on_click(move |event, window, cx| {
+                            cx.stop_propagation();
+                            action(index, view, event, window, cx);
+                        })
+                    })
+                    .child(Icon::new(IconName::File).size(px(14.0)).text_color(
+                        if active && active_segment == segment_index {
+                            tokens.action.accent
+                        } else {
+                            tokens.content.tertiary
+                        },
+                    ))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_sm()
+                            .font_weight(if active && active_segment == segment_index {
+                                FontWeight::MEDIUM
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .child(title),
+                    )
+            };
             div()
                 .id(("workspace-tab", index))
                 .relative()
                 .h(px(42.0))
                 .mt(px(10.0))
-                .min_w(px(148.0))
-                .max_w(px(260.0))
+                .min_w(px(if is_compound { 240.0 } else { 148.0 }))
+                .max_w(px(if is_compound { 380.0 } else { 260.0 }))
                 .flex_1()
-                .px_3()
+                .px(if is_compound { px(4.0) } else { px(12.0) })
                 .flex()
                 .items_center()
                 .gap_2()
@@ -213,30 +318,54 @@ impl RenderOnce for TabStrip {
                     hover(is_hovered.then_some(index), window, cx)
                 })
                 .on_click(move |event, window, cx| activate(index, event, window, cx))
-                .child(
-                    Icon::new(IconName::File)
-                        .size(px(15.0))
-                        .text_color(if active {
-                            tokens.action.accent
-                        } else {
-                            tokens.content.tertiary
-                        }),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .text_sm()
-                        .font_weight(if active {
-                            FontWeight::MEDIUM
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .child(tab.title),
-                )
+                .when(!is_compound, |tab| {
+                    tab.child(
+                        Icon::new(IconName::File)
+                            .size(px(15.0))
+                            .text_color(if active {
+                                tokens.action.accent
+                            } else {
+                                tokens.content.tertiary
+                            }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_sm()
+                            .font_weight(if active {
+                                FontWeight::MEDIUM
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .child(primary_title.clone()),
+                    )
+                })
+                .when(is_compound, |tab| {
+                    let secondary = secondary.expect("compound tab has a secondary segment");
+                    tab.child(segment(
+                        0,
+                        primary_view,
+                        primary_title,
+                        activate_segment.clone(),
+                    ))
+                    .child(
+                        div()
+                            .h(px(20.0))
+                            .w(px(1.0))
+                            .flex_none()
+                            .bg(tokens.surface.border.opacity(0.72)),
+                    )
+                    .child(segment(
+                        1,
+                        secondary.view,
+                        secondary.title,
+                        activate_segment,
+                    ))
+                })
                 .when_some(close, |tab, close| {
                     tab.child(
                         div()
