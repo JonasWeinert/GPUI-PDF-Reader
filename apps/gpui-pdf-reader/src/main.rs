@@ -93,7 +93,10 @@ actions!(
 );
 
 fn main() {
-    let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
+    let initial_paths = std::env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
 
     let extension_assets = Arc::new(extension_assets::ExtensionAssetStore::default());
     let application = Application::new().with_assets(extension_assets::ReaderAssetSource::new(
@@ -117,8 +120,14 @@ fn main() {
         });
         rebuild_application_menus(&mut extensions, cx);
         let application_host = cx.new(|_| application_host::ApplicationHost::new(extensions));
-        let window = application_host::open_pdf_window(application_host.clone(), initial_path, cx)
-            .expect("failed to open the GPUI PDF Reader window");
+        let mut initial_paths = initial_paths.into_iter();
+        let window =
+            application_host::open_pdf_window(application_host.clone(), initial_paths.next(), cx)
+                .expect("failed to open the GPUI PDF Reader window");
+        for path in initial_paths {
+            application_host::open_pdf_window(application_host.clone(), Some(path), cx)
+                .expect("failed to open an additional GPUI PDF Reader window");
+        }
 
         window
             .update(cx, |workspace, window, cx| {

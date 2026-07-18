@@ -34,6 +34,7 @@ struct QaConfig {
     toc_callout_hold: bool,
     reference_details: bool,
     extension_scenario: Option<String>,
+    expected_window_count: Option<usize>,
 }
 
 impl QaConfig {
@@ -76,6 +77,7 @@ impl QaConfig {
             toc_callout_hold: flag("GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD"),
             reference_details: flag("GPUI_PDF_READER_QA_REFERENCE_DETAILS"),
             extension_scenario: std::env::var("GPUI_PDF_READER_QA_EXTENSION_SCENARIO").ok(),
+            expected_window_count: optional_value("GPUI_PDF_READER_QA_WINDOW_COUNT"),
         }
     }
 
@@ -95,6 +97,7 @@ impl QaConfig {
             || self.toc_callout_hold
             || self.reference_details
             || self.extension_scenario.is_some()
+            || self.expected_window_count.is_some()
     }
 
     fn has_navigation_setup(&self) -> bool {
@@ -161,6 +164,43 @@ pub fn install(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
                             return;
                         }
                         cx.background_executor().timer(POLL_INTERVAL).await;
+                    }
+
+                    if let Some(expected) = config.expected_window_count {
+                        let deadline = Instant::now() + config.timeout;
+                        loop {
+                            let (windows, pdf_views, settled) = cx
+                                .update(|_, cx| workspace_window_counts(cx))
+                                .unwrap_or_default();
+                            if windows == expected
+                                && pdf_views == expected
+                                && settled == expected
+                            {
+                                eprintln!(
+                                    "GPUI_PDF_READER_QA_WINDOWS windows={windows} pdf_views={pdf_views} settled={settled}"
+                                );
+                                break;
+                            }
+                            if windows > expected {
+                                fail_and_quit(
+                                    cx,
+                                    &format!(
+                                        "expected {expected} workspace windows, found {windows}"
+                                    ),
+                                );
+                                return;
+                            }
+                            if Instant::now() >= deadline {
+                                fail_and_quit(
+                                    cx,
+                                    &format!(
+                                        "multi-window startup did not settle: expected={expected} windows={windows} pdf_views={pdf_views} settled={settled}"
+                                    ),
+                                );
+                                return;
+                            }
+                            cx.background_executor().timer(POLL_INTERVAL).await;
+                        }
                     }
 
                     if config.has_navigation_setup() {
@@ -449,6 +489,26 @@ fn reader_entity(window: &Window, cx: &App) -> Option<Entity<PdfReader>> {
         .and_then(|workspace| workspace.read(cx).reader())
 }
 
+fn workspace_window_counts(cx: &App) -> (usize, usize, usize) {
+    let windows = cx.windows();
+    let mut pdf_views = 0;
+    let mut settled = 0;
+    for handle in &windows {
+        let Some(handle) = handle.downcast::<WorkspaceWindow>() else {
+            continue;
+        };
+        let Ok(workspace) = handle.read(cx) else {
+            continue;
+        };
+        let Some(reader) = workspace.reader() else {
+            continue;
+        };
+        pdf_views += 1;
+        settled += usize::from(reader.read(cx).qa_viewport_is_settled());
+    }
+    (windows.len(), pdf_views, settled)
+}
+
 fn fail_and_quit(cx: &mut gpui::AsyncWindowContext, message: &str) {
     eprintln!("GPUI_PDF_READER_QA_ERROR {message}");
     let _ = cx.update(|_, cx| cx.quit());
@@ -478,6 +538,7 @@ mod tests {
             toc_callout_hold: false,
             reference_details: false,
             extension_scenario: None,
+            expected_window_count: None,
         };
 
         assert!(!config.requested());
