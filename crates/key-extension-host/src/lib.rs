@@ -11,8 +11,10 @@ mod diagnostic;
 mod host;
 mod native;
 mod registry;
+mod services;
 
 pub use diagnostic::*;
 pub use host::*;
 pub use native::*;
 pub use registry::*;
+pub use services::*;

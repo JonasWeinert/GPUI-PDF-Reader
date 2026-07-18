@@ -71,7 +71,7 @@ use key_extension_api::{
 #[cfg(feature = "installable-extensions")]
 use key_extension_api::{LifecycleState, Permission};
 use key_extension_gpui::{BoundedStateMap, DeclarativeView, InvokeExtensionCommand};
-use key_extension_host::ArbitratedEffect;
+use key_extension_host::{ArbitratedEffect, ServiceDispatch};
 #[cfg(feature = "installable-extensions")]
 use key_extension_host::{OwnedCommand, PermissionDecision};
 #[cfg(feature = "installable-extensions")]
@@ -2460,6 +2460,22 @@ impl PdfReader {
     /// Executes bounded host ticks from event/animation callbacks, never from
     /// `Render`. High-frequency navigation is coalesced by snapshot equality.
     fn flush_extension_snapshots(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let completions = self.extensions.poll_service_completions(32);
+        for completion in completions {
+            match self
+                .extensions
+                .complete_effect(&completion.effect, completion.result)
+            {
+                Ok(report) if !report.effects.is_empty() => {
+                    self.execute_extension_effects(report.effects, window, cx);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.warning =
+                        Some(format!("Extension task completion failed: {error}").into());
+                }
+            }
+        }
         let report = match self
             .extensions
             .publish_snapshots(self.extension_snapshot_values())
@@ -2474,7 +2490,7 @@ impl PdfReader {
         if !report.effects.is_empty() {
             self.execute_extension_effects(report.effects, window, cx);
         }
-        if report.deferred_events > 0 {
+        if report.deferred_events > 0 || self.extensions.has_pending_service_work() {
             self.schedule_extension_snapshot_sync(window, cx);
         }
     }
@@ -2552,7 +2568,14 @@ impl PdfReader {
                 break;
             }
             completed += 1;
-            let result = self.execute_extension_effect(&effect, window, cx);
+            let result = match self.extensions.dispatch_service_effect(&effect) {
+                ServiceDispatch::Immediate(result) => result,
+                ServiceDispatch::Deferred => {
+                    self.schedule_extension_snapshot_sync(window, cx);
+                    continue;
+                }
+                ServiceDispatch::Unsupported => self.execute_extension_effect(&effect, window, cx),
+            };
             match self.extensions.complete_effect(&effect, result) {
                 Ok(report) => {
                     pending.extend(report.effects);

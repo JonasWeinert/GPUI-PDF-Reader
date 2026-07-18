@@ -28,11 +28,11 @@ use key_extension_api::{
 use key_extension_gpui::{native_menu_slots, resolve_menu_slots};
 #[cfg(feature = "installable-extensions")]
 use key_extension_host::OwnedCommand;
-#[cfg(feature = "installable-extensions")]
 use key_extension_host::PermissionDecision;
 use key_extension_host::{
     ArbitratedEffect, CollectedContributions, ExtensionHost, HostConfig, HostError,
-    NativeExtension, NativeExtensionAdapter, NativeUpdate, OwnedView, PackageMetadata, TickReport,
+    HostServiceRouter, NativeExtension, NativeExtensionAdapter, NativeUpdate, OwnedView,
+    PackageMetadata, ServiceCompletion, ServiceDispatch, TickReport,
 };
 #[cfg(feature = "installable-extensions")]
 use key_extension_package::PackageSourceKind;
@@ -62,6 +62,7 @@ const THEME_MENU: &str = "com.jonasweinert.gpuipdf.theme/view-theme-menu";
 /// It is deliberately independent from GPUI's global application state.
 pub struct ReaderExtensions {
     host: ExtensionHost,
+    services: HostServiceRouter,
     theme_command: CommandId,
     pdf_capabilities: Arc<PdfCapabilityBridge>,
     extension_assets: Arc<ExtensionAssetStore>,
@@ -153,6 +154,7 @@ impl ReaderExtensions {
 
         Ok(Self {
             host,
+            services: HostServiceRouter::default(),
             theme_command,
             pdf_capabilities,
             extension_assets,
@@ -193,6 +195,7 @@ impl ReaderExtensions {
         register_pdf_capabilities(&mut host);
         Self {
             host,
+            services: HostServiceRouter::default(),
             theme_command: theme_command_id(),
             pdf_capabilities: Arc::new(PdfCapabilityBridge::default()),
             extension_assets,
@@ -231,6 +234,69 @@ impl ReaderExtensions {
         self.last_snapshots
             .retain(|(kind, _)| !DOCUMENT_SNAPSHOTS.contains(kind));
         self.host.invalidate_document_scope(DOCUMENT_SNAPSHOTS);
+        self.services.cancel_all();
+    }
+
+    /// Routes storage and task effects through host-owned semantic services.
+    /// OS, GPUI, and PDF effects remain the application shell's responsibility.
+    pub fn dispatch_service_effect(&mut self, effect: &ArbitratedEffect) -> ServiceDispatch {
+        let storage_quota = match &effect.request.effect {
+            ExtensionEffect::StorageGet { area, .. }
+            | ExtensionEffect::StoragePut { area, .. }
+            | ExtensionEffect::StorageDelete { area, .. } => {
+                self.extension_storage_quota(&effect.extension, *area)
+            }
+            _ => 0,
+        };
+        self.services.dispatch(effect, storage_quota)
+    }
+
+    fn extension_storage_quota(
+        &self,
+        extension: &ExtensionId,
+        area: key_extension_api::StorageArea,
+    ) -> u64 {
+        let Some(record) = self.host.registry().get(extension) else {
+            return 0;
+        };
+        let requested = match area {
+            key_extension_api::StorageArea::Settings => record.manifest().storage.settings_bytes,
+            key_extension_api::StorageArea::Document => record.manifest().storage.document_bytes,
+            key_extension_api::StorageArea::EphemeralCache => {
+                record.manifest().storage.ephemeral_cache_bytes
+            }
+        };
+        let granted = record
+            .manifest()
+            .permissions
+            .iter()
+            .filter_map(|request| match &request.permission {
+                Permission::Storage(storage)
+                    if storage.area == area
+                        && self
+                            .host
+                            .permission_decision(extension, &request.permission)
+                            == PermissionDecision::Granted =>
+                {
+                    Some(storage.quota_bytes)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        requested.min(granted)
+    }
+
+    /// Drains a bounded number of background service completions. The reader
+    /// returns them through `complete_effect`, preserving normal generation and
+    /// stale-result validation.
+    pub fn poll_service_completions(&mut self, maximum: usize) -> Vec<ServiceCompletion> {
+        self.services.poll_ready(maximum)
+    }
+
+    #[must_use]
+    pub fn has_pending_service_work(&self) -> bool {
+        self.services.active_task_count() > 0
     }
 
     pub fn contributions(&mut self) -> CollectedContributions {
@@ -436,6 +502,7 @@ impl ReaderExtensions {
             ))
         })?;
         packages.disable(&mut self.host, extension)?;
+        self.services.cancel_extension(extension);
         self.persist_managed_package(extension, None, false)?;
         self.sync_extension_assets(extension, false)?;
         self.last_snapshots.clear();
@@ -472,6 +539,7 @@ impl ReaderExtensions {
         } else if !self.restoration_failures.contains_key(extension) {
             return Err(ExtensionPackageError::NotManaged(extension.clone()));
         }
+        self.services.cancel_extension(extension);
         if let Some(registry) = self.registry.as_mut() {
             registry
                 .remove(extension)
@@ -503,6 +571,7 @@ impl ReaderExtensions {
             self.host.state(extension) == Some(key_extension_api::LifecycleState::Active),
         )?;
         if self.host.state(extension) != Some(key_extension_api::LifecycleState::Active) {
+            self.services.cancel_extension(extension);
             self.extension_assets.remove_extension(extension);
         }
         self.last_snapshots.clear();
