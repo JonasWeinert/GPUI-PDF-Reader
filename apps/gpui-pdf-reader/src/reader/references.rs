@@ -1252,10 +1252,9 @@ impl PdfReader {
         };
         anchor.x -= self.scroll.x;
         anchor.y -= self.scroll.y;
-        let card_width = desired_width.clamp(
-            220.0,
-            LINK_CARD_WIDTH.min((self.viewport_width - LINK_CARD_MARGIN * 2.0).max(220.0)),
-        );
+        let maximum_card_width =
+            LINK_CARD_WIDTH.min((self.viewport_width - LINK_CARD_MARGIN * 2.0).max(1.0));
+        let card_width = desired_width.min(maximum_card_width).max(1.0);
         let position = self.link_card_pointer.map_or_else(
             || {
                 link_card_position(
@@ -1287,9 +1286,7 @@ impl PdfReader {
                 .top(px(position.y))
                 .left(px(position.x))
                 .w(px(card_width))
-                .max_h(px(
-                    (self.viewport_height - LINK_CARD_MARGIN * 2.0).max(120.0)
-                ))
+                .max_h(px((self.viewport_height - LINK_CARD_MARGIN * 2.0).max(1.0)))
                 .overflow_hidden()
                 .rounded_xl()
                 .border_1()
@@ -1299,9 +1296,7 @@ impl PdfReader {
                 .child(
                     div()
                         .id("link-preview-card-scroll")
-                        .max_h(px(
-                            (self.viewport_height - LINK_CARD_MARGIN * 2.0).max(120.0)
-                        ))
+                        .max_h(px((self.viewport_height - LINK_CARD_MARGIN * 2.0).max(1.0)))
                         .overflow_y_scroll()
                         .child(div().h(px(3.0)).w_full().flex_none().bg(card_accent))
                         .child(div().min_w_0().px_4().pt_3().pb_4().child(content)),
@@ -2068,9 +2063,7 @@ impl PdfReader {
                 .id("reference-details-panel")
                 .block_mouse_except_scroll()
                 .absolute()
-                .top(px(
-                    self.reader_toolbar_height() + FLUID_PANEL_VERTICAL_MARGIN
-                ))
+                .top(px(FLUID_PANEL_VERTICAL_MARGIN))
                 .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
                 .right(px(right))
                 .w(px(panel_width))

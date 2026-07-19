@@ -1,7 +1,4 @@
-use super::comments::{
-    annotation_actions_enabled, comment_draft_needs_confirmation, comments_toolbar_label,
-    floating_pill_position,
-};
+use super::comments::{comment_draft_needs_confirmation, floating_pill_position};
 use super::*;
 use crate::annotations::{AnnotationStore, DocumentKey, JsonSidecarStore};
 use gpui_component::{ThemeColor, ThemeMode};
@@ -649,15 +646,6 @@ fn letter_pages(count: usize) -> Vec<PageSize> {
 }
 
 #[test]
-fn annotation_controls_enable_for_any_writable_text_context_without_an_open_editor() {
-    assert!(annotation_actions_enabled(true, false, false, false));
-    assert!(!annotation_actions_enabled(false, false, false, false));
-    assert!(!annotation_actions_enabled(true, true, false, false));
-    assert!(!annotation_actions_enabled(true, false, true, false));
-    assert!(!annotation_actions_enabled(true, false, false, true));
-}
-
-#[test]
 fn zoom_controls_disable_without_a_document_and_at_their_exact_limits() {
     assert_eq!(zoom_controls_enabled(false, 1.0), (false, false));
     assert_eq!(zoom_controls_enabled(true, MIN_ZOOM), (false, true));
@@ -671,18 +659,6 @@ fn only_a_modified_open_comment_requires_discard_confirmation() {
     assert!(!comment_draft_needs_confirmation(false, true));
     assert!(!comment_draft_needs_confirmation(true, false));
     assert!(comment_draft_needs_confirmation(true, true));
-}
-
-#[test]
-fn hidden_comment_editor_remains_visible_in_the_responsive_toolbar_label() {
-    assert_eq!(comments_toolbar_label(false, false, false), "Comments");
-    assert_eq!(comments_toolbar_label(false, true, true), "Notes");
-    assert_eq!(
-        comments_toolbar_label(true, false, false),
-        "Comments · Editing"
-    );
-    assert_eq!(comments_toolbar_label(true, true, false), "Notes •");
-    assert_eq!(comments_toolbar_label(true, true, true), "Notes •");
 }
 
 #[test]
@@ -963,9 +939,8 @@ fn accelerated_command_wheel_zoom_is_finite_and_clamped_per_packet() {
 }
 
 #[test]
-fn sidebar_animation_opens_closes_reverses_and_clamps_width() {
+fn sidebar_animation_opens_closes_and_reverses() {
     let mut sidebar = SidebarState::default();
-    assert_eq!(sidebar.available_width(1_200.0), 0.0);
     sidebar.toggle(SidePanel::Comments);
     assert_eq!(sidebar.target, 1.0);
 
@@ -977,9 +952,6 @@ fn sidebar_animation_opens_closes_reverses_and_clamps_width() {
         previous = sidebar.progress;
     }
     assert_eq!(sidebar.progress, 1.0);
-    assert_eq!(sidebar.available_width(1_200.0), SIDEBAR_WIDTH);
-    assert_eq!(sidebar.available_width(500.0), 200.0);
-    assert_eq!(sidebar.available_width(250.0), 0.0);
 
     sidebar.toggle(SidePanel::Comments);
     sidebar.advance(1.0 / 60.0);

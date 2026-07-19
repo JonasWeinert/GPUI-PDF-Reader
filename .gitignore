@@ -28,3 +28,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Local build-in-public content planning.
+/content/

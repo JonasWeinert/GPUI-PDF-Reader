@@ -24,7 +24,6 @@ fi
 
 cd "$root"
 cargo build --locked
-GPUI_PDF_READER_QA_FLUID_VIEW=1 \
 GPUI_PDF_READER_QA_THEME="Catppuccin Latte" \
 GPUI_PDF_READER_QA_TOC_HOVER=1 \
 GPUI_PDF_READER_QA_TOC_CALLOUT_HOLD=1 \

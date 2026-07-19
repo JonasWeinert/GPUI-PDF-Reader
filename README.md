@@ -28,7 +28,7 @@ are macOS-specific today.
 
 ## Highlights
 
-- Open PDFs from the toolbar, `Command-O`, or the command line.
+- Open PDFs with `Command-O`, the empty-state control, or the command line.
 - Smooth continuous horizontal and vertical scrolling with a trackpad, mouse,
   or keyboard.
 - Cursor-anchored pinch and `Command`/`Control`-wheel zoom from 20% to 500%,
@@ -39,18 +39,16 @@ are macOS-specific today.
 - Selection-anchored highlights in yellow, green, blue, pink, or purple.
 - Markdown-backed comments with a WYSIWYG editor for bold, italic, inline
   code, bulleted lists, and numbered lists.
-- Classic and Fluid reader views, selectable from the View menu. Classic keeps
-  controls in the titlebar; Fluid uses intent-sensitive floating controls over
-  the document.
+- One intent-sensitive reader interface with compact floating controls over
+  each PDF pane. There is no separate layout mode to configure.
 - Thirty-seven bundled gpui-component themes, selectable from View → Theme,
   plus a system-following mode. All reader chrome and icons use shared semantic
   theme tokens. Dark themes use PDFium forced-color rendering for dark paper
   and readable text/vector content while preserving embedded image pixels.
-  The PDF paper stays distinct from the workspace, and Fluid view provides a
+  The PDF paper stays distinct from the workspace, and the floating controls provide a
   moon/sun control to show the original light PDF without changing app theme.
-- Animated comments and search panels. Classic makes room for them; Fluid
-  floats near-full-height panels over the PDF while extending horizontal reach
-  so covered content remains accessible.
+- Animated near-full-height comments and search panels float over their PDF
+  pane while extending horizontal reach so covered content remains accessible.
 - Case-insensitive in-document search with on-page result highlights, a
   virtualized result list, and previous/next navigation.
 - PDFium rendering for intrinsic page rotation, CropBox pages, annotations,
@@ -155,8 +153,7 @@ implemented yet.
 
 | Action | Input |
 |---|---|
-| Open | Toolbar or `Command-O` |
-| Switch layout | Classic View or Fluid View in the View menu |
+| Open | Empty-state control or `Command-O` |
 | Scroll | Two-finger trackpad, mouse wheel, or both trackpad axes |
 | Horizontal scroll | Native horizontal gesture or `Shift`-wheel |
 | Pan | Middle-button drag |
@@ -168,20 +165,19 @@ implemented yet.
 | First / last page | `Home` / `End` |
 | Select text | Left drag; `Shift`-click extends; double-click selects a word |
 | Select all / copy | `Command-A` / `Command-C` |
-| Highlight selection | Choose one of the five color controls; Fluid also shows a selection pill |
-| Add comment to selection | Toolbar or `Command-Option-M` |
-| Search document | Toolbar or `Command-F` |
+| Highlight selection | Choose one of the five floating color controls |
+| Add comment to selection | Floating selection control or `Command-Option-M` |
+| Search document | Floating Search control or `Command-F` |
 | Next / previous search result | `Command-G` / `Command-Shift-G` |
-| Show / hide comments | Comments control in the toolbar |
+| Show / hide comments | Floating Comments control |
 | Install or update an extension | File → Install or Update Extension, then review it in the Extensions panel |
 | Open an active extension | Tools → Extensions → extension name |
 | Manage extension settings | Tools → Extensions → Manage |
 
 The comment editor displays formatted content directly while storing Markdown.
 Its hovering formatting pill provides bold, italic, inline code, bulleted-list,
-and numbered-list controls. Both views auto-save edits; `Escape` or Back returns
-to the comments list. Classic keeps this workflow in its docked sidebar, while
-Fluid animates between panes in its floating panel.
+and numbered-list controls. Edits auto-save; `Escape` or Back returns to the
+comments list with an animated transition inside its floating panel.
 
 Keyboard scrolling is animated. Precise trackpad deltas are applied directly,
 and zoom gestures preserve the document position beneath the pointer.

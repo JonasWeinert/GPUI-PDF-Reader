@@ -6,8 +6,12 @@ an accepted product plan.
 
 ## Workspace and views
 
-- Add tabs and split panes by allowing a window content layout to contain more
-  than one view placement.
+- Persist tab order, compound membership, active child, and split ratio during
+  workspace restoration.
+- Add vertical, nested, and more-than-two-pane layouts only after a concrete
+  workflow justifies their added navigation and resource-policy complexity.
+- Add direct drag extraction of one compound child. The current bounded model
+  moves a compound tab as one unit and exposes explicit swap/separate actions.
 - Add an explicit **New View** command for multiple simultaneous views of one
   item. Reuse the same document session while keeping view-local navigation,
   selection, zoom, and panels independent.

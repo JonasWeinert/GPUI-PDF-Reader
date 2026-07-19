@@ -83,10 +83,8 @@ pub fn pdf_paper_border(theme: &Theme, forced_dark: bool) -> Hsla {
 #[derive(Clone, Copy, Debug)]
 pub struct ReaderPalette {
     pub ui: ThemeTokens,
-    pub chrome: Hsla,
     pub surface: Hsla,
     pub surface_subtle: Hsla,
-    pub control: Hsla,
     pub control_hover: Hsla,
     pub control_pressed: Hsla,
     pub separator: Hsla,
@@ -119,10 +117,8 @@ impl ReaderPalette {
         let ui = ThemeTokens::from_theme(theme);
         Self {
             ui,
-            chrome: ui.surface.chrome,
             surface: ui.surface.background,
             surface_subtle: ui.surface.muted,
-            control: ui.action.control,
             control_hover: ui.action.control_hover,
             control_pressed: ui.action.control_pressed,
             separator: ui.surface.border,

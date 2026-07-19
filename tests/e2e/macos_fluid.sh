@@ -57,7 +57,6 @@ run_case() {
     GPUI_PDF_READER_QA_EXIT=1 \
       "$binary" "$working_pdf" >"$case_log" 2>&1 &
   else
-    GPUI_PDF_READER_QA_FLUID_VIEW=1 \
     GPUI_PDF_READER_QA_TIMEOUT_MS=30000 \
     GPUI_PDF_READER_QA_REPORT=1 \
     GPUI_PDF_READER_QA_EXIT=1 \

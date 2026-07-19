@@ -23,9 +23,12 @@
   split/dock placement, generic work scheduling, activity levels, resource
   profiles, allocation, and stateful reconciliation without GPUI or PDF code.
 - The app now has one process `ApplicationHost` and a `WorkspaceWindow` root.
-  Different PDFs open in different windows, duplicate paths focus the existing
-  item, and an empty reader window is reused. Multiple command-line paths open
-  together. Settings is a real host-owned view with a real left window dock.
+  Windows own ordered tabs; a tab can hold one view or a horizontal two-view
+  compound split. Tabs reorder and transfer across windows, edge drops create
+  splits, and split children activate, resize, swap, separate, and close
+  independently. Duplicate paths focus the existing item and an empty reader
+  window is reused. Settings is a real host-owned view with a real left window
+  dock.
 - One process-wide PDFium supervisor fairly serves all documents. Per-document
   cancellation, bounded backpressure, generation routing, and close cleanup
   preserve the existing render, text, search, preview, and analysis behavior.
@@ -33,9 +36,10 @@
   previews use one fixed bounded process executor with shared document
   lifetimes and cache cleanup. Native pinch monitoring is also process-wide.
 - Resource Auto/Saver/Balanced/Performance modes use detected macOS RAM, CPU,
-  and Low Power Mode. View activation maintains a bounded warm/cold MRU set;
-  allocations directly control PDF tile/text cache ceilings and prefetch, and
-  suspended views release render/text state safely.
+  and Low Power Mode. View activation maintains interactive, visible split
+  companion, bounded warm/cold MRU, and suspended states; allocations directly
+  control PDF tile/text cache ceilings and prefetch, and suspended views
+  release render/text state safely.
 - Theme and extension runtime ownership are application-scoped while reader
   interaction state remains view-scoped. The current extension protocol still
   intentionally publishes one active document scope.
@@ -97,8 +101,8 @@
   strict Clippy, the minimal feature build, dependency-boundary audit, 788-record
   789-record license audit, and the isolated PDFium tiled-render parity test.
 - The earlier post-refactor native macOS E2E suite passes 15 real GPUI launches: three
-  rapid zoom/debounce cases, Classic feature creation and reload, Fluid feature
-  creation and reload, four theme/PDF-appearance cases, TOC hover/navigation,
+  rapid zoom/debounce cases, full and focused floating-layout feature creation
+  and reload, four theme/PDF-appearance cases, TOC hover/navigation,
   internal-link navigation, link preview, and scientific-reference inference.
   Every case reached its exact quiet Ready state without a QA error, panic, or
   GPU/Metal fault.

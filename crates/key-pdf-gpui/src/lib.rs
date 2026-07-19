@@ -41,7 +41,7 @@ pub use planning::{
 #[cfg(target_os = "macos")]
 pub use canvas::{
     PdfCanvasPage, PdfCanvasPagePaintContext, PdfCanvasSnapshot, PdfCanvasStyle, PdfCanvasTile,
-    content_rect_to_bounds, pdf_canvas,
+    content_rect_to_bounds, pdf_canvas, pdf_canvas_measured,
 };
 #[cfg(target_os = "macos")]
 pub use gpui_adapter::{PdfViewport, appearance_from_theme};

@@ -2,7 +2,7 @@
 
 - A transparent macOS `TitlebarOptions` lets the app toolbar and traffic lights share one surface. Reserve the traffic-light width and mark only empty toolbar regions as `WindowControlArea::Drag`.
 - Keep custom titlebar setup behind `cfg(target_os = "macos")`; other platforms should retain native decorations until their own chrome is implemented.
-- `TOOLBAR_HEIGHT` is geometry, not just styling. Viewport sizing, content offsets, pointer mapping, and sidebar-anchor E2E all depend on it.
+- PDF-local geometry must come from the reader pane's GPUI prepaint bounds, never `Window::viewport_size()`. A window can contain tab chrome, context chrome, docks, or two simultaneous reader panes.
 - GPUI has no first-class disabled button. A disabled control must omit `on_click`, lower opacity, and avoid a pointer cursor; dimming an active handler is misleading.
 - Use `FocusHandle::is_focused(window)` before moving a cloned handle into an input canvas to style focused text fields and editors.
 - `uniform_list` rows have fixed heights. Put spacing on an outer row and the border/background on an inner card so clipping stays deterministic.
@@ -11,19 +11,19 @@
 - `Window::on_window_should_close` is synchronous: return `false`, open one guarded async prompt, then call `remove_window()` only after confirmation. Handle the app's Quit action at the reader root; `on_app_quit` runs too late to cancel termination.
 - For native visual QA, identify the exact app window by PID/title with `CGWindowListCopyWindowInfo`, then capture that window ID only. Never use a full-screen capture when other documents may be visible.
 - A child moved from a flex row into a `relative` overlay container needs an explicit height such as `h_full`; width alone can leave a canvas at zero height even though its paint snapshot is valid.
-- Keep Classic and Fluid geometry behind one view-mode state. Classic subtracts animated panel width from the viewport; Fluid keeps the full viewport and adds the panel's occluded width to `max_scroll_x` so covered PDF content remains reachable.
+- The reader has one floating-control layout. It keeps the full pane viewport and adds a panel's occluded width to `max_scroll_x` so covered PDF content remains reachable.
 - Context pills need viewport-local geometry. Build the visible selected line in content coordinates, subtract scroll, then clamp below/above placement to the currently unobscured width.
 - For two-pane panel transitions, retain both panes and animate their opposing absolute `left` offsets. Close the editor entity only after the Back animation reaches the list, otherwise the outgoing pane disappears before the slide.
-- Comment autosave is view-independent: debounce editor changes, update the existing annotation ID so its highlight survives, and flush before returning to the list. Fluid animates the pane transition; Classic closes the editor immediately inside its docked sidebar.
-- Annotation context is also view-independent. Both canvases resolve clicks on highlighted text, and both tool surfaces operate on either a selection or the active annotation; only control placement differs.
+- Comment autosave debounces editor changes, updates the existing annotation ID so its highlight survives, and flushes before the animated return to the list.
+- Annotation context operates on either a selection or the active annotation. Keep its floating controls in pane-local coordinates.
 - GPUI `Normal` hitboxes do not block hitboxes behind them. A floating control over an interactive canvas must use `block_mouse_except_scroll()` (or `occlude()` when scrolling must also stop); otherwise the canvas receives the same mouse-down and can clear the selection before the button click runs.
 - Rounded GPUI controls should clip their own hover/pressed backgrounds with `overflow_hidden`; otherwise a square state layer can leak through a rounded button. Floating-pill buttons also need a base color matching the pill rather than the titlebar's gray ghost style.
 - Keep Fluid panel horizontal occlusion separate from its vertical inset. Equal explicit `top`/`bottom` values center the panel without changing how much PDF content remains reachable behind it.
 - gpui-component 0.5.1 is compatible with crates.io GPUI 0.2.2, so it can share the locally patched display-safe GPUI. Initialize it before opening windows and install `gpui-component-assets` on `Application` for SVG icons.
 - Treat theme styling like utility classes: render code asks for semantic tokens such as surface, muted, primary, danger, and selection; one adapter resolves those tokens from the active gpui-component theme. Convert only the active theme's PDF background/foreground to opaque render colors at the UI-to-worker boundary.
 - Derive dark PDF paper by lifting the theme background slightly toward its foreground, and use that exact opaque color for both the GPUI page backing and PDFium bitmap. This keeps paper distinct from the pane and avoids seams while tiles load.
-- Keep the Fluid PDF light/dark toggle independent of application theme selection. It only appears for dark themes and reuses the full render-appearance invalidation path so old tiles cannot survive a switch.
-- Put document-outline navigation inside the PDF viewport so Classic and Fluid share identical behavior. A narrow overlay rail can allow wheel events through while its markers own hover and click; the detail card is painted as an overflowing child so it does not reserve document width.
+- Keep the PDF light/dark toggle independent of application theme selection. It only appears for dark themes and reuses the full render-appearance invalidation path so old tiles cannot survive a switch.
+- Put document-outline navigation inside the PDF pane. A narrow overlay rail can allow wheel events through while its markers own hover and click; the detail card is painted as an overflowing child so it does not reserve document width.
 - Keep outline entries in a compact vertically centered stack rather than stretching them across the document height. Interpolate one floating hover position and strength in the existing frame loop; a linear falloff from that position produces the smooth triangular cascade without starting an animation per marker.
 - Give every outline marker one fixed left origin. Depth may shorten the resting line, but must never indent it. In the hover card, use a bold title, a wrapping hierarchy breadcrumb, and a standalone page number; section ordinal counters add noise.
 - Moving from a narrow marker into its overflowing callout needs a short delayed-close bridge. Cancel that close when the callout receives hover, and render breadcrumb ancestors as indexed controls so each segment can navigate without collapsing the card.

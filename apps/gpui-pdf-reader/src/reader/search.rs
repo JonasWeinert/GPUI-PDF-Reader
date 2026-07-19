@@ -242,7 +242,6 @@ impl PdfReader {
 
     pub(super) fn render_search_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let palette = ReaderPalette::from_theme(Theme::global(cx));
-        let fluid = self.view_mode == ReaderView::Fluid;
         let result_count = self.search.order.len();
         let input_error = self.search.input_error.clone();
         let page_count = self
@@ -428,7 +427,7 @@ impl PdfReader {
             .min_h(px(0.0))
             .w_full()
             .bg(palette.surface_subtle)
-            .when(fluid, |list| list.rounded_b_xl())
+            .rounded_b_xl()
             .into_any_element()
         };
 
@@ -436,7 +435,7 @@ impl PdfReader {
             .size_full()
             .flex()
             .flex_col()
-            .when(fluid, |panel| panel.rounded_xl())
+            .rounded_xl()
             .bg(palette.surface)
             .text_color(palette.text)
             .child(

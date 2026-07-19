@@ -84,10 +84,7 @@ impl PdfReader {
         if progress <= 0.0 && self.extension_ui_panel.target() <= 0.0 {
             return None;
         }
-        let width = SIDEBAR_WIDTH.min(
-            (full_width - MIN_DOCUMENT_VIEWPORT_WIDTH - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0)
-                .max(280.0),
-        );
+        let width = SIDEBAR_WIDTH.min((full_width - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(1.0));
         let hidden_distance = width + FLUID_PANEL_HORIZONTAL_MARGIN + 8.0;
         let right = FLUID_PANEL_HORIZONTAL_MARGIN - hidden_distance * (1.0 - progress);
         let content = self.render_extension_contribution_panel(cx);
@@ -95,9 +92,7 @@ impl PdfReader {
             div()
                 .id("extension-ui-floating-panel")
                 .absolute()
-                .top(px(
-                    self.reader_toolbar_height() + FLUID_PANEL_VERTICAL_MARGIN
-                ))
+                .top(px(FLUID_PANEL_VERTICAL_MARGIN))
                 .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
                 .right(px(right))
                 .w(px(width))
@@ -661,9 +656,7 @@ impl PdfReader {
             .size_full()
             .flex()
             .flex_col()
-            .when(self.view_mode == ReaderView::Fluid, |panel| {
-                panel.rounded_xl()
-            })
+            .rounded_xl()
             .overflow_hidden()
             .bg(palette.surface)
             .text_color(palette.text)

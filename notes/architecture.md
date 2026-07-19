@@ -34,14 +34,22 @@ another app. Run `scripts/audit-boundaries.sh` after changing manifests.
 
 - `ApplicationHost` is the process owner for shared extension, PDF engine,
   annotation, reference, theme, resource, item, view, and window services.
-- A `WorkspaceWindow` is window chrome around a typed view. PDF and Settings
-  are the first two view kinds; the window layout already reserves left,
-  right, bottom, overlay, and modal slots outside document-local panels.
-- Items, views, and windows have separate typed IDs. Opening the same canonical
-  file focuses its existing window; opening a different file creates another
-  item, view, and window. A host-owned Settings view needs no fake document.
-- The current layout is one view per window. Tabs, splits, and multiple views
-  of one item are additive layout changes, not changes to PDF domain state.
+- A `WorkspaceWindow` owns application chrome plus ordered `WorkspaceTab`s.
+  A tab owns one view slot or one horizontal pair, with a separate active-view
+  identity. PDF and Settings are the first two view kinds; left, right, bottom,
+  overlay, and modal slots remain outside document-local panels.
+- Items, views, tabs, and windows have separate typed IDs. Opening the same
+  canonical file focuses its existing view wherever it is placed. New files
+  can open as tabs or in separate windows. A host-owned Settings view needs no
+  fake document.
+- A compound tab keeps both child views visible while only the selected child
+  is interactive. The visible companion has its own resource activity level,
+  bounded PDF caches, and remains scrollable without implicit activation.
+- The context bar between tabs and content is generic window chrome. Split
+  controls, future location tools, and other view-neutral actions compose into
+  its slots rather than being embedded in PDF code.
+- Multiple independent views of one item remain an additive session/view
+  change, not a change to PDF domain state.
 - Theme selection and extension runtime ownership are application-scoped.
   Selection, zoom, scrolling, panels, and navigation remain view-scoped.
 

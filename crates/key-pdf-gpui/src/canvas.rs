@@ -2,8 +2,8 @@ use crate::canvas_model::{
     PdfCanvasLimits, PdfCanvasMetrics, page_viewport_rect, pdf_canvas_scrollbars, valid_rect,
 };
 use gpui::{
-    Bounds, ContentMask, Corners, Hsla, IntoElement, Pixels, RenderImage, Styled, Window, canvas,
-    point, px, quad, size,
+    App, Bounds, ContentMask, Corners, Hsla, IntoElement, Pixels, RenderImage, Styled, Window,
+    canvas, point, px, quad, size,
 };
 use key_pdf_core::Rect;
 use std::sync::Arc;
@@ -156,8 +156,27 @@ pub fn pdf_canvas<O>(
 where
     O: 'static,
 {
+    pdf_canvas_measured(
+        snapshot,
+        |_, _, _| {},
+        move |page, window| {
+            paint_page_overlay(page, window);
+        },
+    )
+}
+
+/// Creates a PDF canvas that reports its physical pane bounds during prepaint.
+/// Nested hosts should use these bounds instead of the containing window size.
+pub fn pdf_canvas_measured<O>(
+    snapshot: PdfCanvasSnapshot<O>,
+    measure: impl 'static + FnOnce(Bounds<Pixels>, &mut Window, &mut App),
+    mut paint_page_overlay: impl 'static + FnMut(PdfCanvasPagePaintContext<'_, O>, &mut Window),
+) -> impl IntoElement + Styled
+where
+    O: 'static,
+{
     canvas(
-        |_, _, _| (),
+        move |bounds, window, cx| measure(bounds, window, cx),
         move |bounds, _, window, _| {
             paint_pdf_canvas(snapshot, bounds, window, &mut paint_page_overlay);
         },
