@@ -9,15 +9,15 @@ use crate::reader::PdfReader;
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::{OpenDocument, OpenSettings};
 use gpui::{
-    App, AppContext, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement,
+    App, AppContext, BoxShadow, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render,
-    ScrollHandle, SharedString, Window, div, prelude::*, px, relative,
+    ScrollHandle, SharedString, Window, div, point, prelude::*, px, relative,
 };
 use gpui_component::{Icon, IconName, Theme};
 use key_ui_gpui::{
     CONTEXT_BAR_HEIGHT, TAB_BAR_HEIGHT, TAB_HOVER_CARD_WIDTH, TabBarAction, TabDragPayload,
     TabDropAction, TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover,
-    TabSegmentAction, TabStrip, ThemeTokens, WorkspaceContextBar, tab_hover_card_x,
+    TabSegmentAction, TabStrip, ThemeTokens, UnitTransition, WorkspaceContextBar, tab_hover_card_x,
     tab_search_popover_x,
 };
 use key_workspace_core::{
@@ -27,7 +27,7 @@ use key_workspace_core::{
 };
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 enum WorkspaceContent {
     Pdf(Entity<PdfReader>),
@@ -303,6 +303,10 @@ pub(crate) struct WorkspaceWindow {
     tab_search_field: Entity<TextField>,
     split_menu_open: bool,
     split_resizing: bool,
+    split_activation: UnitTransition,
+    split_activation_from: Option<ViewId>,
+    split_animation_frame_queued: bool,
+    last_split_animation_tick: Instant,
     focus_handle: FocusHandle,
     warning: Option<SharedString>,
     recently_moved_tab: Option<TabId>,
@@ -373,6 +377,10 @@ impl WorkspaceWindow {
                 tab_search_field,
                 split_menu_open: false,
                 split_resizing: false,
+                split_activation: UnitTransition::visible(),
+                split_activation_from: None,
+                split_animation_frame_queued: false,
+                last_split_animation_tick: Instant::now(),
                 focus_handle,
                 warning: None,
                 recently_moved_tab: None,
@@ -445,6 +453,10 @@ impl WorkspaceWindow {
                 tab_search_field,
                 split_menu_open: false,
                 split_resizing: false,
+                split_activation: UnitTransition::visible(),
+                split_activation_from: None,
+                split_animation_frame_queued: false,
+                last_split_animation_tick: Instant::now(),
                 focus_handle,
                 warning: None,
                 recently_moved_tab: None,
@@ -834,6 +846,7 @@ impl WorkspaceWindow {
         if !self.active_tab().contains_view(view) || self.active_view().id == view {
             return;
         }
+        self.begin_split_activation(view, window, cx);
         self.tabs[self.active_tab].layout.active_view = view;
         self.finish_tab_activation(window, cx);
     }
@@ -881,6 +894,7 @@ impl WorkspaceWindow {
         if detached == first {
             self.active_tab += 1;
         }
+        self.reset_split_activation();
         self.split_menu_open = false;
         self.finish_tab_activation(window, cx);
     }
@@ -918,6 +932,7 @@ impl WorkspaceWindow {
             .expect("remaining split view has a slot")
             .view
             .clone();
+        self.reset_split_activation();
         remove_workspace_view(
             self.host.clone(),
             self.descriptor.id,
@@ -961,6 +976,63 @@ impl WorkspaceWindow {
         }
     }
 
+    fn begin_split_activation(
+        &mut self,
+        next: ViewId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.active_view().id;
+        if previous == next {
+            return;
+        }
+        let starting_emphasis = if self.split_activation_from == Some(next) {
+            1.0 - self.split_activation.value()
+        } else {
+            0.0
+        };
+        self.split_activation_from = Some(previous);
+        self.split_activation.snap_to(starting_emphasis);
+        self.split_activation.set_target(1.0);
+        self.last_split_animation_tick = Instant::now();
+        self.queue_split_animation_frame(window, cx);
+    }
+
+    fn reset_split_activation(&mut self) {
+        self.split_activation.snap_to(1.0);
+        self.split_activation_from = None;
+    }
+
+    fn queue_split_animation_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.split_animation_frame_queued {
+            return;
+        }
+        self.split_animation_frame_queued = true;
+        let weak = cx.weak_entity();
+        window.on_next_frame(move |window, cx| {
+            weak.update(cx, |workspace, cx| {
+                workspace.advance_split_animation(window, cx)
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    fn advance_split_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_animation_frame_queued = false;
+        let now = Instant::now();
+        let elapsed = now
+            .duration_since(self.last_split_animation_tick)
+            .as_secs_f32();
+        self.last_split_animation_tick = now;
+        if self.split_activation.advance_with_response(elapsed, 26.0) {
+            self.queue_split_animation_frame(window, cx);
+        } else {
+            self.split_activation_from = None;
+            cx.notify();
+        }
+    }
+
     pub(crate) fn activate_tab(
         &mut self,
         view: ViewId,
@@ -968,6 +1040,11 @@ impl WorkspaceWindow {
         cx: &mut Context<Self>,
     ) {
         if let Some(index) = self.tabs.iter().position(|tab| tab.contains_view(view)) {
+            if index == self.active_tab && self.tabs[index].is_split() {
+                self.begin_split_activation(view, window, cx);
+            } else if index != self.active_tab {
+                self.reset_split_activation();
+            }
             self.tabs[index].layout.active_view = view;
             self.activate_tab_index(index, window, cx);
         }
@@ -976,6 +1053,9 @@ impl WorkspaceWindow {
     fn activate_tab_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
+        }
+        if index != self.active_tab {
+            self.reset_split_activation();
         }
         self.active_tab = index;
         self.tab_search_open = false;
@@ -993,6 +1073,11 @@ impl WorkspaceWindow {
     ) {
         if index >= self.tabs.len() || !self.tabs[index].contains_view(view) {
             return;
+        }
+        if index == self.active_tab && self.tabs[index].is_split() {
+            self.begin_split_activation(view, window, cx);
+        } else if index != self.active_tab {
+            self.reset_split_activation();
         }
         self.tabs[index].layout.active_view = view;
         self.activate_tab_index(index, window, cx);
@@ -1269,19 +1354,31 @@ impl WorkspaceWindow {
         let tabs = self
             .tabs
             .iter()
-            .map(|tab| {
+            .enumerate()
+            .map(|(index, tab)| {
                 let active = tab.active_slot();
                 let presentation = if let Some((first, second, _)) = tab.split_views() {
                     let first_slot = tab.slot(first).expect("split first view has a slot");
                     let second_slot = tab.slot(second).expect("split second view has a slot");
-                    TabPresentation::new(first_slot.view.title.clone(), first_slot.state_detail(cx))
-                        .view(first.get())
-                        .split(
-                            second.get(),
-                            second_slot.view.title.clone(),
-                            second_slot.state_detail(cx),
-                            usize::from(tab.layout.active_view == second),
-                        )
+                    let presentation = TabPresentation::new(
+                        first_slot.view.title.clone(),
+                        first_slot.state_detail(cx),
+                    )
+                    .view(first.get())
+                    .split(
+                        second.get(),
+                        second_slot.view.title.clone(),
+                        second_slot.state_detail(cx),
+                        usize::from(tab.layout.active_view == second),
+                    );
+                    if index == self.active_tab {
+                        let outgoing = self
+                            .split_activation_from
+                            .map(|view| usize::from(view == second));
+                        presentation.segment_transition(outgoing, self.split_activation.value())
+                    } else {
+                        presentation
+                    }
                 } else {
                     TabPresentation::new(active.view.title.clone(), tab.state_detail(cx))
                         .view(active.view.id.get())
@@ -1574,6 +1671,7 @@ impl WorkspaceWindow {
                 )
             });
         WorkspaceContextBar::new(tokens)
+            .bottom_border(split.is_none())
             .leading(split_button)
             .center(
                 div()
@@ -1795,119 +1893,116 @@ impl WorkspaceWindow {
                 .into_any_element();
         };
         let active = self.active_view().id;
-        let first_title: SharedString = self
-            .active_tab()
-            .slot(first)
-            .expect("split view has first slot")
-            .view
-            .title
-            .clone()
-            .into();
-        let second_title: SharedString = self
-            .active_tab()
-            .slot(second)
-            .expect("split view has second slot")
-            .view
-            .title
-            .clone()
-            .into();
         let first_content = self.render_view_slot(first, cx);
         let second_content = self.render_view_slot(second, cx);
         let tokens = ThemeTokens::from_theme(Theme::global(cx));
+        let activation_progress = self.split_activation.value();
+        let activation_from = self.split_activation_from;
+        let first_emphasis =
+            split_pane_emphasis(first, active, activation_from, activation_progress);
+        let second_emphasis =
+            split_pane_emphasis(second, active, activation_from, activation_progress);
         let first_weak = cx.weak_entity();
         let second_weak = first_weak.clone();
         let pane = |view: ViewId,
-                    title: SharedString,
                     content: gpui::AnyElement,
-                    is_active: bool,
+                    emphasis: f32,
                     weak: gpui::WeakEntity<WorkspaceWindow>| {
-            div()
-                .relative()
-                .min_w_0()
-                .h_full()
-                .overflow_hidden()
-                .border_2()
-                .border_color(if is_active {
-                    tokens.action.accent.opacity(0.82)
-                } else {
-                    tokens.surface.border.opacity(0.72)
-                })
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    weak.update(cx, |workspace, cx| {
-                        workspace.activate_split_view(view, window, cx)
+            let border_alpha = 0.5 + emphasis * 0.42;
+            let separator_alpha = (1.0 - emphasis) * 0.82;
+            div().relative().min_w_0().h_full().child(
+                div()
+                    .relative()
+                    .size_full()
+                    .overflow_hidden()
+                    .rounded_xl()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(tokens.surface.border.opacity(border_alpha))
+                    .bg(tokens.surface.background)
+                    .shadow(vec![
+                        BoxShadow {
+                            color: gpui::black().opacity(0.13 * emphasis),
+                            offset: point(px(0.0), px(2.0)),
+                            blur_radius: px(5.0),
+                            spread_radius: px(-1.0),
+                        },
+                        BoxShadow {
+                            color: gpui::black().opacity(0.16 * emphasis),
+                            offset: point(px(0.0), px(7.0)),
+                            blur_radius: px(19.0),
+                            spread_radius: px(-4.0),
+                        },
+                    ])
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        weak.update(cx, |workspace, cx| {
+                            workspace.activate_split_view(view, window, cx)
+                        })
+                        .ok();
                     })
-                    .ok();
-                })
-                .child(content)
-                .when(!is_active, |pane| {
-                    pane.child(
+                    .child(content)
+                    .child(
                         div()
                             .absolute()
-                            .right_3()
-                            .bottom_3()
-                            .max_w(px(220.0))
-                            .px_2()
-                            .py_1()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .rounded_lg()
-                            .shadow_sm()
-                            .bg(tokens.surface.overlay)
-                            .text_xs()
-                            .text_color(tokens.content.secondary)
-                            .child(title),
+                            .inset_0()
+                            .rounded_xl()
+                            .border_l_1()
+                            .border_r_1()
+                            .border_b_1()
+                            .border_color(tokens.action.accent_border.opacity(0.2 * emphasis)),
                     )
-                })
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_3()
+                            .right_3()
+                            .h(px(1.0))
+                            .rounded_full()
+                            .bg(tokens.surface.border.opacity(separator_alpha)),
+                    ),
+            )
         };
         div()
             .size_full()
             .flex()
+            .px(px(8.0))
+            .pb(px(8.0))
+            .bg(tokens.surface.muted.opacity(0.68))
             .child(
-                pane(
-                    first,
-                    first_title,
-                    first_content,
-                    active == first,
-                    first_weak,
-                )
-                .w(relative(ratio))
-                .flex_none(),
+                pane(first, first_content, first_emphasis, first_weak)
+                    .w(relative(ratio))
+                    .flex_none(),
             )
             .child(
                 div()
                     .id("workspace-split-divider")
                     .relative()
                     .h_full()
-                    .w(px(10.0))
+                    .w(px(14.0))
                     .flex_none()
                     .cursor(CursorStyle::ResizeLeftRight)
-                    .bg(tokens.surface.background)
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_split_resize))
                     .child(
                         div()
                             .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .left(px(4.0))
+                            .top(px(22.0))
+                            .bottom(px(22.0))
+                            .left(px(6.0))
                             .w(px(2.0))
+                            .rounded_full()
                             .bg(if self.split_resizing {
                                 tokens.action.accent
                             } else {
-                                tokens.surface.border
+                                tokens.surface.border.opacity(0.68)
                             }),
                     ),
             )
             .child(
-                pane(
-                    second,
-                    second_title,
-                    second_content,
-                    active == second,
-                    second_weak,
-                )
-                .min_w_0()
-                .flex_1(),
+                pane(second, second_content, second_emphasis, second_weak)
+                    .min_w_0()
+                    .flex_1(),
             )
             .into_any_element()
     }
@@ -2121,6 +2216,26 @@ fn start_truncate(text: &str, maximum_characters: usize) -> String {
     format!("…{suffix}")
 }
 
+fn split_pane_emphasis(
+    view: ViewId,
+    active: ViewId,
+    outgoing: Option<ViewId>,
+    progress: f32,
+) -> f32 {
+    let progress = if progress.is_finite() {
+        progress.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if view == active {
+        progress
+    } else if outgoing == Some(view) {
+        1.0 - progress
+    } else {
+        0.0
+    }
+}
+
 impl Focusable for WorkspaceWindow {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.active_tab().active_slot().content {
@@ -2195,9 +2310,10 @@ impl Render for WorkspaceWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_index_after_close, end_truncate, reorder_destination, start_truncate,
-        tab_matches_query,
+        active_index_after_close, end_truncate, reorder_destination, split_pane_emphasis,
+        start_truncate, tab_matches_query,
     };
+    use key_workspace_core::ViewId;
 
     #[test]
     fn tab_search_matches_titles_and_paths_case_insensitively() {
@@ -2237,5 +2353,19 @@ mod tests {
         assert_eq!(end_truncate("abcdefgh", 5), "abcd…");
         assert_eq!(start_truncate("/one/two/file.pdf", 9), "…file.pdf");
         assert_eq!(start_truncate("short", 9), "short");
+    }
+
+    #[test]
+    fn split_pane_emphasis_crossfades_without_a_brightness_jump() {
+        let first = ViewId::from_raw(1);
+        let second = ViewId::from_raw(2);
+        for progress in [0.0, 0.15, 0.5, 0.85, 1.0] {
+            let outgoing = split_pane_emphasis(first, second, Some(first), progress);
+            let incoming = split_pane_emphasis(second, second, Some(first), progress);
+            assert!((outgoing + incoming - 1.0).abs() < f32::EPSILON);
+        }
+        assert_eq!(split_pane_emphasis(second, second, None, 1.0), 1.0);
+        assert_eq!(split_pane_emphasis(first, second, None, 1.0), 0.0);
+        assert_eq!(split_pane_emphasis(second, second, None, f32::NAN), 1.0);
     }
 }

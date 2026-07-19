@@ -12,6 +12,7 @@ pub const CONTEXT_BAR_HEIGHT: f32 = 44.0;
 #[derive(IntoElement)]
 pub struct WorkspaceContextBar {
     tokens: ThemeTokens,
+    bottom_border: bool,
     leading: Vec<AnyElement>,
     center: Vec<AnyElement>,
     trailing: Vec<AnyElement>,
@@ -22,10 +23,19 @@ impl WorkspaceContextBar {
     pub fn new(tokens: ThemeTokens) -> Self {
         Self {
             tokens,
+            bottom_border: true,
             leading: Vec::new(),
             center: Vec::new(),
             trailing: Vec::new(),
         }
+    }
+
+    /// Controls whether the shell paints its lower separator. Compound views
+    /// can disable it and let their active child visually join the bar.
+    #[must_use]
+    pub fn bottom_border(mut self, visible: bool) -> Self {
+        self.bottom_border = visible;
+        self
     }
 
     #[must_use]
@@ -57,8 +67,10 @@ impl RenderOnce for WorkspaceContextBar {
             .flex()
             .items_center()
             .gap_2()
-            .border_b_1()
-            .border_color(self.tokens.surface.border.opacity(0.72))
+            .when(self.bottom_border, |bar| {
+                bar.border_b_1()
+                    .border_color(self.tokens.surface.border.opacity(0.72))
+            })
             .bg(self.tokens.surface.background)
             .text_color(self.tokens.content.primary)
             .child(

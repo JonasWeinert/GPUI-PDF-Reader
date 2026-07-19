@@ -1,7 +1,7 @@
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, ClickEvent, Context, FontWeight, IntoElement, Pixels,
-    Point, Render, RenderOnce, ScrollHandle, SharedString, Window, WindowControlArea, div,
-    ease_in_out, linear_color_stop, linear_gradient, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, BoxShadow, ClickEvent, Context, FontWeight,
+    IntoElement, Pixels, Point, Render, RenderOnce, ScrollHandle, SharedString, Window,
+    WindowControlArea, div, ease_in_out, linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 use gpui_component::{Icon, IconName};
 use std::rc::Rc;
@@ -43,7 +43,7 @@ pub type TabBarAction = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 pub type TabHoverAction = Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>;
 pub type TabDropAction = Rc<dyn Fn(&TabDragPayload, usize, &mut Window, &mut App)>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TabPresentation {
     pub view: u64,
     pub title: SharedString,
@@ -52,6 +52,8 @@ pub struct TabPresentation {
     pub recently_moved: bool,
     pub secondary: Option<TabSegmentPresentation>,
     pub active_segment: usize,
+    pub outgoing_segment: Option<usize>,
+    pub segment_transition: f32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +74,8 @@ impl TabPresentation {
             recently_moved: false,
             secondary: None,
             active_segment: 0,
+            outgoing_segment: None,
+            segment_transition: 1.0,
         }
     }
 
@@ -107,6 +111,18 @@ impl TabPresentation {
             detail: detail.into(),
         });
         self.active_segment = active_segment.min(1);
+        self
+    }
+
+    /// Crossfades the selected treatment between a compound tab's children.
+    #[must_use]
+    pub fn segment_transition(mut self, outgoing: Option<usize>, progress: f32) -> Self {
+        self.outgoing_segment = outgoing.map(|segment| segment.min(1));
+        self.segment_transition = if progress.is_finite() {
+            progress.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         self
     }
 }
@@ -232,12 +248,25 @@ impl RenderOnce for TabStrip {
             let primary_view = tab.view;
             let secondary = tab.secondary;
             let active_segment = tab.active_segment;
+            let outgoing_segment = tab.outgoing_segment;
+            let segment_transition = tab.segment_transition;
             let segment = |segment_index: usize,
                            view: u64,
                            title: SharedString,
                            activate_segment: Option<TabSegmentAction>| {
+                let selected = active && active_segment == segment_index;
+                let emphasis = if !active {
+                    0.0
+                } else if selected {
+                    segment_transition
+                } else if outgoing_segment == Some(segment_index) {
+                    1.0 - segment_transition
+                } else {
+                    0.0
+                };
                 div()
                     .id(("workspace-tab-segment", index * 2 + segment_index))
+                    .relative()
                     .min_w_0()
                     .h(px(32.0))
                     .px_2()
@@ -246,10 +275,25 @@ impl RenderOnce for TabStrip {
                     .items_center()
                     .gap_2()
                     .rounded_lg()
-                    .bg(if active && active_segment == segment_index {
-                        tokens.action.accent_soft.opacity(0.76)
-                    } else {
-                        gpui::transparent_black()
+                    .border_1()
+                    .border_color(tokens.surface.border.opacity(0.9 * emphasis))
+                    .bg(tokens.surface.overlay.opacity(emphasis))
+                    .shadow(vec![
+                        BoxShadow {
+                            color: gpui::black().opacity(0.1 * emphasis),
+                            offset: point(px(0.0), px(1.0)),
+                            blur_radius: px(3.0),
+                            spread_radius: px(-1.0),
+                        },
+                        BoxShadow {
+                            color: gpui::black().opacity(0.12 * emphasis),
+                            offset: point(px(0.0), px(3.0)),
+                            blur_radius: px(9.0),
+                            spread_radius: px(-2.0),
+                        },
+                    ])
+                    .when(!selected, |segment| {
+                        segment.hover(move |segment| segment.bg(tokens.action.control_hover))
                     })
                     .when_some(activate_segment, |segment, action| {
                         segment.on_click(move |event, window, cx| {
@@ -257,13 +301,15 @@ impl RenderOnce for TabStrip {
                             action(index, view, event, window, cx);
                         })
                     })
-                    .child(Icon::new(IconName::File).size(px(14.0)).text_color(
-                        if active && active_segment == segment_index {
-                            tokens.action.accent
-                        } else {
-                            tokens.content.tertiary
-                        },
-                    ))
+                    .child(
+                        Icon::new(IconName::File)
+                            .size(px(14.0))
+                            .text_color(if selected {
+                                tokens.action.accent
+                            } else {
+                                tokens.content.tertiary
+                            }),
+                    )
                     .child(
                         div()
                             .min_w_0()
@@ -271,7 +317,7 @@ impl RenderOnce for TabStrip {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_sm()
-                            .font_weight(if active && active_segment == segment_index {
+                            .font_weight(if selected {
                                 FontWeight::MEDIUM
                             } else {
                                 FontWeight::NORMAL
@@ -354,10 +400,11 @@ impl RenderOnce for TabStrip {
                     ))
                     .child(
                         div()
-                            .h(px(20.0))
+                            .h(px(16.0))
                             .w(px(1.0))
                             .flex_none()
-                            .bg(tokens.surface.border.opacity(0.72)),
+                            .rounded_full()
+                            .bg(tokens.surface.border.opacity(0.58)),
                     )
                     .child(segment(
                         1,
@@ -858,9 +905,12 @@ mod tests {
     fn compound_tab_presentation_keeps_typed_child_identity_and_bounds_selection() {
         let tab = TabPresentation::new("First", "p 1/2")
             .view(41)
-            .split(42, "Second", "p 2/2", 9);
+            .split(42, "Second", "p 2/2", 9)
+            .segment_transition(Some(0), 0.35);
         assert_eq!(tab.view, 41);
         assert_eq!(tab.active_segment, 1);
+        assert_eq!(tab.outgoing_segment, Some(0));
+        assert!((tab.segment_transition - 0.35).abs() < f32::EPSILON);
         let second = tab.secondary.expect("split builder adds a second segment");
         assert_eq!(second.view, 42);
         assert_eq!(second.title.as_ref(), "Second");
