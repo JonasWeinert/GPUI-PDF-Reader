@@ -16,6 +16,8 @@ pub struct WorkspaceContextBar {
     leading: Vec<AnyElement>,
     center: Vec<AnyElement>,
     trailing: Vec<AnyElement>,
+    auxiliary: Option<AnyElement>,
+    auxiliary_height: f32,
 }
 
 impl WorkspaceContextBar {
@@ -27,6 +29,8 @@ impl WorkspaceContextBar {
             leading: Vec::new(),
             center: Vec::new(),
             trailing: Vec::new(),
+            auxiliary: None,
+            auxiliary_height: 0.0,
         }
     }
 
@@ -55,11 +59,20 @@ impl WorkspaceContextBar {
         self.trailing.push(item.into_any_element());
         self
     }
+
+    /// Adds a bounded second row supplied by the active view. Its explicit
+    /// height allows the owner to animate layout without absolute overlays.
+    #[must_use]
+    pub fn auxiliary(mut self, height: f32, item: impl IntoElement) -> Self {
+        self.auxiliary_height = height.max(0.0);
+        self.auxiliary = Some(item.into_any_element());
+        self
+    }
 }
 
 impl RenderOnce for WorkspaceContextBar {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        div()
+        let primary = div()
             .h(px(CONTEXT_BAR_HEIGHT))
             .w_full()
             .flex_none()
@@ -67,11 +80,6 @@ impl RenderOnce for WorkspaceContextBar {
             .flex()
             .items_center()
             .gap_2()
-            .when(self.bottom_border, |bar| {
-                bar.border_b_1()
-                    .border_color(self.tokens.surface.border.opacity(0.72))
-            })
-            .bg(self.tokens.surface.background)
             .text_color(self.tokens.content.primary)
             .child(
                 div()
@@ -96,6 +104,27 @@ impl RenderOnce for WorkspaceContextBar {
                     .items_center()
                     .gap_1()
                     .children(self.trailing),
-            )
+            );
+        div()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .when(self.bottom_border, |bar| {
+                bar.border_b_1()
+                    .border_color(self.tokens.surface.border.opacity(0.72))
+            })
+            .bg(self.tokens.surface.background)
+            .child(primary)
+            .when_some(self.auxiliary, |bar, auxiliary| {
+                bar.child(
+                    div()
+                        .h(px(self.auxiliary_height))
+                        .w_full()
+                        .flex_none()
+                        .overflow_hidden()
+                        .child(auxiliary),
+                )
+            })
     }
 }

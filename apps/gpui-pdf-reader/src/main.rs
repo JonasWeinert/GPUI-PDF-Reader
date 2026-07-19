@@ -2,6 +2,7 @@ mod annotations;
 mod app_extensions;
 mod application_host;
 mod backend;
+mod control_bar;
 mod document_jump;
 mod extension_assets;
 #[cfg(feature = "installable-extensions")]

@@ -323,17 +323,6 @@ impl Render for PdfReader {
         self.request_visible_tiles(window);
         let full_width = self.viewport_width.max(1.0);
 
-        let page_count = self
-            .document
-            .as_ref()
-            .map(|document| document.pages.len())
-            .unwrap_or(0);
-        let zoom_label: SharedString = format!("{}%", (self.zoom * 100.0).round() as u32).into();
-        let document_open = page_count > 0;
-        let (zoom_out_enabled, zoom_in_enabled) = zoom_controls_enabled(document_open, self.zoom);
-        let search_selected = self.sidebar.panel == SidePanel::Search && self.sidebar.target > 0.5;
-        let comments_selected =
-            self.sidebar.panel == SidePanel::Comments && self.sidebar.target > 0.5;
         let toc_navigation = self.render_toc_navigation(palette, cx);
         let link_preview = self.render_link_preview_card(palette, cx);
 
@@ -536,18 +525,6 @@ impl Render for PdfReader {
         let sidebar_reveal = fluid_sidebar_extent(self.viewport_width, self.sidebar.progress);
         let panel_reveal = self.fluid_panel_occlusion();
         let available_width = (self.viewport_width - panel_reveal).max(1.0);
-        let main_pill = self.render_fluid_main_pill(
-            FluidPillState {
-                available_width,
-                document_open,
-                zoom_out_enabled,
-                zoom_in_enabled,
-                zoom_label,
-                search_selected,
-                comments_selected,
-            },
-            cx,
-        );
         let has_stable_selection = self
             .selection
             .is_some_and(|selection| selection.anchor != selection.focus);
@@ -596,16 +573,6 @@ impl Render for PdfReader {
             .w_full()
             .overflow_hidden()
             .child(content)
-            .child(
-                div()
-                    .absolute()
-                    .top(px(14.0))
-                    .left_0()
-                    .w(px(available_width))
-                    .flex()
-                    .justify_center()
-                    .child(main_pill),
-            )
             .children(context_pill)
             .child(sidebar)
             .children(link_preview)

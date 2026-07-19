@@ -44,6 +44,7 @@ struct QaConfig {
     expected_tab_count: Option<usize>,
     tab_drag_scenario: Option<String>,
     split_view_scenario: bool,
+    control_bar_scenario: bool,
     resource_trace: bool,
     resource_sample_interval: Duration,
     resource_stress: bool,
@@ -99,6 +100,7 @@ impl QaConfig {
             expected_tab_count: optional_value("GPUI_PDF_READER_QA_TAB_COUNT"),
             tab_drag_scenario: std::env::var("GPUI_PDF_READER_QA_TAB_DRAG_SCENARIO").ok(),
             split_view_scenario: flag("GPUI_PDF_READER_QA_SPLIT_VIEW_SCENARIO"),
+            control_bar_scenario: flag("GPUI_PDF_READER_QA_CONTROL_BAR_SCENARIO"),
             resource_trace: flag("GPUI_PDF_READER_QA_RESOURCE_TRACE"),
             resource_sample_interval: Duration::from_millis(
                 optional_value::<u64>("GPUI_PDF_READER_QA_RESOURCE_SAMPLE_MS")
@@ -139,6 +141,7 @@ impl QaConfig {
             || self.expected_tab_count.is_some()
             || self.tab_drag_scenario.is_some()
             || self.split_view_scenario
+            || self.control_bar_scenario
             || self.resource_trace
             || self.resource_stress
             || self.progressive_open
@@ -528,6 +531,106 @@ pub fn install(
                                 fail_and_quit(cx, &error);
                                 return;
                             }
+                        }
+                    }
+
+                    if config.control_bar_scenario {
+                        let opened = cx.update(|window, cx| {
+                            let Some(workspace) = window.root::<WorkspaceWindow>().flatten() else {
+                                return false;
+                            };
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.qa_control_bar_open_search(window, cx);
+                                workspace.qa_control_bar_set_search_query("page", cx);
+                            });
+                            true
+                        });
+                        if !matches!(opened, Ok(true)) {
+                            fail_and_quit(cx, "control-bar QA could not access the workspace root");
+                            return;
+                        }
+                        let deadline = Instant::now() + config.timeout;
+                        let (owner, results, expanded_height) = loop {
+                            let state = cx
+                                .update(|window, cx| {
+                                    let workspace = window.root::<WorkspaceWindow>().flatten()?;
+                                    Some(workspace.read(cx).qa_control_bar_state(cx))
+                                })
+                                .ok()
+                                .flatten();
+                            if let Some((owner, true, results, true, height)) = state
+                                && results > 0
+                                && (height
+                                    - (key_ui_gpui::CONTEXT_BAR_HEIGHT + 94.0))
+                                    .abs()
+                                    <= 0.05
+                            {
+                                break (owner, results, height);
+                            }
+                            if Instant::now() >= deadline {
+                                fail_and_quit(
+                                    cx,
+                                    &format!("control bar search did not settle: {state:?}"),
+                                );
+                                return;
+                            }
+                            cx.background_executor().timer(POLL_INTERVAL).await;
+                        };
+                        let active_owner = cx
+                            .update(|window, cx| {
+                                window
+                                    .root::<WorkspaceWindow>()
+                                    .flatten()
+                                    .map(|workspace| workspace.read(cx).qa_window_and_view().1)
+                            })
+                            .ok()
+                            .flatten();
+                        if active_owner != Some(owner) {
+                            fail_and_quit(
+                                cx,
+                                "control bar projection owner did not match the active view",
+                            );
+                            return;
+                        }
+                        let closed = cx.update(|window, cx| {
+                            let Some(workspace) = window.root::<WorkspaceWindow>().flatten() else {
+                                return false;
+                            };
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.qa_control_bar_close_search(window, cx)
+                            });
+                            true
+                        });
+                        if !matches!(closed, Ok(true)) {
+                            fail_and_quit(cx, "control-bar QA could not close search");
+                            return;
+                        }
+                        let deadline = Instant::now() + config.timeout;
+                        loop {
+                            let state = cx
+                                .update(|window, cx| {
+                                    let workspace = window.root::<WorkspaceWindow>().flatten()?;
+                                    Some(workspace.read(cx).qa_control_bar_state(cx))
+                                })
+                                .ok()
+                                .flatten();
+                            if let Some((_, false, 0, true, height)) = state
+                                && (height - key_ui_gpui::CONTEXT_BAR_HEIGHT).abs() <= 0.1
+                            {
+                                eprintln!(
+                                    "GPUI_PDF_READER_QA_CONTROL_BAR owner={} results={} expanded_height={expanded_height:.1} collapsed_height={height:.1} reset=1",
+                                    owner.get(), results
+                                );
+                                break;
+                            }
+                            if Instant::now() >= deadline {
+                                fail_and_quit(
+                                    cx,
+                                    &format!("control bar did not collapse and reset: {state:?}"),
+                                );
+                                return;
+                            }
+                            cx.background_executor().timer(POLL_INTERVAL).await;
                         }
                     }
 
@@ -1028,6 +1131,14 @@ async fn run_split_view_scenario(
     if active_after != next_active {
         return Err("click-equivalent split activation did not switch active view".to_owned());
     }
+    let control_owner = handle
+        .update(cx, |workspace, _, cx| workspace.qa_control_bar_state(cx).0)
+        .map_err(|error| format!("split control-bar state unavailable: {error}"))?;
+    if control_owner != active_after {
+        return Err(format!(
+            "split control bar followed {control_owner}, expected active view {active_after}"
+        ));
+    }
 
     handle
         .update(cx, |workspace, _, cx| {
@@ -1095,7 +1206,7 @@ async fn run_split_view_scenario(
     }
 
     Ok(format!(
-        "opened={} visible=2 switched=1 resized=1 swapped=1 separated=1 closed=1",
+        "opened={} visible=2 switched=1 bar_owner=1 resized=1 swapped=1 separated=1 closed=1",
         before.len()
     ))
 }
@@ -1550,6 +1661,7 @@ mod tests {
             expected_tab_count: None,
             tab_drag_scenario: None,
             split_view_scenario: false,
+            control_bar_scenario: false,
             resource_trace: false,
             resource_sample_interval: Duration::from_millis(DEFAULT_RESOURCE_SAMPLE_MS),
             resource_stress: false,

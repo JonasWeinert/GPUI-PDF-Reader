@@ -66,7 +66,7 @@ if grep -Eiq 'GPUI_PDF_READER_QA_ERROR|thread .* panicked|panicked at|InvalidRes
   fail "app log contains a QA, panic, or GPU/Metal failure"
 fi
 
-expected='GPUI_PDF_READER_QA_SPLIT opened=2 visible=2 switched=1 resized=1 swapped=1 separated=1 closed=1'
+expected='GPUI_PDF_READER_QA_SPLIT opened=2 visible=2 switched=1 bar_owner=1 resized=1 swapped=1 separated=1 closed=1'
 actual=$(grep '^GPUI_PDF_READER_QA_SPLIT ' "$log" || true)
 [ "$actual" = "$expected" ] || fail "split lifecycle report was missing or incomplete"
 
