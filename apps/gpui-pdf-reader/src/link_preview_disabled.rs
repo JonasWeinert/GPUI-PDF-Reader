@@ -6,6 +6,7 @@ use std::{collections::HashMap, path::PathBuf};
 pub struct WebsitePreview {
     pub title: Option<String>,
     pub site_name: Option<String>,
+    pub details: Vec<String>,
     pub resolved_url: String,
     pub image_path: Option<PathBuf>,
 }

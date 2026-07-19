@@ -24,13 +24,14 @@
 
 mod executor;
 mod link_preview;
+mod registry_preview;
 mod scholarly;
 
 pub use executor::{
     ReferenceDocumentScope, ReferenceExecutor, ReferenceExecutorConfig, ReferenceExecutorSnapshot,
 };
 pub use link_preview::{
-    LinkPreviewEvent, LinkPreviewFetcher, LinkPreviewSession, WebsitePreview,
+    LinkPreviewEvent, LinkPreviewFetcher, LinkPreviewKind, LinkPreviewSession, WebsitePreview,
     WebsitePreviewProvider, WebsitePreviewState,
 };
 pub use scholarly::{
