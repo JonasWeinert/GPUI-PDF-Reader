@@ -9,6 +9,9 @@ description = "Reusable GPUI theme, animation, control, and panel primitives for
 gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
 gpui-component = "=0.5.1"
 
+[dependencies]
+key-workspace-core = { path = "../key-workspace-core" }
+
 [lints.rust]
 unsafe_code = "forbid"
 

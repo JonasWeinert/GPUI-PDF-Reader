@@ -15,6 +15,7 @@ pub use transition::UnitTransition;
 
 #[cfg(target_os = "macos")]
 mod context_bar;
+mod control_bar_layout;
 #[cfg(target_os = "macos")]
 mod controls;
 #[cfg(target_os = "macos")]
@@ -28,6 +29,9 @@ mod theme;
 
 #[cfg(target_os = "macos")]
 pub use context_bar::{CONTEXT_BAR_HEIGHT, WorkspaceContextBar};
+pub use control_bar_layout::{
+    ControlBarDisplayMode, ControlBarLayoutItem, solve_control_bar_layout,
+};
 #[cfg(target_os = "macos")]
 pub use controls::{ChromeButtonStyle, chrome_button, close_button, icon_button, icon_label};
 #[cfg(target_os = "macos")]
