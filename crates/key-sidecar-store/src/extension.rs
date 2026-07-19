@@ -453,8 +453,14 @@ pub fn extension_document_namespace(document: &DocumentKey) -> String {
     digest.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_le_bytes());
     digest.update(path);
     digest.update(identity.byte_len().to_le_bytes());
-    digest.update(identity.modified_unix_seconds().to_le_bytes());
-    digest.update(identity.modified_nanos().to_le_bytes());
+    if let Some(content_sha256) = identity.content_sha256() {
+        digest.update([1]);
+        digest.update(content_sha256);
+    } else {
+        digest.update([0]);
+        digest.update(identity.modified_unix_seconds().to_le_bytes());
+        digest.update(identity.modified_nanos().to_le_bytes());
+    }
     digest.update(
         u64::try_from(identity.page_count())
             .unwrap_or(u64::MAX)
@@ -566,6 +572,7 @@ fn io_error(operation: &str, path: &Path, error: io::Error) -> ExtensionError {
 #[cfg(test)]
 mod tests {
     use std::{
+        sync::atomic::{AtomicU64, Ordering},
         sync::{Arc, Barrier},
         thread,
         time::{SystemTime, UNIX_EPOCH},
@@ -576,11 +583,16 @@ mod tests {
     use super::*;
 
     fn temporary_root() -> PathBuf {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("key-extension-storage-{nonce}"))
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "key-extension-storage-{}-{nonce}-{sequence}",
+            std::process::id()
+        ))
     }
 
     #[test]

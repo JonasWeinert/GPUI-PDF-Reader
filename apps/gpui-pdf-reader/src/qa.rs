@@ -45,6 +45,7 @@ struct QaConfig {
     tab_drag_scenario: Option<String>,
     split_view_scenario: bool,
     control_bar_scenario: bool,
+    multi_annotation_scenario: bool,
     resource_trace: bool,
     resource_sample_interval: Duration,
     resource_stress: bool,
@@ -101,6 +102,7 @@ impl QaConfig {
             tab_drag_scenario: std::env::var("GPUI_PDF_READER_QA_TAB_DRAG_SCENARIO").ok(),
             split_view_scenario: flag("GPUI_PDF_READER_QA_SPLIT_VIEW_SCENARIO"),
             control_bar_scenario: flag("GPUI_PDF_READER_QA_CONTROL_BAR_SCENARIO"),
+            multi_annotation_scenario: flag("GPUI_PDF_READER_QA_MULTI_ANNOTATION_SCENARIO"),
             resource_trace: flag("GPUI_PDF_READER_QA_RESOURCE_TRACE"),
             resource_sample_interval: Duration::from_millis(
                 optional_value::<u64>("GPUI_PDF_READER_QA_RESOURCE_SAMPLE_MS")
@@ -142,6 +144,7 @@ impl QaConfig {
             || self.tab_drag_scenario.is_some()
             || self.split_view_scenario
             || self.control_bar_scenario
+            || self.multi_annotation_scenario
             || self.resource_trace
             || self.resource_stress
             || self.progressive_open
@@ -632,6 +635,120 @@ pub fn install(
                             }
                             cx.background_executor().timer(POLL_INTERVAL).await;
                         }
+                    }
+
+                    if config.multi_annotation_scenario {
+                        let tab_count = cx
+                            .update(|window, cx| {
+                                window
+                                    .root::<WorkspaceWindow>()
+                                    .flatten()
+                                    .map_or(0, |workspace| workspace.read(cx).qa_tab_count())
+                            })
+                            .unwrap_or(0);
+                        if tab_count < 2 {
+                            fail_and_quit(
+                                cx,
+                                "multi-annotation QA requires at least two PDF tabs",
+                            );
+                            return;
+                        }
+                        let mut contexts = Vec::with_capacity(tab_count);
+                        for index in 0..tab_count {
+                            let activated = cx
+                                .update(|window, cx| {
+                                    let Some(workspace) =
+                                        window.root::<WorkspaceWindow>().flatten()
+                                    else {
+                                        return false;
+                                    };
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.qa_activate_tab(index, window, cx)
+                                    });
+                                    true
+                                })
+                                .unwrap_or(false);
+                            if !activated {
+                                fail_and_quit(
+                                    cx,
+                                    "multi-annotation QA could not activate a PDF tab",
+                                );
+                                return;
+                            }
+                            let deadline = Instant::now() + config.timeout;
+                            loop {
+                                let outcome = cx
+                                    .update(|window, cx| {
+                                        let Some(reader) = reader_entity(window, cx) else {
+                                            return Ok(false);
+                                        };
+                                        reader.update(cx, |reader, cx| {
+                                            reader.qa_drive_fluid_scenario(window, cx)
+                                        })
+                                    })
+                                    .unwrap_or_else(|error| {
+                                        Err(format!(
+                                            "multi-annotation window update failed: {error}"
+                                        ))
+                                    });
+                                match outcome {
+                                    Ok(true) => break,
+                                    Ok(false) => {}
+                                    Err(message) => {
+                                        fail_and_quit(cx, &message);
+                                        return;
+                                    }
+                                }
+                                if Instant::now() >= deadline {
+                                    fail_and_quit(
+                                        cx,
+                                        &format!(
+                                            "multi-annotation tab {index} did not settle"
+                                        ),
+                                    );
+                                    return;
+                                }
+                                cx.background_executor().timer(POLL_INTERVAL).await;
+                            }
+                            let context = cx
+                                .update(|window, cx| {
+                                    reader_entity(window, cx)
+                                        .map(|reader| reader.read(cx).qa_annotation_context())
+                                })
+                                .ok()
+                                .flatten();
+                            let Some(Ok(context)) = context else {
+                                fail_and_quit(
+                                    cx,
+                                    &format!(
+                                        "multi-annotation tab {index} has invalid ownership state: {context:?}"
+                                    ),
+                                );
+                                return;
+                            };
+                            contexts.push(context);
+                        }
+                        let unique_views = contexts
+                            .iter()
+                            .map(|context| context.0)
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len();
+                        let unique_paths = contexts
+                            .iter()
+                            .map(|context| context.1.clone())
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len();
+                        if unique_views != tab_count || unique_paths != tab_count {
+                            fail_and_quit(
+                                cx,
+                                "multi-annotation contexts were reused across PDF tabs",
+                            );
+                            return;
+                        }
+                        eprintln!(
+                            "GPUI_PDF_READER_QA_MULTI_ANNOTATIONS tabs={tab_count} unique_views={unique_views} unique_paths={unique_paths} persisted={}",
+                            contexts.len()
+                        );
                     }
 
                     if config.resource_stress {
@@ -1662,6 +1779,7 @@ mod tests {
             tab_drag_scenario: None,
             split_view_scenario: false,
             control_bar_scenario: false,
+            multi_annotation_scenario: false,
             resource_trace: false,
             resource_sample_interval: Duration::from_millis(DEFAULT_RESOURCE_SAMPLE_MS),
             resource_stress: false,

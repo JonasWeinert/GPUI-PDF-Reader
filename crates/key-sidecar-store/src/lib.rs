@@ -2,8 +2,8 @@
 //!
 //! [`AnnotationStore`] is intentionally synchronous and narrow while
 //! [`AnnotationService`] supplies the reusable process-level, multi-document
-//! writer actor. [`JsonSidecarStore`] keeps the GPUI PDF Reader v1 sidecar
-//! format.
+//! writer actor. [`JsonSidecarStore`] writes content-addressed schema 2
+//! sidecars and conservatively reads legacy schema 1 sidecars.
 
 #![forbid(unsafe_code)]
 

@@ -70,6 +70,47 @@ pub(super) enum QaExtensionPhase {
 
 impl PdfReader {
     #[cfg(debug_assertions)]
+    pub(crate) fn qa_annotation_context(
+        &self,
+    ) -> Result<(ViewId, PathBuf, u64, usize, usize), String> {
+        if self.annotations_loading {
+            return Err("annotations are still loading".into());
+        }
+        if self.annotation_persistence_blocked {
+            return Err("annotation persistence is blocked".into());
+        }
+        let document = self
+            .document
+            .as_ref()
+            .ok_or_else(|| "document state is missing".to_owned())?;
+        let annotations = self
+            .annotations
+            .as_ref()
+            .ok_or_else(|| "annotation state is missing".to_owned())?;
+        if self.annotation_identity.is_none() {
+            return Err("annotation identity is missing".into());
+        }
+        if annotations.revision() != self.annotation_saved_revision {
+            return Err(format!(
+                "annotation revision {} is not persisted at {}",
+                annotations.revision(),
+                self.annotation_saved_revision
+            ));
+        }
+        let comments = annotations
+            .iter()
+            .filter(|annotation| annotation.comment_markdown().is_some())
+            .count();
+        Ok((
+            self.workspace_view_id,
+            document.path.clone(),
+            annotations.revision(),
+            annotations.len(),
+            comments,
+        ))
+    }
+
+    #[cfg(debug_assertions)]
     pub(crate) fn qa_viewport_contract(&self) -> (f32, f32, Option<(f32, f32)>) {
         (
             self.viewport_width,

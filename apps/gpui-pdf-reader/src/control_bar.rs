@@ -314,6 +314,17 @@ impl ViewControlBar {
 
         let label = control_label(item, mode);
         if item.kind == ControlBarItemKind::Display {
+            let icon = control_icon(item, mode);
+            let label = label.map(|label| {
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(label)
+                    .into_any_element()
+            });
             return div()
                 .id(SharedString::from(format!("control-display-{id}")))
                 .h(px(32.0))
@@ -323,13 +334,11 @@ impl ViewControlBar {
                 .px_2()
                 .flex()
                 .items_center()
-                .justify_center()
+                .justify_start()
                 .gap_1()
                 .overflow_hidden()
                 .rounded_md()
                 .bg(tokens.surface.muted.opacity(0.68))
-                .text_ellipsis()
-                .whitespace_nowrap()
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(if item.state.enabled {
@@ -337,14 +346,14 @@ impl ViewControlBar {
                 } else {
                     tokens.content.tertiary
                 })
-                .children(control_icon(item, mode))
+                .children(icon)
                 .children(label)
                 .into_any_element();
         }
 
         let weak = cx.weak_entity();
         let style = if item.state.selected {
-            ChromeButtonStyle::Selected
+            ChromeButtonStyle::SubtleSelected
         } else {
             ChromeButtonStyle::Ghost
         };

@@ -41,7 +41,7 @@ impl AnnotationStore for MemoryAnnotationStore {
         let Some(entry) = entries.get(document.source_path()) else {
             return Ok(AnnotationSet::new(document.identity().page_count()));
         };
-        if &entry.identity != document.identity() {
+        if !entry.identity.same_revision(document.identity()) {
             return Err(StoreError::Conflict(
                 StoreConflict::DocumentIdentityMismatch {
                     expected: document.identity().clone(),
@@ -68,7 +68,7 @@ impl AnnotationStore for MemoryAnnotationStore {
 
         let mut entries = self.entries.lock().map_err(|_| StoreError::LockPoisoned)?;
         if let Some(entry) = entries.get(document.source_path())
-            && &entry.identity != document.identity()
+            && !entry.identity.same_revision(document.identity())
         {
             return Err(StoreError::Conflict(
                 StoreConflict::DocumentIdentityMismatch {

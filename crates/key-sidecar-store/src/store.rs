@@ -1,7 +1,8 @@
 use key_pdf_core::{AnnotationError, AnnotationSet};
+use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter};
-use std::fs::{self, File, Metadata};
-use std::io;
+use std::fs::{File, Metadata};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,7 @@ pub struct DocumentIdentity {
     modified_unix_seconds: i64,
     modified_nanos: u32,
     page_count: usize,
+    content_sha256: Option<[u8; 32]>,
 }
 
 impl DocumentIdentity {
@@ -33,16 +35,29 @@ impl DocumentIdentity {
             modified_unix_seconds,
             modified_nanos,
             page_count,
+            content_sha256: None,
         })
     }
 
+    pub fn new_with_content_sha256(
+        byte_len: u64,
+        modified_unix_seconds: i64,
+        modified_nanos: u32,
+        page_count: usize,
+        content_sha256: [u8; 32],
+    ) -> Result<Self, StoreError> {
+        let mut identity = Self::new(byte_len, modified_unix_seconds, modified_nanos, page_count)?;
+        identity.content_sha256 = Some(content_sha256);
+        Ok(identity)
+    }
+
     pub fn from_pdf(path: &Path, page_count: usize) -> Result<Self, StoreError> {
-        let metadata = fs::metadata(path).map_err(|source| StoreError::Io {
-            operation: "read PDF metadata",
+        let file = File::open(path).map_err(|source| StoreError::Io {
+            operation: "open PDF for identity",
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_metadata(&metadata, page_count)
+        Self::from_file(&file, path, page_count)
     }
 
     pub(crate) fn from_file(
@@ -50,20 +65,48 @@ impl DocumentIdentity {
         path: &Path,
         page_count: usize,
     ) -> Result<Self, StoreError> {
-        let metadata = file.metadata().map_err(|source| StoreError::Io {
+        let before = file.metadata().map_err(|source| StoreError::Io {
             operation: "read locked PDF metadata",
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_metadata(&metadata, page_count)
+        let content_sha256 = hash_file(file, path)?;
+        let after = file.metadata().map_err(|source| StoreError::Io {
+            operation: "re-read locked PDF metadata",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if metadata_revision(&before)? != metadata_revision(&after)? {
+            return Err(StoreError::InvalidDocumentIdentity);
+        }
+        Self::from_metadata(&after, page_count, Some(content_sha256))
     }
 
-    fn from_metadata(metadata: &Metadata, page_count: usize) -> Result<Self, StoreError> {
+    fn from_metadata(
+        metadata: &Metadata,
+        page_count: usize,
+        content_sha256: Option<[u8; 32]>,
+    ) -> Result<Self, StoreError> {
         let modified = metadata
             .modified()
             .map_err(|_| StoreError::InvalidDocumentIdentity)?;
         let (seconds, nanos) = system_time_parts(modified)?;
-        Self::new(metadata.len(), seconds, nanos, page_count)
+        let mut identity = Self::new(metadata.len(), seconds, nanos, page_count)?;
+        identity.content_sha256 = content_sha256;
+        Ok(identity)
+    }
+
+    pub(crate) fn from_file_metadata(
+        file: &File,
+        path: &Path,
+        page_count: usize,
+    ) -> Result<Self, StoreError> {
+        let metadata = file.metadata().map_err(|source| StoreError::Io {
+            operation: "read PDF metadata",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::from_metadata(&metadata, page_count, None)
     }
 
     pub fn byte_len(&self) -> u64 {
@@ -81,6 +124,73 @@ impl DocumentIdentity {
     pub fn page_count(&self) -> usize {
         self.page_count
     }
+
+    pub fn content_sha256(&self) -> Option<&[u8; 32]> {
+        self.content_sha256.as_ref()
+    }
+
+    /// Compares the immutable PDF content when both identities carry a
+    /// digest. Legacy identities fall back to the exact metadata tuple that
+    /// schema 1 stored, preserving its conservative safety behavior.
+    pub fn same_revision(&self, other: &Self) -> bool {
+        match (self.content_sha256, other.content_sha256) {
+            (Some(left), Some(right)) => {
+                self.byte_len == other.byte_len
+                    && self.page_count == other.page_count
+                    && left == right
+            }
+            _ => {
+                self.byte_len == other.byte_len
+                    && self.modified_unix_seconds == other.modified_unix_seconds
+                    && self.modified_nanos == other.modified_nanos
+                    && self.page_count == other.page_count
+            }
+        }
+    }
+
+    pub(crate) fn same_metadata_revision(&self, other: &Self) -> bool {
+        self.byte_len == other.byte_len
+            && self.modified_unix_seconds == other.modified_unix_seconds
+            && self.modified_nanos == other.modified_nanos
+            && self.page_count == other.page_count
+    }
+}
+
+fn hash_file(file: &File, path: &Path) -> Result<[u8; 32], StoreError> {
+    let mut reader = file.try_clone().map_err(|source| StoreError::Io {
+        operation: "clone PDF for identity",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| StoreError::Io {
+            operation: "seek PDF for identity",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|source| StoreError::Io {
+            operation: "hash PDF identity",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn metadata_revision(metadata: &Metadata) -> Result<(u64, i64, u32), StoreError> {
+    let modified = metadata
+        .modified()
+        .map_err(|_| StoreError::InvalidDocumentIdentity)?;
+    let (seconds, nanos) = system_time_parts(modified)?;
+    Ok((metadata.len(), seconds, nanos))
 }
 
 fn system_time_parts(time: SystemTime) -> Result<(i64, u32), StoreError> {
