@@ -94,9 +94,8 @@ pub(super) fn search_document_jump(result: &SearchMatch) -> DocumentJump {
 }
 
 impl PdfReader {
-    pub(super) fn find_document(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_sidebar(SidePanel::Search, window, cx);
-        window.focus(&self.search_field.focus_handle(cx));
+    pub(super) fn find_document(&mut self, _: &Find, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(PdfReaderEvent::OpenSearch);
     }
 
     pub(super) fn next_search_result(

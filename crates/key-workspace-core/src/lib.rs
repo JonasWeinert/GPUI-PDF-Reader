@@ -5,6 +5,7 @@
 //! policy so hosts and feature crates can agree without depending on one
 //! another's implementations.
 
+mod control_bar;
 mod ids;
 mod layout;
 mod model;
@@ -12,6 +13,7 @@ mod resource_registry;
 mod resources;
 mod scheduler;
 
+pub use control_bar::*;
 pub use ids::*;
 pub use layout::*;
 pub use model::*;

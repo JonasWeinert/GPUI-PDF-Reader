@@ -2,8 +2,9 @@
 
 - Anchor app annotations to inclusive PDFium page/character indices, never screen coordinates. Recompute paint bounds from the current text layer at any zoom.
 - Keep highlights and comments in one exact-range record so recoloring preserves a comment and adding a comment preserves its highlight.
-- Store app annotations in a versioned sidecar. Validate PDF size, modification time, and page count on load and immediately before every atomic save.
-- The current PDF identity is metadata-based to avoid hashing a large document on every edit. A future stronger identity needs a cached content/PDF identifier plus a cheap way to detect replacement without putting full-file I/O on each save.
+- Store app annotations in a versioned sidecar. Schema 2 persists a SHA-256 content identity plus size and page count, so copying or touching an unchanged PDF does not detach its annotations. Legacy schema 1 remains conservatively metadata-bound.
+- Hash once when a document context opens. Normal save revalidation uses the already captured size and modification tuple; it falls back to content hashing only when metadata changed. This retains replacement checks without hashing a large document on every edit.
+- Annotation ownership is per reader: each view owns its `AnnotationSet`, identity, generation, service client, document lane, and event receiver. Never route by active tab or a process-global current-document cursor.
 - Unix `rename` replaces an existing sidecar atomically; Windows does not offer the same behavior through `std::fs::rename`. Use a platform-specific atomic replace before enabling Windows support.
 - Treat a corrupt or stale sidecar as blocked persistence. Do not accept edits that look saved when they cannot be written safely.
 - Coalesce queued same-document snapshots before sidecar writes. Color clicks can arrive much faster than `fsync` completes.

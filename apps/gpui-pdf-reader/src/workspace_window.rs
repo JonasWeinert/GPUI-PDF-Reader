@@ -5,6 +5,7 @@ use crate::application_host::{
     open_settings_window, remove_workspace_view, select_workspace_tab_views, set_resource_mode,
     transfer_workspace_view_registration, workspace_window_handle,
 };
+use crate::control_bar::ViewControlBar;
 use crate::reader::PdfReader;
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::{OpenDocument, OpenSettings};
@@ -15,10 +16,9 @@ use gpui::{
 };
 use gpui_component::{Icon, IconName, Theme};
 use key_ui_gpui::{
-    CONTEXT_BAR_HEIGHT, TAB_BAR_HEIGHT, TAB_HOVER_CARD_WIDTH, TabBarAction, TabDragPayload,
-    TabDropAction, TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover,
-    TabSegmentAction, TabStrip, ThemeTokens, UnitTransition, WorkspaceContextBar, tab_hover_card_x,
-    tab_search_popover_x,
+    TAB_BAR_HEIGHT, TAB_HOVER_CARD_WIDTH, TabBarAction, TabDragPayload, TabDropAction,
+    TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover, TabSegmentAction, TabStrip,
+    ThemeTokens, UnitTransition, tab_hover_card_x, tab_search_popover_x,
 };
 use key_workspace_core::{
     ContentPlacement, DockPanel, ItemKind, ResourceAllocation, ResourceMode, SplitAxis, TabId,
@@ -38,6 +38,7 @@ struct WorkspaceViewSlot {
     item: Option<WorkspaceItemDescriptor>,
     view: WorkspaceViewDescriptor,
     content: WorkspaceContent,
+    control_bar: Entity<ViewControlBar>,
 }
 
 impl WorkspaceViewSlot {
@@ -331,6 +332,7 @@ impl WorkspaceWindow {
             window,
             cx,
         );
+        let control_bar = ViewControlBar::new_pdf(reader.clone(), window, cx);
         let focus_handle = cx.focus_handle();
         let tab_id = host.read(cx).allocate_tab_id();
         let tab_search_field = cx.new(|cx| TextField::new(cx, "Search open tabs", 512));
@@ -367,6 +369,7 @@ impl WorkspaceWindow {
                         item,
                         view,
                         content: WorkspaceContent::Pdf(reader),
+                        control_bar,
                     },
                 )],
                 active_tab: 0,
@@ -410,6 +413,7 @@ impl WorkspaceWindow {
         docks.left.active_panel = Some("core.settings-navigation".into());
         let tab_search_field = cx.new(|cx| TextField::new(cx, "Search open tabs", 512));
         let field_for_events = tab_search_field.clone();
+        let control_bar = ViewControlBar::new_settings(view.clone(), cx);
         let entity: Entity<Self> = cx.new(|cx| {
             cx.subscribe_in(
                 &field_for_events,
@@ -443,6 +447,7 @@ impl WorkspaceWindow {
                         item: None,
                         view,
                         content: WorkspaceContent::Settings,
+                        control_bar,
                     }],
                 }],
                 active_tab: 0,
@@ -670,6 +675,47 @@ impl WorkspaceWindow {
         self.close_split_view(view, window, cx);
     }
 
+    #[cfg(debug_assertions)]
+    pub(crate) fn qa_control_bar_open_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_tab()
+            .active_slot()
+            .control_bar
+            .update(cx, |bar, cx| bar.qa_open_search(window, cx));
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn qa_control_bar_close_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_tab()
+            .active_slot()
+            .control_bar
+            .update(cx, |bar, cx| bar.qa_close_search(window, cx));
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn qa_control_bar_set_search_query(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.active_tab()
+            .active_slot()
+            .control_bar
+            .update(cx, |bar, cx| bar.qa_set_search_query(query, cx));
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn qa_control_bar_state(&self, cx: &App) -> (ViewId, bool, usize, bool, f32) {
+        self.active_tab()
+            .active_slot()
+            .control_bar
+            .read(cx)
+            .qa_state()
+    }
+
     pub(crate) fn open_pdf(
         &mut self,
         path: PathBuf,
@@ -722,6 +768,7 @@ impl WorkspaceWindow {
             window,
             cx,
         );
+        let control_bar = ViewControlBar::new_pdf(reader.clone(), window, cx);
         let tab_id = self.host.read(cx).allocate_tab_id();
         self.tabs.push(WorkspaceTab::single(
             tab_id,
@@ -729,6 +776,7 @@ impl WorkspaceWindow {
                 item,
                 view,
                 content: WorkspaceContent::Pdf(reader),
+                control_bar,
             },
         ));
         self.active_tab = self.tabs.len() - 1;
@@ -752,6 +800,7 @@ impl WorkspaceWindow {
         });
         docks.left.active_panel = Some("core.settings-navigation".into());
         let tab_id = self.host.read(cx).allocate_tab_id();
+        let control_bar = ViewControlBar::new_settings(view.clone(), cx);
         self.tabs.push(WorkspaceTab {
             layout: WorkspaceTabLayout::single(tab_id, view.id),
             docks,
@@ -759,6 +808,7 @@ impl WorkspaceWindow {
                 item: None,
                 view,
                 content: WorkspaceContent::Settings,
+                control_bar,
             }],
         });
         self.active_tab = self.tabs.len() - 1;
@@ -1289,6 +1339,7 @@ impl WorkspaceWindow {
                 cx,
             );
             reader.update(cx, |reader, _| reader.restore_after_transfer(snapshot));
+            slot.control_bar = ViewControlBar::new_pdf(reader.clone(), window, cx);
             slot.content = WorkspaceContent::Pdf(reader);
         }
     }
@@ -1624,7 +1675,7 @@ impl WorkspaceWindow {
         let weak = cx.weak_entity();
         let split = self.active_tab().split_views();
         let active = self.active_view();
-        let active_title: SharedString = active.title.clone().into();
+        let control_bar = self.active_tab().active_slot().control_bar.clone();
         let split_button = div()
             .id("workspace-split-menu-button")
             .relative()
@@ -1670,23 +1721,17 @@ impl WorkspaceWindow {
                         .bg(tokens.action.accent),
                 )
             });
-        WorkspaceContextBar::new(tokens)
-            .bottom_border(split.is_none())
-            .leading(split_button)
-            .center(
+        div()
+            .relative()
+            .w_full()
+            .flex_none()
+            .child(control_bar)
+            .child(
                 div()
-                    .min_w_0()
-                    .max_w(px(420.0))
-                    .px_3()
-                    .py_1()
-                    .rounded_lg()
-                    .bg(tokens.surface.muted.opacity(0.72))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .text_sm()
-                    .text_color(tokens.content.secondary)
-                    .child(active_title),
+                    .absolute()
+                    .top(px(6.0))
+                    .left(px(12.0))
+                    .child(split_button),
             )
             .into_any_element()
     }
@@ -1809,9 +1854,15 @@ impl WorkspaceWindow {
                 );
             }
         }
+        let control_bar_height = self
+            .active_tab()
+            .active_slot()
+            .control_bar
+            .read(cx)
+            .current_height();
         div()
             .absolute()
-            .top(px(TAB_BAR_HEIGHT + CONTEXT_BAR_HEIGHT + 6.0))
+            .top(px(TAB_BAR_HEIGHT + control_bar_height + 6.0))
             .left(px(12.0))
             .w(px(268.0))
             .p_2()

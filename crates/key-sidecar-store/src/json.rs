@@ -12,14 +12,16 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const SIDECAR_SCHEMA_VERSION: u32 = 1;
+pub const SIDECAR_SCHEMA_VERSION: u32 = 2;
+const LEGACY_SIDECAR_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SIDECAR_BYTES: usize = 4 * 1024 * 1024;
 
 const SIDECAR_SUFFIX: &str = ".gpui-pdf-reader.json";
 const MAX_TEMP_FILE_ATTEMPTS: usize = 32;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Adjacent versioned JSON sidecars compatible with GPUI PDF Reader schema 1.
+/// Adjacent versioned JSON sidecars. Schema 2 writes a content digest while
+/// the decoder remains compatible with conservative schema 1 identities.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JsonSidecarStore;
 
@@ -169,26 +171,41 @@ fn validate_snapshot(
 }
 
 fn revalidate_document_path(document: &DocumentKey) -> Result<(), StoreError> {
-    let found =
-        DocumentIdentity::from_pdf(document.source_path(), document.identity().page_count())?;
-    ensure_identity(document.identity(), found)
+    let file = File::open(document.source_path()).map_err(|source| StoreError::Io {
+        operation: "open PDF for annotation validation",
+        path: document.source_path().to_path_buf(),
+        source,
+    })?;
+    revalidate_file(&file, document)
 }
 
 fn revalidate_locked_document(file: &File, document: &DocumentKey) -> Result<(), StoreError> {
-    let locked = DocumentIdentity::from_file(
-        file,
-        document.source_path(),
-        document.identity().page_count(),
-    )?;
-    ensure_identity(document.identity(), locked)?;
+    revalidate_file(file, document)?;
 
     // A path can be replaced after its previous inode was opened. Checking the
     // current path as well ensures we never write a sidecar for that replacement.
     revalidate_document_path(document)
 }
 
+fn revalidate_file(file: &File, document: &DocumentKey) -> Result<(), StoreError> {
+    let metadata = DocumentIdentity::from_file_metadata(
+        file,
+        document.source_path(),
+        document.identity().page_count(),
+    )?;
+    if document.identity().same_metadata_revision(&metadata) {
+        return Ok(());
+    }
+    let content = DocumentIdentity::from_file(
+        file,
+        document.source_path(),
+        document.identity().page_count(),
+    )?;
+    ensure_identity(document.identity(), content)
+}
+
 fn ensure_identity(expected: &DocumentIdentity, found: DocumentIdentity) -> Result<(), StoreError> {
-    if &found == expected {
+    if expected.same_revision(&found) {
         Ok(())
     } else {
         Err(StoreError::Conflict(
@@ -238,7 +255,10 @@ fn decode_sidecar(
         path: path.to_path_buf(),
         source,
     })?;
-    if probe.schema_version != SIDECAR_SCHEMA_VERSION {
+    if !matches!(
+        probe.schema_version,
+        LEGACY_SIDECAR_SCHEMA_VERSION | SIDECAR_SCHEMA_VERSION
+    ) {
         return Err(StoreError::UnsupportedSchemaVersion {
             found: probe.schema_version,
             supported: SIDECAR_SCHEMA_VERSION,
@@ -249,7 +269,9 @@ fn decode_sidecar(
             path: path.to_path_buf(),
             source,
         })?;
-    let identity = DocumentIdentity::try_from(stored.document)?;
+    let identity = stored
+        .document
+        .into_identity(stored.schema_version == SIDECAR_SCHEMA_VERSION)?;
     ensure_identity(expected_identity, identity.clone())?;
     let records = stored
         .annotations
@@ -416,6 +438,8 @@ struct StoredDocumentIdentity {
     modified_unix_seconds: i64,
     modified_nanos: u32,
     page_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_sha256: Option<String>,
 }
 
 impl TryFrom<&DocumentIdentity> for StoredDocumentIdentity {
@@ -428,21 +452,67 @@ impl TryFrom<&DocumentIdentity> for StoredDocumentIdentity {
             modified_nanos: identity.modified_nanos(),
             page_count: u64::try_from(identity.page_count())
                 .map_err(|_| StoreError::InvalidDocumentIdentity)?,
+            content_sha256: Some(encode_digest(
+                identity
+                    .content_sha256()
+                    .ok_or(StoreError::InvalidDocumentIdentity)?,
+            )),
         })
     }
 }
 
-impl TryFrom<StoredDocumentIdentity> for DocumentIdentity {
-    type Error = StoreError;
-
-    fn try_from(stored: StoredDocumentIdentity) -> Result<Self, Self::Error> {
-        Self::new(
-            stored.byte_len,
-            stored.modified_unix_seconds,
-            stored.modified_nanos,
-            usize::try_from(stored.page_count).map_err(|_| StoreError::InvalidDocumentIdentity)?,
-        )
+impl StoredDocumentIdentity {
+    fn into_identity(self, require_digest: bool) -> Result<DocumentIdentity, StoreError> {
+        let page_count =
+            usize::try_from(self.page_count).map_err(|_| StoreError::InvalidDocumentIdentity)?;
+        let digest = self
+            .content_sha256
+            .as_deref()
+            .map(decode_digest)
+            .transpose()?;
+        if require_digest && digest.is_none() {
+            return Err(StoreError::InvalidDocumentIdentity);
+        }
+        if let Some(digest) = digest {
+            DocumentIdentity::new_with_content_sha256(
+                self.byte_len,
+                self.modified_unix_seconds,
+                self.modified_nanos,
+                page_count,
+                digest,
+            )
+        } else {
+            DocumentIdentity::new(
+                self.byte_len,
+                self.modified_unix_seconds,
+                self.modified_nanos,
+                page_count,
+            )
+        }
     }
+}
+
+fn encode_digest(digest: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut encoded, byte| {
+            let _ = write!(encoded, "{byte:02x}");
+            encoded
+        })
+}
+
+fn decode_digest(encoded: &str) -> Result<[u8; 32], StoreError> {
+    if encoded.len() != 64 || !encoded.is_ascii() {
+        return Err(StoreError::InvalidDocumentIdentity);
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&encoded[start..start + 2], 16)
+            .map_err(|_| StoreError::InvalidDocumentIdentity)?;
+    }
+    Ok(digest)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -528,8 +598,10 @@ impl TryFrom<StoredAnnotation> for RestoredAnnotation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::FileTimes;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::{Duration, UNIX_EPOCH};
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -558,7 +630,8 @@ mod tests {
     }
 
     fn fixed_identity(page_count: usize) -> DocumentIdentity {
-        DocumentIdentity::new(42, 1_700_000_000, 123, page_count).unwrap()
+        DocumentIdentity::new_with_content_sha256(42, 1_700_000_000, 123, page_count, [0x2a; 32])
+            .unwrap()
     }
 
     fn range(start_page: usize, start: usize, end_page: usize, end: usize) -> TextRange {
@@ -605,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_one_encoding_is_byte_for_byte_compatible_with_the_reader() {
+    fn schema_two_encoding_persists_content_identity() {
         let mut annotations = AnnotationSet::new(3);
         annotations
             .add(
@@ -620,12 +693,13 @@ mod tests {
         let actual =
             String::from_utf8(encode_sidecar(&fixed_identity(3), &annotations).unwrap()).unwrap();
         let expected = r#"{
-  "schema_version": 1,
+  "schema_version": 2,
   "document": {
     "byte_len": 42,
     "modified_unix_seconds": 1700000000,
     "modified_nanos": 123,
-    "page_count": 3
+    "page_count": 3,
+    "content_sha256": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
   },
   "revision": 2,
   "annotations": [
@@ -719,6 +793,38 @@ mod tests {
     }
 
     #[test]
+    fn content_identity_survives_copy_style_timestamp_changes() {
+        let directory = TestDirectory::new("content-identity");
+        let original = pdf_document(&directory, 1);
+        let store = JsonSidecarStore;
+        let annotations = revision_one(1, HighlightColor::Blue);
+        store.compare_and_save(&original, 0, &annotations).unwrap();
+
+        let file = File::open(original.source_path()).unwrap();
+        file.set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_234_567)))
+            .unwrap();
+        let copied_revision = DocumentKey::from_pdf(original.source_path(), 1).unwrap();
+
+        assert_ne!(
+            original.identity().modified_unix_seconds(),
+            copied_revision.identity().modified_unix_seconds()
+        );
+        assert!(
+            original
+                .identity()
+                .same_revision(copied_revision.identity())
+        );
+        assert_eq!(store.load(&copied_revision).unwrap(), annotations);
+    }
+
+    #[test]
+    fn legacy_identity_stays_conservative_when_timestamp_changes() {
+        let original = DocumentIdentity::new(42, 100, 0, 2).unwrap();
+        let touched = DocumentIdentity::new(42, 101, 0, 2).unwrap();
+        assert!(!original.same_revision(&touched));
+    }
+
+    #[test]
     fn stale_schema_identity_corruption_unknown_fields_and_oversize_are_rejected() {
         let directory = TestDirectory::new("invalid-input");
         let document = pdf_document(&directory, 1);
@@ -742,11 +848,12 @@ mod tests {
         ));
 
         let wrong = encode_sidecar(
-            &DocumentIdentity::new(
+            &DocumentIdentity::new_with_content_sha256(
                 document.identity().byte_len() + 1,
                 document.identity().modified_unix_seconds(),
                 document.identity().modified_nanos(),
                 1,
+                *document.identity().content_sha256().unwrap(),
             )
             .unwrap(),
             &AnnotationSet::new(1),

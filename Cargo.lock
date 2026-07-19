@@ -3472,6 +3472,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "gpui-component",
+ "key-workspace-core",
 ]
 
 [[package]]
@@ -3479,6 +3480,7 @@ name = "key-workspace-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

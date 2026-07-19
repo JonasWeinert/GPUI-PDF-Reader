@@ -12,6 +12,9 @@ pub enum ChromeButtonStyle {
     Floating,
     /// Shows a persistent accent selection.
     Selected,
+    /// Indicates an active chrome mode without the stronger outlined treatment
+    /// used for selected rows and primary segmented controls.
+    SubtleSelected,
     /// Uses the primary accent as a filled call to action.
     Primary,
 }
@@ -44,6 +47,13 @@ pub fn chrome_button(
         ChromeButtonStyle::Selected => (
             tokens.action.accent_soft,
             tokens.action.accent_border,
+            tokens.action.accent,
+            tokens.action.accent_soft_hover,
+            tokens.action.control_pressed,
+        ),
+        ChromeButtonStyle::SubtleSelected => (
+            tokens.action.accent_soft,
+            tokens.action.accent_soft,
             tokens.action.accent,
             tokens.action.accent_soft_hover,
             tokens.action.control_pressed,

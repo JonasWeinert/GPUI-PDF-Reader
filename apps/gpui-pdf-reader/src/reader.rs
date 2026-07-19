@@ -52,12 +52,12 @@ use crate::{
 };
 use gpui::{
     Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context,
-    CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, ListAlignment,
-    ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
-    Pixels, Point, PromptButton, PromptLevel, Render, RenderImage, ScrollWheelEvent, SharedString,
-    StyledText, Task, TextRun, Transformation, UniformListScrollHandle, Window, canvas, div,
-    ease_in_out, font, img, list, percentage, point, prelude::*, px, quad, rems, size,
-    uniform_list,
+    CursorStyle, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, IntoElement,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathPromptOptions, Pixels, Point, PromptButton, PromptLevel, Render, RenderImage,
+    ScrollWheelEvent, SharedString, StyledText, Task, TextRun, Transformation,
+    UniformListScrollHandle, Window, canvas, div, ease_in_out, font, img, list, percentage, point,
+    prelude::*, px, quad, rems, size, uniform_list,
 };
 #[cfg(debug_assertions)]
 use gpui::{Keystroke, Modifiers, ScrollDelta, TouchPhase};
@@ -110,6 +110,7 @@ use std::time::{Duration, Instant};
 
 mod annotation_io;
 mod comments;
+pub(crate) mod control_bar;
 mod extensions;
 #[cfg(debug_assertions)]
 pub(crate) mod qa;
@@ -149,6 +150,13 @@ use toc::{
 };
 use toc::{active_toc_index, advance_toc_hover_state, toc_hover_state_is_animating};
 use ui::{ChromeButtonStyle, chrome_button, empty_state, error_banner, icon_label};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PdfReaderEvent {
+    OpenSearch,
+}
+
+impl EventEmitter<PdfReaderEvent> for PdfReader {}
 
 const ERROR_BAR_HEIGHT: f32 = 34.0;
 const MAX_COPY_TEXT_BYTES: usize = 64 * 1024 * 1024;
@@ -444,16 +452,6 @@ impl ExtensionSnapshotDispatch {
     fn begin_dispatch(&mut self) {
         self.scheduled = false;
     }
-}
-
-struct FluidPillState {
-    available_width: f32,
-    document_open: bool,
-    zoom_out_enabled: bool,
-    zoom_in_enabled: bool,
-    zoom_label: SharedString,
-    search_selected: bool,
-    comments_selected: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -801,7 +799,7 @@ impl PdfReader {
                         cx.notify();
                     }
                     TextFieldEvent::Submit => reader.navigate_search(true, window, cx),
-                    TextFieldEvent::Cancel => reader.toggle_sidebar(SidePanel::Search, window, cx),
+                    TextFieldEvent::Cancel => {}
                 },
             )
             .detach();
@@ -4622,172 +4620,6 @@ impl PdfReader {
         self.sync_viewport_snapshot();
         self.start_animation(window, cx);
         cx.notify();
-    }
-
-    fn render_fluid_main_pill(
-        &mut self,
-        state: FluidPillState,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
-        let compact = state.available_width < 700.0;
-        let has_context = self.context_range().is_some() && self.comment_editor.is_none();
-        // When a side panel leaves a narrow document strip, the local pill
-        // keeps context actions available and the main pill keeps its global
-        // zoom/search/comments controls unclipped.
-        let show_context_in_main = has_context && state.available_width >= 520.0;
-        let context_actions_enabled =
-            has_context && !self.annotations_loading && !self.annotation_persistence_blocked;
-        let comment_label = if compact {
-            Icon::new(if self.context_has_comment() {
-                IconName::BookOpen
-            } else {
-                IconName::Plus
-            })
-            .into_any_element()
-        } else if self.context_has_comment() {
-            "Edit note".into_any_element()
-        } else {
-            "Add note".into_any_element()
-        };
-
-        div()
-            .id("fluid-main-pill")
-            .block_mouse_except_scroll()
-            .h(px(44.0))
-            .max_w(px((state.available_width - 24.0).max(1.0)))
-            .px_1()
-            .flex()
-            .items_center()
-            .gap_1()
-            .overflow_hidden()
-            .rounded_full()
-            .border_1()
-            .border_color(palette.text.opacity(0.13))
-            .bg(palette.surface)
-            .shadow_sm()
-            .text_color(palette.text)
-            .child(Self::segment_button(
-                palette,
-                "fluid-zoom-out",
-                Icon::new(IconName::Minus),
-                state.zoom_out_enabled,
-                cx.listener(|reader, _, window, cx| reader.zoom_out(&ZoomOut, window, cx)),
-            ))
-            .child(
-                div()
-                    .h(px(30.0))
-                    .min_w(px(if compact { 46.0 } else { 54.0 }))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(if state.document_open {
-                        palette.text
-                    } else {
-                        palette.text_tertiary
-                    })
-                    .child(state.zoom_label),
-            )
-            .child(Self::segment_button(
-                palette,
-                "fluid-zoom-in",
-                Icon::new(IconName::Plus),
-                state.zoom_in_enabled,
-                cx.listener(|reader, _, window, cx| reader.zoom_in(&ZoomIn, window, cx)),
-            ))
-            .when(!compact, |pill| {
-                pill.child(Self::segment_button(
-                    palette,
-                    "fluid-fit-width",
-                    "Fit",
-                    state.document_open,
-                    cx.listener(|reader, _, window, cx| reader.fit_width(&FitWidth, window, cx)),
-                ))
-            })
-            .when(show_context_in_main, |pill| {
-                pill.child(div().h(px(24.0)).w(px(1.0)).bg(palette.separator))
-                    .children(
-                        [
-                            "fluid-main-highlight-yellow",
-                            "fluid-main-highlight-green",
-                            "fluid-main-highlight-blue",
-                            "fluid-main-highlight-pink",
-                            "fluid-main-highlight-purple",
-                        ]
-                        .into_iter()
-                        .zip(HighlightColor::ALL)
-                        .map(|(id, color)| {
-                            Self::highlight_button(
-                                palette,
-                                id,
-                                color,
-                                context_actions_enabled,
-                                cx.listener(move |reader, _, _, cx| {
-                                    reader.add_highlight(color, cx)
-                                }),
-                            )
-                        }),
-                    )
-                    .child(Self::segment_button(
-                        palette,
-                        "fluid-main-context-comment",
-                        comment_label,
-                        context_actions_enabled,
-                        cx.listener(|reader, _, window, cx| reader.comment_on_context(window, cx)),
-                    ))
-            })
-            .child(div().h(px(24.0)).w(px(1.0)).bg(palette.separator))
-            .child(Self::chrome_button(
-                palette,
-                "fluid-toggle-search",
-                if compact {
-                    Icon::new(IconName::Search).into_any_element()
-                } else {
-                    "Search".into_any_element()
-                },
-                if state.search_selected {
-                    ChromeButtonStyle::Selected
-                } else {
-                    ChromeButtonStyle::Floating
-                },
-                state.document_open,
-                cx.listener(|reader, _, window, cx| reader.find_document(&Find, window, cx)),
-            ))
-            .child(Self::chrome_button(
-                palette,
-                "fluid-toggle-comments",
-                if compact {
-                    Icon::new(IconName::PanelRight).into_any_element()
-                } else {
-                    "Comments".into_any_element()
-                },
-                if state.comments_selected {
-                    ChromeButtonStyle::Selected
-                } else {
-                    ChromeButtonStyle::Floating
-                },
-                state.document_open,
-                cx.listener(|reader, _, window, cx| {
-                    reader.toggle_comments(&ToggleComments, window, cx)
-                }),
-            ))
-            .when(Theme::global(cx).is_dark(), |pill| {
-                pill.child(Self::segment_button(
-                    palette,
-                    "fluid-toggle-pdf-dark-mode",
-                    Icon::new(if self.pdf_dark_mode_enabled {
-                        IconName::Moon
-                    } else {
-                        IconName::Sun
-                    }),
-                    true,
-                    cx.listener(|reader, _, window, cx| reader.toggle_pdf_dark_mode(window, cx)),
-                ))
-            })
-            .into_any_element()
     }
 
     fn render_fluid_context_pill(

@@ -40,12 +40,12 @@ impl CommentEmptyPresentation {
         let title = if loading {
             "Loading comments…"
         } else if persistence_blocked {
-            "Comments unavailable"
+            "No comments loaded"
         } else {
             "No comments yet"
         };
         let detail = if persistence_blocked {
-            "Resolve the annotation sidecar problem before adding comments."
+            "Reading is unaffected. Comments stay disabled until the saved comments file is replaced."
         } else {
             "Select text, then use either floating Note control."
         };
@@ -53,9 +53,66 @@ impl CommentEmptyPresentation {
     }
 }
 
+fn annotation_error_presentation(message: &str) -> SharedString {
+    if stale_sidecar_error(message) {
+        "Saved comments are for another version of this PDF, so they were not loaded.".into()
+    } else {
+        message.to_owned().into()
+    }
+}
+
+fn stale_sidecar_error(message: &str) -> bool {
+    message.starts_with("annotation sidecar belongs to a different PDF revision")
+}
+
+fn annotation_error_banner(palette: ReaderPalette, message: SharedString) -> gpui::AnyElement {
+    if !stale_sidecar_error(&message) {
+        return error_banner(palette, message);
+    }
+    div()
+        .mx_4()
+        .mt_3()
+        .p_3()
+        .flex()
+        .items_start()
+        .gap_2()
+        .rounded_lg()
+        .bg(palette.warning.opacity(0.12))
+        .text_color(palette.text)
+        .child(
+            Icon::new(IconName::TriangleAlert)
+                .size(px(15.0))
+                .text_color(palette.warning),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Comments belong to another PDF version"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .line_height(px(18.0))
+                        .text_color(palette.text_secondary)
+                        .child(annotation_error_presentation(&message)),
+                ),
+        )
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CommentEditorPresentation, CommentEmptyPresentation};
+    use super::{
+        CommentEditorPresentation, CommentEmptyPresentation, annotation_error_presentation,
+    };
 
     #[test]
     fn editor_copy_is_shared_without_losing_state() {
@@ -80,7 +137,17 @@ mod tests {
         assert!(empty.detail.contains("floating Note"));
         assert_eq!(
             CommentEmptyPresentation::new(false, true).title,
-            "Comments unavailable"
+            "No comments loaded"
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_errors_are_concise_without_hiding_the_safety_decision() {
+        let message = "annotation sidecar belongs to a different PDF revision (expected 1 byte; found 2 bytes)";
+        let presented = annotation_error_presentation(message);
+        assert_eq!(
+            presented,
+            "Saved comments are for another version of this PDF, so they were not loaded."
         );
     }
 }
@@ -949,7 +1016,7 @@ impl PdfReader {
         let list_error = self
             .annotation_error
             .clone()
-            .map(|message| error_banner(palette, message));
+            .map(|message| annotation_error_banner(palette, message));
         let progress = self.comment_pane.progress;
         let list_pane = div()
             .absolute()
@@ -982,7 +1049,7 @@ impl PdfReader {
             let editor_error = self
                 .annotation_error
                 .clone()
-                .map(|message| error_banner(palette, message));
+                .map(|message| annotation_error_banner(palette, message));
             div()
                 .absolute()
                 .top_0()

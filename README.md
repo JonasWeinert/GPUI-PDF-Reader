@@ -75,9 +75,10 @@ Forms are rendered for visual fidelity but are not interactive yet.
 Highlights and comments are app-managed annotations. GPUI PDF Reader leaves
 the PDF unchanged and stores them beside it in a versioned JSON sidecar named
 `<document>.pdf.gpui-pdf-reader.json`. The reader validates the sidecar against
-the PDF's file size, modification time, and page count before loading or
-saving it. Keep the sidecar with the PDF when moving a document if you want to
-retain its annotations.
+the PDF's SHA-256 content identity, file size, and page count before loading or
+saving it. Moving, copying, or restoring an unchanged document does not detach
+its annotations. Keep the sidecar with the PDF when moving a document if you
+want to retain them.
 
 ## Build from source
 
@@ -285,6 +286,14 @@ sidecar:
 
 ```sh
 sh tests/e2e/macos_fluid.sh
+```
+
+The annotation-ownership scenario creates and persists independent highlights
+and comments in three tabs, then changes one PDF's timestamp and reloads it to
+verify that content identity—not tab order or file metadata—owns the sidecar:
+
+```sh
+sh tests/e2e/macos_annotation_ownership.sh
 ```
 
 The extension scenario installs and uses both reference packages, relaunches
