@@ -546,9 +546,8 @@ impl ViewportController {
     }
 
     /// Updates the viewport while retaining the PDF point at the center of the
-    /// unobscured region. This is the same operation for a window resize, a
-    /// classic sidebar changing the viewport width, or a fluid overlay changing
-    /// `right_occlusion`.
+    /// unobscured region. This is the same operation for a pane resize or a
+    /// floating panel changing `right_occlusion`.
     pub fn set_viewport(&mut self, metrics: ViewportMetrics) -> InputDisposition {
         let Some(metrics) = self.normalized_metrics(metrics) else {
             return InputDisposition::IgnoredInvalid;

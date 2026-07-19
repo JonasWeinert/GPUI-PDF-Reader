@@ -70,6 +70,17 @@ pub(super) enum QaExtensionPhase {
 
 impl PdfReader {
     #[cfg(debug_assertions)]
+    pub(crate) fn qa_viewport_contract(&self) -> (f32, f32, Option<(f32, f32)>) {
+        (
+            self.viewport_width,
+            self.viewport_height,
+            self.canvas_bounds
+                .get()
+                .map(|bounds| (f32::from(bounds.size.width), f32::from(bounds.size.height))),
+        )
+    }
+
+    #[cfg(debug_assertions)]
     pub(crate) fn qa_resource_snapshot(&self) -> QaReaderResourceSnapshot {
         let cached_tile_bytes = self
             .rendered
@@ -204,8 +215,7 @@ impl PdfReader {
             .as_ref()
             .map_or_else(|| "none".to_owned(), |pane| pane.owner.to_string());
         format!(
-            "GPUI_PDF_READER_QA view={:?} theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} reference_preview={} reference_group={} citation_source={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} reference_panel={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} extension_packages={} extension_active={} extension_suspended={} extension_failed={} extension_panel={} extension_checks={} extension_native_rejected={} status={:?}",
-            self.view_mode,
+            "GPUI_PDF_READER_QA view=Fluid theme={} pdf_render={} pdf_dark_enabled={} toc={} links={} link_navigations={} link_preview={} reference_preview={} reference_group={} citation_source={} link_preview_state={} scholarly={} scientific={}/{} references={} dois={} bracket_citations={} superscript_citations={} toc_hover={} toc_hover_strength={:.3} toc_text_matches={} toc_callout_holds={} zoom={:.3} cached_tiles={} cached_bytes={} max_tile_bytes={} cached_text_pages={} text_desired={} pending={} desired={} visible_exact={}/{} visible_pages={} debouncing={} scroll=({:.2},{:.2}) sidebar={:.3}/{:.0} reference_panel={:.3}/{:.0} comment_pane={:.3}/{:.0} comment_editor={} comment_dirty={} autosave_pending={} sidebar_transitions={} sidebar_anchor_error={:.6} annotations={} highlights={} highlight_colors={} comments={} annotation_revision={}/{}/{} annotation_loading={} annotation_blocked={} search_results={} search_pages={} search_highlight_runs={} active_search={} search_focuses={} search_complete={} extension_packages={} extension_active={} extension_suspended={} extension_failed={} extension_panel={} extension_checks={} extension_native_rejected={} status={:?}",
             theme_name,
             if matches!(
                 self.render_appearance,
@@ -309,11 +319,6 @@ impl PdfReader {
     #[cfg(not(feature = "installable-extensions"))]
     fn qa_extension_package_counts(&self) -> (usize, usize, usize, usize) {
         (0, 0, 0, 0)
-    }
-
-    #[cfg(debug_assertions)]
-    pub fn qa_use_fluid_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_view_mode(ReaderView::Fluid, window, cx);
     }
 
     #[cfg(debug_assertions)]
@@ -1435,7 +1440,7 @@ impl PdfReader {
                     return Ok(false);
                 }
                 if self.comment_editor.is_none() {
-                    return Err("Classic autosave closed the comment editor".to_owned());
+                    return Err("autosave closed the comment editor".to_owned());
                 }
                 let comment = annotations
                     .iter()
@@ -1474,19 +1479,19 @@ impl PdfReader {
                 let annotation = annotations
                     .iter()
                     .find(|annotation| annotation.comment_markdown().is_some())
-                    .ok_or_else(|| "Classic comment vanished before parity checks".to_owned())?;
+                    .ok_or_else(|| "comment vanished before interaction checks".to_owned())?;
                 let id = annotation.id();
                 let start = annotation.range().start();
                 let page = self
                     .layout()
                     .and_then(|layout| layout.page_rect(start.page))
-                    .ok_or_else(|| "Classic hit-test page is not laid out".to_owned())?;
+                    .ok_or_else(|| "comment hit-test page is not laid out".to_owned())?;
                 let bounds = self
                     .page_text
                     .get(&start.page)
                     .and_then(|text| text.get(start.index))
                     .and_then(|character| character.bounds)
-                    .ok_or_else(|| "Classic hit-test character has no bounds".to_owned())?;
+                    .ok_or_else(|| "comment hit-test character has no bounds".to_owned())?;
                 let pointer = self.canvas_to_window(Offset {
                     x: page.x + (bounds.left + bounds.right) * page.width * 0.5 - self.scroll.x,
                     y: page.y + (bounds.top + bounds.bottom) * page.height * 0.5 - self.scroll.y,
@@ -1515,18 +1520,16 @@ impl PdfReader {
                     || self.selection.is_some()
                     || !self.context_has_comment()
                 {
-                    return Err(
-                        "clicking a Classic highlight did not expose its toolbar context".into(),
-                    );
+                    return Err("clicking a highlight did not expose its floating context".into());
                 }
                 self.comment_on_context(window, cx);
                 if self.comment_editor.is_none() || self.editing_annotation != Some(id) {
-                    return Err("Classic toolbar Edit Comment did not open the annotation".into());
+                    return Err("floating Edit Comment did not open the annotation".into());
                 }
                 self.return_to_comment_list(window, cx);
                 self.open_comment_from_list(id, window, cx);
                 if self.comment_editor.is_none() || self.editing_annotation != Some(id) {
-                    return Err("Classic comment-list row did not open the editor".into());
+                    return Err("comment-list row did not open the editor".into());
                 }
                 self.return_to_comment_list(window, cx);
                 self.qa_feature_phase = QaFeaturePhase::WaitCommentsOpen;
@@ -1622,7 +1625,8 @@ impl PdfReader {
                     // clamp near the search hit.
                     if let Some(layout) = self.layout() {
                         self.viewport.set_scroll(Offset::new(
-                            (layout.content_width - self.viewport_width).max(0.0) * 0.5,
+                            (layout.content_width - self.panel_safe_viewport_width()).max(0.0)
+                                * 0.5,
                             self.scroll.y,
                         ));
                         self.sync_viewport_snapshot();
@@ -1698,7 +1702,6 @@ impl PdfReader {
                 {
                     return Err("fluid scenario requires a PDF with no existing sidecar".into());
                 }
-                self.set_view_mode(ReaderView::Fluid, window, cx);
                 let range = self
                     .qa_text_range(0, "Select this sentence")
                     .ok_or_else(|| "fixture Fluid text was not extracted".to_owned())?;
@@ -1883,8 +1886,7 @@ impl PdfReader {
                     .iter()
                     .next()
                     .ok_or_else(|| "Fluid scenario annotation disappeared".to_owned())?;
-                if self.view_mode != ReaderView::Fluid
-                    || annotations.len() != 1
+                if annotations.len() != 1
                     || annotation.highlight() != Some(HighlightColor::Yellow)
                     || annotation.comment_markdown() != Some("fluid note")
                     || self.active_annotation != Some(annotation.id())
@@ -1894,8 +1896,7 @@ impl PdfReader {
                     || !self.search.complete
                 {
                     return Err(format!(
-                        "unexpected final Fluid state: view={:?}, annotations={}, results={}, complete={}",
-                        self.view_mode,
+                        "unexpected final Fluid state: annotations={}, results={}, complete={}",
                         annotations.len(),
                         self.search.order.len(),
                         self.search.complete

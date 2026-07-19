@@ -1107,9 +1107,10 @@ async fn wait_for_split_resources(
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        let (readers, settled, interactive, visible) = handle
-            .update(cx, |workspace, _, cx| {
+        let (readers, settled, interactive, visible, pane_aligned) = handle
+            .update(cx, |workspace, window, cx| {
                 let readers = workspace.readers();
+                let window_width = f32::from(window.viewport_size().width).max(1.0);
                 let settled = readers
                     .iter()
                     .filter(|reader| reader.read(cx).qa_viewport_is_settled())
@@ -1118,6 +1119,14 @@ async fn wait_for_split_resources(
                     .iter()
                     .map(|reader| reader.read(cx).qa_resource_snapshot().activity)
                     .collect::<Vec<_>>();
+                let pane_aligned = readers.iter().all(|reader| {
+                    let (width, height, measured) = reader.read(cx).qa_viewport_contract();
+                    measured.is_some_and(|(measured_width, measured_height)| {
+                        (width - measured_width).abs() <= 1.0
+                            && (height - measured_height).abs() <= 1.0
+                            && width < window_width * 0.75
+                    })
+                });
                 (
                     readers.len(),
                     settled,
@@ -1133,15 +1142,16 @@ async fn wait_for_split_resources(
                             **activity == key_workspace_core::ActivityLevel::ForegroundVisible
                         })
                         .count(),
+                    pane_aligned,
                 )
             })
             .map_err(|error| format!("split resource state unavailable: {error}"))?;
-        if readers == 2 && settled == 2 && interactive == 1 && visible == 1 {
+        if readers == 2 && settled == 2 && interactive == 1 && visible == 1 && pane_aligned {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "split resources did not settle: readers={readers} settled={settled} interactive={interactive} visible={visible}"
+                "split resources did not settle: readers={readers} settled={settled} interactive={interactive} visible={visible} pane_aligned={pane_aligned}"
             ));
         }
         cx.background_executor().timer(POLL_INTERVAL).await;
@@ -1149,15 +1159,6 @@ async fn wait_for_split_resources(
 }
 
 fn apply_initial_overrides(window: WindowHandle<WorkspaceWindow>, cx: &mut App) {
-    if flag("GPUI_PDF_READER_QA_FLUID_VIEW") {
-        window
-            .update(cx, |workspace, window, cx| {
-                if let Some(reader) = workspace.reader() {
-                    reader.update(cx, |reader, cx| reader.qa_use_fluid_view(window, cx));
-                }
-            })
-            .ok();
-    }
     if let Ok(theme_name) = std::env::var("GPUI_PDF_READER_QA_THEME") {
         window
             .update(cx, |workspace, window, cx| {

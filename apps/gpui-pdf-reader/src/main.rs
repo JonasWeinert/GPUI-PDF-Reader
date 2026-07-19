@@ -86,10 +86,8 @@ actions!(
         Find,
         ToggleComments,
         AddComment,
-        ClassicView,
         NextSearchResult,
         PreviousSearchResult,
-        FluidView,
         OpenSettings,
         Quit,
     ]
@@ -177,11 +175,7 @@ pub(crate) fn rebuild_application_menus(
     let analysis_menu_items = extensions.native_menu_items("tools.analysis");
     #[cfg(feature = "installable-extensions")]
     let extension_entries = extensions.extension_tool_entries();
-    let mut view_items = vec![
-        MenuItem::action("Classic View", ClassicView),
-        MenuItem::action("Fluid View", FluidView),
-        MenuItem::separator(),
-    ];
+    let mut view_items = Vec::new();
     view_items.extend(theme_menu_items);
     view_items.extend([
         MenuItem::separator(),

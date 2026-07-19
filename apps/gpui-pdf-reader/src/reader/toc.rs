@@ -454,7 +454,7 @@ impl PdfReader {
         let current_page = layout.current_page(self.scroll.y, self.viewport_height);
         let active = active_toc_index(&document.toc, current_page);
         let hovered = self.toc_hovered.filter(|index| *index < document.toc.len());
-        let maximum_card_width = (self.viewport_width - TOC_RAIL_WIDTH - 28.0).clamp(190.0, 360.0);
+        let maximum_card_width = (self.viewport_width - TOC_RAIL_WIDTH - 28.0).clamp(1.0, 360.0);
         let marker_data: Vec<_> = document
             .toc
             .iter()

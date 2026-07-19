@@ -45,18 +45,18 @@ use crate::search::{
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::theme::{self, ReaderPalette, ThemePreference};
 use crate::{
-    ActualSize, AddComment, ClassicView, CopySelection, EditCopy, EditCut, EditPaste,
-    EditSelectAll, Find, FirstPage, FitWidth, FluidView, InstallExtension, LastPage,
-    ManageExtensions, NextSearchResult, OpenDocument, PageDown, PageUp, PreviousSearchResult, Quit,
-    ScrollDown, ScrollLeft, ScrollRight, ScrollUp, SelectAll, ToggleComments, ZoomIn, ZoomOut,
+    ActualSize, AddComment, CopySelection, EditCopy, EditCut, EditPaste, EditSelectAll, Find,
+    FirstPage, FitWidth, InstallExtension, LastPage, ManageExtensions, NextSearchResult,
+    OpenDocument, PageDown, PageUp, PreviousSearchResult, Quit, ScrollDown, ScrollLeft,
+    ScrollRight, ScrollUp, SelectAll, ToggleComments, ZoomIn, ZoomOut,
 };
 use gpui::{
     Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context,
     CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, ListAlignment,
     ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
     Pixels, Point, PromptButton, PromptLevel, Render, RenderImage, ScrollWheelEvent, SharedString,
-    StyledText, Task, TextRun, Transformation, UniformListScrollHandle, Window, WindowControlArea,
-    div, ease_in_out, font, img, list, percentage, point, prelude::*, px, quad, rems, size,
+    StyledText, Task, TextRun, Transformation, UniformListScrollHandle, Window, canvas, div,
+    ease_in_out, font, img, list, percentage, point, prelude::*, px, quad, rems, size,
     uniform_list,
 };
 #[cfg(debug_assertions)]
@@ -90,7 +90,7 @@ use key_pdf_gpui::{
     PdfCanvasPagePaintContext, PdfCanvasSnapshot, PdfCanvasStyle, PdfCanvasTile, PdfReaderConfig,
     PdfReaderLimits, ScrollBehavior as ViewportScrollBehavior, ScrollOffset, ViewportController,
     ViewportMetrics, ViewportPoint, command_wheel_zoom_factor, content_rect_to_bounds,
-    desired_raster_size as viewport_raster_size, pdf_canvas,
+    desired_raster_size as viewport_raster_size, pdf_canvas_measured,
     tile_core_rect as viewport_tile_core_rect, tile_logical_rect,
 };
 #[cfg(test)]
@@ -150,7 +150,6 @@ use toc::{
 use toc::{active_toc_index, advance_toc_hover_state, toc_hover_state_is_animating};
 use ui::{ChromeButtonStyle, chrome_button, empty_state, error_banner, icon_label};
 
-const TOOLBAR_HEIGHT: f32 = 52.0;
 const ERROR_BAR_HEIGHT: f32 = 34.0;
 const MAX_COPY_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const RESOURCE_MIB: u64 = 1024 * 1024;
@@ -357,7 +356,6 @@ pub(crate) struct ReaderTransferSnapshot {
     zoom: f32,
     fit_width: bool,
     scroll: Offset,
-    view_mode: ReaderView,
     pdf_dark_mode_enabled: bool,
 }
 
@@ -448,13 +446,6 @@ impl ExtensionSnapshotDispatch {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ReaderView {
-    #[default]
-    Classic,
-    Fluid,
-}
-
 struct FluidPillState {
     available_width: f32,
     document_open: bool,
@@ -509,11 +500,6 @@ impl SidebarState {
         transition.advance(dt);
         self.progress = transition.value();
         self.target = transition.target();
-    }
-
-    fn available_width(self, full_width: f32) -> f32 {
-        let maximum_sidebar = (full_width - MIN_DOCUMENT_VIEWPORT_WIDTH).max(0.0);
-        SIDEBAR_WIDTH.min(maximum_sidebar) * self.progress
     }
 }
 
@@ -683,7 +669,6 @@ pub struct PdfReader {
     search_list_state: ListState,
     comment_list_scroll: UniformListScrollHandle,
     status: ReaderStatus,
-    view_mode: ReaderView,
     theme_preference: ThemePreference,
     selected_theme: Option<SharedString>,
     render_appearance: RenderAppearance,
@@ -898,7 +883,6 @@ impl PdfReader {
                 search_list_state: ListState::new(0, ListAlignment::Top, px(160.0)),
                 comment_list_scroll: UniformListScrollHandle::new(),
                 status: ReaderStatus::Initializing,
-                view_mode: ReaderView::Classic,
                 theme_preference: ThemePreference::System,
                 selected_theme: None,
                 render_appearance: render_appearance_from_theme(Theme::global(cx), true),
@@ -1477,7 +1461,6 @@ impl PdfReader {
                 self.pending_link_navigation = None;
                 self.status = ReaderStatus::Ready;
                 if let Some(snapshot) = self.pending_transfer_snapshot.take() {
-                    self.view_mode = snapshot.view_mode;
                     self.pdf_dark_mode_enabled = snapshot.pdf_dark_mode_enabled;
                     if snapshot.fit_width {
                         self.viewport.fit_width();
@@ -2716,44 +2699,52 @@ impl PdfReader {
     }
 
     fn update_viewport(&mut self, window: &Window) {
-        let size = window.viewport_size();
-        let full_width = f32::from(size.width).max(1.0);
-        let width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
-        let toolbar_height = self.reader_toolbar_height();
-        let error_height = self.content_top() - toolbar_height;
-        let height = (f32::from(size.height) - toolbar_height - error_height).max(1.0);
-        let right_occlusion = if self.view_mode == ReaderView::Fluid {
-            fluid_sidebar_extent(width, self.sidebar.progress)
-                + reference_panel_extent(width, self.reference_panel.value())
-        } else {
-            0.0
-        };
+        let (width, height) = self.canvas_bounds.get().map_or_else(
+            || {
+                let size = window.viewport_size();
+                (
+                    f32::from(size.width).max(1.0),
+                    (f32::from(size.height) - self.content_top()).max(1.0),
+                )
+            },
+            |bounds| {
+                (
+                    f32::from(bounds.size.width).max(1.0),
+                    f32::from(bounds.size.height).max(1.0),
+                )
+            },
+        );
+        self.set_viewport_metrics(width, height, window.scale_factor());
+    }
+
+    fn update_viewport_for_pane(&mut self, pane: gpui::Size<Pixels>, window: &Window) {
+        self.set_viewport_metrics(
+            f32::from(pane.width).max(1.0),
+            f32::from(pane.height).max(1.0),
+            window.scale_factor(),
+        );
+    }
+
+    fn set_viewport_metrics(&mut self, width: f32, height: f32, scale_factor: f32) {
+        let right_occlusion = fluid_sidebar_extent(width, self.sidebar.progress)
+            + reference_panel_extent(width, self.reference_panel.value());
         self.viewport.set_viewport(ViewportMetrics {
             width,
             height,
             right_occlusion,
-            scale_factor: window.scale_factor(),
+            scale_factor,
         });
         self.sync_viewport_snapshot();
     }
 
     fn update_sidebar_viewport_preserving_anchor(&mut self, window: &Window) {
-        let size = window.viewport_size();
-        let full_width = f32::from(size.width).max(1.0);
-        let next_width = (full_width - self.sidebar_reserved_width(full_width)).max(1.0);
-        let right_occlusion = if self.view_mode == ReaderView::Fluid {
-            fluid_sidebar_extent(next_width, self.sidebar.progress)
-                + reference_panel_extent(next_width, self.reference_panel.value())
-        } else {
-            0.0
-        };
-        self.viewport.set_viewport(ViewportMetrics {
-            width: next_width,
-            height: self.viewport_height,
-            right_occlusion,
-            scale_factor: window.scale_factor(),
-        });
-        self.sync_viewport_snapshot();
+        let next_width = self
+            .canvas_bounds
+            .get()
+            .map_or(self.viewport_width, |bounds| {
+                f32::from(bounds.size.width).max(1.0)
+            });
+        self.set_viewport_metrics(next_width, self.viewport_height, window.scale_factor());
         if let Some(anchor) = self.sidebar_anchor
             && let Some((x, y)) = self
                 .layout()
@@ -2767,23 +2758,9 @@ impl PdfReader {
         }
     }
 
-    fn sidebar_reserved_width(&self, full_width: f32) -> f32 {
-        match self.view_mode {
-            ReaderView::Classic => {
-                self.sidebar.available_width(full_width)
-                    + reference_panel_extent(full_width, self.reference_panel.value())
-            }
-            ReaderView::Fluid => 0.0,
-        }
-    }
-
     fn fluid_panel_occlusion(&self) -> f32 {
-        if self.view_mode == ReaderView::Fluid {
-            fluid_sidebar_extent(self.viewport_width, self.sidebar.progress)
-                + reference_panel_extent(self.viewport_width, self.reference_panel.value())
-        } else {
-            0.0
-        }
+        fluid_sidebar_extent(self.viewport_width, self.sidebar.progress)
+            + reference_panel_extent(self.viewport_width, self.reference_panel.value())
     }
 
     fn fluid_panel_width(&self) -> f32 {
@@ -2796,43 +2773,6 @@ impl PdfReader {
 
     fn max_scroll_x(&self, _layout: &DocumentLayout) -> f32 {
         self.viewport.maximum_scroll().x
-    }
-
-    fn set_view_mode(&mut self, mode: ReaderView, window: &mut Window, cx: &mut Context<Self>) {
-        if self.view_mode == mode {
-            return;
-        }
-        self.sidebar_anchor = self.layout().and_then(|layout| {
-            layout.anchor_at_content_point(
-                self.scroll.x + self.panel_safe_viewport_width() * 0.5,
-                self.scroll.y + self.viewport_height * 0.5,
-            )
-        });
-        self.viewport.disable_fit_width();
-        self.sync_viewport_snapshot();
-        self.cancel_comment_autosave();
-        self.view_mode = mode;
-        let editor_open = self.comment_editor.is_some();
-        self.comment_pane = CommentPaneState {
-            progress: if editor_open { 1.0 } else { 0.0 },
-            target: if editor_open { 1.0 } else { 0.0 },
-            close_editor_on_finish: false,
-        };
-        self.update_sidebar_viewport_preserving_anchor(window);
-        self.sidebar_anchor = None;
-        self.request_visible_tiles(window);
-        if self.comment_draft_dirty {
-            self.schedule_comment_autosave(window, cx);
-        }
-        cx.notify();
-    }
-
-    fn use_classic_view(&mut self, _: &ClassicView, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_view_mode(ReaderView::Classic, window, cx);
-    }
-
-    fn use_fluid_view(&mut self, _: &FluidView, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_view_mode(ReaderView::Fluid, window, cx);
     }
 
     #[cfg(feature = "installable-extensions")]
@@ -3427,7 +3367,6 @@ impl PdfReader {
             zoom: self.zoom,
             fit_width: self.fit_width,
             scroll: self.scroll,
-            view_mode: self.view_mode,
             pdf_dark_mode_enabled: self.pdf_dark_mode_enabled,
         }
     }
@@ -3437,18 +3376,10 @@ impl PdfReader {
     }
 
     fn content_top(&self) -> f32 {
-        self.reader_toolbar_height()
-            + if matches!(self.status, ReaderStatus::Error(_)) {
-                ERROR_BAR_HEIGHT
-            } else {
-                0.0
-            }
-    }
-
-    fn reader_toolbar_height(&self) -> f32 {
-        match self.view_mode {
-            ReaderView::Classic => TOOLBAR_HEIGHT,
-            ReaderView::Fluid => 0.0,
+        if matches!(self.status, ReaderStatus::Error(_)) {
+            ERROR_BAR_HEIGHT
+        } else {
+            0.0
         }
     }
 
@@ -4721,7 +4652,7 @@ impl PdfReader {
             .id("fluid-main-pill")
             .block_mouse_except_scroll()
             .h(px(44.0))
-            .max_w(px((state.available_width - 24.0).max(280.0)))
+            .max_w(px((state.available_width - 24.0).max(1.0)))
             .px_1()
             .flex()
             .items_center()
@@ -4859,6 +4790,7 @@ impl PdfReader {
     fn render_fluid_context_pill(
         &mut self,
         position: Offset,
+        width: f32,
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -4875,12 +4807,13 @@ impl PdfReader {
             .left(px(position.x))
             .top(px(position.y))
             .h(px(FLUID_CONTEXT_PILL_HEIGHT))
-            .w(px(FLUID_CONTEXT_PILL_WIDTH))
+            .w(px(width))
             .px_1()
             .flex()
             .items_center()
             .justify_center()
             .gap_1()
+            .overflow_hidden()
             .rounded_full()
             .border_1()
             .border_color(palette.text.opacity(0.15))

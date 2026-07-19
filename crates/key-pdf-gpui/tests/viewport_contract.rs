@@ -282,7 +282,7 @@ fn adjacent_tile_destinations_share_the_same_global_edge() {
 }
 
 #[test]
-fn viewport_and_sidebar_width_changes_preserve_the_center_page_anchor() {
+fn viewport_resize_and_overlay_occlusion_preserve_the_center_page_anchor() {
     let mut controller = controller(6, 1_200.0, 760.0);
     controller.set_scroll(ScrollOffset::new(0.0, 1_900.0));
     let before = anchor_at_center(&controller);
@@ -295,22 +295,22 @@ fn viewport_and_sidebar_width_changes_preserve_the_center_page_anchor() {
         }),
         InputDisposition::Applied
     );
-    let classic_sidebar = anchor_at_center(&controller);
-    assert_eq!(before.page, classic_sidebar.page);
-    assert!((before.x_fraction - classic_sidebar.x_fraction).abs() < 0.0001);
-    assert!((before.y_fraction - classic_sidebar.y_fraction).abs() < 0.0001);
+    let resized = anchor_at_center(&controller);
+    assert_eq!(before.page, resized.page);
+    assert!((before.x_fraction - resized.x_fraction).abs() < 0.0001);
+    assert!((before.y_fraction - resized.y_fraction).abs() < 0.0001);
 
-    let before_fluid = classic_sidebar;
+    let before_overlay = resized;
     controller.set_viewport(ViewportMetrics {
         width: 1_200.0,
         height: 760.0,
         right_occlusion: 344.0,
         scale_factor: 2.0,
     });
-    let fluid_overlay = anchor_at_center(&controller);
-    assert_eq!(before_fluid.page, fluid_overlay.page);
-    assert!((before_fluid.x_fraction - fluid_overlay.x_fraction).abs() < 0.0001);
-    assert!((before_fluid.y_fraction - fluid_overlay.y_fraction).abs() < 0.0001);
+    let overlay = anchor_at_center(&controller);
+    assert_eq!(before_overlay.page, overlay.page);
+    assert!((before_overlay.x_fraction - overlay.x_fraction).abs() < 0.0001);
+    assert!((before_overlay.y_fraction - overlay.y_fraction).abs() < 0.0001);
 }
 
 #[test]

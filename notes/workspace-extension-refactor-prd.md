@@ -326,7 +326,7 @@ monolithic reader view.
 ### Exit criteria
 
 - A harness can embed the PDF component without the app's main window type.
-- Classic and Fluid views retain feature parity.
+- The single floating-control reader layout retains all reader features.
 - Shared controls no longer have feature-specific dependencies.
 - Panel layout, z-order, focus, text selection, animations, and accessibility
   behavior pass component and macOS E2E checks.
@@ -679,7 +679,7 @@ Agree:
 - Standard reader with a reference third-party package.
 - Safe mode with all third-party extensions disabled.
 - Future Key app and notes-only configuration.
-- Native macOS E2E for Classic and Fluid views, zoom, display changes, themes,
+- Native macOS E2E for the floating reader layout, zoom, display changes, themes,
   search, comments, TOC, links, and scholarly references.
 
 ### Quality gates for every phase

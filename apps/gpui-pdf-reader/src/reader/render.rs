@@ -1,4 +1,4 @@
-use super::comments::{annotation_actions_enabled, comments_toolbar_label, floating_pill_position};
+use super::comments::floating_pill_position;
 use super::*;
 
 struct PaintPageOverlayState {
@@ -226,9 +226,44 @@ impl PaintPageOverlayState {
 }
 
 impl PdfReader {
+    fn record_pane_bounds(
+        bounds: Bounds<Pixels>,
+        measured_bounds: &Cell<Option<Bounds<Pixels>>>,
+        reader: gpui::WeakEntity<PdfReader>,
+        window: &mut Window,
+    ) {
+        if measured_bounds.replace(Some(bounds)) == Some(bounds) {
+            return;
+        }
+        window.on_next_frame(move |window, cx| {
+            reader
+                .update(cx, |reader, cx| {
+                    reader.update_viewport_for_pane(bounds.size, window);
+                    reader.request_visible_tiles(window);
+                    cx.notify();
+                })
+                .ok();
+        });
+    }
+
+    fn empty_pane_bounds_probe(
+        measured_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+        reader: gpui::WeakEntity<PdfReader>,
+    ) -> impl IntoElement {
+        canvas(
+            move |bounds, window, _| {
+                Self::record_pane_bounds(bounds, &measured_bounds, reader, window);
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0()
+    }
+
     fn document_canvas(
         mut snapshot: PaintSnapshot,
         canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+        reader: gpui::WeakEntity<PdfReader>,
     ) -> impl IntoElement {
         snapshot.canvas.pages.sort_by_key(|page| {
             let has_active_annotation = page
@@ -256,10 +291,14 @@ impl PdfReader {
             active_search,
             navigation_focus,
         );
-        pdf_canvas(canvas, move |page, window| {
-            canvas_bounds.set(Some(page.canvas_bounds));
-            overlay_state.paint_page(page, window);
-        })
+        let measured_bounds = canvas_bounds.clone();
+        pdf_canvas_measured(
+            canvas,
+            move |bounds, window, _| {
+                Self::record_pane_bounds(bounds, &measured_bounds, reader, window);
+            },
+            move |page, window| overlay_state.paint_page(page, window),
+        )
         .size_full()
     }
 }
@@ -282,9 +321,7 @@ impl Render for PdfReader {
         palette.paper_border = theme::pdf_paper_border(active_theme, forced_dark);
         self.update_viewport(window);
         self.request_visible_tiles(window);
-        let full_width = f32::from(window.viewport_size().width).max(1.0);
-        let compact_toolbar = full_width < 920.0;
-        let very_compact_toolbar = full_width < 800.0;
+        let full_width = self.viewport_width.max(1.0);
 
         let page_count = self
             .document
@@ -294,214 +331,9 @@ impl Render for PdfReader {
         let zoom_label: SharedString = format!("{}%", (self.zoom * 100.0).round() as u32).into();
         let document_open = page_count > 0;
         let (zoom_out_enabled, zoom_in_enabled) = zoom_controls_enabled(document_open, self.zoom);
-        let editor_open = self.comment_editor.is_some();
-        let comments_label =
-            comments_toolbar_label(editor_open, compact_toolbar, very_compact_toolbar);
-        let has_annotation_context = self.context_range().is_some();
-        let show_annotation_tools = has_annotation_context && !editor_open;
-        let annotation_tools_enabled = annotation_actions_enabled(
-            has_annotation_context,
-            self.annotations_loading,
-            self.annotation_persistence_blocked,
-            editor_open,
-        );
         let search_selected = self.sidebar.panel == SidePanel::Search && self.sidebar.target > 0.5;
         let comments_selected =
             self.sidebar.panel == SidePanel::Comments && self.sidebar.target > 0.5;
-        let classic_toolbar = div()
-            .h(px(TOOLBAR_HEIGHT))
-            .flex_none()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .bg(palette.chrome)
-            .border_b_1()
-            .border_color(palette.separator)
-            .text_color(palette.text)
-            .child(Self::chrome_button(
-                palette,
-                "open-document",
-                if very_compact_toolbar {
-                    "Open"
-                } else {
-                    "Open…"
-                },
-                ChromeButtonStyle::Ghost,
-                true,
-                cx.listener(|reader, _, window, cx| reader.open_dialog(&OpenDocument, window, cx)),
-            ))
-            .child(
-                div()
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(palette.separator)
-                    .bg(palette.control)
-                    .child(Self::segment_button(
-                        palette,
-                        "zoom-out",
-                        Icon::new(IconName::Minus),
-                        zoom_out_enabled,
-                        cx.listener(|reader, _, window, cx| reader.zoom_out(&ZoomOut, window, cx)),
-                    ))
-                    .child(
-                        div()
-                            .h_full()
-                            .min_w(px(54.0))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .border_l_1()
-                            .border_r_1()
-                            .border_color(palette.separator)
-                            .text_sm()
-                            .text_color(if document_open {
-                                palette.text
-                            } else {
-                                palette.text_tertiary
-                            })
-                            .child(zoom_label.clone()),
-                    )
-                    .child(Self::segment_button(
-                        palette,
-                        "zoom-in",
-                        Icon::new(IconName::Plus),
-                        zoom_in_enabled,
-                        cx.listener(|reader, _, window, cx| reader.zoom_in(&ZoomIn, window, cx)),
-                    ))
-                    .when(!very_compact_toolbar, |controls| {
-                        controls
-                            .child(div().h_full().w(px(1.0)).bg(palette.separator))
-                            .child(Self::segment_button(
-                                palette,
-                                "fit-width",
-                                if compact_toolbar { "Fit" } else { "Fit Width" },
-                                document_open,
-                                cx.listener(|reader, _, window, cx| {
-                                    reader.fit_width(&FitWidth, window, cx)
-                                }),
-                            ))
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .h_full()
-                    .window_control_area(WindowControlArea::Drag),
-            )
-            .when(show_annotation_tools, |toolbar| {
-                toolbar.child(
-                    div()
-                        .h(px(34.0))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .px_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(palette.separator)
-                        .bg(palette.control)
-                        .when(!compact_toolbar, |controls| {
-                            controls.child(
-                                div()
-                                    .pl_2()
-                                    .pr_1()
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(palette.text_secondary)
-                                    .child("Highlight"),
-                            )
-                        })
-                        .children(
-                            [
-                                "highlight-yellow",
-                                "highlight-green",
-                                "highlight-blue",
-                                "highlight-pink",
-                                "highlight-purple",
-                            ]
-                            .into_iter()
-                            .zip(HighlightColor::ALL)
-                            .map(|(id, color)| {
-                                Self::highlight_button(
-                                    palette,
-                                    id,
-                                    color,
-                                    annotation_tools_enabled,
-                                    cx.listener(move |reader, _, _, cx| {
-                                        reader.add_highlight(color, cx)
-                                    }),
-                                )
-                            }),
-                        )
-                        .child(div().h(px(22.0)).w(px(1.0)).bg(palette.separator))
-                        .child(Self::segment_button(
-                            palette,
-                            "add-selection-comment",
-                            if self.context_has_comment() {
-                                if very_compact_toolbar {
-                                    "Edit"
-                                } else {
-                                    "Edit Comment"
-                                }
-                            } else if very_compact_toolbar {
-                                "Note"
-                            } else {
-                                "Comment"
-                            },
-                            annotation_tools_enabled,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.comment_on_context(window, cx)
-                            }),
-                        )),
-                )
-            })
-            .when(
-                !(very_compact_toolbar && show_annotation_tools),
-                |toolbar| {
-                    toolbar
-                        .child(Self::chrome_button(
-                            palette,
-                            "toggle-search",
-                            if compact_toolbar { "Find" } else { "Search" },
-                            if search_selected {
-                                ChromeButtonStyle::Selected
-                            } else {
-                                ChromeButtonStyle::Ghost
-                            },
-                            document_open,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.find_document(&Find, window, cx)
-                            }),
-                        ))
-                        .child(Self::chrome_button(
-                            palette,
-                            "toggle-comments",
-                            comments_label,
-                            if comments_selected {
-                                ChromeButtonStyle::Selected
-                            } else {
-                                ChromeButtonStyle::Ghost
-                            },
-                            document_open,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.toggle_comments(&ToggleComments, window, cx)
-                            }),
-                        ))
-                },
-            );
-
-        let toolbar = match self.view_mode {
-            ReaderView::Classic => Some(classic_toolbar.into_any_element()),
-            ReaderView::Fluid => None,
-        };
         let toc_navigation = self.render_toc_navigation(palette, cx);
         let link_preview = self.render_link_preview_card(palette, cx);
 
@@ -596,9 +428,10 @@ impl Render for PdfReader {
             div()
                 .id("document-viewport")
                 .relative()
-                .flex_none()
+                .min_w_0()
+                .flex_1()
                 .h_full()
-                .w(px(self.viewport_width))
+                .w_full()
                 .overflow_hidden()
                 .bg(palette.canvas)
                 .cursor(if self.pan.is_some() {
@@ -617,15 +450,21 @@ impl Render for PdfReader {
                 .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                 .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
-                .child(Self::document_canvas(snapshot, self.canvas_bounds.clone()))
+                .child(Self::document_canvas(
+                    snapshot,
+                    self.canvas_bounds.clone(),
+                    cx.weak_entity(),
+                ))
                 .children(toc_navigation)
                 .into_any_element()
         } else {
             div()
                 .id("empty-state")
-                .flex_none()
+                .relative()
+                .min_w_0()
+                .flex_1()
                 .h_full()
-                .w(px(self.viewport_width))
+                .w_full()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -633,6 +472,10 @@ impl Render for PdfReader {
                 .gap_3()
                 .bg(palette.canvas_empty)
                 .text_color(palette.text)
+                .child(Self::empty_pane_bounds_probe(
+                    self.canvas_bounds.clone(),
+                    cx.weak_entity(),
+                ))
                 .child(
                     div()
                         .mb_2()
@@ -689,119 +532,84 @@ impl Render for PdfReader {
             SidePanel::Search => self.render_search_panel(cx),
             SidePanel::Extensions => self.render_extensions_panel(cx),
         };
-        let workspace = match self.view_mode {
-            ReaderView::Classic => {
-                let sidebar_width = self.sidebar.available_width(full_width);
-                let sidebar_inner_width =
-                    SIDEBAR_WIDTH.min((full_width - MIN_DOCUMENT_VIEWPORT_WIDTH).max(0.0));
-                let sidebar = div()
-                    .id("reader-sidebar")
-                    .h_full()
-                    .w(px(sidebar_width))
-                    .flex_none()
-                    .overflow_hidden()
-                    .bg(palette.surface)
-                    .border_l_1()
-                    .border_color(palette.separator)
-                    .child(
-                        div()
-                            .h_full()
-                            .w(px(sidebar_inner_width))
-                            .child(sidebar_content),
-                    );
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .w_full()
-                    .flex()
-                    .overflow_hidden()
-                    .child(content)
-                    .child(sidebar)
-                    .children(link_preview)
-                    .into_any_element()
-            }
-            ReaderView::Fluid => {
-                let panel_width = self.fluid_panel_width();
-                let sidebar_reveal =
-                    fluid_sidebar_extent(self.viewport_width, self.sidebar.progress);
-                let panel_reveal = self.fluid_panel_occlusion();
-                let available_width = (self.viewport_width - panel_reveal).max(1.0);
-                let main_pill = self.render_fluid_main_pill(
-                    FluidPillState {
-                        available_width,
-                        document_open,
-                        zoom_out_enabled,
-                        zoom_in_enabled,
-                        zoom_label,
-                        search_selected,
-                        comments_selected,
-                    },
-                    cx,
+        let panel_width = self.fluid_panel_width();
+        let sidebar_reveal = fluid_sidebar_extent(self.viewport_width, self.sidebar.progress);
+        let panel_reveal = self.fluid_panel_occlusion();
+        let available_width = (self.viewport_width - panel_reveal).max(1.0);
+        let main_pill = self.render_fluid_main_pill(
+            FluidPillState {
+                available_width,
+                document_open,
+                zoom_out_enabled,
+                zoom_in_enabled,
+                zoom_label,
+                search_selected,
+                comments_selected,
+            },
+            cx,
+        );
+        let has_stable_selection = self
+            .selection
+            .is_some_and(|selection| selection.anchor != selection.focus);
+        let show_context_pill = !self.selecting
+            && self.comment_editor.is_none()
+            && (has_stable_selection || self.active_annotation.is_some());
+        let context_enabled =
+            show_context_pill && !self.annotations_loading && !self.annotation_persistence_blocked;
+        let context_pill = show_context_pill
+            .then(|| self.context_anchor_in_viewport())
+            .flatten()
+            .map(|anchor| {
+                let context_pill_width =
+                    FLUID_CONTEXT_PILL_WIDTH.min((available_width - 24.0).max(1.0));
+                let position = floating_pill_position(
+                    anchor,
+                    available_width,
+                    self.viewport_height,
+                    context_pill_width,
+                    FLUID_CONTEXT_PILL_HEIGHT,
                 );
-                let has_stable_selection = self
-                    .selection
-                    .is_some_and(|selection| selection.anchor != selection.focus);
-                let show_context_pill = !self.selecting
-                    && self.comment_editor.is_none()
-                    && (has_stable_selection || self.active_annotation.is_some());
-                let context_enabled = show_context_pill
-                    && !self.annotations_loading
-                    && !self.annotation_persistence_blocked;
-                let context_pill = show_context_pill
-                    .then(|| self.context_anchor_in_viewport())
-                    .flatten()
-                    .map(|anchor| {
-                        let position = floating_pill_position(
-                            anchor,
-                            available_width,
-                            self.viewport_height,
-                            FLUID_CONTEXT_PILL_WIDTH,
-                            FLUID_CONTEXT_PILL_HEIGHT,
-                        );
-                        self.render_fluid_context_pill(position, context_enabled, cx)
-                    });
-                let sidebar = div()
-                    .id("fluid-sidebar-reveal")
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right_0()
-                    .w(px(sidebar_reveal))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .id("reader-sidebar")
-                            .absolute()
-                            .top(px(FLUID_PANEL_VERTICAL_MARGIN))
-                            .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
-                            .right(px(FLUID_PANEL_HORIZONTAL_MARGIN))
-                            .w(px(panel_width))
-                            .child(FloatingPanel::new(palette, sidebar_content)),
-                    );
+                self.render_fluid_context_pill(position, context_pill_width, context_enabled, cx)
+            });
+        let sidebar = div()
+            .id("fluid-sidebar-reveal")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(sidebar_reveal))
+            .overflow_hidden()
+            .child(
                 div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .w_full()
-                    .overflow_hidden()
-                    .child(content)
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(14.0))
-                            .left_0()
-                            .w(px(available_width))
-                            .flex()
-                            .justify_center()
-                            .child(main_pill),
-                    )
-                    .children(context_pill)
-                    .child(sidebar)
-                    .children(link_preview)
-                    .into_any_element()
-            }
-        };
+                    .id("reader-sidebar")
+                    .absolute()
+                    .top(px(FLUID_PANEL_VERTICAL_MARGIN))
+                    .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
+                    .right(px(FLUID_PANEL_HORIZONTAL_MARGIN))
+                    .w(px(panel_width))
+                    .child(FloatingPanel::new(palette, sidebar_content)),
+            );
+        let workspace = div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .overflow_hidden()
+            .child(content)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(14.0))
+                    .left_0()
+                    .w(px(available_width))
+                    .flex()
+                    .justify_center()
+                    .child(main_pill),
+            )
+            .children(context_pill)
+            .child(sidebar)
+            .children(link_preview)
+            .into_any_element();
 
         let error_bar = if let ReaderStatus::Error(message) = &self.status {
             Some(
@@ -858,11 +666,8 @@ impl Render for PdfReader {
             .on_action(cx.listener(Self::add_comment))
             .on_action(cx.listener(Self::next_search_result))
             .on_action(cx.listener(Self::previous_search_result))
-            .on_action(cx.listener(Self::use_classic_view))
-            .on_action(cx.listener(Self::use_fluid_view))
             .on_action(cx.listener(Self::invoke_extension_command))
             .on_action(cx.listener(Self::quit_application))
-            .children(toolbar)
             .children(error_bar)
             .child(workspace)
             .children(extension_ui_panel)

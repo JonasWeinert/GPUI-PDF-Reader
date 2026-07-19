@@ -3,7 +3,7 @@ use gpui::{App, ClickEvent, FontWeight, IntoElement, SharedString, Window, div, 
 use gpui_component::{Icon, IconName};
 pub(super) use key_ui_gpui::ChromeButtonStyle;
 
-/// Shared button chrome used by classic, fluid, and floating reader controls.
+/// Shared button chrome used by reader panels and floating controls.
 pub(super) fn chrome_button(
     palette: ReaderPalette,
     id: &'static str,

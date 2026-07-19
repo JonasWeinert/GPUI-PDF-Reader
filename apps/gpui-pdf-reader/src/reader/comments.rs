@@ -36,7 +36,7 @@ pub(super) struct CommentEmptyPresentation {
 }
 
 impl CommentEmptyPresentation {
-    pub(super) fn new(loading: bool, persistence_blocked: bool, fluid: bool) -> Self {
+    pub(super) fn new(loading: bool, persistence_blocked: bool) -> Self {
         let title = if loading {
             "Loading comments…"
         } else if persistence_blocked {
@@ -46,10 +46,8 @@ impl CommentEmptyPresentation {
         };
         let detail = if persistence_blocked {
             "Resolve the annotation sidecar problem before adding comments."
-        } else if fluid {
-            "Select text, then use either floating Note control."
         } else {
-            "Select text in the document, then choose New Comment."
+            "Select text, then use either floating Note control."
         };
         Self { title, detail }
     }
@@ -76,47 +74,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_copy_keeps_layout_specific_guidance() {
-        let classic = CommentEmptyPresentation::new(false, false, false);
-        let fluid = CommentEmptyPresentation::new(false, false, true);
-        assert_eq!(classic.title, fluid.title);
-        assert_ne!(classic.detail, fluid.detail);
+    fn empty_copy_explains_the_floating_note_controls() {
+        let empty = CommentEmptyPresentation::new(false, false);
+        assert_eq!(empty.title, "No comments yet");
+        assert!(empty.detail.contains("floating Note"));
         assert_eq!(
-            CommentEmptyPresentation::new(false, true, true).title,
+            CommentEmptyPresentation::new(false, true).title,
             "Comments unavailable"
         );
     }
 }
 
-pub(super) fn annotation_actions_enabled(
-    has_context: bool,
-    annotations_loading: bool,
-    persistence_blocked: bool,
-    comment_editor_open: bool,
-) -> bool {
-    has_context && !annotations_loading && !persistence_blocked && !comment_editor_open
-}
-
 pub(super) fn comment_draft_needs_confirmation(editor_open: bool, draft_dirty: bool) -> bool {
     editor_open && draft_dirty
-}
-
-pub(super) fn comments_toolbar_label(
-    editor_open: bool,
-    compact_toolbar: bool,
-    very_compact_toolbar: bool,
-) -> &'static str {
-    if editor_open {
-        if compact_toolbar {
-            "Notes •"
-        } else {
-            "Comments · Editing"
-        }
-    } else if very_compact_toolbar {
-        "Notes"
-    } else {
-        "Comments"
-    }
 }
 
 pub(super) fn floating_pill_position(
@@ -136,42 +106,6 @@ pub(super) fn floating_pill_position(
         (anchor.y - pill_height - 10.0).max(margin)
     };
     Offset { x, y }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CommentListStyle {
-    Classic,
-    Fluid,
-}
-
-impl CommentListStyle {
-    fn list_id(self) -> &'static str {
-        match self {
-            Self::Classic => "comment-list",
-            Self::Fluid => "fluid-comment-list",
-        }
-    }
-
-    fn row_id(self) -> &'static str {
-        match self {
-            Self::Classic => "comment",
-            Self::Fluid => "fluid-comment",
-        }
-    }
-
-    fn row_height(self) -> f32 {
-        match self {
-            Self::Classic => 104.0,
-            Self::Fluid => 96.0,
-        }
-    }
-
-    fn preview_height(self) -> f32 {
-        match self {
-            Self::Classic => 44.0,
-            Self::Fluid => 42.0,
-        }
-    }
 }
 
 impl PdfReader {
@@ -549,12 +483,9 @@ impl PdfReader {
         self.editing_annotation = editing;
         self.comment_editor = Some(editor.clone());
         self.comment_draft_dirty = false;
-        self.comment_pane
-            .show_editor(self.view_mode == ReaderView::Fluid);
+        self.comment_pane.show_editor(true);
         self.show_sidebar(SidePanel::Comments, window, cx);
-        if self.view_mode == ReaderView::Fluid {
-            self.start_animation(window, cx);
-        }
+        self.start_animation(window, cx);
         window.focus(&editor.focus_handle(cx));
         cx.notify();
     }
@@ -697,13 +628,15 @@ impl PdfReader {
         self.cancel_comment_autosave();
         self.comment_draft_dirty = false;
         window.focus(&self.focus_handle);
-        if self.view_mode == ReaderView::Fluid {
-            self.comment_pane.show_list(true);
-            self.start_animation(window, cx);
-        } else {
-            self.comment_pane.show_list(false);
+        self.comment_pane.show_list(true);
+        // If Back is activated before the editor's entrance animation has
+        // painted its first frame, both the current and target progress are
+        // already zero. There is then no animation tick to perform the
+        // deferred unmount, so finish it synchronously.
+        if !self.comment_pane.is_animating() {
             self.finish_comment_editor_close();
         }
+        self.start_animation(window, cx);
         cx.notify();
     }
 
@@ -867,12 +800,11 @@ impl PdfReader {
 
     pub(super) fn render_comment_list(
         &mut self,
-        style: CommentListStyle,
         palette: ReaderPalette,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         uniform_list(
-            style.list_id(),
+            "comment-list",
             self.comment_order.len(),
             cx.processor(move |reader, range: std::ops::Range<usize>, _window, cx| {
                 range
@@ -880,106 +812,82 @@ impl PdfReader {
                         let id = *reader.comment_order.get(index)?;
                         let (page, preview, color, active) =
                             reader.comment_row_presentation(id, palette)?;
-                        let action = match style {
-                            CommentListStyle::Fluid => div()
-                                .text_color(if active {
-                                    palette.accent
-                                } else {
-                                    palette.text_secondary
-                                })
-                                .child(Self::icon_label(IconName::ArrowRight, "Open"))
-                                .into_any_element(),
-                            CommentListStyle::Classic => div()
-                                .id(("edit-comment", index))
-                                .px_2()
-                                .py_1()
-                                .overflow_hidden()
-                                .rounded_md()
-                                .text_color(palette.accent)
-                                .hover(|button| button.bg(palette.accent_soft))
-                                .on_click(cx.listener(move |reader, _, window, cx| {
-                                    reader.edit_comment(id, window, cx)
-                                }))
-                                .child("Edit")
-                                .into_any_element(),
-                        };
+                        let action = div()
+                            .text_color(if active {
+                                palette.accent
+                            } else {
+                                palette.text_secondary
+                            })
+                            .child(Self::icon_label(IconName::ArrowRight, "Open"));
                         Some(
-                            div()
-                                .h(px(style.row_height()))
-                                .w_full()
-                                .px_3()
-                                .py_1()
-                                .child(
-                                    div()
-                                        .id((style.row_id(), index))
-                                        .size_full()
-                                        .overflow_hidden()
-                                        .flex()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(if active {
-                                            palette.accent_border
+                            div().h(px(96.0)).w_full().px_3().py_1().child(
+                                div()
+                                    .id(("comment", index))
+                                    .size_full()
+                                    .overflow_hidden()
+                                    .flex()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(if active {
+                                        palette.accent_border
+                                    } else {
+                                        palette.separator
+                                    })
+                                    .bg(if active {
+                                        palette.accent_soft
+                                    } else {
+                                        palette.surface
+                                    })
+                                    .cursor_pointer()
+                                    .hover(move |row| {
+                                        row.bg(if active {
+                                            palette.accent_soft_hover
                                         } else {
-                                            palette.separator
+                                            palette.surface_subtle
                                         })
-                                        .bg(if active {
-                                            palette.accent_soft
-                                        } else {
-                                            palette.surface
-                                        })
-                                        .cursor_pointer()
-                                        .hover(move |row| {
-                                            row.bg(if active {
-                                                palette.accent_soft_hover
-                                            } else {
-                                                palette.surface_subtle
-                                            })
-                                        })
-                                        .on_click(cx.listener(move |reader, _, window, cx| {
-                                            reader.open_comment_from_list(id, window, cx);
-                                        }))
-                                        .child(div().w(px(4.0)).h_full().flex_none().bg(color))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .px_3()
-                                                .py_2()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .child(
-                                                            div()
-                                                                .text_color(if active {
-                                                                    palette.accent
-                                                                } else {
-                                                                    palette.text_secondary
-                                                                })
-                                                                .child(format!(
-                                                                    "PAGE {}",
-                                                                    page + 1
-                                                                )),
-                                                        )
-                                                        .child(action),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .h(px(style.preview_height()))
-                                                        .overflow_hidden()
-                                                        .text_sm()
-                                                        .line_height(px(20.0))
-                                                        .text_color(palette.text)
-                                                        .child(preview),
-                                                ),
-                                        ),
-                                ),
+                                    })
+                                    .on_click(cx.listener(move |reader, _, window, cx| {
+                                        reader.open_comment_from_list(id, window, cx);
+                                    }))
+                                    .child(div().w(px(4.0)).h_full().flex_none().bg(color))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .px_3()
+                                            .py_2()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .child(
+                                                        div()
+                                                            .text_color(if active {
+                                                                palette.accent
+                                                            } else {
+                                                                palette.text_secondary
+                                                            })
+                                                            .child(format!("PAGE {}", page + 1)),
+                                                    )
+                                                    .child(action),
+                                            )
+                                            .child(
+                                                div()
+                                                    .h(px(42.0))
+                                                    .overflow_hidden()
+                                                    .text_sm()
+                                                    .line_height(px(20.0))
+                                                    .text_color(palette.text)
+                                                    .child(preview),
+                                            ),
+                                    ),
+                            ),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -990,14 +898,11 @@ impl PdfReader {
         .min_h(px(0.0))
         .w_full()
         .bg(palette.surface_subtle)
-        .when(style == CommentListStyle::Fluid, |list| list.rounded_b_xl())
+        .rounded_b_xl()
         .into_any_element()
     }
 
-    pub(super) fn render_fluid_comments_panel(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    pub(super) fn render_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let palette = ReaderPalette::from_theme(Theme::global(cx));
         let list_header = div()
             .h(px(54.0))
@@ -1035,11 +940,10 @@ impl PdfReader {
             let empty = CommentEmptyPresentation::new(
                 self.annotations_loading,
                 self.annotation_persistence_blocked,
-                true,
             );
             empty_state(palette, IconName::BookOpen, empty.title, empty.detail)
         } else {
-            self.render_comment_list(CommentListStyle::Fluid, palette, cx)
+            self.render_comment_list(palette, cx)
         };
 
         let list_error = self
@@ -1173,13 +1077,6 @@ impl PdfReader {
             .into_any_element()
     }
 
-    pub(super) fn render_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        match self.view_mode {
-            ReaderView::Classic => self.render_classic_comments_panel(cx),
-            ReaderView::Fluid => self.render_fluid_comments_panel(cx),
-        }
-    }
-
     pub(super) fn comment_row_presentation(
         &self,
         id: AnnotationId,
@@ -1205,126 +1102,5 @@ impl PdfReader {
             color,
             self.active_annotation == Some(id),
         ))
-    }
-
-    pub(super) fn render_classic_comments_panel(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
-        let error = self.annotation_error.clone();
-        let editor_open = self.comment_editor.is_some();
-        let annotations_pending = self
-            .annotations
-            .as_ref()
-            .is_some_and(|annotations| annotations.revision() > self.annotation_saved_revision);
-        let presentation = CommentEditorPresentation::new(
-            editor_open,
-            self.editing_annotation.is_some(),
-            self.comment_draft_dirty || self.comment_autosave_task.is_some() || annotations_pending,
-        );
-        let save_status = presentation.save_status;
-        let title = presentation.title;
-        let header = div()
-            .h(px(54.0))
-            .flex_none()
-            .px_4()
-            .flex()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(palette.separator)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when(editor_open, |heading| {
-                        heading.child(Self::chrome_button(
-                            palette,
-                            "classic-comment-back",
-                            Self::icon_label(IconName::ChevronLeft, "Overview"),
-                            ChromeButtonStyle::Ghost,
-                            true,
-                            cx.listener(|reader, _, window, cx| {
-                                reader.return_to_comment_list(window, cx)
-                            }),
-                        ))
-                    })
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
-                    .when(editor_open, |heading| {
-                        heading.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_full()
-                                .bg(if save_status == "Saved" {
-                                    palette.green.opacity(0.12)
-                                } else {
-                                    palette.accent_soft
-                                })
-                                .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(if save_status == "Saved" {
-                                    palette.green
-                                } else {
-                                    palette.accent
-                                })
-                                .child(save_status),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(Self::chrome_button(
-                        palette,
-                        "close-comments",
-                        Icon::new(IconName::Close).size(px(16.0)),
-                        ChromeButtonStyle::Ghost,
-                        true,
-                        cx.listener(|reader, _, window, cx| {
-                            reader.toggle_sidebar(SidePanel::Comments, window, cx)
-                        }),
-                    )),
-            );
-
-        let body = if let Some(editor) = self.comment_editor.clone() {
-            div()
-                .flex_1()
-                .min_h(px(0.0))
-                .p_4()
-                .flex()
-                .flex_col()
-                .child(editor)
-                .into_any_element()
-        } else if self.comment_order.is_empty() {
-            let empty = CommentEmptyPresentation::new(
-                self.annotations_loading,
-                self.annotation_persistence_blocked,
-                false,
-            );
-            empty_state(palette, IconName::BookOpen, empty.title, empty.detail)
-        } else {
-            self.render_comment_list(CommentListStyle::Classic, palette, cx)
-        };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(palette.surface)
-            .text_color(palette.text)
-            .child(header)
-            .children(error.map(|message| error_banner(palette, message)))
-            .child(body)
-            .into_any_element()
     }
 }
