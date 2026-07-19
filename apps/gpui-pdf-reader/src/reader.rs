@@ -628,6 +628,7 @@ pub struct PdfReader {
     reference_summary_previous_tab: ReferenceSummaryTab,
     doi_copy_started: Option<Instant>,
     link_card_expansion: RevealState,
+    external_link_preview_expanded: bool,
     #[cfg(debug_assertions)]
     scientific_analysis_complete: bool,
     scientific_document: bool,
@@ -842,6 +843,7 @@ impl PdfReader {
                 reference_summary_previous_tab: ReferenceSummaryTab::Tldr,
                 doi_copy_started: None,
                 link_card_expansion: RevealState::default(),
+                external_link_preview_expanded: false,
                 #[cfg(debug_assertions)]
                 scientific_analysis_complete: false,
                 scientific_document: false,
@@ -2508,6 +2510,7 @@ impl PdfReader {
         self.reference_summary_previous_tab = ReferenceSummaryTab::Tldr;
         self.doi_copy_started = None;
         self.link_card_expansion = RevealState::default();
+        self.external_link_preview_expanded = false;
         self.link_card_pointer = None;
         self.link_card_pointer_target = None;
         self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);

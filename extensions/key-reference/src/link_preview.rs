@@ -1,5 +1,6 @@
 //! Bounded website metadata and share-image previews.
 
+use crate::registry_preview::fetch_registry_preview;
 use crate::{ReferenceDocumentScope, ReferenceExecutor};
 use image::{ImageFormat, ImageReader, codecs::webp::WebPDecoder};
 use key_safe_http::{
@@ -28,10 +29,33 @@ const USER_AGENT_VALUE: &str = "GPUI-PDF-Reader/0.1 link-preview";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebsitePreview {
+    pub kind: LinkPreviewKind,
     pub title: Option<String>,
     pub site_name: Option<String>,
+    pub details: Vec<String>,
     pub resolved_url: String,
     pub image_path: Option<PathBuf>,
+}
+
+/// Describes where a link card's metadata came from.
+///
+/// Keeping this alongside the generic website model lets hosts render richer
+/// registry cards without owning provider-specific networking or parsing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkPreviewKind {
+    Website,
+    ClinicalTrialsGov,
+    Osf,
+}
+
+impl LinkPreviewKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Website => "Website",
+            Self::ClinicalTrialsGov => "ClinicalTrials.gov",
+            Self::Osf => "OSF Registration",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,6 +266,20 @@ fn fetch_website_preview(
     cache: &DocumentCache,
     cancellation: &CancellationToken,
 ) -> Result<WebsitePreview, String> {
+    // Registry APIs are deliberately attempted before scraping the landing
+    // page. They give stable structured fields and do not depend on markup.
+    // A failed specialized lookup falls through to the ordinary safe website
+    // preview so a public registry page still gets a useful card.
+    if let Some(Ok(registry)) = fetch_registry_preview(url, cancellation) {
+        return Ok(WebsitePreview {
+            kind: registry.kind,
+            title: Some(registry.title),
+            site_name: Some(registry.kind.label().to_owned()),
+            details: registry.details,
+            resolved_url: registry.resolved_url,
+            image_path: None,
+        });
+    }
     let response = safe_get(
         url,
         "text/html,application/xhtml+xml;q=0.9",
@@ -264,8 +302,10 @@ fn fetch_website_preview(
         .image_url
         .and_then(|image_url| fetch_and_cache_image(image_url, cache, cancellation).ok());
     Ok(WebsitePreview {
+        kind: LinkPreviewKind::Website,
         title: metadata.title,
         site_name: metadata.site_name,
+        details: Vec::new(),
         resolved_url: resolved.to_string(),
         image_path,
     })
@@ -656,8 +696,10 @@ mod tests {
             assert!(!cancellation.is_cancelled());
             self.calls.fetch_add(1, Ordering::AcqRel);
             Ok(WebsitePreview {
+                kind: LinkPreviewKind::Website,
                 title: Some("Injected preview".to_owned()),
                 site_name: None,
+                details: Vec::new(),
                 resolved_url: url.to_owned(),
                 image_path: None,
             })

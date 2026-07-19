@@ -622,6 +622,7 @@ impl PdfReader {
         self.link_source_hovered = true;
         if self.previewed_link != Some(id) || self.previewed_reference.is_some() {
             self.link_card_expansion = RevealState::default();
+            self.external_link_preview_expanded = false;
             self.clear_destination_preview(window, cx);
         }
         self.previewed_link = Some(id);
@@ -707,6 +708,7 @@ impl PdfReader {
         self.link_source_hovered = true;
         if self.previewed_reference != Some(index) || self.previewed_link.is_some() {
             self.link_card_expansion = RevealState::default();
+            self.external_link_preview_expanded = false;
             self.clear_destination_preview(window, cx);
         }
         self.previewed_link = None;
@@ -780,9 +782,25 @@ impl PdfReader {
         self.link_card_hovered = false;
         self.previewed_link = None;
         self.previewed_reference = None;
+        self.external_link_preview_expanded = false;
         self.link_card_pointer = None;
         self.link_card_pointer_target = None;
         self.clear_destination_preview(window, cx);
+    }
+
+    pub(super) fn toggle_external_link_preview_expansion(&mut self, cx: &mut Context<Self>) {
+        let is_external_link = self.previewed_link.is_some_and(|id| {
+            self.document
+                .as_ref()
+                .and_then(|document| document.links.iter().find(|link| link.id == id))
+                .is_some_and(|link| matches!(link.target, PdfLinkTarget::External { .. }))
+        });
+        if !is_external_link {
+            return;
+        }
+        self.external_link_preview_expanded = !self.external_link_preview_expanded;
+        self.link_card_reposition_revision = self.link_card_reposition_revision.wrapping_add(1);
+        cx.notify();
     }
 
     pub(super) fn link_pointer_in_viewport(&self, position: Point<Pixels>) -> Offset {
@@ -960,42 +978,72 @@ impl PdfReader {
                             .as_ref()
                             .and_then(|session| session.website(url))
                             .cloned();
-                        let (title, site_name, image_path, status) = match state {
+                        let (title, site_name, image_path, details, status) = match state {
                             Some(WebsitePreviewState::Ready(preview)) => (
                                 preview.title.unwrap_or_else(|| host.clone()),
                                 preview.site_name,
                                 preview.image_path,
+                                preview.details,
                                 None,
                             ),
                             Some(WebsitePreviewState::Failed(_)) => (
                                 host.clone(),
                                 None,
                                 None,
+                                Vec::new(),
                                 Some("Preview unavailable".to_owned()),
                             ),
                             Some(WebsitePreviewState::Loading) => (
                                 host.clone(),
                                 None,
                                 None,
+                                Vec::new(),
                                 Some("Loading website preview…".to_owned()),
                             ),
                             None => (
                                 host.clone(),
                                 None,
                                 None,
+                                Vec::new(),
                                 Some("Website preview is unavailable".to_owned()),
                             ),
                         };
+                        let detail_count = details.len();
+                        let expanded = self.external_link_preview_expanded;
                         let open_id = id;
                         let desired_width = if image_path.is_some() {
                             328.0
                         } else {
                             measured_preview_width(
-                                &[title.as_str(), site_name.as_deref().unwrap_or(&host)],
+                                &[
+                                    title.as_str(),
+                                    site_name.as_deref().unwrap_or(&host),
+                                    details.first().map(String::as_str).unwrap_or_default(),
+                                ],
                                 228.0,
                                 360.0,
                             )
                         };
+                        let detail_lines = if expanded {
+                            details
+                                .iter()
+                                .map(|detail| preview_card_text_lines(detail, desired_width, 2))
+                                .sum::<usize>()
+                        } else {
+                            detail_count
+                        };
+                        let title_lines = if expanded {
+                            preview_card_text_lines(&title, desired_width, 6)
+                        } else {
+                            1
+                        };
+                        let expansion_extra_lines = title_lines
+                            .saturating_add(detail_lines)
+                            .saturating_sub(1 + detail_count);
+                        let toggle_expansion = cx.listener(|reader, _, _, cx| {
+                            reader.toggle_external_link_preview_expansion(cx);
+                            cx.stop_propagation();
+                        });
                         let content = div()
                             .min_w_0()
                             .when_some(image_path, |content, image_path| {
@@ -1026,12 +1074,17 @@ impl PdfReader {
                                     )
                                     .child(
                                         div()
+                                            .id(("link-preview-summary", id))
                                             .min_w_0()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
+                                            .cursor_pointer()
+                                            .when(expanded, |title| title.whitespace_normal())
+                                            .when(!expanded, |title| {
+                                                title.whitespace_nowrap().text_ellipsis()
+                                            })
                                             .text_sm()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(palette.text)
+                                            .on_click(toggle_expansion)
                                             .child(title),
                                     ),
                             )
@@ -1053,6 +1106,20 @@ impl PdfReader {
                                         .text_color(palette.text_secondary)
                                         .child(status),
                                 )
+                            })
+                            .when(!details.is_empty(), |content| {
+                                content.child(div().mt_2().flex().flex_col().gap_1().children(
+                                    details.into_iter().map(|detail| {
+                                        div()
+                                            .text_xs()
+                                            .text_color(palette.text_secondary)
+                                            .when(expanded, |line| line.whitespace_normal())
+                                            .when(!expanded, |line| {
+                                                line.whitespace_nowrap().text_ellipsis()
+                                            })
+                                            .child(detail)
+                                    }),
+                                ))
                             })
                             .child(
                                 div()
@@ -1095,6 +1162,8 @@ impl PdfReader {
                                 274.0
                             } else {
                                 156.0
+                                    + detail_count as f32 * 18.0
+                                    + expansion_extra_lines as f32 * 18.0
                             },
                             desired_width,
                             palette.blue,
@@ -2719,6 +2788,16 @@ pub(super) fn measured_preview_width(lines: &[&str], minimum: f32, maximum: f32)
         .max()
         .unwrap_or(0);
     (longest as f32 * 6.6 + 54.0).clamp(minimum, maximum)
+}
+
+/// Estimates wrapped tooltip rows from the same compact text metrics used to
+/// choose card width. The card is repositioned on expansion, so this keeps a
+/// newly revealed title within the viewport rather than clipping its bottom.
+fn preview_card_text_lines(text: &str, card_width: f32, maximum_lines: usize) -> usize {
+    let usable_width = (card_width - 48.0).max(80.0);
+    let characters_per_line = (usable_width / 6.6).floor().max(1.0) as usize;
+    let count = text.chars().count().div_ceil(characters_per_line);
+    count.clamp(1, maximum_lines)
 }
 
 pub(super) fn escape_markdown_text(text: &str) -> String {
