@@ -250,7 +250,7 @@ fn reference_previews_measure_content_and_expand_their_shell_smoothly() {
     let expanded = reference_preview_width(Some(&ready), 1.0);
     assert_eq!(collapsed, 232.0);
     assert!(halfway > collapsed && halfway < expanded);
-    assert!(expanded <= LINK_CARD_WIDTH);
+    assert!(expanded <= key_ui_gpui::ReaderUiConfig::default().link_card_width);
     assert_eq!(reference_preview_width(None, 1.0), 232.0);
     assert_eq!(reference_hero_height("Short title"), 116.0);
     assert_eq!(
@@ -270,9 +270,18 @@ fn reference_previews_measure_content_and_expand_their_shell_smoothly() {
 
 #[test]
 fn dense_link_hover_requires_a_stable_neighbor_before_handoff() {
-    assert!(LINK_CARD_MOVE_DEBOUNCE < LINK_HOVER_HANDOFF_DELAY);
-    assert!(LINK_HOVER_HANDOFF_DELAY < LINK_HOVER_CLOSE_DELAY);
-    assert!(LINK_HOVER_CLOSE_DELAY >= Duration::from_millis(300));
+    assert!(
+        LINK_CARD_MOVE_DEBOUNCE
+            < Duration::from_millis(
+                key_ui_gpui::DesignSystemConfig::default()
+                    .motion
+                    .hover_handoff_delay_ms
+                    .into(),
+            )
+    );
+    let motion = key_ui_gpui::DesignSystemConfig::default().motion;
+    assert!(motion.hover_handoff_delay_ms < motion.hover_close_delay_ms);
+    assert!(motion.hover_close_delay_ms >= 300);
     let origin = point(px(100.0), px(200.0));
     let pending = PendingLinkHover {
         target: Some(PreviewTarget::Link(1)),
@@ -327,13 +336,19 @@ fn reference_panel_geometry_is_responsive_and_preserves_document_space() {
     assert_eq!(reference_panel_extent(250.0, 1.0), 0.0);
     assert_eq!(reference_panel_width(500.0), 176.0);
     assert!((reference_panel_width(1_100.0) - 396.0).abs() < 0.001);
-    assert_eq!(reference_panel_width(2_000.0), REFERENCE_PANEL_MAX_WIDTH);
+    assert_eq!(
+        reference_panel_width(2_000.0),
+        key_ui_gpui::ReaderUiConfig::default().reference_panel_max_width,
+    );
 
     let full_extent = reference_panel_extent(1_100.0, 1.0);
     assert!((full_extent - 420.0).abs() < 0.001);
     assert_eq!(reference_panel_extent(1_100.0, -2.0), 0.0);
     assert_eq!(reference_panel_extent(1_100.0, 2.0), full_extent);
-    assert!(1_100.0 - full_extent >= MIN_DOCUMENT_VIEWPORT_WIDTH);
+    assert!(
+        1_100.0 - full_extent
+            >= key_ui_gpui::ReaderUiConfig::default().minimum_document_viewport_width,
+    );
 
     assert_eq!(fluid_sidebar_extent(1_100.0, 0.0), 0.0);
     assert_eq!(fluid_sidebar_extent(1_100.0, 1.0), 368.0);
@@ -514,17 +529,18 @@ fn link_preview_helpers_choose_destination_context_and_keep_cards_on_screen() {
         340.0,
         190.0,
     );
-    assert!(position.x >= LINK_CARD_MARGIN);
-    assert!(position.x + 340.0 <= 800.0 - LINK_CARD_MARGIN + 0.001);
-    assert!(position.y >= LINK_CARD_MARGIN);
-    assert!(position.y + 190.0 <= 600.0 - LINK_CARD_MARGIN + 0.001);
+    let ui = key_ui_gpui::ReaderUiConfig::default();
+    assert!(position.x >= ui.link_card_margin);
+    assert!(position.x + 340.0 <= 800.0 - ui.link_card_margin + 0.001);
+    assert!(position.y >= ui.link_card_margin);
+    assert!(position.y + 190.0 <= 600.0 - ui.link_card_margin + 0.001);
     let pointer_position =
         pointer_link_card_position(Offset { x: 400.0, y: 240.0 }, 800.0, 600.0, 340.0, 190.0);
     assert!((pointer_position.x + 170.0 - 400.0).abs() < 0.001);
-    assert_eq!(pointer_position.y, 240.0 + LINK_CARD_GAP);
+    assert_eq!(pointer_position.y, 240.0 + ui.link_card_gap);
     let edge_position =
         pointer_link_card_position(Offset { x: 790.0, y: 590.0 }, 800.0, 600.0, 340.0, 190.0);
-    assert!(edge_position.x + 340.0 <= 800.0 - LINK_CARD_MARGIN + 0.001);
+    assert!(edge_position.x + 340.0 <= 800.0 - ui.link_card_margin + 0.001);
     assert!(edge_position.y < 590.0);
     assert!(!link_preview_should_close(true, false));
     assert!(!link_preview_should_close(false, true));
@@ -672,8 +688,8 @@ fn fluid_context_pill_stays_on_screen_and_prefers_below_the_selection() {
         },
         500.0,
         600.0,
-        FLUID_CONTEXT_PILL_WIDTH,
-        FLUID_CONTEXT_PILL_HEIGHT,
+        key_ui_gpui::ReaderUiConfig::default().context_pill_width,
+        key_ui_gpui::ReaderUiConfig::default().context_pill_height,
     );
     assert_eq!(below.y, 148.0);
     assert!((below.x - 93.0).abs() < f32::EPSILON);
@@ -687,8 +703,8 @@ fn fluid_context_pill_stays_on_screen_and_prefers_below_the_selection() {
         },
         500.0,
         600.0,
-        FLUID_CONTEXT_PILL_WIDTH,
-        FLUID_CONTEXT_PILL_HEIGHT,
+        key_ui_gpui::ReaderUiConfig::default().context_pill_width,
+        key_ui_gpui::ReaderUiConfig::default().context_pill_height,
     );
     assert_eq!(clamped_left.x, 12.0);
 
@@ -701,8 +717,8 @@ fn fluid_context_pill_stays_on_screen_and_prefers_below_the_selection() {
         },
         500.0,
         600.0,
-        FLUID_CONTEXT_PILL_WIDTH,
-        FLUID_CONTEXT_PILL_HEIGHT,
+        key_ui_gpui::ReaderUiConfig::default().context_pill_width,
+        key_ui_gpui::ReaderUiConfig::default().context_pill_height,
     );
     assert_eq!(above.x, 274.0);
     assert_eq!(above.y, 520.0);

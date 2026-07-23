@@ -8,17 +8,18 @@ use crate::application_host::{
 use crate::control_bar::ViewControlBar;
 use crate::reader::PdfReader;
 use crate::text_field::{TextField, TextFieldEvent};
-use crate::{OpenDocument, OpenSettings};
+use crate::{LoadUiConfiguration, OpenDocument, OpenSettings};
 use gpui::{
-    App, AppContext, BoxShadow, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement,
+    App, AppContext, Context, CursorStyle, Entity, FocusHandle, Focusable, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Render,
-    ScrollHandle, SharedString, Window, div, point, prelude::*, px, relative,
+    ScrollHandle, SharedString, Window, div, prelude::*, px, relative,
 };
-use gpui_component::{Icon, IconName, Theme};
+use gpui_component::{Icon, IconName};
 use key_ui_gpui::{
-    TAB_BAR_HEIGHT, TAB_HOVER_CARD_WIDTH, TabBarAction, TabDragPayload, TabDropAction,
-    TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover, TabSegmentAction, TabStrip,
-    ThemeTokens, UnitTransition, tab_hover_card_x, tab_search_popover_x,
+    ChromeLayoutConfig, ChromeRowOrder, DesignStyled as _, ElevationRole, RadiusRole, TabBarAction,
+    TabDragPayload, TabDropAction, TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover,
+    TabSegmentAction, TabStrip, ThemeTokens, UnitTransition, resolved_design_system, semantic_icon,
+    tab_hover_card_x, tab_hover_card_y, tab_search_popover_x, workspace_utility_controls,
 };
 use key_workspace_core::{
     ContentPlacement, DockPanel, ItemKind, ResourceAllocation, ResourceMode, SplitAxis, TabId,
@@ -91,9 +92,10 @@ impl WorkspaceViewSlot {
     }
 
     fn hover_card(&self, tokens: ThemeTokens, cx: &App) -> TabHoverCard {
+        let icons = resolved_design_system(cx).appearance.icons;
         let icon = match &self.content {
-            WorkspaceContent::Pdf(_) => IconName::File,
-            WorkspaceContent::Settings => IconName::Settings,
+            WorkspaceContent::Pdf(_) => semantic_icon(icons.document),
+            WorkspaceContent::Settings => semantic_icon(icons.settings),
         };
         let card = TabHoverCard::new(tokens, self.hover_title(cx)).leading(
             div()
@@ -102,7 +104,7 @@ impl WorkspaceViewSlot {
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded_lg()
+                .design_radius(RadiusRole::Large, &tokens)
                 .bg(tokens.action.accent_soft)
                 .text_color(tokens.action.accent)
                 .child(Icon::new(icon).size(px(15.0))),
@@ -118,7 +120,7 @@ impl WorkspaceViewSlot {
                     .gap_2()
                     .text_xs()
                     .text_color(tokens.content.tertiary)
-                    .child(Icon::new(IconName::Folder).size(px(13.0)))
+                    .child(Icon::new(semantic_icon(icons.folder)).size(px(13.0)))
                     .child(
                         div()
                             .min_w_0()
@@ -213,6 +215,7 @@ impl WorkspaceTab {
     }
 
     fn hover_card(&self, tokens: ThemeTokens, cx: &App) -> TabHoverCard {
+        let icons = resolved_design_system(cx).appearance.icons;
         let Some((first, second, _)) = self.split_views() else {
             return self.active_slot().hover_card(tokens, cx);
         };
@@ -231,9 +234,9 @@ impl WorkspaceTab {
                 .gap_3()
                 .child(
                     Icon::new(if slot.view.kind == ItemKind::Settings {
-                        IconName::Settings
+                        semantic_icon(icons.settings)
                     } else {
-                        IconName::File
+                        semantic_icon(icons.document)
                     })
                     .size(px(14.0))
                     .text_color(if view == active {
@@ -269,7 +272,12 @@ impl WorkspaceTab {
                         ),
                 )
                 .when(view == active, |row| {
-                    row.child(div().size(px(6.0)).rounded_full().bg(tokens.action.accent))
+                    row.child(
+                        div()
+                            .size(px(6.0))
+                            .design_radius(RadiusRole::Pill, &tokens)
+                            .bg(tokens.action.accent),
+                    )
                 })
         });
         TabHoverCard::new(tokens, "Split view")
@@ -280,7 +288,7 @@ impl WorkspaceTab {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded_lg()
+                    .design_radius(RadiusRole::Large, &tokens)
                     .bg(tokens.action.accent_soft)
                     .text_color(tokens.action.accent)
                     .child(Icon::new(IconName::Frame).size(px(15.0))),
@@ -628,6 +636,16 @@ impl WorkspaceWindow {
     }
 
     #[cfg(debug_assertions)]
+    pub(crate) fn qa_hold_inactive_tab_hover(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(index) = (0..self.tabs.len()).find(|index| *index != self.active_tab) else {
+            return false;
+        };
+        self.hovered_tab = Some(index);
+        cx.notify();
+        true
+    }
+
+    #[cfg(debug_assertions)]
     pub(crate) fn qa_split_state(
         &self,
     ) -> (usize, Vec<ViewId>, ViewId, Option<(ViewId, ViewId, f32)>) {
@@ -713,7 +731,7 @@ impl WorkspaceWindow {
             .active_slot()
             .control_bar
             .read(cx)
-            .qa_state()
+            .qa_state(cx)
     }
 
     pub(crate) fn open_pdf(
@@ -1075,7 +1093,10 @@ impl WorkspaceWindow {
             .duration_since(self.last_split_animation_tick)
             .as_secs_f32();
         self.last_split_animation_tick = now;
-        if self.split_activation.advance_with_response(elapsed, 26.0) {
+        if self.split_activation.advance_with_optional_response(
+            elapsed,
+            resolved_design_system(cx).motion.fast_response,
+        ) {
             self.queue_split_animation_frame(window, cx);
         } else {
             self.split_activation_from = None;
@@ -1401,7 +1422,7 @@ impl WorkspaceWindow {
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
+        let tokens = ThemeTokens::from_app(cx);
         let tabs = self
             .tabs
             .iter()
@@ -1477,6 +1498,14 @@ impl WorkspaceWindow {
                 })
                 .ok();
         });
+        let close_segment_weak = weak.clone();
+        let close_segment: TabSegmentAction = Rc::new(move |_, view, _, window, cx| {
+            close_segment_weak
+                .update(cx, |workspace, cx| {
+                    workspace.close_split_view(ViewId::from_raw(view), window, cx)
+                })
+                .ok();
+        });
         let search_weak = weak.clone();
         let search: TabBarAction = Rc::new(move |_, window, cx| {
             search_weak
@@ -1515,13 +1544,44 @@ impl WorkspaceWindow {
             new_tab,
         )
         .on_activate_segment(activate_segment)
+        .on_close_segment(close_segment)
         .on_close(close)
         .on_drop(drop)
         .into_any_element()
     }
 
+    fn chrome_layout(&self, window: &Window, cx: &App) -> ChromeLayoutConfig {
+        let system = resolved_design_system(cx);
+        let width = f32::from(window.viewport_size().width);
+        *system
+            .workspace
+            .chrome
+            .resolve(system.responsive.classify(width))
+    }
+
+    fn control_row_height(&self, cx: &App) -> f32 {
+        self.active_tab()
+            .active_slot()
+            .control_bar
+            .read(cx)
+            .current_height(cx)
+    }
+
+    fn tab_row_offset(&self, chrome: ChromeLayoutConfig, cx: &App) -> f32 {
+        if chrome.row_order == ChromeRowOrder::ControlsThenTabs {
+            self.control_row_height(cx)
+        } else {
+            0.0
+        }
+    }
+
+    fn total_chrome_height(&self, chrome: ChromeLayoutConfig, cx: &App) -> f32 {
+        chrome.tab_bar_height + self.control_row_height(cx)
+    }
+
     fn render_tab_search(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
+        let tokens = ThemeTokens::from_app(cx);
+        let icons = resolved_design_system(cx).appearance.icons;
         let weak = cx.weak_entity();
         let filtered_indices = self.filtered_tab_indices();
         let row_count = filtered_indices.len();
@@ -1564,7 +1624,7 @@ impl WorkspaceWindow {
                     .min_h(px(58.0))
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .design_radius(RadiusRole::Medium, &tokens)
                     .cursor_pointer()
                     .bg(if active {
                         tokens.action.accent_soft
@@ -1583,11 +1643,11 @@ impl WorkspaceWindow {
                     .gap_3()
                     .child(
                         Icon::new(if split.is_some() {
-                            IconName::Frame
+                            semantic_icon(icons.split)
                         } else if active_slot.view.kind == ItemKind::Settings {
-                            IconName::Settings
+                            semantic_icon(icons.settings)
                         } else {
-                            IconName::File
+                            semantic_icon(icons.document)
                         })
                         .size(px(16.0))
                         .text_color(tokens.action.accent),
@@ -1623,7 +1683,7 @@ impl WorkspaceWindow {
                             div()
                                 .size(px(6.0))
                                 .flex_none()
-                                .rounded_full()
+                                .design_radius(RadiusRole::Pill, &tokens)
                                 .bg(tokens.action.accent),
                         )
                     })
@@ -1648,33 +1708,59 @@ impl WorkspaceWindow {
         let index = self.hovered_tab.filter(|index| *index != self.active_tab)?;
         let tab = self.tabs.get(index)?;
         let width = f32::from(window.viewport_size().width);
+        let tokens = ThemeTokens::from_app(cx);
+        let popover = tokens.components.popover;
+        let chrome = self.chrome_layout(window, cx);
         let x = self.tab_scroll.bounds_for_item(index).map_or_else(
-            || tab_hover_card_x(112.0, 180.0, width, TAB_HOVER_CARD_WIDTH),
+            || {
+                tab_hover_card_x(
+                    chrome.tab_leading_inset,
+                    chrome.tab_width,
+                    width,
+                    popover.tab_hover_width,
+                    popover.edge_margin,
+                )
+            },
             |bounds| {
                 tab_hover_card_x(
                     f32::from(bounds.origin.x),
                     f32::from(bounds.size.width),
                     width,
-                    TAB_HOVER_CARD_WIDTH,
+                    popover.tab_hover_width,
+                    popover.edge_margin,
                 )
             },
         );
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
+        let y = self.tab_row_offset(chrome, cx)
+            + tab_hover_card_y(
+                chrome.tab_bar_height,
+                chrome.tab_height,
+                chrome.tab_popover_gap,
+            );
         Some(
             div()
                 .absolute()
-                .top(px(TAB_BAR_HEIGHT + 8.0))
+                .top(px(y))
                 .left(px(x))
                 .child(tab.hover_card(tokens, cx))
                 .into_any_element(),
         )
     }
 
-    fn render_context_bar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
+    fn render_context_bar(
+        &self,
+        chrome: ChromeLayoutConfig,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let tokens = ThemeTokens::from_app(cx);
+        let icons = resolved_design_system(cx).appearance.icons;
         let weak = cx.weak_entity();
+        let split_weak = weak.clone();
         let split = self.active_tab().split_views();
         let active = self.active_view();
+        let (first_active, second_active) = split
+            .map(|(first, second, _)| (active.id == first, active.id == second))
+            .unwrap_or((false, false));
         let control_bar = self.active_tab().active_slot().control_bar.clone();
         let split_button = div()
             .id("workspace-split-menu-button")
@@ -1683,7 +1769,7 @@ impl WorkspaceWindow {
             .flex()
             .items_center()
             .justify_center()
-            .rounded_lg()
+            .design_radius(RadiusRole::Large, &tokens)
             .cursor_pointer()
             .text_color(if split.is_some() {
                 tokens.action.accent
@@ -1697,14 +1783,60 @@ impl WorkspaceWindow {
             })
             .hover(move |button| button.bg(tokens.action.control_hover))
             .on_click(move |_, _, cx| {
-                weak.update(cx, |workspace, cx| {
-                    workspace.split_menu_open = !workspace.split_menu_open;
-                    workspace.tab_search_open = false;
-                    cx.notify();
-                })
-                .ok();
+                split_weak
+                    .update(cx, |workspace, cx| {
+                        workspace.split_menu_open = !workspace.split_menu_open;
+                        workspace.tab_search_open = false;
+                        cx.notify();
+                    })
+                    .ok();
             })
-            .child(Icon::new(IconName::Frame).size(px(16.0)))
+            .child(
+                div()
+                    .relative()
+                    .w(px(16.0))
+                    .h(px(14.0))
+                    .design_radius(RadiusRole::Small, &tokens)
+                    .border_1()
+                    .border_color(tokens.content.tertiary.opacity(0.88))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(2.0))
+                            .bottom(px(2.0))
+                            .left(px(2.0))
+                            .w(px(5.0))
+                            .design_radius(RadiusRole::Small, &tokens)
+                            .bg(if first_active {
+                                tokens.action.accent
+                            } else {
+                                tokens.surface.muted
+                            }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(2.0))
+                            .bottom(px(2.0))
+                            .right(px(2.0))
+                            .w(px(5.0))
+                            .design_radius(RadiusRole::Small, &tokens)
+                            .bg(if second_active {
+                                tokens.action.accent
+                            } else {
+                                tokens.surface.muted
+                            }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(1.0))
+                            .bottom(px(1.0))
+                            .left(px(7.0))
+                            .w(px(1.0))
+                            .bg(tokens.content.tertiary.opacity(0.7)),
+                    ),
+            )
             .when_some(split, |button, (first, _, _)| {
                 button.child(
                     div()
@@ -1717,27 +1849,61 @@ impl WorkspaceWindow {
                         })
                         .w(px(7.0))
                         .h(px(2.0))
-                        .rounded_full()
+                        .design_radius(RadiusRole::Pill, &tokens)
                         .bg(tokens.action.accent),
                 )
             });
+        let utilities = (!chrome.utilities_in_tab_row()).then(|| {
+            let sidebar: TabBarAction = Rc::new(|_, _, _| {});
+            let search_weak = weak;
+            let search: TabBarAction = Rc::new(move |_, window, cx| {
+                search_weak
+                    .update(cx, |workspace, cx| {
+                        workspace.tab_search_open = !workspace.tab_search_open;
+                        if workspace.tab_search_open {
+                            window.focus(&workspace.tab_search_field.read(cx).focus_handle(cx));
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            });
+            workspace_utility_controls(tokens, icons, sidebar, search, false)
+        });
         div()
             .relative()
             .w_full()
             .flex_none()
-            .child(control_bar)
+            .flex()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .ml(px(chrome.control_leading_inset))
+                    .child(control_bar),
+            )
             .child(
                 div()
                     .absolute()
                     .top(px(6.0))
-                    .left(px(12.0))
+                    .left(px(chrome.control_leading_inset + 12.0))
                     .child(split_button),
             )
+            .when_some(utilities, |row, utilities| {
+                row.child(
+                    div()
+                        .absolute()
+                        .top(px(5.0))
+                        .left(px(chrome.utility_controls_leading_inset))
+                        .h(px(34.0))
+                        .child(utilities),
+                )
+            })
             .into_any_element()
     }
 
-    fn render_split_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
+    fn render_split_menu(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let tokens = ThemeTokens::from_app(cx);
+        let icons = resolved_design_system(cx).appearance.icons;
         let weak = cx.weak_entity();
         let row = |id: &'static str,
                    icon: IconName,
@@ -1753,7 +1919,7 @@ impl WorkspaceWindow {
                 .flex()
                 .items_center()
                 .gap_3()
-                .rounded_md()
+                .design_radius(RadiusRole::Medium, &tokens)
                 .cursor_pointer()
                 .text_sm()
                 .hover(move |item| item.bg(tokens.action.control_hover))
@@ -1773,25 +1939,25 @@ impl WorkspaceWindow {
         if let Some((first, second, _)) = self.active_tab().split_views() {
             rows.push(row(
                 "workspace-split-swap",
-                IconName::Replace,
+                semantic_icon(icons.swap),
                 "Swap positions",
                 Rc::new(|workspace, window, cx| workspace.swap_split_views(window, cx)),
             ));
             rows.push(row(
                 "workspace-split-separate",
-                IconName::GalleryVerticalEnd,
+                semantic_icon(icons.separate),
                 "Separate views",
                 Rc::new(|workspace, window, cx| workspace.separate_split(window, cx)),
             ));
             rows.push(row(
                 "workspace-split-close-left",
-                IconName::PanelLeftClose,
+                semantic_icon(icons.close_left),
                 "Close left view",
                 Rc::new(move |workspace, window, cx| workspace.close_split_view(first, window, cx)),
             ));
             rows.push(row(
                 "workspace-split-close-right",
-                IconName::PanelRightClose,
+                semantic_icon(icons.close_right),
                 "Close right view",
                 Rc::new(move |workspace, window, cx| {
                     workspace.close_split_view(second, window, cx)
@@ -1812,7 +1978,7 @@ impl WorkspaceWindow {
                         .flex()
                         .items_center()
                         .gap_3()
-                        .rounded_md()
+                        .design_radius(RadiusRole::Medium, &tokens)
                         .cursor_pointer()
                         .hover(move |item| item.bg(tokens.action.control_hover))
                         .on_click(move |_, window, cx| {
@@ -1823,9 +1989,9 @@ impl WorkspaceWindow {
                         })
                         .child(
                             Icon::new(if tab.active_slot().view.kind == ItemKind::Settings {
-                                IconName::Settings
+                                semantic_icon(icons.settings)
                             } else {
-                                IconName::File
+                                semantic_icon(icons.document)
                             })
                             .size(px(15.0))
                             .text_color(tokens.action.accent),
@@ -1854,24 +2020,19 @@ impl WorkspaceWindow {
                 );
             }
         }
-        let control_bar_height = self
-            .active_tab()
-            .active_slot()
-            .control_bar
-            .read(cx)
-            .current_height();
+        let chrome = self.chrome_layout(window, cx);
         div()
             .absolute()
-            .top(px(TAB_BAR_HEIGHT + control_bar_height + 6.0))
+            .top(px(self.total_chrome_height(chrome, cx) + 6.0))
             .left(px(12.0))
             .w(px(268.0))
             .p_2()
             .overflow_hidden()
-            .rounded_xl()
+            .design_radius(RadiusRole::Large, &tokens)
             .border_1()
-            .border_color(tokens.surface.border)
-            .shadow_lg()
-            .bg(tokens.surface.overlay)
+            .border_color(tokens.materials.floating.border)
+            .design_elevation(ElevationRole::Floating, &tokens)
+            .bg(tokens.materials.floating.background)
             .text_color(tokens.content.primary)
             .flex()
             .flex_col()
@@ -1907,7 +2068,7 @@ impl WorkspaceWindow {
     fn render_workspace_content(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some((first, second, ratio)) = self.active_tab().split_views() else {
             let content = self.render_view_slot(self.active_view().id, cx);
-            let tokens = ThemeTokens::from_theme(Theme::global(cx));
+            let tokens = ThemeTokens::from_app(cx);
             let left_weak = cx.weak_entity();
             let right_weak = left_weak.clone();
             let drop_target =
@@ -1946,7 +2107,8 @@ impl WorkspaceWindow {
         let active = self.active_view().id;
         let first_content = self.render_view_slot(first, cx);
         let second_content = self.render_view_slot(second, cx);
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
+        let tokens = ThemeTokens::from_app(cx);
+        let split_layout = resolved_design_system(cx).workspace.split;
         let activation_progress = self.split_activation.value();
         let activation_from = self.split_activation_from;
         let first_emphasis =
@@ -1966,26 +2128,21 @@ impl WorkspaceWindow {
                     .relative()
                     .size_full()
                     .overflow_hidden()
-                    .rounded_xl()
+                    .design_radius(RadiusRole::Large, &tokens)
                     .border_l_1()
                     .border_r_1()
                     .border_b_1()
-                    .border_color(tokens.surface.border.opacity(border_alpha))
-                    .bg(tokens.surface.background)
-                    .shadow(vec![
-                        BoxShadow {
-                            color: gpui::black().opacity(0.13 * emphasis),
-                            offset: point(px(0.0), px(2.0)),
-                            blur_radius: px(5.0),
-                            spread_radius: px(-1.0),
-                        },
-                        BoxShadow {
-                            color: gpui::black().opacity(0.16 * emphasis),
-                            offset: point(px(0.0), px(7.0)),
-                            blur_radius: px(19.0),
-                            spread_radius: px(-4.0),
-                        },
-                    ])
+                    .border_color(if emphasis > 0.5 {
+                        tokens.action.accent_border.opacity(0.82)
+                    } else {
+                        tokens.surface.border.opacity(border_alpha)
+                    })
+                    .bg(if emphasis > 0.5 {
+                        tokens.surface.background
+                    } else {
+                        tokens.surface.overlay
+                    })
+                    .design_elevation_with_strength(ElevationRole::Surface, emphasis, &tokens)
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         weak.update(cx, |workspace, cx| {
                             workspace.activate_split_view(view, window, cx)
@@ -1997,7 +2154,7 @@ impl WorkspaceWindow {
                         div()
                             .absolute()
                             .inset_0()
-                            .rounded_xl()
+                            .design_radius(RadiusRole::Large, &tokens)
                             .border_l_1()
                             .border_r_1()
                             .border_b_1()
@@ -2010,7 +2167,7 @@ impl WorkspaceWindow {
                             .left_3()
                             .right_3()
                             .h(px(1.0))
-                            .rounded_full()
+                            .design_radius(RadiusRole::Pill, &tokens)
                             .bg(tokens.surface.border.opacity(separator_alpha)),
                     ),
             )
@@ -2018,9 +2175,8 @@ impl WorkspaceWindow {
         div()
             .size_full()
             .flex()
-            .px(px(8.0))
-            .pb(px(8.0))
-            .bg(tokens.surface.muted.opacity(0.68))
+            .p(px(split_layout.outer_padding))
+            .bg(tokens.surface.split_gutter)
             .child(
                 pane(first, first_content, first_emphasis, first_weak)
                     .w(relative(ratio))
@@ -2031,7 +2187,7 @@ impl WorkspaceWindow {
                     .id("workspace-split-divider")
                     .relative()
                     .h_full()
-                    .w(px(14.0))
+                    .w(px(split_layout.pane_gap))
                     .flex_none()
                     .cursor(CursorStyle::ResizeLeftRight)
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_split_resize))
@@ -2040,9 +2196,11 @@ impl WorkspaceWindow {
                             .absolute()
                             .top(px(22.0))
                             .bottom(px(22.0))
-                            .left(px(6.0))
-                            .w(px(2.0))
-                            .rounded_full()
+                            .left(px((split_layout.pane_gap
+                                - split_layout.divider_line_width)
+                                * 0.5))
+                            .w(px(split_layout.divider_line_width))
+                            .design_radius(RadiusRole::Pill, &tokens)
                             .bg(if self.split_resizing {
                                 tokens.action.accent
                             } else {
@@ -2065,15 +2223,85 @@ impl WorkspaceWindow {
         }
     }
 
+    fn load_ui_configuration(
+        &mut self,
+        _: &LoadUiConfiguration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Load UI Configuration".into()),
+        });
+        let weak = cx.weak_entity();
+        let host = self.host.clone();
+        window
+            .spawn(cx, async move |cx| {
+                let Ok(Ok(Some(paths))) = prompt.await else {
+                    return;
+                };
+                let Some(path) = paths.into_iter().next() else {
+                    return;
+                };
+                let loaded = crate::theme::load_design_system(Some(&path));
+                let _ = cx.update(|window, cx| match loaded {
+                    Ok(config) => {
+                        match crate::theme::apply_configured_theme(
+                            &config.appearance.theme,
+                            window,
+                            cx,
+                        ) {
+                            Ok(selected) => {
+                                crate::theme::apply_design_system(&config, cx);
+                                host.update(cx, |host, _| {
+                                    host.set_theme_selection(
+                                        if selected.is_some() {
+                                            crate::theme::ThemePreference::Named
+                                        } else {
+                                            crate::theme::ThemePreference::System
+                                        },
+                                        selected,
+                                    );
+                                });
+                                weak.update(cx, |workspace, cx| {
+                                    workspace.warning = None;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }
+                            Err(error) => {
+                                weak.update(cx, |workspace, cx| {
+                                    workspace.warning = Some(error.into());
+                                    cx.notify();
+                                })
+                                .ok();
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        weak.update(cx, |workspace, cx| {
+                            workspace.warning =
+                                Some(format!("UI configuration was not applied: {error}").into());
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                });
+            })
+            .detach();
+    }
+
     fn render_settings(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
+        let tokens = ThemeTokens::from_app(cx);
         let plan = self.host.read(cx).resource_coordinator().plan(&[]);
         let requested_mode = self.host.read(cx).requested_resource_mode();
         let effective_mode: SharedString = format!("{:?}", plan.effective_mode).into();
         let section = |title: &'static str, detail: &'static str| {
             div()
                 .p_4()
-                .rounded_lg()
+                .design_radius(RadiusRole::Large, &tokens)
                 .border_1()
                 .border_color(tokens.surface.border)
                 .bg(tokens.surface.overlay)
@@ -2099,7 +2327,7 @@ impl WorkspaceWindow {
             .size_full()
             .flex()
             .flex_col()
-            .bg(tokens.surface.background)
+            .bg(tokens.materials.window.background)
             .text_color(tokens.content.primary)
             .child(
                 div()
@@ -2117,12 +2345,23 @@ impl WorkspaceWindow {
                             .gap_4()
                             .child(div().text_2xl().font_weight(gpui::FontWeight::BOLD).child("Application settings"))
                             .child(div().text_color(tokens.content.secondary).child("This is a real workspace view backed by the same host, placement, dock, and resource contracts as PDF views. Controls are intentionally illustrative for now."))
-                            .child(section("Appearance", "Theme and document presentation"))
+                            .child(
+                                section("Appearance", "Theme and UI configuration")
+                                    .id("settings-load-ui-configuration")
+                                    .cursor_pointer()
+                                    .hover(move |row| row.bg(tokens.action.control_hover))
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(LoadUiConfiguration),
+                                            cx,
+                                        );
+                                    }),
+                            )
                             .child(section("Extensions", "Permissions, settings, and contributed tools"))
                             .child(
                                 div()
                                     .p_4()
-                                    .rounded_lg()
+                                    .design_radius(RadiusRole::Large, &tokens)
                                     .bg(tokens.action.accent_soft)
                                     .flex()
                                     .flex_col()
@@ -2152,7 +2391,7 @@ impl WorkspaceWindow {
                                                     .id(("resource-mode", index))
                                                     .px_3()
                                                     .py_1()
-                                                    .rounded_full()
+                                                    .design_radius(RadiusRole::Pill, &tokens)
                                                     .border_1()
                                                     .border_color(if selected { tokens.action.accent } else { tokens.surface.border })
                                                     .bg(if selected { tokens.action.accent } else { tokens.surface.overlay })
@@ -2174,7 +2413,7 @@ impl WorkspaceWindow {
     }
 
     fn render_settings_dock(&self, cx: &App) -> gpui::AnyElement {
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
+        let tokens = ThemeTokens::from_app(cx);
         let extent = self.active_tab().docks.left.extent;
         div()
             .h_full()
@@ -2189,7 +2428,7 @@ impl WorkspaceWindow {
                     .mt_4()
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .design_radius(RadiusRole::Medium, &tokens)
                     .bg(tokens.action.accent_soft)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .child("General"),
@@ -2302,13 +2541,27 @@ impl Render for WorkspaceWindow {
         let left_dock = (self.active_tab().docks.left.open
             && self.active_view().kind == ItemKind::Settings)
             .then(|| self.render_settings_dock(cx));
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
+        let tokens = ThemeTokens::from_app(cx);
         let viewport_width = f32::from(window.viewport_size().width);
-        let search_x = tab_search_popover_x(viewport_width);
+        let chrome = self.chrome_layout(window, cx);
+        let search_x = tab_search_popover_x(
+            viewport_width,
+            chrome.utility_controls_leading_inset,
+            tokens.components.popover.tab_search_width,
+            tokens.components.popover.edge_margin,
+        );
+        let search_y = self.total_chrome_height(chrome, cx) + tokens.components.popover.edge_margin;
+        let tab_bar = self.render_tab_bar(cx);
+        let context_bar = self.render_context_bar(chrome, cx);
+        let chrome_rows = match chrome.row_order {
+            ChromeRowOrder::TabsThenControls => vec![tab_bar, context_bar],
+            ChromeRowOrder::ControlsThenTabs => vec![context_bar, tab_bar],
+        };
         div()
             .key_context("WorkspaceWindow")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::open_dialog))
+            .on_action(cx.listener(Self::load_ui_configuration))
             .on_action(cx.listener(Self::open_settings))
             .on_mouse_move(cx.listener(Self::resize_split))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::end_split_resize))
@@ -2318,8 +2571,7 @@ impl Render for WorkspaceWindow {
             .flex()
             .flex_col()
             .bg(tokens.surface.background)
-            .child(self.render_tab_bar(cx))
-            .child(self.render_context_bar(cx))
+            .children(chrome_rows)
             .child(
                 div()
                     .min_h_0()
@@ -2332,14 +2584,14 @@ impl Render for WorkspaceWindow {
                 root.child(
                     div()
                         .absolute()
-                        .top(px(TAB_BAR_HEIGHT + 8.0))
+                        .top(px(search_y))
                         .left(px(search_x))
                         .child(self.render_tab_search(cx)),
                 )
             })
             .children(self.render_tab_hover_card(window, cx))
             .when(self.split_menu_open, |root| {
-                root.child(self.render_split_menu(cx))
+                root.child(self.render_split_menu(window, cx))
             })
             .when_some(self.warning.clone(), |root, warning| {
                 root.child(
@@ -2349,7 +2601,7 @@ impl Render for WorkspaceWindow {
                         .left_4()
                         .right_4()
                         .p_3()
-                        .rounded_lg()
+                        .design_radius(RadiusRole::Large, &tokens)
                         .bg(tokens.status.danger_soft)
                         .text_color(tokens.status.danger)
                         .child(warning),

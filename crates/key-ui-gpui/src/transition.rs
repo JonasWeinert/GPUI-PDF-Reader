@@ -135,6 +135,21 @@ impl UnitTransition {
         self.is_animating()
     }
 
+    /// Advances using a resolved design-system response. `None` represents a
+    /// reduced-motion policy and settles immediately at the current target.
+    pub fn advance_with_optional_response(
+        &mut self,
+        elapsed_seconds: f32,
+        response: Option<f32>,
+    ) -> bool {
+        if let Some(response) = response {
+            self.advance_with_response(elapsed_seconds, response)
+        } else {
+            self.value = self.target;
+            false
+        }
+    }
+
     /// Interpolates between two scalar values using the current progress.
     #[must_use]
     pub fn interpolate(self, start: f32, end: f32) -> f32 {

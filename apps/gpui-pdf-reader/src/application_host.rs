@@ -615,7 +615,7 @@ pub(crate) fn open_pdf_window(
     let path_for_window = normalized.clone();
     let handle = cx
         .open_window(
-            window_options(host.read(cx).windows.len()),
+            window_options(host.read(cx).windows.len(), cx),
             move |window, cx| {
                 WorkspaceWindow::new_pdf(
                     host_for_window,
@@ -796,7 +796,7 @@ pub(crate) fn open_settings_window(
     let view_for_window = view_descriptor.clone();
     let handle = cx
         .open_window(
-            window_options(host.read(cx).windows.len()),
+            window_options(host.read(cx).windows.len(), cx),
             move |window, cx| {
                 WorkspaceWindow::new_settings(
                     host_for_window,
@@ -816,7 +816,7 @@ pub(crate) fn open_settings_window(
     Ok(handle)
 }
 
-fn window_options(index: usize) -> WindowOptions {
+fn window_options(index: usize, cx: &App) -> WindowOptions {
     let cascade = (index.min(8) as f32) * 24.0;
     let bounds = Bounds {
         origin: Point::new(px(120.0 + cascade), px(80.0 + cascade)),
@@ -825,6 +825,7 @@ fn window_options(index: usize) -> WindowOptions {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(700.0), px(480.0))),
+        window_background: crate::theme::window_background_appearance(cx),
         focus: true,
         ..Default::default()
     };

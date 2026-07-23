@@ -76,7 +76,7 @@ fn annotation_error_banner(palette: ReaderPalette, message: SharedString) -> gpu
         .flex()
         .items_start()
         .gap_2()
-        .rounded_lg()
+        .design_radius(RadiusRole::Large, &palette.ui)
         .bg(palette.warning.opacity(0.12))
         .text_color(palette.text)
         .child(
@@ -893,7 +893,7 @@ impl PdfReader {
                                     .size_full()
                                     .overflow_hidden()
                                     .flex()
-                                    .rounded_md()
+                                    .design_radius(RadiusRole::Medium, &palette.ui)
                                     .border_1()
                                     .border_color(if active {
                                         palette.accent_border
@@ -970,7 +970,7 @@ impl PdfReader {
     }
 
     pub(super) fn render_comments_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
+        let palette = ReaderPalette::from_app(cx);
         let list_header = div()
             .h(px(54.0))
             .flex_none()
@@ -1022,11 +1022,11 @@ impl PdfReader {
             .absolute()
             .top_0()
             .bottom_0()
-            .left(px(-SIDEBAR_WIDTH * progress))
+            .left(px(-self.theme_tokens.reader.sidebar_width * progress))
             .w_full()
             .flex()
             .flex_col()
-            .rounded_xl()
+            .design_radius(RadiusRole::Large, &palette.ui)
             .bg(palette.surface)
             .child(list_header)
             .children(list_error)
@@ -1054,11 +1054,11 @@ impl PdfReader {
                 .absolute()
                 .top_0()
                 .bottom_0()
-                .left(px(SIDEBAR_WIDTH * (1.0 - progress)))
+                .left(px(self.theme_tokens.reader.sidebar_width * (1.0 - progress)))
                 .w_full()
                 .flex()
                 .flex_col()
-                .rounded_xl()
+                .design_radius(RadiusRole::Large, &palette.ui)
                 .bg(palette.surface)
                 .child(
                     div()
@@ -1136,7 +1136,7 @@ impl PdfReader {
             .relative()
             .size_full()
             .overflow_hidden()
-            .rounded_xl()
+            .design_radius(RadiusRole::Large, &palette.ui)
             .bg(palette.surface)
             .text_color(palette.text)
             .child(list_pane)

@@ -3320,6 +3320,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "key-editor-core",
+ "key-ui-gpui",
 ]
 
 [[package]]
@@ -3341,6 +3342,7 @@ dependencies = [
  "gpui-component",
  "key-extension-api",
  "key-extension-host",
+ "key-ui-gpui",
 ]
 
 [[package]]
@@ -3467,11 +3469,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "key-ui-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "key-ui-gpui"
 version = "0.1.0"
 dependencies = [
  "gpui",
  "gpui-component",
+ "key-ui-core",
  "key-workspace-core",
 ]
 

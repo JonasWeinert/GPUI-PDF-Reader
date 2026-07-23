@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "appearance": {
+    "theme": {
+      "source": "system"
+    }
+  },
+  "palette": {
+    "split_gutter_foreground_mix": 0.15
+  },
+  "workspace": {
+    "chrome": {
+      "regular": {
+        "row_order": "controls_then_tabs",
+        "utility_controls_row": "top",
+        "utility_controls_leading_inset": 104.0,
+        "tab_bar_height": 42.0,
+        "tab_height": 30.0,
+        "split_segment_height": 24.0,
+        "tab_popover_gap": 4.0,
+        "tab_leading_inset": 0.0,
+        "control_leading_inset": 196.0,
+        "tab_width": 220.0,
+        "split_tab_width": 440.0,
+        "new_tab_button_size": 28.0
+      },
+      "compact": {
+        "row_order": "controls_then_tabs",
+        "utility_controls_row": "top",
+        "utility_controls_leading_inset": 92.0,
+        "tab_bar_height": 40.0,
+        "tab_height": 28.0,
+        "split_segment_height": 22.0,
+        "tab_popover_gap": 4.0,
+        "tab_leading_inset": 0.0,
+        "control_leading_inset": 184.0,
+        "tab_width": 190.0,
+        "split_tab_width": 380.0,
+        "new_tab_button_size": 26.0
+      },
+      "comfortable": null
+    }
+  }
+}

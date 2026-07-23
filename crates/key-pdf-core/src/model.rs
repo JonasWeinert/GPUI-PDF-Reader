@@ -374,8 +374,22 @@ impl TextLayer {
         range: RangeInclusive<usize>,
         maximum_glyphs: usize,
     ) -> Vec<Rect> {
+        self.visible_selection_runs_with_glyph_count(page_rect, viewport, range, maximum_glyphs)
+            .0
+    }
+
+    /// Like [`Self::visible_selection_runs`], but also returns the number of
+    /// glyph rectangles inspected. Overlay painters can charge that work to a
+    /// shared frame budget while keeping their visual rectangles coalesced.
+    pub fn visible_selection_runs_with_glyph_count(
+        &self,
+        page_rect: Rect,
+        viewport: Rect,
+        range: RangeInclusive<usize>,
+        maximum_glyphs: usize,
+    ) -> (Vec<Rect>, usize) {
         if maximum_glyphs == 0 {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         let mut glyphs = Vec::new();
         self.for_each_visible_in_range_while(page_rect, viewport, range, |index, rect| {
@@ -383,6 +397,7 @@ impl TextLayer {
             glyphs.len() < maximum_glyphs
         });
         glyphs.sort_unstable_by_key(|(index, _)| *index);
+        let glyph_count = glyphs.len();
 
         let mut runs: Vec<Rect> = Vec::new();
         for (_, glyph) in glyphs {
@@ -394,7 +409,7 @@ impl TextLayer {
                 runs.push(glyph);
             }
         }
-        runs
+        (runs, glyph_count)
     }
 }
 
@@ -1371,7 +1386,9 @@ mod tests {
             height: 1_000.0,
         };
 
-        let runs = layer.visible_selection_runs(page, page, 0..=3, 100);
+        let (runs, inspected_glyphs) =
+            layer.visible_selection_runs_with_glyph_count(page, page, 0..=3, 100);
+        assert_eq!(inspected_glyphs, 3);
         assert_eq!(runs.len(), 2);
         for (run, expected) in runs.iter().zip([
             Rect {

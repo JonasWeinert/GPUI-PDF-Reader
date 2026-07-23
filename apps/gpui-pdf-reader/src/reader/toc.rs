@@ -1,15 +1,12 @@
 use super::*;
 
-const TOC_RAIL_WIDTH: f32 = 54.0;
-const TOC_MARKER_LEFT: f32 = 8.0;
+#[cfg(test)]
 pub(super) const TOC_STACK_MARGIN: f32 = 22.0;
-const TOC_STACK_SPACING: f32 = 12.0;
-const TOC_CASCADE_RADIUS: f32 = 5.0;
+#[cfg(test)]
 pub(super) const TOC_CARD_MIN_HEIGHT: f32 = 82.0;
 const TOC_BREADCRUMB_CHARACTER_BUDGET: usize = 46;
 const TOC_BREADCRUMB_MIN_LABEL_CHARACTERS: usize = 8;
 pub(super) const TOC_BREADCRUMB_MAX_LABEL_CHARACTERS: usize = 20;
-const TOC_HOVER_LEAVE_DELAY: Duration = Duration::from_millis(120);
 const MAX_TOC_HEADING_MATCHES: usize = 16;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,25 +82,50 @@ pub(super) fn resolve_toc_destination(
     }
 }
 
+#[cfg(test)]
 pub(super) fn toc_stack_geometry(viewport_height: f32, count: usize) -> Option<(f32, f32)> {
+    let ui = key_ui_gpui::ReaderUiConfig::default();
+    toc_stack_geometry_with_ui(viewport_height, count, ui)
+}
+
+fn toc_stack_geometry_with_ui(
+    viewport_height: f32,
+    count: usize,
+    ui: key_ui_gpui::ReaderUiConfig,
+) -> Option<(f32, f32)> {
     if count == 0 || !viewport_height.is_finite() || viewport_height <= 0.0 {
         return None;
     }
     if count == 1 {
         return Some((viewport_height * 0.5, 0.0));
     }
-    let available = (viewport_height - TOC_STACK_MARGIN * 2.0).max(1.0);
-    let spacing = (available / (count - 1) as f32).min(TOC_STACK_SPACING);
+    let available = (viewport_height - ui.toc_stack_margin * 2.0).max(1.0);
+    let spacing = (available / (count - 1) as f32).min(ui.toc_stack_spacing);
     let height = spacing * (count - 1) as f32;
     Some(((viewport_height - height) * 0.5, spacing))
 }
 
+#[cfg(test)]
 pub(super) fn toc_cascade_amount(index: usize, hover_position: f32, hover_strength: f32) -> f32 {
+    toc_cascade_amount_with_radius(
+        index,
+        hover_position,
+        hover_strength,
+        key_ui_gpui::ReaderUiConfig::default().toc_cascade_radius,
+    )
+}
+
+fn toc_cascade_amount_with_radius(
+    index: usize,
+    hover_position: f32,
+    hover_strength: f32,
+    radius: f32,
+) -> f32 {
     if !hover_position.is_finite() || !hover_strength.is_finite() {
         return 0.0;
     }
     let distance = (index as f32 - hover_position).abs();
-    (1.0 - distance / TOC_CASCADE_RADIUS).clamp(0.0, 1.0) * hover_strength.clamp(0.0, 1.0)
+    (1.0 - distance / radius).clamp(0.0, 1.0) * hover_strength.clamp(0.0, 1.0)
 }
 
 pub(super) fn toc_hover_state_is_animating(
@@ -197,7 +219,20 @@ pub(super) fn toc_display_breadcrumbs(breadcrumbs: &[(usize, String)]) -> Vec<(u
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn toc_callout_height(breadcrumbs: &[(usize, String)], width: f32) -> f32 {
+    toc_callout_height_with_minimum(
+        breadcrumbs,
+        width,
+        key_ui_gpui::ReaderUiConfig::default().toc_card_min_height,
+    )
+}
+
+fn toc_callout_height_with_minimum(
+    breadcrumbs: &[(usize, String)],
+    width: f32,
+    minimum_height: f32,
+) -> f32 {
     let available_width = (width - 32.0).max(64.0);
     let characters_per_line = (available_width / 6.5).floor().max(8.0);
     let character_count = breadcrumbs
@@ -206,7 +241,7 @@ pub(super) fn toc_callout_height(breadcrumbs: &[(usize, String)], width: f32) ->
         .sum::<usize>()
         .saturating_add(breadcrumbs.len().saturating_sub(1) * 3);
     let lines = ((character_count as f32 / characters_per_line).ceil() as usize).max(1);
-    (64.0 + lines as f32 * 18.0).max(TOC_CARD_MIN_HEIGHT)
+    (64.0 + lines as f32 * 18.0).max(minimum_height)
 }
 
 pub(super) fn toc_callout_width(breadcrumbs: &[(usize, String)], maximum_width: f32) -> f32 {
@@ -255,9 +290,10 @@ impl PdfReader {
         self.toc_hover_revision = self.toc_hover_revision.wrapping_add(1);
         let revision = self.toc_hover_revision;
         let weak = cx.weak_entity();
+        let leave_delay = Duration::from_millis(self.theme_tokens.motion.toc_leave_delay_ms.into());
         window
             .spawn(cx, async move |cx| {
-                cx.background_executor().timer(TOC_HOVER_LEAVE_DELAY).await;
+                cx.background_executor().timer(leave_delay).await;
                 let _ = cx.update(|window, cx| {
                     weak.update(cx, |reader, cx| {
                         if reader.toc_hover_revision == revision {
@@ -444,25 +480,33 @@ impl PdfReader {
             return None;
         }
 
+        let ui = self.theme_tokens.reader;
         let (stack_top, marker_spacing) =
-            toc_stack_geometry(self.viewport_height, document.toc.len())?;
+            toc_stack_geometry_with_ui(self.viewport_height, document.toc.len(), ui)?;
         let marker_hit_height = if marker_spacing <= f32::EPSILON {
-            TOC_STACK_SPACING
+            ui.toc_stack_spacing
         } else {
-            marker_spacing.clamp(6.0, TOC_STACK_SPACING)
+            marker_spacing.clamp(6.0, ui.toc_stack_spacing)
         };
         let current_page = layout.current_page(self.scroll.y, self.viewport_height);
         let active = active_toc_index(&document.toc, current_page);
         let hovered = self.toc_hovered.filter(|index| *index < document.toc.len());
-        let maximum_card_width = (self.viewport_width - TOC_RAIL_WIDTH - 28.0).clamp(1.0, 360.0);
+        let maximum_card_width = (self.viewport_width
+            - ui.toc_rail_width
+            - self.theme_tokens.components.common.control_small)
+            .clamp(1.0, self.theme_tokens.reader.link_card_width + 20.0);
         let marker_data: Vec<_> = document
             .toc
             .iter()
             .enumerate()
             .map(|(index, entry)| {
                 let selected = active == Some(index);
-                let cascade =
-                    toc_cascade_amount(index, self.toc_hover_position, self.toc_hover_strength);
+                let cascade = toc_cascade_amount_with_radius(
+                    index,
+                    self.toc_hover_position,
+                    self.toc_hover_strength,
+                    ui.toc_cascade_radius,
+                );
                 let baseline = (14.0 - f32::from(entry.depth.min(4))).max(10.0);
                 let width = baseline + (52.0 - baseline) * cascade;
                 (
@@ -480,8 +524,9 @@ impl PdfReader {
             let breadcrumbs =
                 toc_display_breadcrumbs(&toc_breadcrumb_entries(&document.toc, index)?);
             let card_width = toc_callout_width(&breadcrumbs, maximum_card_width);
-            let card_height = toc_callout_height(&breadcrumbs, card_width)
-                .min((self.viewport_height - 20.0).max(TOC_CARD_MIN_HEIGHT));
+            let card_height =
+                toc_callout_height_with_minimum(&breadcrumbs, card_width, ui.toc_card_min_height)
+                    .min((self.viewport_height - 20.0).max(ui.toc_card_min_height));
             Some((
                 entry.title.clone(),
                 entry.page,
@@ -501,10 +546,10 @@ impl PdfReader {
                     .top(px(y - marker_hit_height * 0.5))
                     .left_0()
                     .h(px(marker_hit_height))
-                    .w(px(TOC_RAIL_WIDTH))
+                    .w(px(ui.toc_rail_width))
                     .flex()
                     .items_center()
-                    .pl(px(TOC_MARKER_LEFT))
+                    .pl(px(ui.toc_marker_left))
                     .cursor_pointer()
                     .on_hover(cx.listener(move |reader, hovered, window, cx| {
                         reader.set_toc_hovered(index, *hovered, window, cx)
@@ -516,7 +561,7 @@ impl PdfReader {
                         div()
                             .h(px(if is_hovered { 3.0 } else { 2.0 }))
                             .w(px(width))
-                            .rounded_full()
+                            .design_radius(RadiusRole::Pill, &palette.ui)
                             .bg(if is_hovered {
                                 palette.text
                             } else if hovered.is_none() && selected {
@@ -552,7 +597,7 @@ impl PdfReader {
                                         .id(("toc-breadcrumb", entry_index))
                                         .max_w(px(card_width - 42.0))
                                         .whitespace_normal()
-                                        .rounded_sm()
+                                        .design_radius(RadiusRole::Small, &palette.ui)
                                         .px_1()
                                         .text_xs()
                                         .text_color(palette.text_secondary)
@@ -576,17 +621,19 @@ impl PdfReader {
                         }))
                         .absolute()
                         .top(px(card_y))
-                        .left(px(TOC_RAIL_WIDTH + 6.0))
+                        .left(px(
+                            ui.toc_rail_width + self.theme_tokens.geometry.radius_small
+                        ))
                         .w(px(card_width))
                         .h(px(card_height))
                         .px_4()
                         .py_3()
                         .overflow_y_scroll()
-                        .rounded_xl()
+                        .design_radius(RadiusRole::Large, &palette.ui)
                         .border_1()
                         .border_color(palette.text.opacity(0.13))
                         .bg(palette.surface)
-                        .shadow_sm()
+                        .design_elevation(ElevationRole::Surface, &palette.ui)
                         .text_color(palette.text)
                         .child(
                             div()
@@ -624,7 +671,7 @@ impl PdfReader {
                 .top_0()
                 .bottom_0()
                 .left_0()
-                .w(px(TOC_RAIL_WIDTH))
+                .w(px(ui.toc_rail_width))
                 .children(markers)
                 .children(detail_card)
                 .into_any_element(),

@@ -1,8 +1,6 @@
-use gpui::{
-    AnyElement, App, FontWeight, IntoElement, RenderOnce, SharedString, Window, div, prelude::*, px,
-};
+use gpui::{AnyElement, App, IntoElement, RenderOnce, SharedString, Window, div, prelude::*, px};
 
-use crate::ThemeTokens;
+use crate::{DesignStyled, ElevationRole, ThemeTokens, TypographyRole};
 
 /// Surface treatment for a panel container.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -56,13 +54,15 @@ impl RenderOnce for PanelShell {
             .min_w_0()
             .min_h_0()
             .overflow_hidden()
-            .bg(self.tokens.surface.background)
+            .bg(self.tokens.materials.surface.background)
+            .design_corners(self.tokens.components.corners.panel)
             .when(self.style == PanelShellStyle::Floating, |shell| {
                 shell
-                    .rounded_xl()
+                    .design_corners(self.tokens.components.corners.floating)
                     .border_1()
-                    .border_color(self.tokens.content.primary.opacity(0.13))
-                    .shadow_sm()
+                    .border_color(self.tokens.materials.floating.border)
+                    .bg(self.tokens.materials.floating.background)
+                    .design_elevation(ElevationRole::Floating, &self.tokens)
             })
             .child(self.content)
     }
@@ -104,14 +104,14 @@ impl PanelHeader {
 impl RenderOnce for PanelHeader {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         div()
-            .h(px(54.0))
+            .h(px(self.tokens.geometry.panel_header_height))
             .flex_none()
             .px_4()
             .flex()
             .items_center()
             .justify_between()
             .border_b_1()
-            .border_color(self.tokens.surface.border)
+            .border_color(self.tokens.materials.surface.border)
             .text_color(self.tokens.content.primary)
             .child(
                 div()
@@ -126,8 +126,7 @@ impl RenderOnce for PanelHeader {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .design_typography(TypographyRole::Title, &self.tokens)
                             .child(self.title),
                     ),
             )

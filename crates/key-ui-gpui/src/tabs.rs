@@ -1,28 +1,31 @@
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, BoxShadow, ClickEvent, Context, FontWeight,
-    IntoElement, Pixels, Point, Render, RenderOnce, ScrollHandle, SharedString, Window,
-    WindowControlArea, div, ease_in_out, linear_color_stop, linear_gradient, point, prelude::*, px,
+    Animation, AnimationExt, AnyElement, App, ClickEvent, Context, IntoElement, Pixels, Point,
+    Render, RenderOnce, ScrollHandle, SharedString, Window, WindowControlArea, div, ease_in_out,
+    linear_color_stop, linear_gradient, prelude::*, px,
 };
 use gpui_component::{Icon, IconName};
 use std::rc::Rc;
 use std::time::Duration;
 
-use crate::{HoverCardShell, ThemeTokens};
-
-pub const TAB_BAR_HEIGHT: f32 = 52.0;
-pub const TAB_HOVER_CARD_WIDTH: f32 = 282.0;
-pub const TAB_SEARCH_POPOVER_WIDTH: f32 = 380.0;
-const TAB_BAR_LEADING_INSET: f32 = 104.0;
+use crate::{
+    DesignStyled, ElevationRole, HoverCardShell, IconRoleConfig, ThemeTokens, TypographyRole,
+    resolved_design_system, semantic_icon,
+};
 
 #[must_use]
-pub fn tab_search_popover_x(viewport_width: f32) -> f32 {
+pub fn tab_search_popover_x(
+    viewport_width: f32,
+    leading_inset: f32,
+    popover_width: f32,
+    edge_margin: f32,
+) -> f32 {
     // Align the surface with the start of the title-bar controls. This keeps
     // the chevron visually connected to the popover without letting a wide
     // surface drift over the document from the far edge of the window.
-    let desired = TAB_BAR_LEADING_INSET;
+    let desired = leading_inset;
     desired.clamp(
-        8.0,
-        (viewport_width - TAB_SEARCH_POPOVER_WIDTH - 8.0).max(8.0),
+        edge_margin,
+        (viewport_width - popover_width - edge_margin).max(edge_margin),
     )
 }
 
@@ -32,9 +35,17 @@ pub fn tab_hover_card_x(
     tab_width: f32,
     viewport_width: f32,
     card_width: f32,
+    edge_margin: f32,
 ) -> f32 {
-    (tab_left + (tab_width - card_width) * 0.5)
-        .clamp(8.0, (viewport_width - card_width - 8.0).max(8.0))
+    (tab_left + (tab_width - card_width) * 0.5).clamp(
+        edge_margin,
+        (viewport_width - card_width - edge_margin).max(edge_margin),
+    )
+}
+
+#[must_use]
+pub fn tab_hover_card_y(tab_bar_height: f32, tab_height: f32, gap: f32) -> f32 {
+    (tab_bar_height - tab_height) * 0.5 + tab_height + gap
 }
 
 pub type TabIndexAction = Rc<dyn Fn(usize, &ClickEvent, &mut Window, &mut App)>;
@@ -160,6 +171,7 @@ pub struct TabStrip {
     scroll: ScrollHandle,
     on_activate: TabIndexAction,
     on_activate_segment: Option<TabSegmentAction>,
+    on_close_segment: Option<TabSegmentAction>,
     on_close: Option<TabIndexAction>,
     on_hover: TabHoverAction,
     on_sidebar: TabBarAction,
@@ -189,6 +201,7 @@ impl TabStrip {
             scroll,
             on_activate,
             on_activate_segment: None,
+            on_close_segment: None,
             on_close: None,
             on_hover,
             on_sidebar,
@@ -211,6 +224,12 @@ impl TabStrip {
     }
 
     #[must_use]
+    pub fn on_close_segment(mut self, action: TabSegmentAction) -> Self {
+        self.on_close_segment = Some(action);
+        self
+    }
+
+    #[must_use]
     pub fn on_drop(mut self, action: TabDropAction) -> Self {
         self.on_drop = Some(action);
         self
@@ -218,26 +237,48 @@ impl TabStrip {
 }
 
 impl RenderOnce for TabStrip {
-    fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let tokens = self.tokens;
-        let fade_width = px(42.0);
+        let system = resolved_design_system(cx);
+        let viewport_width = f32::from(window.viewport_size().width);
+        let width_class = system.responsive.classify(viewport_width);
+        let chrome = *system.workspace.chrome.resolve(width_class);
+        let utilities_in_tab_row = chrome.utilities_in_tab_row();
+        let icons = system.appearance.icons;
+        let fade_width = px(chrome.title_fade_width);
         let tab_count = self.tabs.len();
         let tab_units = self
             .tabs
             .iter()
-            .map(|tab| if tab.secondary.is_some() { 1.65 } else { 1.0 })
+            .map(|tab| {
+                if tab.secondary.is_some() {
+                    chrome.split_tab_width / chrome.tab_width
+                } else {
+                    1.0
+                }
+            })
             .sum::<f32>();
-        let available_tab_width =
-            (f32::from(window.viewport_size().width) - TAB_BAR_LEADING_INSET - 96.0 - 52.0)
-                .max(148.0);
-        let tabs_overflow = tab_units * 148.0 + 8.0 > available_tab_width;
-        let preferred_tab_width = (tab_units * 260.0 + 8.0).min(available_tab_width);
+        let utility_width = if utilities_in_tab_row {
+            chrome.utility_cluster_width
+        } else {
+            0.0
+        };
+        let available_tab_width = (viewport_width
+            - chrome.tab_leading_inset
+            - utility_width
+            - chrome.trailing_reserved_width)
+            .max(chrome.tab_width * chrome.tab_min_width_ratio);
+        let tabs_overflow = tab_units * chrome.tab_width * chrome.tab_min_width_ratio
+            + tokens.components.popover.edge_margin
+            > available_tab_width;
+        let preferred_tab_width = (tab_units * chrome.tab_width + 4.0).min(available_tab_width);
         let drop_at_end = self.on_drop.clone();
         let tabs = self.tabs.into_iter().enumerate().map(|(index, tab)| {
             let active = index == self.active;
             let show_separator = !active && index + 1 < tab_count && index + 1 != self.active;
             let activate = self.on_activate.clone();
             let activate_segment = self.on_activate_segment.clone();
+            let close_segment = self.on_close_segment.clone();
             let hover = self.on_hover.clone();
             let close = self.on_close.clone();
             let drop = self.on_drop.clone();
@@ -253,7 +294,8 @@ impl RenderOnce for TabStrip {
             let segment = |segment_index: usize,
                            view: u64,
                            title: SharedString,
-                           activate_segment: Option<TabSegmentAction>| {
+                           activate_segment: Option<TabSegmentAction>,
+                           close_segment: Option<TabSegmentAction>| {
                 let selected = active && active_segment == segment_index;
                 let emphasis = if !active {
                     0.0
@@ -268,30 +310,17 @@ impl RenderOnce for TabStrip {
                     .id(("workspace-tab-segment", index * 2 + segment_index))
                     .relative()
                     .min_w_0()
-                    .h(px(32.0))
+                    .h(px(chrome.split_segment_height))
                     .px_2()
                     .flex_1()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .rounded_lg()
+                    .design_corners(tokens.components.corners.split_segment)
                     .border_1()
                     .border_color(tokens.surface.border.opacity(0.9 * emphasis))
                     .bg(tokens.surface.overlay.opacity(emphasis))
-                    .shadow(vec![
-                        BoxShadow {
-                            color: gpui::black().opacity(0.1 * emphasis),
-                            offset: point(px(0.0), px(1.0)),
-                            blur_radius: px(3.0),
-                            spread_radius: px(-1.0),
-                        },
-                        BoxShadow {
-                            color: gpui::black().opacity(0.12 * emphasis),
-                            offset: point(px(0.0), px(3.0)),
-                            blur_radius: px(9.0),
-                            spread_radius: px(-2.0),
-                        },
-                    ])
+                    .design_elevation_with_strength(ElevationRole::Surface, emphasis, &tokens)
                     .when(!selected, |segment| {
                         segment.hover(move |segment| segment.bg(tokens.action.control_hover))
                     })
@@ -302,7 +331,7 @@ impl RenderOnce for TabStrip {
                         })
                     })
                     .child(
-                        Icon::new(IconName::File)
+                        Icon::new(semantic_icon(icons.document))
                             .size(px(14.0))
                             .text_color(if selected {
                                 tokens.action.accent
@@ -316,40 +345,74 @@ impl RenderOnce for TabStrip {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_sm()
-                            .font_weight(if selected {
-                                FontWeight::MEDIUM
-                            } else {
-                                FontWeight::NORMAL
-                            })
+                            .design_typography(
+                                if selected {
+                                    TypographyRole::Label
+                                } else {
+                                    TypographyRole::Body
+                                },
+                                &tokens,
+                            )
                             .child(title),
                     )
+                    .when_some(close_segment, |segment, close| {
+                        segment.child(
+                            div()
+                                .id(("close-workspace-tab-segment", index * 2 + segment_index))
+                                .size(px(20.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .design_corners(tokens.components.corners.button)
+                                .text_color(tokens.content.tertiary)
+                                .hover(move |button| {
+                                    button
+                                        .bg(tokens.action.control_pressed)
+                                        .text_color(tokens.content.primary)
+                                })
+                                .on_click(move |event, window, cx| {
+                                    cx.stop_propagation();
+                                    close(index, view, event, window, cx);
+                                })
+                                .child(Icon::new(semantic_icon(icons.close)).size(px(11.0))),
+                        )
+                    })
             };
             div()
                 .id(("workspace-tab", index))
                 .relative()
-                .h(px(42.0))
-                .mt(px(10.0))
-                .min_w(px(if is_compound { 240.0 } else { 148.0 }))
-                .max_w(px(if is_compound { 380.0 } else { 260.0 }))
+                .h(px(chrome.tab_height))
+                .min_w(px(if is_compound {
+                    chrome.split_tab_width * chrome.tab_min_width_ratio
+                } else {
+                    chrome.tab_width * chrome.tab_min_width_ratio
+                }))
+                .max_w(px(if is_compound {
+                    chrome.split_tab_width
+                } else {
+                    chrome.tab_width
+                }))
                 .flex_1()
-                .px(if is_compound { px(4.0) } else { px(12.0) })
+                .px(px(if is_compound {
+                    chrome.split_horizontal_padding
+                } else {
+                    chrome.tab_horizontal_padding
+                }))
                 .flex()
                 .items_center()
                 .gap_2()
-                .rounded_t_xl()
-                .border_t_1()
-                .border_l_1()
-                .border_r_1()
+                .design_corners(tokens.components.corners.tab)
+                .border_1()
                 .border_color(if active {
-                    tokens.surface.border.opacity(0.72)
+                    tokens.materials.control.border
                 } else {
-                    tokens.surface.muted
+                    gpui::transparent_black()
                 })
                 .bg(if active {
                     tokens.surface.background
                 } else {
-                    tokens.surface.muted
+                    gpui::transparent_black()
                 })
                 .text_color(if active {
                     tokens.content.primary
@@ -366,7 +429,7 @@ impl RenderOnce for TabStrip {
                 .on_click(move |event, window, cx| activate(index, event, window, cx))
                 .when(!is_compound, |tab| {
                     tab.child(
-                        Icon::new(IconName::File)
+                        Icon::new(semantic_icon(icons.document))
                             .size(px(15.0))
                             .text_color(if active {
                                 tokens.action.accent
@@ -381,12 +444,14 @@ impl RenderOnce for TabStrip {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_sm()
-                            .font_weight(if active {
-                                FontWeight::MEDIUM
-                            } else {
-                                FontWeight::NORMAL
-                            })
+                            .design_typography(
+                                if active {
+                                    TypographyRole::Label
+                                } else {
+                                    TypographyRole::Body
+                                },
+                                &tokens,
+                            )
                             .child(primary_title.clone()),
                     )
                 })
@@ -397,13 +462,14 @@ impl RenderOnce for TabStrip {
                         primary_view,
                         primary_title,
                         activate_segment.clone(),
+                        close_segment.clone(),
                     ))
                     .child(
                         div()
                             .h(px(16.0))
                             .w(px(1.0))
                             .flex_none()
-                            .rounded_full()
+                            .design_corners(tokens.components.corners.context_pill)
                             .bg(tokens.surface.border.opacity(0.58)),
                     )
                     .child(segment(
@@ -411,25 +477,28 @@ impl RenderOnce for TabStrip {
                         secondary.view,
                         secondary.title,
                         activate_segment,
+                        close_segment,
                     ))
                 })
-                .when_some(close, |tab, close| {
-                    tab.child(
-                        div()
-                            .id(("close-workspace-tab", index))
-                            .size(px(24.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .hover(move |button| button.bg(tokens.action.control_pressed))
-                            .on_click(move |event, window, cx| {
-                                cx.stop_propagation();
-                                close(index, event, window, cx);
-                            })
-                            .child(Icon::new(IconName::Close).size(px(13.0))),
-                    )
+                .when(!is_compound, |tab| {
+                    tab.when_some(close, |tab, close| {
+                        tab.child(
+                            div()
+                                .id(("close-workspace-tab", index))
+                                .size(px(24.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .design_corners(tokens.components.corners.button)
+                                .hover(move |button| button.bg(tokens.action.control_pressed))
+                                .on_click(move |event, window, cx| {
+                                    cx.stop_propagation();
+                                    close(index, event, window, cx);
+                                })
+                                .child(Icon::new(semantic_icon(icons.close)).size(px(13.0))),
+                        )
+                    })
                 })
                 .when(show_separator, |tab| {
                     tab.child(
@@ -443,18 +512,21 @@ impl RenderOnce for TabStrip {
                     )
                 })
                 .when(recently_moved, |tab| {
-                    tab.child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .rounded_t_xl()
-                            .bg(tokens.action.accent_soft)
-                            .with_animation(
-                                "recently-moved-tab",
-                                Animation::new(Duration::from_millis(260)).with_easing(ease_in_out),
-                                |pulse, delta| pulse.opacity(1.0 - delta),
-                            ),
-                    )
+                    tab.when_some(tokens.motion.tab_move_duration_ms, |tab, duration_ms| {
+                        tab.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .design_corners(tokens.components.corners.tab)
+                                .bg(tokens.action.accent_soft)
+                                .with_animation(
+                                    "recently-moved-tab",
+                                    Animation::new(Duration::from_millis(duration_ms.into()))
+                                        .with_easing(ease_in_out),
+                                    |pulse, delta| pulse.opacity(1.0 - delta),
+                                ),
+                        )
+                    })
                 })
                 .when_some(drag, |tab, drag| {
                     let preview_tokens = tokens;
@@ -480,47 +552,27 @@ impl RenderOnce for TabStrip {
         let sidebar = self.on_sidebar;
         let search = self.on_search;
         let new_tab = self.on_new;
+        let inline_new_tab = new_tab.clone();
         div()
             .relative()
-            .h(px(TAB_BAR_HEIGHT))
+            .h(px(chrome.tab_bar_height))
             .w_full()
             .flex_none()
             .flex()
             .items_center()
             .overflow_hidden()
-            .pl(px(TAB_BAR_LEADING_INSET))
+            .pl(px(if utilities_in_tab_row {
+                chrome.utility_controls_leading_inset
+            } else {
+                chrome.tab_leading_inset
+            }))
             .window_control_area(WindowControlArea::Drag)
-            .bg(tokens.surface.chrome)
-            .border_b_1()
-            .border_color(tokens.surface.border.opacity(0.65))
-            .child(
-                div()
-                    .h_full()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_1()
-                    .child(titlebar_icon_button(
-                        tokens,
-                        "workspace-sidebar-placeholder",
-                        IconName::PanelLeft,
-                        sidebar,
-                    ))
-                    .child(titlebar_icon_button(
-                        tokens,
-                        "workspace-tab-search",
-                        IconName::ChevronDown,
-                        search,
-                    ))
-                    .child(
-                        div()
-                            .h(px(24.0))
-                            .w(px(1.0))
-                            .mx_2()
-                            .bg(tokens.surface.border.opacity(0.72)),
-                    ),
-            )
+            .bg(tokens.materials.chrome.background)
+            .when(utilities_in_tab_row, |bar| {
+                bar.child(workspace_utility_controls(
+                    tokens, icons, sidebar, search, true,
+                ))
+            })
             .child(
                 div()
                     .relative()
@@ -531,13 +583,13 @@ impl RenderOnce for TabStrip {
                         rail.w(px(preferred_tab_width)).flex_none()
                     })
                     .overflow_hidden()
-                    .bg(tokens.surface.muted)
                     .child(
                         div()
                             .id("workspace-tabs-scroll")
                             .h_full()
                             .w_full()
                             .flex()
+                            .items_center()
                             .overflow_x_scroll()
                             .track_scroll(&self.scroll)
                             .children(tabs)
@@ -545,7 +597,7 @@ impl RenderOnce for TabStrip {
                                 div()
                                     .id("workspace-tab-drop-end")
                                     .h_full()
-                                    .w(px(8.0))
+                                    .w(px(4.0))
                                     .flex_none()
                                     .when_some(drop_at_end, |target, drop| {
                                         target
@@ -558,7 +610,24 @@ impl RenderOnce for TabStrip {
                                                 drop(drag, tab_count, window, cx);
                                             })
                                     }),
-                            ),
+                            )
+                            .when(!tabs_overflow, |strip| {
+                                strip.child(
+                                    div()
+                                        .h(px(chrome.tab_height))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .ml_1()
+                                        .child(new_tab_button(
+                                            tokens,
+                                            "workspace-new-tab-inline",
+                                            inline_new_tab,
+                                            chrome.new_tab_button_size,
+                                            semantic_icon(icons.new_tab),
+                                        )),
+                                )
+                            }),
                     )
                     .when(tabs_overflow, |strip| {
                         strip
@@ -590,20 +659,23 @@ impl RenderOnce for TabStrip {
                             )
                     }),
             )
-            .child(
-                div()
-                    .h_full()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .child(titlebar_icon_button(
-                        tokens,
-                        "workspace-new-tab",
-                        IconName::Plus,
-                        new_tab,
-                    )),
-            )
+            .when(tabs_overflow, |bar| {
+                bar.child(
+                    div()
+                        .h(px(chrome.tab_height))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .ml_1()
+                        .child(new_tab_button(
+                            tokens,
+                            "workspace-new-tab-overflow",
+                            new_tab,
+                            chrome.new_tab_button_size,
+                            semantic_icon(icons.new_tab),
+                        )),
+                )
+            })
             .when(!tabs_overflow, |bar| bar.child(div().h_full().flex_1()))
     }
 }
@@ -616,27 +688,28 @@ struct TabDragPreview {
 
 impl Render for TabDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let preview = self.tokens.components.popover;
         div()
-            .pl(self.position.x - px(110.0))
-            .pt(self.position.y - px(20.0))
+            .pl(self.position.x - px(preview.drag_preview_width * 0.5))
+            .pt(self.position.y - px(preview.drag_preview_height * 0.5))
             .child(
                 div()
-                    .w(px(220.0))
-                    .h(px(40.0))
+                    .w(px(preview.drag_preview_width))
+                    .h(px(preview.drag_preview_height))
                     .px_3()
                     .flex()
                     .items_center()
                     .gap_2()
                     .overflow_hidden()
-                    .rounded_lg()
+                    .design_corners(self.tokens.components.corners.card)
                     .border_1()
                     .border_color(self.tokens.surface.border)
-                    .shadow_lg()
-                    .bg(self.tokens.surface.background)
+                    .design_elevation(ElevationRole::Floating, &self.tokens)
+                    .bg(self.tokens.materials.floating.background)
                     .text_color(self.tokens.content.primary)
                     .child(
-                        Icon::new(IconName::File)
-                            .size(px(14.0))
+                        Icon::new(semantic_icon(self.tokens.icons.document))
+                            .size(px(self.tokens.components.common.icon_medium))
                             .text_color(self.tokens.action.accent),
                     )
                     .child(
@@ -645,8 +718,7 @@ impl Render for TabDragPreview {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
+                            .design_typography(TypographyRole::Label, &self.tokens)
                             .child(self.title.clone()),
                     ),
             )
@@ -705,18 +777,27 @@ impl TabHoverCard {
 impl RenderOnce for TabHoverCard {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let title_character_count = self.title.chars().count();
-        let title_distance = ((title_character_count.saturating_sub(31)) as f32 * 7.2).max(0.0);
-        let title: AnyElement = if title_distance > 0.0 {
+        let popover = self.tokens.components.popover;
+        let title_distance = ((title_character_count
+            .saturating_sub(popover.marquee_start_characters.into()))
+            as f32
+            * popover.average_character_width)
+            .max(0.0);
+        let marquee_speed = self.tokens.motion.marquee_points_per_second;
+        let marquee_minimum = self.tokens.motion.marquee_min_duration_ms;
+        let title: AnyElement = if title_distance > 0.0
+            && let (Some(speed), Some(minimum_ms)) = (marquee_speed, marquee_minimum)
+        {
             div()
                 .absolute()
                 .left_0()
                 .whitespace_nowrap()
-                .font_weight(FontWeight::SEMIBOLD)
+                .design_typography(TypographyRole::Heading, &self.tokens)
                 .child(self.title)
                 .with_animation(
                     "tab-hover-title-marquee",
                     Animation::new(Duration::from_secs_f32(
-                        (title_distance / 22.0).max(4.5) * 2.0,
+                        (title_distance / speed).max(minimum_ms as f32 / 1_000.0) * 2.0,
                     ))
                     .repeat()
                     .with_easing(ease_in_out),
@@ -735,7 +816,7 @@ impl RenderOnce for TabHoverCard {
                 .absolute()
                 .left_0()
                 .whitespace_nowrap()
-                .font_weight(FontWeight::SEMIBOLD)
+                .design_typography(TypographyRole::Heading, &self.tokens)
                 .child(self.title)
                 .into_any_element()
         };
@@ -755,9 +836,10 @@ impl RenderOnce for TabHoverCard {
                     .child(
                         div()
                             .relative()
-                            .h(px(18.0))
+                            .h(px(self.tokens.typography.heading.size_rem
+                                * 16.0
+                                * self.tokens.typography.heading.line_height))
                             .overflow_hidden()
-                            .text_sm()
                             .child(title),
                     )
                     .when_some(self.subtitle, |content, subtitle| {
@@ -766,18 +848,61 @@ impl RenderOnce for TabHoverCard {
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .whitespace_nowrap()
-                                .text_xs()
+                                .design_typography(TypographyRole::Caption, &self.tokens)
                                 .text_color(self.tokens.content.secondary)
                                 .child(subtitle),
                         )
                     }),
             );
 
-        HoverCardShell::new(self.tokens, px(TAB_HOVER_CARD_WIDTH))
-            .section(header)
-            .when_some(self.body, |card, body| card.section(body))
-            .when_some(self.footer, |card, footer| card.section(footer))
+        HoverCardShell::new(
+            self.tokens,
+            px(self.tokens.components.popover.tab_hover_width),
+        )
+        .section(header)
+        .when_some(self.body, |card, body| card.section(body))
+        .when_some(self.footer, |card, footer| card.section(footer))
     }
+}
+
+/// Shared window-level utility group used by either chrome row according to
+/// the typed responsive layout configuration.
+pub fn workspace_utility_controls(
+    tokens: ThemeTokens,
+    icons: IconRoleConfig,
+    sidebar: TabBarAction,
+    search: TabBarAction,
+    trailing_separator: bool,
+) -> AnyElement {
+    div()
+        .h_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_1()
+        .child(titlebar_icon_button(
+            tokens,
+            "workspace-sidebar-placeholder",
+            semantic_icon(icons.sidebar),
+            sidebar,
+        ))
+        .child(titlebar_icon_button(
+            tokens,
+            "workspace-tab-search",
+            semantic_icon(icons.tab_list),
+            search,
+        ))
+        .when(trailing_separator, |group| {
+            group.child(
+                div()
+                    .h(px(tokens.components.common.separator_length))
+                    .w(px(tokens.components.common.separator_width))
+                    .mx_2()
+                    .bg(tokens.materials.chrome.border),
+            )
+        })
+        .into_any_element()
 }
 
 fn titlebar_icon_button(
@@ -788,17 +913,39 @@ fn titlebar_icon_button(
 ) -> impl IntoElement {
     div()
         .id(id)
-        .size(px(34.0))
+        .size(px(tokens.components.common.control_medium))
         .flex()
         .items_center()
         .justify_center()
-        .rounded_lg()
+        .design_corners(tokens.components.corners.button)
         .text_color(tokens.content.secondary)
         .cursor_pointer()
         .hover(move |button| button.bg(tokens.action.control_hover))
         .active(move |button| button.bg(tokens.action.control_pressed))
         .on_click(move |event, window, cx| action(event, window, cx))
-        .child(Icon::new(icon).size(px(16.0)))
+        .child(Icon::new(icon).size(px(tokens.components.common.icon_large)))
+}
+
+fn new_tab_button(
+    tokens: ThemeTokens,
+    id: &'static str,
+    action: TabBarAction,
+    size: f32,
+    icon: IconName,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .size(px(size))
+        .flex()
+        .items_center()
+        .justify_center()
+        .design_corners(tokens.components.corners.button)
+        .text_color(tokens.content.secondary)
+        .cursor_pointer()
+        .hover(move |button| button.bg(tokens.action.control_hover))
+        .active(move |button| button.bg(tokens.action.control_pressed))
+        .on_click(move |event, window, cx| action(event, window, cx))
+        .child(Icon::new(icon).size(px(tokens.components.common.icon_medium)))
 }
 
 /// Reusable popover shell for searchable tab lists. The owner supplies its
@@ -831,56 +978,55 @@ impl RenderOnce for TabSearchPopover {
         let count: SharedString = format!("{row_count}").into();
         div()
             .occlude()
-            .w(px(TAB_SEARCH_POPOVER_WIDTH))
-            .max_h(px(460.0))
+            .w(px(self.tokens.components.popover.tab_search_width))
+            .max_h(px(self.tokens.components.popover.tab_search_max_height))
             .overflow_hidden()
-            .rounded_xl()
+            .design_corners(self.tokens.components.corners.popover)
             .border_1()
-            .border_color(self.tokens.content.primary.opacity(0.12))
-            .shadow_lg()
-            .bg(self.tokens.surface.background)
+            .border_color(self.tokens.materials.floating.border)
+            .design_elevation(ElevationRole::Floating, &self.tokens)
+            .bg(self.tokens.materials.floating.background)
             .text_color(self.tokens.content.primary)
             .flex()
             .flex_col()
             .child(
                 div()
-                    .h(px(48.0))
+                    .h(px(self.tokens.components.popover.row_height))
                     .flex_none()
                     .px_3()
                     .flex()
                     .items_center()
                     .gap_2()
                     .child(
-                        Icon::new(IconName::Search)
-                            .size(px(15.0))
+                        Icon::new(semantic_icon(self.tokens.icons.search))
+                            .size(px(self.tokens.components.common.icon_medium))
                             .text_color(self.tokens.action.accent),
                     )
                     .child(
                         div()
                             .flex_1()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .design_typography(TypographyRole::Heading, &self.tokens)
                             .child("Open tabs"),
                     )
                     .child(
                         div()
-                            .min_w(px(24.0))
-                            .h(px(22.0))
+                            .min_w(px(self.tokens.components.common.separator_length))
+                            .h(px(self.tokens.components.common.row_compact - 6.0))
                             .px_2()
-                            .rounded_full()
+                            .design_corners(self.tokens.components.corners.context_pill)
                             .flex()
                             .items_center()
                             .justify_center()
                             .bg(self.tokens.surface.muted)
-                            .text_xs()
+                            .design_typography(TypographyRole::Caption, &self.tokens)
                             .text_color(self.tokens.content.secondary)
                             .child(count),
                     ),
             )
             .child(
                 div()
-                    .h(px(1.0))
-                    .bg(self.tokens.surface.border.opacity(0.72)),
+                    .h(px(self.tokens.components.common.separator_width))
+                    .bg(self.tokens.materials.floating.border),
             )
             .child(div().px_3().pt_3().pb_2().child(self.input))
             .child(
@@ -899,7 +1045,7 @@ impl RenderOnce for TabSearchPopover {
 
 #[cfg(test)]
 mod tests {
-    use super::{TabPresentation, tab_hover_card_x, tab_search_popover_x};
+    use super::{TabPresentation, tab_hover_card_x, tab_hover_card_y, tab_search_popover_x};
 
     #[test]
     fn compound_tab_presentation_keeps_typed_child_identity_and_bounds_selection() {
@@ -918,14 +1064,15 @@ mod tests {
 
     #[test]
     fn search_popover_stays_near_its_control_and_inside_narrow_windows() {
-        assert_eq!(tab_search_popover_x(1_200.0), 104.0);
-        assert_eq!(tab_search_popover_x(390.0), 8.0);
+        assert_eq!(tab_search_popover_x(1_200.0, 104.0, 380.0, 8.0), 104.0);
+        assert_eq!(tab_search_popover_x(390.0, 104.0, 380.0, 8.0), 8.0);
     }
 
     #[test]
     fn hover_card_centers_under_tabs_and_clamps_to_edges() {
-        assert_eq!(tab_hover_card_x(400.0, 200.0, 1_200.0, 282.0), 359.0);
-        assert_eq!(tab_hover_card_x(2.0, 120.0, 800.0, 282.0), 8.0);
-        assert_eq!(tab_hover_card_x(760.0, 120.0, 800.0, 282.0), 510.0);
+        assert_eq!(tab_hover_card_y(52.0, 34.0, 4.0), 47.0);
+        assert_eq!(tab_hover_card_x(400.0, 200.0, 1_200.0, 282.0, 8.0), 359.0);
+        assert_eq!(tab_hover_card_x(2.0, 120.0, 800.0, 282.0, 8.0), 8.0);
+        assert_eq!(tab_hover_card_x(760.0, 120.0, 800.0, 282.0, 8.0), 510.0);
     }
 }

@@ -60,29 +60,24 @@ fn fetch_clinical_trials(
 }
 
 fn parse_clinical_trials(value: &Value, nct_id: &str) -> Result<RegistryPreview, String> {
-    let title = string_at(&value, "/protocolSection/identificationModule/briefTitle")
-        .or_else(|| {
-            string_at(
-                &value,
-                "/protocolSection/identificationModule/officialTitle",
-            )
-        })
+    let title = string_at(value, "/protocolSection/identificationModule/briefTitle")
+        .or_else(|| string_at(value, "/protocolSection/identificationModule/officialTitle"))
         .ok_or_else(|| "ClinicalTrials.gov returned no study title".to_owned())?;
     let mut details = vec![format!("Trial: {nct_id}")];
     push_field(
         &mut details,
         "Status",
-        string_at(&value, "/protocolSection/statusModule/overallStatus"),
+        string_at(value, "/protocolSection/statusModule/overallStatus"),
     );
     push_field(
         &mut details,
         "Type",
-        string_at(&value, "/protocolSection/designModule/studyType"),
+        string_at(value, "/protocolSection/designModule/studyType"),
     );
     push_field(
         &mut details,
         "Condition",
-        first_string_at(&value, "/protocolSection/conditionsModule/conditions"),
+        first_string_at(value, "/protocolSection/conditionsModule/conditions"),
     );
     Ok(RegistryPreview {
         kind: LinkPreviewKind::ClinicalTrialsGov,
@@ -105,23 +100,23 @@ fn fetch_osf_registration(
 }
 
 fn parse_osf_registration(value: &Value, registration_id: &str) -> Result<RegistryPreview, String> {
-    let title = string_at(&value, "/data/attributes/title")
+    let title = string_at(value, "/data/attributes/title")
         .ok_or_else(|| "OSF returned no registration title".to_owned())?;
     let mut details = vec![format!("Registration: {registration_id}")];
     push_field(
         &mut details,
         "Registered",
-        string_at(&value, "/data/attributes/date_registered"),
+        string_at(value, "/data/attributes/date_registered"),
     );
     push_field(
         &mut details,
         "Provider",
-        string_at(&value, "/data/attributes/provider"),
+        string_at(value, "/data/attributes/provider"),
     );
     push_field(
         &mut details,
         "Description",
-        string_at(&value, "/data/attributes/description"),
+        string_at(value, "/data/attributes/description"),
     );
     Ok(RegistryPreview {
         kind: LinkPreviewKind::Osf,

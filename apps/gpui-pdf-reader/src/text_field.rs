@@ -5,9 +5,10 @@ use gpui::{
     TextLayout, TextRun, UTF16Selection, UnderlineStyle, Window, actions, canvas, div, font, point,
     prelude::*, px, quad, size,
 };
-use gpui_component::Theme;
 use std::ops::Range;
 use std::{error::Error, fmt};
+
+use key_ui_gpui::{DesignStyled as _, RadiusRole};
 
 use crate::theme::ReaderPalette;
 use crate::{EditCopy, EditCut, EditPaste, EditSelectAll};
@@ -192,6 +193,7 @@ pub struct TextField {
     layout: TextLayout,
     selecting: bool,
     max_bytes: usize,
+    borderless: bool,
 }
 
 impl TextField {
@@ -207,6 +209,7 @@ impl TextField {
             layout: TextLayout::default(),
             selecting: false,
             max_bytes,
+            borderless: false,
         }
     }
 
@@ -231,6 +234,13 @@ impl TextField {
                 self.rejected(rejection, cx);
                 Err(rejection)
             }
+        }
+    }
+
+    pub fn set_borderless(&mut self, borderless: bool, cx: &mut Context<Self>) {
+        if self.borderless != borderless {
+            self.borderless = borderless;
+            cx.notify();
         }
     }
 
@@ -544,7 +554,7 @@ impl EntityInputHandler for TextField {
 
 impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
+        let palette = ReaderPalette::from_app(cx);
         let focused = self.focus_handle.is_focused(window);
         let display: SharedString = if self.buffer.text.is_empty() {
             " ".into()
@@ -590,17 +600,20 @@ impl Render for TextField {
             .h(px(36.0))
             .w_full()
             .overflow_hidden()
-            .px_3()
+            .px(if self.borderless { px(0.0) } else { px(12.0) })
             .flex()
             .items_center()
-            .rounded_md()
-            .border_1()
-            .border_color(if focused {
-                palette.accent
-            } else {
-                palette.separator
+            .when(!self.borderless, |field| {
+                field
+                    .design_radius(RadiusRole::Medium, &palette.ui)
+                    .border_1()
+                    .border_color(if focused {
+                        palette.accent
+                    } else {
+                        palette.separator
+                    })
+                    .bg(palette.surface_subtle)
             })
-            .bg(palette.surface_subtle)
             .text_color(palette.text)
             .text_sm()
             .line_height(px(22.0))
@@ -631,7 +644,7 @@ impl Render for TextField {
                 element.child(
                     div()
                         .absolute()
-                        .left_3()
+                        .left(if self.borderless { px(0.0) } else { px(12.0) })
                         .text_color(palette.text_tertiary)
                         .child(self.placeholder.clone()),
                 )

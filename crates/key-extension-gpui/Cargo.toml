@@ -12,6 +12,7 @@ key-extension-host = { path = "../key-extension-host" }
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "macos-blade"] }
 gpui-component = "=0.5.1"
+key-ui-gpui = { path = "../key-ui-gpui" }
 
 [lints.rust]
 unsafe_code = "forbid"

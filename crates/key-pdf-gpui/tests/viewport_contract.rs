@@ -1,10 +1,10 @@
 use key_pdf_core::{DocumentLayout, PageAnchor, PageSize, PixelRect, RasterSize, Rect, TileKey};
 use key_pdf_gpui::{
-    DEFAULT_MAX_RASTER_DIMENSION, DEFAULT_MAX_ZOOM, DEFAULT_MIN_ZOOM, DEFAULT_TILE_BLEED,
-    DEFAULT_TILE_SIZE, DemandTier, InputDisposition, PdfReaderConfig, PdfReaderLimits,
-    ScrollBehavior, ScrollOffset, TilePlanningInput, ViewportController, ViewportMetrics,
-    ViewportPoint, command_wheel_zoom_factor, desired_raster_size, inflate_tile_rect,
-    plan_visible_tiles, tile_core_rect, tile_logical_rect,
+    DEFAULT_MAX_RASTER_DIMENSION, DEFAULT_MAX_ZOOM, DEFAULT_MIN_ZOOM, DEFAULT_RENDER_QUANTUM,
+    DEFAULT_TILE_BLEED, DEFAULT_TILE_SIZE, DemandTier, InputDisposition, PdfReaderConfig,
+    PdfReaderLimits, ScrollBehavior, ScrollOffset, TilePlanningInput, ViewportController,
+    ViewportMetrics, ViewportPoint, command_wheel_zoom_factor, desired_raster_size,
+    inflate_tile_rect, plan_visible_tiles, tile_core_rect, tile_logical_rect,
 };
 use key_pdf_runtime::{ColorMode, DemandIntent, DemandPriority, DocumentSessionManager};
 use std::collections::HashSet;
@@ -183,6 +183,64 @@ fn high_zoom_raster_is_sharp_without_allocating_a_full_page() {
     assert!(rendered.width <= DEFAULT_TILE_SIZE + DEFAULT_TILE_BLEED * 2);
     assert!(rendered.height <= DEFAULT_TILE_SIZE + DEFAULT_TILE_BLEED * 2);
     assert!(rendered.width as usize * rendered.height as usize * 4 < 5 * 1024 * 1024);
+}
+
+#[test]
+fn default_raster_dimensions_match_physical_display_pixels() {
+    let limits = PdfReaderLimits::default();
+    assert_eq!(DEFAULT_RENDER_QUANTUM, 1);
+    assert_eq!(
+        desired_raster_size(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 816.0,
+                height: 1_056.0,
+            },
+            2.0,
+            &limits,
+        ),
+        RasterSize {
+            width: 1_632,
+            height: 2_112,
+        }
+    );
+}
+
+#[test]
+fn display_scale_change_replans_tiles_at_the_new_density() {
+    let mut controller = controller(1, 900.0, 700.0);
+    assert_eq!(
+        controller.set_viewport(ViewportMetrics {
+            width: 900.0,
+            height: 700.0,
+            right_occlusion: 0.0,
+            scale_factor: 1.0,
+        }),
+        InputDisposition::Applied
+    );
+    controller.drain_events().for_each(drop);
+    let low_density_raster = controller.plan_tiles().tiles[0].request.key.raster;
+
+    assert_eq!(
+        controller.set_viewport(ViewportMetrics {
+            width: 900.0,
+            height: 700.0,
+            right_occlusion: 0.0,
+            scale_factor: 2.0,
+        }),
+        InputDisposition::Applied
+    );
+    let high_density_raster = controller.plan_tiles().tiles[0].request.key.raster;
+    assert_eq!(high_density_raster.width, low_density_raster.width * 2);
+    assert_eq!(high_density_raster.height, low_density_raster.height * 2);
+    assert!(controller.drain_events().any(|event| matches!(
+        event,
+        key_pdf_gpui::PdfReaderEvent::DemandInvalidated {
+            cause: key_pdf_gpui::DemandInvalidation::Viewport,
+            ..
+        }
+    )));
 }
 
 #[test]

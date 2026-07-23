@@ -8,7 +8,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex,
+    ActiveTheme as _, Icon, Selectable as _, Sizable as _, h_flex,
     input::{Input, InputEvent, InputState},
     progress::Progress,
     text::TextView,
@@ -19,6 +19,7 @@ use key_extension_api::{
     TextEmphasis, UiContribution, UiNode, UiNodeKind, UiTone,
 };
 use key_extension_host::OwnedView;
+use key_ui_gpui::{DesignStyled as _, ThemeTokens, TypographyRole, semantic_icon};
 
 use crate::{
     BoundedStateMap, InvokeExtensionCommand, resolve_host_icon, safe_markdown::safe_markdown_html,
@@ -192,6 +193,8 @@ impl DeclarativeView {
             return None;
         }
 
+        let tokens = ThemeTokens::from_app(cx);
+        let metrics = tokens.components.extensions;
         let element =
             match &node.kind {
                 UiNodeKind::Column { children } => v_flex()
@@ -268,15 +271,14 @@ impl DeclarativeView {
                     .child(
                         div()
                             .min_w_0()
-                            .text_sm()
+                            .design_typography(TypographyRole::Body, &tokens)
                             .text_color(cx.theme().muted_foreground)
                             .child(label.clone()),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .design_typography(TypographyRole::Heading, &tokens)
                             .child(format_metric_value(self.state.resolve(value), *format)),
                     )
                     .into_any_element(),
@@ -305,7 +307,7 @@ impl DeclarativeView {
                     label,
                     command,
                 } => Button::new(self.element_key(&node.id, "icon-button"))
-                    .icon(self.render_icon(icon))
+                    .icon(self.render_icon(icon, tokens))
                     .tooltip(label.clone())
                     .small()
                     .compact()
@@ -344,7 +346,7 @@ impl DeclarativeView {
                         .gap_1()
                         .child(
                             div()
-                                .text_sm()
+                                .design_typography(TypographyRole::Body, &tokens)
                                 .text_color(cx.theme().muted_foreground)
                                 .child(label.clone()),
                         )
@@ -370,7 +372,7 @@ impl DeclarativeView {
                         .gap_1()
                         .child(
                             div()
-                                .text_sm()
+                                .design_typography(TypographyRole::Body, &tokens)
                                 .text_color(cx.theme().muted_foreground)
                                 .child(label.clone()),
                         )
@@ -433,16 +435,16 @@ impl DeclarativeView {
                     div()
                         .flex_none()
                         .px_2()
-                        .py_1()
-                        .rounded_full()
-                        .text_xs()
+                        .h(px(metrics.badge_height))
+                        .design_corners(tokens.components.corners.context_pill)
+                        .design_typography(TypographyRole::Caption, &tokens)
                         .bg(background)
                         .text_color(foreground)
                         .child(label.clone())
                         .into_any_element()
                 }
                 UiNodeKind::Divider => div()
-                    .h(px(1.))
+                    .h(px(tokens.components.common.separator_width))
                     .w_full()
                     .bg(cx.theme().border)
                     .into_any_element(),
@@ -454,12 +456,12 @@ impl DeclarativeView {
                     let fallback_color = cx.theme().muted_foreground;
                     img(extension_asset_key(&self.owner, asset))
                         .max_w_full()
-                        .max_h(px(320.))
+                        .max_h(px(tokens.components.common.content_max_width * 0.45))
                         .with_fallback(move || {
                             h_flex()
                                 .gap_2()
                                 .text_color(fallback_color)
-                                .child(Icon::new(IconName::File))
+                                .child(Icon::new(semantic_icon(tokens.icons.document)))
                                 .child(fallback_text.clone())
                                 .into_any_element()
                         })
@@ -472,7 +474,7 @@ impl DeclarativeView {
                     .gap_1()
                     .child(
                         div()
-                            .text_sm()
+                            .design_typography(TypographyRole::Body, &tokens)
                             .text_color(cx.theme().muted_foreground)
                             .child(label.clone()),
                     )
@@ -494,11 +496,11 @@ impl DeclarativeView {
         .into()
     }
 
-    fn render_icon(&self, icon: &IconRef) -> Icon {
+    fn render_icon(&self, icon: &IconRef, tokens: ThemeTokens) -> Icon {
         match icon {
             IconRef::Host(name) => resolve_host_icon(name)
                 .map(Icon::new)
-                .unwrap_or_else(|| Icon::new(IconName::File)),
+                .unwrap_or_else(|| Icon::new(semantic_icon(tokens.icons.document))),
             IconRef::Asset(path) => Icon::empty().path(extension_asset_key(&self.owner, path)),
         }
     }
@@ -602,10 +604,11 @@ fn command_handler(
 }
 
 fn missing_control(label: &str, cx: &App) -> AnyElement {
+    let tokens = ThemeTokens::from_app(cx);
     h_flex()
         .gap_2()
         .text_color(cx.theme().muted_foreground)
-        .child(Icon::new(IconName::TriangleAlert))
+        .child(Icon::new(semantic_icon(tokens.icons.error)))
         .child(label.to_owned())
         .into_any_element()
 }

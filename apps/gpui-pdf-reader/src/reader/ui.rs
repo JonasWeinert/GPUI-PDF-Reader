@@ -2,6 +2,7 @@ use crate::theme::ReaderPalette;
 use gpui::{App, ClickEvent, FontWeight, IntoElement, SharedString, Window, div, prelude::*, px};
 use gpui_component::{Icon, IconName};
 pub(super) use key_ui_gpui::ChromeButtonStyle;
+use key_ui_gpui::{DesignStyled as _, RadiusRole};
 
 /// Shared button chrome used by reader panels and floating controls.
 pub(super) fn chrome_button(
@@ -42,7 +43,7 @@ pub(super) fn empty_state(
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded_full()
+                .design_radius(RadiusRole::Pill, &palette.ui)
                 .bg(palette.accent_soft)
                 .text_color(palette.accent)
                 .text_lg()
@@ -71,7 +72,7 @@ pub(super) fn error_banner(palette: ReaderPalette, message: SharedString) -> gpu
         .mx_4()
         .mt_3()
         .p_3()
-        .rounded_md()
+        .design_radius(RadiusRole::Medium, &palette.ui)
         .bg(palette.error_soft)
         .text_xs()
         .line_height(px(18.0))

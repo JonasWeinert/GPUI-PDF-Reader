@@ -67,6 +67,17 @@ pub enum ControlBarItemKind {
     TextInput,
 }
 
+/// How an item consumes horizontal space in a control-bar host.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlBarWidth {
+    /// Keep the presentation's measured width.
+    #[default]
+    Intrinsic,
+    /// Consume the space left after intrinsic items have been laid out.
+    Max,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ControlBarPresentation {
     pub label: String,
@@ -77,6 +88,11 @@ pub struct ControlBarPresentation {
     pub widths: [f32; 3],
     /// Lower-priority items collapse before higher-priority items.
     pub priority: u16,
+    /// Lets one view-owned control act as the control bar's flexible location.
+    pub width: ControlBarWidth,
+    /// Keeps a button icon-only at every responsive width.
+    #[serde(default)]
+    pub icon_only: bool,
 }
 
 impl ControlBarPresentation {
@@ -89,6 +105,8 @@ impl ControlBarPresentation {
             tooltip: None,
             widths,
             priority,
+            width: ControlBarWidth::Intrinsic,
+            icon_only: false,
         }
     }
 
@@ -107,6 +125,19 @@ impl ControlBarPresentation {
     #[must_use]
     pub fn tooltip(mut self, tooltip: impl Into<String>) -> Self {
         self.tooltip = Some(tooltip.into());
+        self
+    }
+
+    /// Requests all remaining horizontal space in the control-bar host.
+    #[must_use]
+    pub fn max_width(mut self) -> Self {
+        self.width = ControlBarWidth::Max;
+        self
+    }
+
+    #[must_use]
+    pub fn icon_only(mut self) -> Self {
+        self.icon_only = true;
         self
     }
 }
