@@ -11,6 +11,16 @@
 
 mod transition;
 
+pub use key_ui_core::{
+    AccessibilityPreferences, AppearanceConfig, BackdropEffect, ChromeLayoutConfig, ChromeRowOrder,
+    ChromeUtilityControlsRow, CommonComponentConfig, ComponentConfig, ComponentCornerConfig,
+    ConfigError as DesignSystemConfigError, ControlBarComponentConfig, CornerShape, CornerSpec,
+    DesignSystemConfig, FeatureComponentConfig, FeaturePolicy, FontWeightToken, IconRoleConfig,
+    InteractionConfig, InteractionState, PaletteContrastConfig, PopoverComponentConfig,
+    ReaderUiConfig, ResolvedDesignSystem, RgbaColor, SemanticColorConfig, SemanticIcon,
+    SplitLayoutConfig, StateValue, TextStyleConfig, ThemeSelection, TypographyConfig, WidthClass,
+    WorkspaceLayoutConfig,
+};
 pub use transition::UnitTransition;
 
 #[cfg(target_os = "macos")]
@@ -22,6 +32,8 @@ mod controls;
 mod hover_card;
 #[cfg(target_os = "macos")]
 mod panel;
+#[cfg(target_os = "macos")]
+mod style;
 #[cfg(target_os = "macos")]
 mod tabs;
 #[cfg(target_os = "macos")]
@@ -39,10 +51,15 @@ pub use hover_card::HoverCardShell;
 #[cfg(target_os = "macos")]
 pub use panel::{PanelHeader, PanelShell, PanelShellStyle};
 #[cfg(target_os = "macos")]
+pub use style::{DesignStyled, ElevationRole, RadiusRole, TypographyRole};
+#[cfg(target_os = "macos")]
 pub use tabs::{
-    TAB_BAR_HEIGHT, TAB_HOVER_CARD_WIDTH, TAB_SEARCH_POPOVER_WIDTH, TabBarAction, TabDragPayload,
-    TabDropAction, TabHoverAction, TabHoverCard, TabIndexAction, TabPresentation, TabSearchPopover,
-    TabSegmentAction, TabSegmentPresentation, TabStrip, tab_hover_card_x, tab_search_popover_x,
+    TabBarAction, TabDragPayload, TabDropAction, TabHoverAction, TabHoverCard, TabIndexAction,
+    TabPresentation, TabSearchPopover, TabSegmentAction, TabSegmentPresentation, TabStrip,
+    tab_hover_card_x, tab_hover_card_y, tab_search_popover_x, workspace_utility_controls,
 };
 #[cfg(target_os = "macos")]
-pub use theme::{ActionTokens, ContentTokens, StatusTokens, SurfaceTokens, ThemeTokens};
+pub use theme::{
+    ActionTokens, ContentTokens, MaterialToken, MaterialTokens, StatusTokens, SurfaceTokens,
+    ThemeTokens, configured_color, install_design_system, resolved_design_system, semantic_icon,
+};

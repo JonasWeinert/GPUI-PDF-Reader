@@ -15,6 +15,7 @@ members = [
     "crates/key-pdfium",
     "crates/key-safe-http",
     "crates/key-sidecar-store",
+    "crates/key-ui-core",
     "crates/key-ui-gpui",
     "crates/key-workspace-core",
     "extensions/key-reference",

@@ -8,6 +8,7 @@ struct PaintPageOverlayState {
     active_search: Option<SearchMatchId>,
     navigation_focus: Option<NavigationFocusFrame>,
     annotation_budget: PaintBudget,
+    annotation_geometry_budget: PaintBudget,
     search_budget: PaintBudget,
     selection_budget: PaintBudget,
     extension_overlay_budget: PaintBudget,
@@ -28,6 +29,7 @@ impl PaintPageOverlayState {
             active_search,
             navigation_focus,
             annotation_budget: PaintBudget::new(MAX_VISIBLE_ANNOTATION_QUADS),
+            annotation_geometry_budget: PaintBudget::new(MAX_VISIBLE_ANNOTATION_QUADS),
             search_budget: PaintBudget::new(MAX_VISIBLE_SEARCH_HIGHLIGHT_RUNS),
             selection_budget: PaintBudget::new(MAX_VISIBLE_SELECTION_QUADS),
             extension_overlay_budget: PaintBudget::new(MAX_VISIBLE_EXTENSION_OVERLAY_REGIONS),
@@ -83,7 +85,9 @@ impl PaintPageOverlayState {
                 }),
                 |window| {
                     for annotation in &overlay.annotations {
-                        if self.annotation_budget.exhausted() {
+                        if self.annotation_budget.exhausted()
+                            || self.annotation_geometry_budget.exhausted()
+                        {
                             break;
                         }
                         let Some(range) = annotation
@@ -108,26 +112,35 @@ impl PaintPageOverlayState {
                             None if annotation.has_comment => palette.warning.opacity(0.24),
                             None => continue,
                         };
-                        let exhausted = chars.for_each_visible_in_range_while(
-                            rect,
-                            content_viewport,
-                            range,
-                            |_, highlight| {
-                                if !self.annotation_budget.take() {
-                                    return false;
-                                }
-                                window.paint_quad(quad(
-                                    content_rect_to_bounds(bounds, highlight, scroll),
-                                    px(1.0),
-                                    color,
-                                    px(0.0),
-                                    gpui::transparent_black(),
-                                    Default::default(),
-                                ));
-                                !self.annotation_budget.exhausted()
-                            },
-                        );
-                        if !exhausted {
+                        // Highlights use the same line-aware geometry as the
+                        // live selection: source-order glyphs on a visual line
+                        // are unioned, bridging glyph-less whitespace without
+                        // crossing a line break. Keep geometry work bounded
+                        // separately from the number of resulting quads.
+                        let (highlight_runs, inspected_glyphs) = chars
+                            .visible_selection_runs_with_glyph_count(
+                                rect,
+                                content_viewport,
+                                range,
+                                self.annotation_geometry_budget.remaining(),
+                            );
+                        self.annotation_geometry_budget.take_up_to(inspected_glyphs);
+                        for highlight in highlight_runs {
+                            if !self.annotation_budget.take() {
+                                break;
+                            }
+                            window.paint_quad(quad(
+                                content_rect_to_bounds(bounds, highlight, scroll),
+                                px(1.0),
+                                color,
+                                px(0.0),
+                                gpui::transparent_black(),
+                                Default::default(),
+                            ));
+                        }
+                        if self.annotation_budget.exhausted()
+                            || self.annotation_geometry_budget.exhausted()
+                        {
                             break;
                         }
                     }
@@ -311,8 +324,10 @@ impl Focusable for PdfReader {
 
 impl Render for PdfReader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.theme_tokens = ThemeTokens::from_app(cx);
+        self.synchronize_render_appearance(window, cx);
         let active_theme = Theme::global(cx);
-        let mut palette = ReaderPalette::from_theme(active_theme);
+        let mut palette = ReaderPalette::from_app(cx);
         let forced_dark = matches!(
             self.render_appearance,
             RenderAppearance::ForcedColors { .. }
@@ -472,11 +487,11 @@ impl Render for PdfReader {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded_lg()
+                        .design_radius(RadiusRole::Large, &palette.ui)
                         .border_1()
                         .border_color(palette.text.opacity(0.15))
                         .bg(palette.surface.opacity(0.07))
-                        .shadow_sm()
+                        .design_elevation(ElevationRole::Surface, &palette.ui)
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("PDF"),
@@ -522,7 +537,11 @@ impl Render for PdfReader {
             SidePanel::Extensions => self.render_extensions_panel(cx),
         };
         let panel_width = self.fluid_panel_width();
-        let sidebar_reveal = fluid_sidebar_extent(self.viewport_width, self.sidebar.progress);
+        let sidebar_reveal = fluid_sidebar_extent_with_ui(
+            self.viewport_width,
+            self.sidebar.progress,
+            self.theme_tokens.reader,
+        );
         let panel_reveal = self.fluid_panel_occlusion();
         let available_width = (self.viewport_width - panel_reveal).max(1.0);
         let has_stable_selection = self
@@ -537,14 +556,16 @@ impl Render for PdfReader {
             .then(|| self.context_anchor_in_viewport())
             .flatten()
             .map(|anchor| {
-                let context_pill_width =
-                    FLUID_CONTEXT_PILL_WIDTH.min((available_width - 24.0).max(1.0));
+                let ui = self.theme_tokens.reader;
+                let context_pill_width = ui
+                    .context_pill_width
+                    .min((available_width - ui.panel_horizontal_margin * 2.0).max(1.0));
                 let position = floating_pill_position(
                     anchor,
                     available_width,
                     self.viewport_height,
                     context_pill_width,
-                    FLUID_CONTEXT_PILL_HEIGHT,
+                    ui.context_pill_height,
                 );
                 self.render_fluid_context_pill(position, context_pill_width, context_enabled, cx)
             });
@@ -560,9 +581,9 @@ impl Render for PdfReader {
                 div()
                     .id("reader-sidebar")
                     .absolute()
-                    .top(px(FLUID_PANEL_VERTICAL_MARGIN))
-                    .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
-                    .right(px(FLUID_PANEL_HORIZONTAL_MARGIN))
+                    .top(px(self.theme_tokens.reader.panel_vertical_margin))
+                    .bottom(px(self.theme_tokens.reader.panel_vertical_margin))
+                    .right(px(self.theme_tokens.reader.panel_horizontal_margin))
                     .w(px(panel_width))
                     .child(FloatingPanel::new(palette, sidebar_content)),
             );
@@ -581,7 +602,7 @@ impl Render for PdfReader {
         let error_bar = if let ReaderStatus::Error(message) = &self.status {
             Some(
                 div()
-                    .h(px(ERROR_BAR_HEIGHT))
+                    .h(px(self.theme_tokens.reader.error_bar_height))
                     .flex_none()
                     .w_full()
                     .flex()

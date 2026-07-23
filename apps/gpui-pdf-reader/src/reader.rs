@@ -123,10 +123,12 @@ mod toc;
 mod ui;
 
 use annotation_io::{AnnotationIo, AnnotationIoEvent, AnnotationIoEvents, AnnotationIoOperation};
-use key_ui_gpui::UnitTransition;
+use key_ui_gpui::{
+    DesignStyled as _, ElevationRole, RadiusRole, ThemeTokens, UnitTransition, semantic_icon,
+};
 #[cfg(debug_assertions)]
 use qa::{QaExtensionPhase, QaFeaturePhase, QaFluidPhase};
-use references::reference_panel_extent;
+use references::reference_panel_extent_with_ui;
 #[cfg(debug_assertions)]
 use references::union_text_bounds;
 #[cfg(test)]
@@ -135,8 +137,8 @@ use references::{
     compact_reference_panel_citation, compact_words, complete_grouped_reference_indices,
     escape_markdown_text, link_card_position, link_hover_candidate_needs_restart,
     link_preview_should_close, link_section_title, measured_preview_width, middle_truncate,
-    pointer_link_card_position, reference_hero_height, reference_panel_width,
-    reference_preview_width, scientific_reference_matches,
+    pointer_link_card_position, reference_hero_height, reference_panel_extent,
+    reference_panel_width, reference_preview_width, scientific_reference_matches,
 };
 #[cfg(test)]
 use search::{SearchListRow, next_search_match_id, search_document_jump};
@@ -158,7 +160,6 @@ pub(crate) enum PdfReaderEvent {
 
 impl EventEmitter<PdfReaderEvent> for PdfReader {}
 
-const ERROR_BAR_HEIGHT: f32 = 34.0;
 const MAX_COPY_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const RESOURCE_MIB: u64 = 1024 * 1024;
 const MAX_VISIBLE_SEARCH_HIGHLIGHT_RUNS: usize = 4_000;
@@ -167,19 +168,6 @@ const MAX_VISIBLE_SELECTION_QUADS: usize = 8_000;
 const MAX_VISIBLE_EXTENSION_OVERLAY_REGIONS: usize = 8_192;
 const ZOOM_RENDER_DEBOUNCE: Duration = Duration::from_millis(150);
 const COMMENT_AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
-const SIDEBAR_WIDTH: f32 = 344.0;
-const REFERENCE_PANEL_MIN_WIDTH: f32 = 372.0;
-const REFERENCE_PANEL_MAX_WIDTH: f32 = 468.0;
-const MIN_DOCUMENT_VIEWPORT_WIDTH: f32 = 300.0;
-const FLUID_PANEL_HORIZONTAL_MARGIN: f32 = 12.0;
-const FLUID_PANEL_VERTICAL_MARGIN: f32 = 18.0;
-const FLUID_CONTEXT_PILL_WIDTH: f32 = 214.0;
-const FLUID_CONTEXT_PILL_HEIGHT: f32 = 40.0;
-const LINK_CARD_WIDTH: f32 = 340.0;
-const LINK_CARD_MARGIN: f32 = 12.0;
-const LINK_CARD_GAP: f32 = 8.0;
-const LINK_HOVER_HANDOFF_DELAY: Duration = Duration::from_millis(180);
-const LINK_HOVER_CLOSE_DELAY: Duration = Duration::from_millis(320);
 const LINK_HOVER_STABILITY_RADIUS: f32 = 3.0;
 const RESOURCE_HIBERNATE_DELAY: Duration = Duration::from_millis(900);
 const DEFAULT_IDLE_CACHE_TRIM_DELAY: Duration = Duration::from_millis(900);
@@ -253,7 +241,6 @@ fn resource_cache_limits(activity: ActivityLevel, amount: ResourceAmount) -> (us
     (cache_bytes, tiles, text_pages)
 }
 const LINK_CARD_MOVE_DEBOUNCE: Duration = Duration::from_millis(45);
-const DOI_COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(1_100);
 
 fn render_appearance_from_theme(theme: &Theme, pdf_dark_mode_enabled: bool) -> RenderAppearance {
     if !theme.is_dark() || !pdf_dark_mode_enabled {
@@ -297,6 +284,14 @@ impl PaintBudget {
 
     fn exhausted(self) -> bool {
         self.remaining == 0
+    }
+
+    fn remaining(self) -> usize {
+        self.remaining
+    }
+
+    fn take_up_to(&mut self, amount: usize) {
+        self.remaining = self.remaining.saturating_sub(amount);
     }
 }
 
@@ -752,6 +747,7 @@ pub struct PdfReader {
     idle_cache_trim_revision: u64,
     idle_cache_trim_task: Option<Task<()>>,
     pending_transfer_snapshot: Option<ReaderTransferSnapshot>,
+    theme_tokens: ThemeTokens,
 }
 
 impl PdfReader {
@@ -885,8 +881,8 @@ impl PdfReader {
                 status: ReaderStatus::Initializing,
                 theme_preference: ThemePreference::System,
                 selected_theme: None,
-                render_appearance: render_appearance_from_theme(Theme::global(cx), true),
-                pdf_dark_mode_enabled: true,
+                render_appearance: render_appearance_from_theme(Theme::global(cx), false),
+                pdf_dark_mode_enabled: false,
                 warning: extension_warning,
                 focus_handle: cx.focus_handle(),
                 zoom: 1.0,
@@ -978,6 +974,7 @@ impl PdfReader {
                 idle_cache_trim_revision: 0,
                 idle_cache_trim_task: None,
                 pending_transfer_snapshot: None,
+                theme_tokens: ThemeTokens::from_app(cx),
             }
         });
 
@@ -2727,8 +2724,9 @@ impl PdfReader {
     }
 
     fn set_viewport_metrics(&mut self, width: f32, height: f32, scale_factor: f32) {
-        let right_occlusion = fluid_sidebar_extent(width, self.sidebar.progress)
-            + reference_panel_extent(width, self.reference_panel.value());
+        let ui = self.theme_tokens.reader;
+        let right_occlusion = fluid_sidebar_extent_with_ui(width, self.sidebar.progress, ui)
+            + reference_panel_extent_with_ui(width, self.reference_panel.value(), ui);
         self.viewport.set_viewport(ViewportMetrics {
             width,
             height,
@@ -2760,12 +2758,13 @@ impl PdfReader {
     }
 
     fn fluid_panel_occlusion(&self) -> f32 {
-        fluid_sidebar_extent(self.viewport_width, self.sidebar.progress)
-            + reference_panel_extent(self.viewport_width, self.reference_panel.value())
+        let ui = self.theme_tokens.reader;
+        fluid_sidebar_extent_with_ui(self.viewport_width, self.sidebar.progress, ui)
+            + reference_panel_extent_with_ui(self.viewport_width, self.reference_panel.value(), ui)
     }
 
     fn fluid_panel_width(&self) -> f32 {
-        fluid_sidebar_width(self.viewport_width)
+        fluid_sidebar_width_with_ui(self.viewport_width, self.theme_tokens.reader)
     }
 
     fn panel_safe_viewport_width(&self) -> f32 {
@@ -3205,6 +3204,14 @@ impl PdfReader {
     }
 
     fn update_render_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.synchronize_render_appearance(window, cx);
+        cx.notify();
+    }
+
+    /// Theme changes are process-global, while each visible PDF has its own
+    /// PDFium tile cache. Checking during render updates both halves of a split
+    /// even when the inactive reader did not initiate the theme selection.
+    fn synchronize_render_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let appearance =
             render_appearance_from_theme(Theme::global(cx), self.pdf_dark_mode_enabled);
         if appearance != self.render_appearance {
@@ -3214,7 +3221,6 @@ impl PdfReader {
             self.render_viewport.clear();
             self.request_visible_tiles(window);
         }
-        cx.notify();
     }
 
     fn toggle_pdf_dark_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3378,7 +3384,7 @@ impl PdfReader {
 
     fn content_top(&self) -> f32 {
         if matches!(self.status, ReaderStatus::Error(_)) {
-            ERROR_BAR_HEIGHT
+            self.theme_tokens.reader.error_bar_height
         } else {
             0.0
         }
@@ -3820,10 +3826,10 @@ impl PdfReader {
                 self.extension_contribution = None;
             }
         }
-        if self
-            .doi_copy_started
-            .is_some_and(|started| now.duration_since(started) >= DOI_COPY_FEEDBACK_DURATION)
-        {
+        if self.doi_copy_started.is_some_and(|started| {
+            now.duration_since(started)
+                >= Duration::from_millis(self.theme_tokens.motion.feedback_duration_ms.into())
+        }) {
             self.doi_copy_started = None;
         }
         advance_toc_hover_state(
@@ -4533,7 +4539,7 @@ impl PdfReader {
             .items_center()
             .justify_center()
             .overflow_hidden()
-            .rounded_md()
+            .design_radius(RadiusRole::Medium, &palette.ui)
             .text_color(palette.text)
             .text_sm()
             .when(enabled, |button| {
@@ -4569,7 +4575,7 @@ impl PdfReader {
             .items_center()
             .justify_center()
             .overflow_hidden()
-            .rounded_md()
+            .design_radius(RadiusRole::Medium, &palette.ui)
             .when(enabled, |button| {
                 button
                     .cursor_pointer()
@@ -4581,7 +4587,7 @@ impl PdfReader {
             .child(
                 div()
                     .size(px(14.0))
-                    .rounded_full()
+                    .design_radius(RadiusRole::Pill, &palette.ui)
                     .border_1()
                     .border_color(palette.text.opacity(0.14))
                     .bg(dot),
@@ -4629,7 +4635,7 @@ impl PdfReader {
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
+        let palette = ReaderPalette::from_app(cx);
         let comment_label = if self.context_has_comment() {
             Icon::new(IconName::BookOpen)
         } else {
@@ -4641,7 +4647,7 @@ impl PdfReader {
             .absolute()
             .left(px(position.x))
             .top(px(position.y))
-            .h(px(FLUID_CONTEXT_PILL_HEIGHT))
+            .h(px(self.theme_tokens.reader.context_pill_height))
             .w(px(width))
             .px_1()
             .flex()
@@ -4649,11 +4655,11 @@ impl PdfReader {
             .justify_center()
             .gap_1()
             .overflow_hidden()
-            .rounded_full()
+            .design_radius(RadiusRole::Pill, &palette.ui)
             .border_1()
             .border_color(palette.text.opacity(0.15))
             .bg(palette.surface)
-            .shadow_sm()
+            .design_elevation(ElevationRole::Surface, &palette.ui)
             .children(
                 [
                     "fluid-context-highlight-yellow",
@@ -5042,12 +5048,22 @@ fn tile_distance_from_viewport(
         .clamp(0.0, u64::MAX as f64) as u64
 }
 
-fn fluid_sidebar_width(full_width: f32) -> f32 {
-    SIDEBAR_WIDTH.min((full_width - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(0.0))
+fn fluid_sidebar_width_with_ui(full_width: f32, ui: key_ui_gpui::ReaderUiConfig) -> f32 {
+    ui.sidebar_width
+        .min((full_width - ui.panel_horizontal_margin * 2.0).max(0.0))
 }
 
+#[cfg(test)]
 fn fluid_sidebar_extent(full_width: f32, progress: f32) -> f32 {
-    (fluid_sidebar_width(full_width) + FLUID_PANEL_HORIZONTAL_MARGIN * 2.0)
+    fluid_sidebar_extent_with_ui(full_width, progress, key_ui_gpui::ReaderUiConfig::default())
+}
+
+fn fluid_sidebar_extent_with_ui(
+    full_width: f32,
+    progress: f32,
+    ui: key_ui_gpui::ReaderUiConfig,
+) -> f32 {
+    (fluid_sidebar_width_with_ui(full_width, ui) + ui.panel_horizontal_margin * 2.0)
         * progress.clamp(0.0, 1.0)
 }
 

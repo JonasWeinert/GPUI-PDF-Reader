@@ -20,6 +20,7 @@ pub(super) fn link_section_title(
         .map(|entry| entry.title.clone())
 }
 
+#[cfg(test)]
 pub(super) fn link_card_position(
     anchor: Rect,
     viewport_width: f32,
@@ -27,21 +28,41 @@ pub(super) fn link_card_position(
     card_width: f32,
     estimated_height: f32,
 ) -> Offset {
-    let maximum_x = (viewport_width - card_width - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN);
-    let x = (anchor.x + anchor.width * 0.5 - card_width * 0.5).clamp(LINK_CARD_MARGIN, maximum_x);
-    let below = anchor.bottom() + LINK_CARD_GAP;
-    let y = if below + estimated_height <= viewport_height - LINK_CARD_MARGIN {
+    link_card_position_with_ui(
+        anchor,
+        viewport_width,
+        viewport_height,
+        card_width,
+        estimated_height,
+        key_ui_gpui::ReaderUiConfig::default(),
+    )
+}
+
+fn link_card_position_with_ui(
+    anchor: Rect,
+    viewport_width: f32,
+    viewport_height: f32,
+    card_width: f32,
+    estimated_height: f32,
+    ui: key_ui_gpui::ReaderUiConfig,
+) -> Offset {
+    let margin = ui.link_card_margin;
+    let maximum_x = (viewport_width - card_width - margin).max(margin);
+    let x = (anchor.x + anchor.width * 0.5 - card_width * 0.5).clamp(margin, maximum_x);
+    let below = anchor.bottom() + ui.link_card_gap;
+    let y = if below + estimated_height <= viewport_height - margin {
         below
     } else {
-        anchor.y - estimated_height - LINK_CARD_GAP
+        anchor.y - estimated_height - ui.link_card_gap
     }
     .clamp(
-        LINK_CARD_MARGIN,
-        (viewport_height - estimated_height - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN),
+        margin,
+        (viewport_height - estimated_height - margin).max(margin),
     );
     Offset { x, y }
 }
 
+#[cfg(test)]
 pub(super) fn pointer_link_card_position(
     pointer: Offset,
     viewport_width: f32,
@@ -49,17 +70,36 @@ pub(super) fn pointer_link_card_position(
     card_width: f32,
     estimated_height: f32,
 ) -> Offset {
-    let maximum_x = (viewport_width - card_width - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN);
-    let x = (pointer.x - card_width * 0.5).clamp(LINK_CARD_MARGIN, maximum_x);
-    let below = pointer.y + LINK_CARD_GAP;
-    let y = if below + estimated_height <= viewport_height - LINK_CARD_MARGIN {
+    pointer_link_card_position_with_ui(
+        pointer,
+        viewport_width,
+        viewport_height,
+        card_width,
+        estimated_height,
+        key_ui_gpui::ReaderUiConfig::default(),
+    )
+}
+
+fn pointer_link_card_position_with_ui(
+    pointer: Offset,
+    viewport_width: f32,
+    viewport_height: f32,
+    card_width: f32,
+    estimated_height: f32,
+    ui: key_ui_gpui::ReaderUiConfig,
+) -> Offset {
+    let margin = ui.link_card_margin;
+    let maximum_x = (viewport_width - card_width - margin).max(margin);
+    let x = (pointer.x - card_width * 0.5).clamp(margin, maximum_x);
+    let below = pointer.y + ui.link_card_gap;
+    let y = if below + estimated_height <= viewport_height - margin {
         below
     } else {
-        pointer.y - estimated_height - LINK_CARD_GAP
+        pointer.y - estimated_height - ui.link_card_gap
     }
     .clamp(
-        LINK_CARD_MARGIN,
-        (viewport_height - estimated_height - LINK_CARD_MARGIN).max(LINK_CARD_MARGIN),
+        margin,
+        (viewport_height - estimated_height - margin).max(margin),
     );
     Offset { x, y }
 }
@@ -872,9 +912,9 @@ impl PdfReader {
         let revision = self.link_hover_revision;
         self.pending_link_hover = Some(PendingLinkHover { target, position });
         let settle_delay = if target.is_some() {
-            LINK_HOVER_HANDOFF_DELAY
+            Duration::from_millis(self.theme_tokens.motion.hover_handoff_delay_ms.into())
         } else {
-            LINK_HOVER_CLOSE_DELAY
+            Duration::from_millis(self.theme_tokens.motion.hover_close_delay_ms.into())
         };
         let weak = cx.weak_entity();
         window
@@ -943,8 +983,11 @@ impl PdfReader {
                     .reduce(union_text_bounds)?;
                 let anchor = normalized_bounds_in_page(page_rect, bounds);
                 let state = self.scholarly_session.state(&reference.text).cloned();
-                let desired_width =
-                    reference_preview_width(state.as_ref(), self.link_card_expansion.value());
+                let desired_width = reference_preview_width_with_ui(
+                    state.as_ref(),
+                    self.link_card_expansion.value(),
+                    self.theme_tokens.reader,
+                );
                 let content = self.render_reference_source_card(
                     target,
                     reference.text,
@@ -1053,7 +1096,7 @@ impl PdfReader {
                                         .h(px(116.0))
                                         .w_full()
                                         .overflow_hidden()
-                                        .rounded_lg()
+                                        .design_radius(RadiusRole::Large, &palette.ui)
                                         .bg(palette.canvas)
                                         .child(
                                             img(image_path)
@@ -1131,7 +1174,7 @@ impl PdfReader {
                                     .items_center()
                                     .justify_center()
                                     .gap_1()
-                                    .rounded_md()
+                                    .design_radius(RadiusRole::Medium, &palette.ui)
                                     .bg(palette.blue)
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -1188,8 +1231,9 @@ impl PdfReader {
                                     reference_identity_color(&reference.text, palette)
                                 })
                                 .unwrap_or(palette.purple);
+                            let margin = self.theme_tokens.reader.link_card_margin;
                             let estimated_height = (58.0 + references.len() as f32 * 122.0)
-                                .min((self.viewport_height - LINK_CARD_MARGIN * 2.0).max(160.0));
+                                .min((self.viewport_height - margin * 2.0).max(160.0));
                             (
                                 anchor,
                                 self.render_grouped_reference_source_card(
@@ -1199,7 +1243,7 @@ impl PdfReader {
                                     cx,
                                 ),
                                 estimated_height,
-                                LINK_CARD_WIDTH,
+                                self.theme_tokens.reader.link_card_width,
                                 card_accent,
                             )
                         } else if let Some(reference) =
@@ -1207,9 +1251,10 @@ impl PdfReader {
                         {
                             let card_accent = reference_identity_color(&reference.text, palette);
                             let state = self.scholarly_session.state(&reference.text).cloned();
-                            let desired_width = reference_preview_width(
+                            let desired_width = reference_preview_width_with_ui(
                                 state.as_ref(),
                                 self.link_card_expansion.value(),
+                                self.theme_tokens.reader,
                             );
                             (
                                 anchor,
@@ -1281,7 +1326,7 @@ impl PdfReader {
                                         .h(px(112.0))
                                         .w_full()
                                         .overflow_hidden()
-                                        .rounded_lg()
+                                        .design_radius(RadiusRole::Large, &palette.ui)
                                         .border_1()
                                         .border_color(palette.separator)
                                         .bg(palette.canvas)
@@ -1321,26 +1366,30 @@ impl PdfReader {
         };
         anchor.x -= self.scroll.x;
         anchor.y -= self.scroll.y;
-        let maximum_card_width =
-            LINK_CARD_WIDTH.min((self.viewport_width - LINK_CARD_MARGIN * 2.0).max(1.0));
+        let ui = self.theme_tokens.reader;
+        let maximum_card_width = ui
+            .link_card_width
+            .min((self.viewport_width - ui.link_card_margin * 2.0).max(1.0));
         let card_width = desired_width.min(maximum_card_width).max(1.0);
         let position = self.link_card_pointer.map_or_else(
             || {
-                link_card_position(
+                link_card_position_with_ui(
                     anchor,
                     self.viewport_width,
                     self.viewport_height,
                     card_width,
                     estimated_height,
+                    ui,
                 )
             },
             |pointer| {
-                pointer_link_card_position(
+                pointer_link_card_position_with_ui(
                     pointer,
                     self.viewport_width,
                     self.viewport_height,
                     card_width,
                     estimated_height,
+                    ui,
                 )
             },
         );
@@ -1355,17 +1404,21 @@ impl PdfReader {
                 .top(px(position.y))
                 .left(px(position.x))
                 .w(px(card_width))
-                .max_h(px((self.viewport_height - LINK_CARD_MARGIN * 2.0).max(1.0)))
+                .max_h(px(
+                    (self.viewport_height - ui.link_card_margin * 2.0).max(1.0)
+                ))
                 .overflow_hidden()
-                .rounded_xl()
+                .design_radius(RadiusRole::Large, &palette.ui)
                 .border_1()
                 .border_color(card_accent.opacity(0.30))
                 .bg(palette.surface)
-                .shadow_sm()
+                .design_elevation(ElevationRole::Surface, &palette.ui)
                 .child(
                     div()
                         .id("link-preview-card-scroll")
-                        .max_h(px((self.viewport_height - LINK_CARD_MARGIN * 2.0).max(1.0)))
+                        .max_h(px(
+                            (self.viewport_height - ui.link_card_margin * 2.0).max(1.0)
+                        ))
                         .overflow_y_scroll()
                         .child(div().h(px(3.0)).w_full().flex_none().bg(card_accent))
                         .child(div().min_w_0().px_4().pt_3().pb_4().child(content)),
@@ -1490,7 +1543,7 @@ impl PdfReader {
                                 .gap_2()
                                 .text_xs()
                                 .text_color(palette.text_tertiary)
-                                .child(loading_source_icon(identity_color))
+                                .child(loading_source_icon(identity_color, palette.ui))
                                 .child("Checking source"),
                         )
                         .child(div().mt_2().child(self.render_grouped_reference_jump(
@@ -1537,7 +1590,7 @@ impl PdfReader {
                         div()
                             .px_2()
                             .py_1()
-                            .rounded_full()
+                            .design_radius(RadiusRole::Pill, &palette.ui)
                             .bg(identity_color.opacity(0.12))
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
@@ -1619,7 +1672,7 @@ impl PdfReader {
                             .items_center()
                             .justify_center()
                             .gap_1()
-                            .rounded_md()
+                            .design_radius(RadiusRole::Medium, &palette.ui)
                             .bg(identity_color.opacity(0.12))
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
@@ -1649,7 +1702,7 @@ impl PdfReader {
                             .gap_2()
                             .text_sm()
                             .text_color(palette.text_secondary)
-                            .child(loading_source_icon(identity_color))
+                            .child(loading_source_icon(identity_color, palette.ui))
                             .child("Checking source")
                     })
                     .when(progress >= 0.65, |status| {
@@ -1672,7 +1725,7 @@ impl PdfReader {
                 .gap_2()
                 .text_sm()
                 .text_color(palette.text_secondary)
-                .child(loading_source_icon(identity_color))
+                .child(loading_source_icon(identity_color, palette.ui))
                 .child("Checking source")
                 .into_any_element(),
         };
@@ -1696,6 +1749,7 @@ impl PdfReader {
         accent: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let palette = ReaderPalette::from_app(cx);
         div()
             .id("link-preview-jump")
             .h(px(30.0))
@@ -1704,7 +1758,7 @@ impl PdfReader {
             .items_center()
             .justify_between()
             .gap_2()
-            .rounded_md()
+            .design_radius(RadiusRole::Medium, &palette.ui)
             .text_xs()
             .font_weight(FontWeight::MEDIUM)
             .text_color(accent)
@@ -1739,7 +1793,7 @@ impl PdfReader {
         else {
             return None;
         };
-        let panel_width = reference_panel_width(full_width);
+        let panel_width = reference_panel_width_with_ui(full_width, self.theme_tokens.reader);
         if panel_width <= 0.0 {
             return None;
         }
@@ -1899,7 +1953,7 @@ impl PdfReader {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded_md()
+                        .design_radius(RadiusRole::Medium, &palette.ui)
                         .cursor_pointer()
                         .text_color(palette.text_secondary)
                         .hover(|button| button.opacity(0.68))
@@ -1926,7 +1980,7 @@ impl PdfReader {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded_md()
+                        .design_radius(RadiusRole::Medium, &palette.ui)
                         .cursor_pointer()
                         .text_color(palette.text_secondary)
                         .hover(|button| button.opacity(0.68))
@@ -1974,7 +2028,7 @@ impl PdfReader {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .rounded_md()
+                                    .design_radius(RadiusRole::Medium, &palette.ui)
                                     .cursor_pointer()
                                     .text_color(palette.text_secondary)
                                     .hover(|button| button.bg(palette.control_hover))
@@ -2011,7 +2065,7 @@ impl PdfReader {
                             .right(px(-54.0))
                             .top(px(-64.0))
                             .size(px(180.0))
-                            .rounded_full()
+                            .design_radius(RadiusRole::Pill, &palette.ui)
                             .border_1()
                             .border_color(identity_color.opacity(0.28)),
                     )
@@ -2021,7 +2075,7 @@ impl PdfReader {
                             .right(px(22.0))
                             .bottom(px(-70.0))
                             .size(px(128.0))
-                            .rounded_full()
+                            .design_radius(RadiusRole::Pill, &palette.ui)
                             .border_1()
                             .border_color(identity_color.opacity(0.20)),
                     )
@@ -2083,7 +2137,7 @@ impl PdfReader {
                                             div()
                                                 .size(px(3.0))
                                                 .flex_none()
-                                                .rounded_full()
+                                                .design_radius(RadiusRole::Pill, &palette.ui)
                                                 .bg(palette.text_tertiary.opacity(0.56)),
                                         )
                                     })
@@ -2132,8 +2186,8 @@ impl PdfReader {
                 .id("reference-details-panel")
                 .block_mouse_except_scroll()
                 .absolute()
-                .top(px(FLUID_PANEL_VERTICAL_MARGIN))
-                .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
+                .top(px(self.theme_tokens.reader.panel_vertical_margin))
+                .bottom(px(self.theme_tokens.reader.panel_vertical_margin))
                 .right(px(right))
                 .w(px(panel_width))
                 .opacity(progress.max(0.01))
@@ -2172,8 +2226,8 @@ impl PdfReader {
         let copy_doi = doi.to_owned();
         let copy_progress = self.doi_copy_started.map_or(0.0, |started| {
             (Instant::now().duration_since(started).as_secs_f32()
-                / DOI_COPY_FEEDBACK_DURATION.as_secs_f32())
-            .clamp(0.0, 1.0)
+                / (self.theme_tokens.motion.feedback_duration_ms as f32 / 1_000.0))
+                .clamp(0.0, 1.0)
         });
         let copy_scale = 1.0 + (copy_progress * std::f32::consts::PI).sin() * 0.12;
         let copy_id = if container_id == "reference-hero-doi" {
@@ -2206,7 +2260,7 @@ impl PdfReader {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded_md()
+                    .design_radius(RadiusRole::Medium, &palette.ui)
                     .cursor_pointer()
                     .text_color(identity_color)
                     .hover(|button| button.opacity(0.72))
@@ -2329,7 +2383,7 @@ impl PdfReader {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .rounded_md()
+                    .design_radius(RadiusRole::Medium, &palette.ui)
                     .cursor_pointer()
                     .hover(|row| row.bg(palette.control_hover))
                     .active(|row| row.bg(palette.control_pressed))
@@ -2360,7 +2414,7 @@ impl PdfReader {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded_full()
+                            .design_radius(RadiusRole::Pill, &palette.ui)
                             .bg(identity_color.opacity(0.10))
                             .child(
                                 Icon::new(if progress > 0.5 {
@@ -2650,7 +2704,7 @@ impl PdfReader {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded_md()
+                    .design_radius(RadiusRole::Medium, &palette.ui)
                     .bg(if primary {
                         identity_color
                     } else {
@@ -2688,20 +2742,38 @@ pub(super) fn text_bounds_overlap(left: TextBounds, right: TextBounds) -> bool {
         && left.bottom > right.top
 }
 
+#[cfg(test)]
 pub(super) fn reference_panel_width(full_width: f32) -> f32 {
+    reference_panel_width_with_ui(full_width, key_ui_gpui::ReaderUiConfig::default())
+}
+
+pub(super) fn reference_panel_width_with_ui(
+    full_width: f32,
+    ui: key_ui_gpui::ReaderUiConfig,
+) -> f32 {
     let maximum =
-        (full_width - MIN_DOCUMENT_VIEWPORT_WIDTH - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(0.0);
+        (full_width - ui.minimum_document_viewport_width - ui.panel_horizontal_margin * 2.0)
+            .max(0.0);
     (full_width * 0.36)
-        .clamp(REFERENCE_PANEL_MIN_WIDTH, REFERENCE_PANEL_MAX_WIDTH)
+        .clamp(ui.reference_panel_min_width, ui.reference_panel_max_width)
         .min(maximum)
 }
 
+#[cfg(test)]
 pub(super) fn reference_panel_extent(full_width: f32, progress: f32) -> f32 {
-    let width = reference_panel_width(full_width);
+    reference_panel_extent_with_ui(full_width, progress, key_ui_gpui::ReaderUiConfig::default())
+}
+
+pub(super) fn reference_panel_extent_with_ui(
+    full_width: f32,
+    progress: f32,
+    ui: key_ui_gpui::ReaderUiConfig,
+) -> f32 {
+    let width = reference_panel_width_with_ui(full_width, ui);
     if width <= 0.0 {
         0.0
     } else {
-        (width + FLUID_PANEL_HORIZONTAL_MARGIN * 2.0) * progress.clamp(0.0, 1.0)
+        (width + ui.panel_horizontal_margin * 2.0) * progress.clamp(0.0, 1.0)
     }
 }
 
@@ -2838,7 +2910,7 @@ pub(super) fn reference_summary_tab_button(
         .px_3()
         .flex()
         .items_center()
-        .rounded_full()
+        .design_radius(RadiusRole::Pill, &palette.ui)
         .cursor_pointer()
         .bg(if active {
             identity_color.opacity(0.14)
@@ -2901,9 +2973,22 @@ pub(super) fn reference_hero_height(title: &str) -> f32 {
     116.0 + (wrapped_lines.saturating_sub(1) as f32 * 24.0)
 }
 
+#[cfg(test)]
 pub(super) fn reference_preview_width(
     state: Option<&ScholarlyMetadataState>,
     expansion_progress: f32,
+) -> f32 {
+    reference_preview_width_with_ui(
+        state,
+        expansion_progress,
+        key_ui_gpui::ReaderUiConfig::default(),
+    )
+}
+
+fn reference_preview_width_with_ui(
+    state: Option<&ScholarlyMetadataState>,
+    expansion_progress: f32,
+    ui: key_ui_gpui::ReaderUiConfig,
 ) -> f32 {
     let compact_width = 232.0;
     let Some(ScholarlyMetadataState::Ready(metadata)) = state else {
@@ -2911,8 +2996,11 @@ pub(super) fn reference_preview_width(
     };
     let title = compact_words(&metadata.title, 11);
     let citation = compact_citation_line(metadata);
-    let expanded_width =
-        measured_preview_width(&[title.as_str(), citation.as_str()], 280.0, LINK_CARD_WIDTH);
+    let expanded_width = measured_preview_width(
+        &[title.as_str(), citation.as_str()],
+        280.0,
+        ui.link_card_width,
+    );
     compact_width + (expanded_width - compact_width) * expansion_progress.clamp(0.0, 1.0)
 }
 
@@ -3001,16 +3089,20 @@ pub(super) fn compact_citation_line(metadata: &ScholarlyMetadata) -> String {
     parts.join(" · ")
 }
 
-pub(super) fn loading_source_icon(color: gpui::Hsla) -> gpui::AnyElement {
-    Icon::new(IconName::LoaderCircle)
-        .size(px(15.0))
-        .text_color(color)
-        .with_animation(
+pub(super) fn loading_source_icon(color: gpui::Hsla, tokens: ThemeTokens) -> gpui::AnyElement {
+    let icon = Icon::new(semantic_icon(tokens.icons.loader))
+        .size(px(tokens.components.references.icon_size))
+        .text_color(color);
+    if let Some(duration_ms) = tokens.motion.spinner_duration_ms {
+        icon.with_animation(
             "reference-source-spinner",
-            Animation::new(Duration::from_millis(800))
+            Animation::new(Duration::from_millis(duration_ms.into()))
                 .repeat()
                 .with_easing(ease_in_out),
             |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
         )
         .into_any_element()
+    } else {
+        icon.into_any_element()
+    }
 }

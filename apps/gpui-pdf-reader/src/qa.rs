@@ -44,6 +44,8 @@ struct QaConfig {
     expected_tab_count: Option<usize>,
     tab_drag_scenario: Option<String>,
     split_view_scenario: bool,
+    split_view_hold: bool,
+    tab_hover_hold: bool,
     control_bar_scenario: bool,
     multi_annotation_scenario: bool,
     resource_trace: bool,
@@ -101,6 +103,8 @@ impl QaConfig {
             expected_tab_count: optional_value("GPUI_PDF_READER_QA_TAB_COUNT"),
             tab_drag_scenario: std::env::var("GPUI_PDF_READER_QA_TAB_DRAG_SCENARIO").ok(),
             split_view_scenario: flag("GPUI_PDF_READER_QA_SPLIT_VIEW_SCENARIO"),
+            split_view_hold: flag("GPUI_PDF_READER_QA_SPLIT_VIEW_HOLD"),
+            tab_hover_hold: flag("GPUI_PDF_READER_QA_TAB_HOVER_HOLD"),
             control_bar_scenario: flag("GPUI_PDF_READER_QA_CONTROL_BAR_SCENARIO"),
             multi_annotation_scenario: flag("GPUI_PDF_READER_QA_MULTI_ANNOTATION_SCENARIO"),
             resource_trace: flag("GPUI_PDF_READER_QA_RESOURCE_TRACE"),
@@ -143,6 +147,8 @@ impl QaConfig {
             || self.expected_tab_count.is_some()
             || self.tab_drag_scenario.is_some()
             || self.split_view_scenario
+            || self.split_view_hold
+            || self.tab_hover_hold
             || self.control_bar_scenario
             || self.multi_annotation_scenario
             || self.resource_trace
@@ -517,6 +523,39 @@ pub fn install(
                                 return;
                             }
                         }
+                    }
+
+                    if config.split_view_hold {
+                        let held = cx.update(|window, cx| {
+                            let Some(workspace) = window.root::<WorkspaceWindow>().flatten() else {
+                                return false;
+                            };
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.qa_split_with_other_tab(window, cx);
+                            });
+                            true
+                        });
+                        if !matches!(held, Ok(true)) {
+                            fail_and_quit(cx, "split-view hold could not access the workspace window");
+                            return;
+                        }
+                        eprintln!("GPUI_PDF_READER_QA_SPLIT_HOLD ready=1");
+                    }
+
+                    if config.tab_hover_hold {
+                        let held = cx.update(|window, cx| {
+                            let Some(workspace) = window.root::<WorkspaceWindow>().flatten() else {
+                                return false;
+                            };
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.qa_hold_inactive_tab_hover(cx)
+                            })
+                        });
+                        if !matches!(held, Ok(true)) {
+                            fail_and_quit(cx, "tab-hover hold requires an inactive tab");
+                            return;
+                        }
+                        eprintln!("GPUI_PDF_READER_QA_TAB_HOVER_HOLD ready=1");
                     }
 
                     if config.split_view_scenario {
@@ -1778,6 +1817,8 @@ mod tests {
             expected_tab_count: None,
             tab_drag_scenario: None,
             split_view_scenario: false,
+            split_view_hold: false,
+            tab_hover_hold: false,
             control_bar_scenario: false,
             multi_annotation_scenario: false,
             resource_trace: false,

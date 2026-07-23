@@ -1,5 +1,6 @@
 use crate::theme::ReaderPalette;
 use gpui::{AnyElement, App, IntoElement, RenderOnce, Window, div, prelude::*};
+use key_ui_gpui::{DesignStyled as _, ElevationRole, RadiusRole};
 
 /// Shared visual shell for transient, floating side panels.
 ///
@@ -28,11 +29,11 @@ impl RenderOnce for FloatingPanel {
             .min_w_0()
             .min_h_0()
             .overflow_hidden()
-            .rounded_xl()
+            .design_radius(RadiusRole::Large, &self.palette.ui)
             .border_1()
             .border_color(self.palette.text.opacity(0.13))
             .bg(self.palette.surface)
-            .shadow_sm()
+            .design_elevation(ElevationRole::Surface, &self.palette.ui)
             .child(self.content)
     }
 }

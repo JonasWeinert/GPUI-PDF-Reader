@@ -345,6 +345,14 @@ fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32) -> f32 {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners.
         return max(corner_center_to_point.x, corner_center_to_point.y);
+    } else if (corner_radius < 0.0) {
+        // Negative radii encode an inward (concave) corner. Reconstruct the
+        // point relative to the original rectangular corner, then combine the
+        // rectangle SDF with the inverse circle SDF that cuts the corner out.
+        let corner_to_point = corner_center_to_point - corner_radius;
+        let rectangle_sdf = max(corner_to_point.x, corner_to_point.y);
+        let cutout_sdf = -corner_radius - length(corner_to_point);
+        return max(rectangle_sdf, cutout_sdf);
     } else {
         // Signed distance of the point from a quad that is inset by corner_radius.
         // It is negative inside this quad, and positive outside.
@@ -609,7 +617,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // points in an inscribed rectangle, or some other quick linear check.
     // However, that might negatively impact performance in the case of
     // reasonable sizes for rounded corners.
-    if (is_within_inner_straight_border && !is_near_rounded_corner) {
+    if (is_within_inner_straight_border && !is_near_rounded_corner && corner_radius >= 0.0) {
         return blend_color(background_color, 1.0);
     }
 

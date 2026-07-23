@@ -1,7 +1,9 @@
-use gpui::{App, ClickEvent, ElementId, FontWeight, IntoElement, Window, div, prelude::*, px};
+use gpui::{App, ClickEvent, ElementId, IntoElement, Window, div, prelude::*, px};
 use gpui_component::{Icon, IconName};
 
-use crate::ThemeTokens;
+use crate::{
+    DesignStyled, ElevationRole, InteractionState, ThemeTokens, TypographyRole, semantic_icon,
+};
 
 /// Visual treatments shared by compact toolbar and panel controls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,15 +33,15 @@ pub fn chrome_button(
 ) -> impl IntoElement {
     let (background, border, text, hover, pressed) = match style {
         ChromeButtonStyle::Ghost => (
-            tokens.surface.chrome,
-            tokens.surface.chrome,
+            tokens.materials.chrome.background,
+            tokens.materials.chrome.background,
             tokens.content.secondary,
             tokens.action.control_hover,
             tokens.action.control_pressed,
         ),
         ChromeButtonStyle::Floating => (
-            tokens.surface.background,
-            tokens.surface.background,
+            tokens.materials.floating.background,
+            tokens.materials.floating.border,
             tokens.content.secondary,
             tokens.action.control_hover,
             tokens.action.control_pressed,
@@ -66,23 +68,55 @@ pub fn chrome_button(
             tokens.action.accent_pressed,
         ),
     };
+    let hovered_state = InteractionState {
+        hovered: true,
+        ..InteractionState::default()
+    };
+    let pressed_state = InteractionState {
+        pressed: true,
+        ..InteractionState::default()
+    };
+    let (hover, pressed) = if matches!(
+        style,
+        ChromeButtonStyle::Ghost | ChromeButtonStyle::Floating
+    ) {
+        (
+            hover.opacity(*tokens.interaction.surface_opacity.resolve(hovered_state)),
+            pressed.opacity(*tokens.interaction.surface_opacity.resolve(pressed_state)),
+        )
+    } else {
+        (hover, pressed)
+    };
+    let border = if matches!(
+        style,
+        ChromeButtonStyle::Selected | ChromeButtonStyle::SubtleSelected
+    ) {
+        border.opacity(
+            *tokens.interaction.border_opacity.resolve(InteractionState {
+                selected: true,
+                ..InteractionState::default()
+            }),
+        )
+    } else {
+        border
+    };
 
     div()
         .id(id)
-        .h(px(32.0))
-        .min_w(px(32.0))
-        .px_3()
+        .h(px(tokens.geometry.control_height))
+        .min_w(px(tokens.geometry.control_height))
+        .px(px(tokens.geometry.space_unit * 3.0))
         .flex()
         .items_center()
         .justify_center()
         .overflow_hidden()
-        .rounded_md()
+        .design_corners(tokens.components.corners.button)
         .border_1()
         .border_color(border)
         .bg(background)
         .text_color(text)
-        .text_sm()
-        .font_weight(FontWeight::MEDIUM)
+        .design_typography(TypographyRole::Label, &tokens)
+        .design_elevation(ElevationRole::Surface, &tokens)
         .when(enabled, |button| {
             button
                 .cursor_pointer()
@@ -90,7 +124,15 @@ pub fn chrome_button(
                 .active(move |button| button.bg(pressed))
                 .on_click(handler)
         })
-        .when(!enabled, |button| button.opacity(0.42))
+        .when(!enabled, |button| {
+            button.design_interaction(
+                InteractionState {
+                    disabled: true,
+                    ..InteractionState::default()
+                },
+                &tokens,
+            )
+        })
         .child(label)
 }
 
@@ -106,7 +148,7 @@ pub fn icon_button(
     chrome_button(
         tokens,
         id,
-        Icon::new(icon).size(px(16.0)),
+        Icon::new(icon).size(px(tokens.geometry.icon_size)),
         style,
         enabled,
         handler,
@@ -122,7 +164,7 @@ pub fn close_button(
     icon_button(
         tokens,
         id,
-        IconName::Close,
+        semantic_icon(tokens.icons.close),
         ChromeButtonStyle::Ghost,
         true,
         handler,

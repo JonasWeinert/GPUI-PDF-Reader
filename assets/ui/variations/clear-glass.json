@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "geometry": {
+    "radius_small": 9.0,
+    "radius_medium": 14.0,
+    "radius_large": 24.0,
+    "radius_pill": 999.0,
+    "control_height": 36.0,
+    "compact_control_height": 32.0,
+    "icon_size": 16.0,
+    "panel_header_height": 54.0,
+    "space_unit": 4.0,
+    "border_width": 1.0
+  },
+  "materials": {
+    "window": { "opacity": 0.72, "border_opacity": 0.55, "highlight_opacity": 0.12, "shadow_opacity": 0.08, "backdrop": "window_blur" },
+    "chrome": { "opacity": 0.58, "border_opacity": 0.52, "highlight_opacity": 0.24, "shadow_opacity": 0.08, "backdrop": "window_blur" },
+    "surface": { "opacity": 0.74, "border_opacity": 0.58, "highlight_opacity": 0.16, "shadow_opacity": 0.10, "backdrop": "window_blur" },
+    "floating": { "opacity": 0.62, "border_opacity": 0.75, "highlight_opacity": 0.32, "shadow_opacity": 0.22, "backdrop": "element_blur" },
+    "control": { "opacity": 0.52, "border_opacity": 0.58, "highlight_opacity": 0.24, "shadow_opacity": 0.08, "backdrop": "element_blur" }
+  },
+  "workspace": {
+    "chrome": {
+      "regular": {
+        "utility_controls_row": "top",
+        "utility_controls_leading_inset": 104.0
+      },
+      "compact": {
+        "utility_controls_row": "top",
+        "utility_controls_leading_inset": 92.0
+      },
+      "comfortable": null
+    }
+  }
+}

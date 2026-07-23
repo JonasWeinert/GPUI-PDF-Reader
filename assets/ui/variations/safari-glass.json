@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "appearance": {
+    "theme": { "source": "system" },
+    "colors": {},
+    "icons": {
+      "new_tab": "add",
+      "close": "close",
+      "document": "document",
+      "settings": "settings",
+      "search": "search",
+      "sidebar": "sidebar",
+      "tab_list": "tab_list",
+      "split": "split",
+      "folder": "folder",
+      "swap": "swap",
+      "separate": "separate",
+      "close_left": "close_left",
+      "close_right": "close_right"
+    }
+  },
+  "policy": {
+    "curvature": "enabled",
+    "concave_corners": "enabled",
+    "shadows": "enabled",
+    "translucency": "enabled",
+    "motion": "enabled",
+    "maximum_corner_radius": 999.0
+  },
+  "geometry": {
+    "radius_small": 7.0,
+    "radius_medium": 12.0,
+    "radius_large": 20.0,
+    "radius_pill": 999.0,
+    "control_height": 34.0,
+    "compact_control_height": 30.0,
+    "icon_size": 16.0,
+    "panel_header_height": 52.0,
+    "space_unit": 4.0,
+    "border_width": 1.0
+  },
+  "materials": {
+    "window": {
+      "opacity": 0.90,
+      "border_opacity": 0.62,
+      "highlight_opacity": 0.10,
+      "shadow_opacity": 0.10,
+      "backdrop": "window_blur"
+    },
+    "chrome": {
+      "opacity": 0.72,
+      "border_opacity": 0.48,
+      "highlight_opacity": 0.20,
+      "shadow_opacity": 0.07,
+      "backdrop": "window_blur"
+    },
+    "surface": {
+      "opacity": 0.88,
+      "border_opacity": 0.58,
+      "highlight_opacity": 0.12,
+      "shadow_opacity": 0.08,
+      "backdrop": "window_blur"
+    },
+    "floating": {
+      "opacity": 0.94,
+      "border_opacity": 0.68,
+      "highlight_opacity": 0.26,
+      "shadow_opacity": 0.20,
+      "backdrop": "element_blur"
+    },
+    "control": {
+      "opacity": 0.62,
+      "border_opacity": 0.42,
+      "highlight_opacity": 0.18,
+      "shadow_opacity": 0.06,
+      "backdrop": "element_blur"
+    }
+  },
+  "palette": {
+    "chrome_foreground_mix": 0.022,
+    "canvas_foreground_mix": 0.080,
+    "sidebar_foreground_mix": 0.040,
+    "split_gutter_foreground_mix": 0.150
+  },
+  "workspace": {
+    "chrome": {
+      "regular": {
+        "row_order": "controls_then_tabs",
+        "utility_controls_row": "top",
+        "utility_controls_leading_inset": 104.0,
+        "tab_bar_height": 42.0,
+        "tab_height": 30.0,
+        "split_segment_height": 24.0,
+        "tab_popover_gap": 4.0,
+        "tab_leading_inset": 0.0,
+        "control_leading_inset": 196.0,
+        "tab_width": 220.0,
+        "split_tab_width": 440.0,
+        "new_tab_button_size": 28.0
+      },
+      "compact": {
+        "row_order": "controls_then_tabs",
+        "utility_controls_row": "top",
+        "utility_controls_leading_inset": 92.0,
+        "tab_bar_height": 40.0,
+        "tab_height": 28.0,
+        "split_segment_height": 22.0,
+        "tab_popover_gap": 4.0,
+        "tab_leading_inset": 0.0,
+        "control_leading_inset": 184.0,
+        "tab_width": 190.0,
+        "split_tab_width": 380.0,
+        "new_tab_button_size": 26.0
+      },
+      "comfortable": null
+    },
+    "split": {
+      "outer_padding": 10.0,
+      "pane_gap": 14.0,
+      "divider_line_width": 2.0
+    }
+  },
+  "motion": {
+    "fast_response": 28.0,
+    "standard_response": 22.0,
+    "gentle_response": 16.0,
+    "short_duration_ms": 180,
+    "medium_duration_ms": 320
+  },
+  "responsive": {
+    "compact_max_width": 760.0,
+    "comfortable_min_width": 1080.0
+  }
+}

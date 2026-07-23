@@ -14,6 +14,13 @@ release cadence, and compatibility policy.
   contract without exposing a PDFium handle.
 - `key-ui-gpui`, `key-editor-gpui`, and `key-pdf-gpui` contain reusable GPUI
   presentation and controller adapters.
+- `key-ui-core` owns the versioned, renderer-independent design-system schema,
+  validation, root policy cascade, base-theme selection, semantic color and
+  icon roles, typography, state/responsive values, independently convex or
+  concave component corners, materials, component/reader layout, shadow
+  geometry, and motion tokens. `key-ui-gpui` is the normal translation boundary from those
+  resolved types into GPUI styling. Product views request semantic roles; they
+  do not parse configuration strings or own raw theme mappings.
 - `key-sidecar-store`, `key-safe-http`, and `key-reference` are replaceable
   storage, bounded-network, and scholarly-provider implementations.
 - `key-extension-api` is the runtime-neutral semantic contract.
@@ -28,7 +35,9 @@ release cadence, and compatibility policy.
 
 Dependencies point inward. Core and extension-contract crates never depend on
 GPUI, PDFium, Wasmtime, networking, app actions, filesystem conventions, or
-another app. Run `scripts/audit-boundaries.sh` after changing manifests.
+another app. Run `scripts/audit-boundaries.sh` after changing manifests. The
+reader build script also scans feature presentation sources before every local
+compile and rejects direct renderer corner/shadow and raw-color bypasses.
 
 ## Workspace host
 
@@ -45,9 +54,12 @@ another app. Run `scripts/audit-boundaries.sh` after changing manifests.
 - A compound tab keeps both child views visible while only the selected child
   is interactive. The visible companion has its own resource activity level,
   bounded PDF caches, and remains scrollable without implicit activation.
-- The context bar between tabs and content is generic window chrome. Split
-  controls, future location tools, and other view-neutral actions compose into
-  its slots rather than being embedded in PDF code.
+- The context bar and tab strip are generic window chrome. Their order,
+  responsive geometry, titlebar-safe insets, tab allocation, and split-pane
+  spacing resolve from the typed `key-ui-core` workspace configuration rather
+  than product render branches. Split controls, future location tools, and
+  other view-neutral actions compose into its slots rather than being embedded
+  in PDF code.
 - Multiple independent views of one item remain an additive session/view
   change, not a change to PDF domain state.
 - Theme selection and extension runtime ownership are application-scoped.

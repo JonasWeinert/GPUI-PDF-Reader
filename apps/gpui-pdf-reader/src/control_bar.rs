@@ -5,22 +5,20 @@ use crate::reader::{PdfReader, PdfReaderEvent};
 use crate::text_field::{TextField, TextFieldEvent};
 use gpui::{
     App, AppContext, Context, Entity, Focusable, FontWeight, IntoElement, Render, ScrollHandle,
-    SharedString, StyledText, TextRun, Window, div, font, prelude::*, px,
+    SharedString, StyledText, TextRun, Window, div, font, linear_color_stop, linear_gradient,
+    point, prelude::*, px,
 };
 use gpui_component::{Icon, IconName, Theme};
 use key_ui_gpui::{
-    ChromeButtonStyle, ControlBarDisplayMode, ThemeTokens, UnitTransition, WorkspaceContextBar,
-    chrome_button, solve_control_bar_layout,
+    ChromeButtonStyle, ControlBarDisplayMode, DesignStyled as _, ElevationRole, IconRoleConfig,
+    RadiusRole, ThemeTokens, TypographyRole, UnitTransition, WorkspaceContextBar, chrome_button,
+    resolved_design_system, semantic_icon, solve_control_bar_layout,
 };
 use key_workspace_core::{
     ControlBarAuxiliary, ControlBarCard, ControlBarEvent, ControlBarInteraction, ControlBarItem,
     ControlBarItemKind, ControlBarRegion, ControlBarSnapshot, ControlIcon, WorkspaceViewDescriptor,
 };
 use std::time::Instant;
-
-const CONTROL_GAP: f32 = 4.0;
-const HOST_RESERVED_WIDTH: f32 = 72.0;
-const AUXILIARY_HEIGHT: f32 = 94.0;
 
 enum ControlBarProvider {
     Pdf(Entity<PdfReader>),
@@ -36,14 +34,22 @@ pub(crate) struct ViewControlBar {
     search_field: Option<Entity<TextField>>,
     search_expanded: bool,
     search_reveal: UnitTransition,
+    title_expanded: bool,
+    title_reveal: UnitTransition,
     result_scroll: ScrollHandle,
+    result_scroll_reveal: UnitTransition,
+    result_scroll_start_x: f32,
+    result_scroll_target_x: f32,
     animation_frame_queued: bool,
     last_animation_tick: Instant,
 }
 
 impl ViewControlBar {
-    pub(crate) fn current_height(&self) -> f32 {
-        key_ui_gpui::CONTEXT_BAR_HEIGHT + AUXILIARY_HEIGHT * self.search_reveal.value()
+    pub(crate) fn current_height(&self, cx: &App) -> f32 {
+        let metrics = ThemeTokens::from_app(cx).components.control_bar;
+        metrics.primary_height
+            + (metrics.auxiliary_height * self.search_reveal.value())
+                .max(metrics.title_auxiliary_height * self.title_reveal.value())
     }
 
     #[cfg(debug_assertions)]
@@ -64,7 +70,10 @@ impl ViewControlBar {
     }
 
     #[cfg(debug_assertions)]
-    pub(crate) fn qa_state(&self) -> (key_workspace_core::ViewId, bool, usize, bool, f32) {
+    pub(crate) fn qa_state(
+        &self,
+        cx: &App,
+    ) -> (key_workspace_core::ViewId, bool, usize, bool, f32) {
         let (results, complete) = self
             .snapshot
             .auxiliary
@@ -77,7 +86,7 @@ impl ViewControlBar {
             self.search_expanded,
             results,
             complete,
-            self.current_height(),
+            self.current_height(cx),
         )
     }
 
@@ -139,7 +148,12 @@ impl ViewControlBar {
                 search_field: Some(search_field),
                 search_expanded: false,
                 search_reveal: UnitTransition::hidden(),
+                title_expanded: false,
+                title_reveal: UnitTransition::hidden(),
                 result_scroll: ScrollHandle::new(),
+                result_scroll_reveal: UnitTransition::hidden(),
+                result_scroll_start_x: 0.0,
+                result_scroll_target_x: 0.0,
                 animation_frame_queued: false,
                 last_animation_tick: Instant::now(),
             }
@@ -155,7 +169,12 @@ impl ViewControlBar {
             search_field: None,
             search_expanded: false,
             search_reveal: UnitTransition::hidden(),
+            title_expanded: false,
+            title_reveal: UnitTransition::hidden(),
             result_scroll: ScrollHandle::new(),
+            result_scroll_reveal: UnitTransition::hidden(),
+            result_scroll_start_x: 0.0,
+            result_scroll_target_x: 0.0,
             animation_frame_queued: false,
             last_animation_tick: Instant::now(),
         })
@@ -185,6 +204,13 @@ impl ViewControlBar {
             return;
         }
         self.search_expanded = expanded;
+        if let Some(field) = &self.search_field {
+            let _ = field.update(cx, |field, cx| field.set_borderless(expanded, cx));
+        }
+        if expanded {
+            self.title_expanded = false;
+            self.title_reveal.set_visible(false);
+        }
         self.search_reveal.set_visible(expanded);
         self.last_animation_tick = Instant::now();
         if expanded {
@@ -194,6 +220,28 @@ impl ViewControlBar {
         } else if let ControlBarProvider::Pdf(reader) = &self.provider {
             reader.update(cx, |reader, cx| reader.control_bar_close_search(cx));
         }
+        self.refresh_snapshot(cx);
+        self.queue_animation_frame(window, cx);
+        cx.notify();
+    }
+
+    fn set_title_expanded(&mut self, expanded: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.title_expanded == expanded {
+            return;
+        }
+        self.title_expanded = expanded;
+        self.title_reveal.set_visible(expanded);
+        if expanded && self.search_expanded {
+            self.search_expanded = false;
+            self.search_reveal.set_visible(false);
+            if let Some(field) = &self.search_field {
+                let _ = field.update(cx, |field, cx| field.set_borderless(false, cx));
+            }
+            if let ControlBarProvider::Pdf(reader) = &self.provider {
+                reader.update(cx, |reader, cx| reader.control_bar_close_search(cx));
+            }
+        }
+        self.last_animation_tick = Instant::now();
         self.refresh_snapshot(cx);
         self.queue_animation_frame(window, cx);
         cx.notify();
@@ -216,7 +264,23 @@ impl ViewControlBar {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_animation_tick).as_secs_f32();
         self.last_animation_tick = now;
-        let animating = self.search_reveal.advance_with_response(elapsed, 25.0);
+        let motion = resolved_design_system(cx).motion;
+        let animating = self
+            .search_reveal
+            .advance_with_optional_response(elapsed, motion.fast_response)
+            || self
+                .title_reveal
+                .advance_with_optional_response(elapsed, motion.fast_response)
+            || self
+                .result_scroll_reveal
+                .advance_with_optional_response(elapsed, motion.gentle_response);
+        if self.result_scroll_reveal.is_animating() || self.result_scroll_reveal.value() > 0.0 {
+            let current = self.result_scroll.offset();
+            let x = self.result_scroll_start_x
+                + (self.result_scroll_target_x - self.result_scroll_start_x)
+                    * self.result_scroll_reveal.value();
+            self.result_scroll.set_offset(point(px(x), current.y));
+        }
         cx.notify();
         if animating {
             self.queue_animation_frame(window, cx);
@@ -224,6 +288,10 @@ impl ViewControlBar {
     }
 
     fn press(&mut self, control: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if control == crate::reader::control_bar::PDF_CONTROL_TITLE {
+            self.set_title_expanded(!self.title_expanded, window, cx);
+            return;
+        }
         if control == crate::reader::control_bar::PDF_CONTROL_SEARCH {
             self.set_search_expanded(!self.search_expanded, window, cx);
             return;
@@ -240,6 +308,7 @@ impl ViewControlBar {
     }
 
     fn activate_card(&mut self, control: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.center_search_card(control);
         if let ControlBarProvider::Pdf(reader) = &self.provider {
             let event = ControlBarEvent {
                 owner: self.snapshot.owner,
@@ -251,6 +320,34 @@ impl ViewControlBar {
         }
     }
 
+    fn center_search_card(&mut self, control: &str) {
+        let Some(index) = self.snapshot.auxiliary.as_ref().and_then(|auxiliary| {
+            auxiliary
+                .cards
+                .iter()
+                .position(|card| card.id.as_str() == control)
+        }) else {
+            return;
+        };
+        let (Some(card), bounds) = (
+            self.result_scroll.bounds_for_item(index),
+            self.result_scroll.bounds(),
+        ) else {
+            return;
+        };
+        let offset = self.result_scroll.offset();
+        let desired = f32::from(offset.x) + f32::from(bounds.center().x - card.center().x);
+        let maximum = f32::from(self.result_scroll.max_offset().width);
+        let target = desired.clamp(-maximum, 0.0);
+        if (target - f32::from(offset.x)).abs() < 1.0 {
+            return;
+        }
+        self.result_scroll_start_x = f32::from(offset.x);
+        self.result_scroll_target_x = target;
+        self.result_scroll_reveal.snap_to(0.0);
+        self.result_scroll_reveal.set_visible(true);
+    }
+
     fn render_item(
         &self,
         item: &ControlBarItem,
@@ -259,32 +356,40 @@ impl ViewControlBar {
         tokens: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let icons = tokens.icons;
         let id = item.id.as_str().to_owned();
         if item.kind == ControlBarItemKind::TextInput {
             let reveal = self.search_reveal.value();
-            let animated_width = 32.0 + (width.max(32.0) - 32.0) * reveal;
             let field = self.search_field.clone();
             let weak = cx.weak_entity();
             return div()
                 .id(SharedString::from(format!("control-input-{id}")))
-                .h(px(36.0))
-                .w(px(animated_width))
-                .min_w(px(32.0))
+                .relative()
+                .h(px(tokens.components.control_bar.search_height))
+                .w(px(width.max(tokens.components.common.control_small)))
+                .min_w(px(tokens.components.common.control_small))
+                .px_3()
                 .flex_none()
                 .flex()
                 .items_center()
+                .gap_2()
                 .overflow_hidden()
+                .design_radius(RadiusRole::Pill, &tokens)
+                .border_1()
+                .border_color(tokens.materials.control.border)
+                .bg(tokens.materials.control.background)
                 .child(
                     div()
-                        .w(px(28.0 * (1.0 - reveal)))
+                        .w(px(tokens.components.common.icon_large))
                         .flex_none()
-                        .overflow_hidden()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .opacity(1.0 - reveal)
                         .text_color(tokens.content.tertiary)
-                        .child(Icon::new(IconName::Search).size(px(15.0))),
+                        .child(
+                            Icon::new(semantic_icon(icons.search))
+                                .size(px(tokens.components.common.icon_medium)),
+                        ),
                 )
                 .when_some(field, |input, field| {
                     input.child(div().min_w_0().flex_1().opacity(reveal).child(field))
@@ -292,29 +397,51 @@ impl ViewControlBar {
                 .child(
                     div()
                         .id("control-search-close")
-                        .ml_1()
-                        .size(px(27.0))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(tokens.components.control_bar.search_close_fade_width))
                         .flex_none()
                         .flex()
                         .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .opacity(reveal)
-                        .text_color(tokens.content.secondary)
-                        .hover(move |button| button.bg(tokens.action.control_hover))
-                        .on_click(move |_, window, cx| {
-                            weak.update(cx, |bar, cx| bar.set_search_expanded(false, window, cx))
-                                .ok();
-                        })
-                        .child(Icon::new(IconName::Close).size(px(14.0))),
+                        .justify_end()
+                        .pr_1()
+                        .bg(linear_gradient(
+                            90.0,
+                            linear_color_stop(tokens.surface.muted.opacity(0.0), 0.0),
+                            linear_color_stop(tokens.surface.muted.opacity(0.72), 0.42),
+                        ))
+                        .child(
+                            div()
+                                .id("control-search-close")
+                                .size(px(tokens.components.common.control_small - 1.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .design_radius(RadiusRole::Pill, &tokens)
+                                .cursor_pointer()
+                                .opacity(reveal)
+                                .text_color(tokens.content.secondary)
+                                .hover(move |button| button.bg(tokens.action.control_hover))
+                                .on_click(move |_, window, cx| {
+                                    weak.update(cx, |bar, cx| {
+                                        bar.set_search_expanded(false, window, cx)
+                                    })
+                                    .ok();
+                                })
+                                .child(
+                                    Icon::new(semantic_icon(icons.close))
+                                        .size(px(tokens.components.common.icon_medium)),
+                                ),
+                        ),
                 )
                 .into_any_element();
         }
 
         let label = control_label(item, mode);
         if item.kind == ControlBarItemKind::Display {
-            let icon = control_icon(item, mode);
+            let icon = control_icon(item, mode, tokens);
             let label = label.map(|label| {
                 div()
                     .min_w_0()
@@ -325,9 +452,11 @@ impl ViewControlBar {
                     .child(label)
                     .into_any_element()
             });
+            let is_title = id == crate::reader::control_bar::PDF_CONTROL_TITLE;
+            let weak = cx.weak_entity();
             return div()
                 .id(SharedString::from(format!("control-display-{id}")))
-                .h(px(32.0))
+                .h(px(tokens.components.common.control_small + 4.0))
                 .w(px(width))
                 .min_w_0()
                 .flex_none()
@@ -337,10 +466,13 @@ impl ViewControlBar {
                 .justify_start()
                 .gap_1()
                 .overflow_hidden()
-                .rounded_md()
-                .bg(tokens.surface.muted.opacity(0.68))
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
+                .design_radius(RadiusRole::Medium, &tokens)
+                .bg(if is_title && self.title_expanded {
+                    tokens.action.accent_soft
+                } else {
+                    gpui::transparent_black()
+                })
+                .design_typography(TypographyRole::Label, &tokens)
                 .text_color(if item.state.enabled {
                     tokens.content.secondary
                 } else {
@@ -348,6 +480,17 @@ impl ViewControlBar {
                 })
                 .children(icon)
                 .children(label)
+                .when(is_title && item.state.enabled, |title| {
+                    title
+                        .cursor_pointer()
+                        .hover(move |title| title.bg(tokens.action.control_hover))
+                        .on_click(move |_, window, cx| {
+                            weak.update(cx, |bar, cx| {
+                                bar.set_title_expanded(!bar.title_expanded, window, cx)
+                            })
+                            .ok();
+                        })
+                })
                 .into_any_element();
         }
 
@@ -369,7 +512,7 @@ impl ViewControlBar {
                     .items_center()
                     .justify_center()
                     .gap_1()
-                    .children(control_icon(item, mode))
+                    .children(control_icon(item, mode, tokens))
                     .children(label),
                 style,
                 item.state.enabled,
@@ -395,7 +538,7 @@ impl ViewControlBar {
         let empty = auxiliary.cards.is_empty().then(|| {
             div()
                 .px_4()
-                .text_sm()
+                .design_typography(TypographyRole::Body, &tokens)
                 .text_color(tokens.content.tertiary)
                 .child(if auxiliary.loading {
                     "Results will appear as pages are searched"
@@ -412,25 +555,25 @@ impl ViewControlBar {
             .items_center()
             .gap_3()
             .border_t_1()
-            .border_color(tokens.surface.border.opacity(0.58))
-            .bg(tokens.surface.background)
+            .border_color(tokens.materials.surface.border)
+            .bg(tokens.materials.surface.background)
+            .text_color(tokens.content.primary)
             .child(
                 div()
-                    .w(px(116.0))
+                    .w(px(tokens.components.control_bar.result_label_width))
                     .flex_none()
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
+                    .design_typography(TypographyRole::Caption, &tokens)
                     .text_color(tokens.content.secondary)
                     .child(label)
                     .when(auxiliary.loading, |status| {
                         status.child(
                             div()
-                                .w(px(42.0))
-                                .h(px(2.0))
-                                .rounded_full()
+                                .w(px(tokens.components.common.separator_length * 1.75))
+                                .h(px(tokens.geometry.border_width * 2.0))
+                                .design_radius(RadiusRole::Pill, &tokens)
                                 .bg(tokens.action.accent.opacity(0.72)),
                         )
                     }),
@@ -452,6 +595,94 @@ impl ViewControlBar {
             .into_any_element()
     }
 
+    fn render_title_auxiliary(
+        &self,
+        tokens: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let metadata = match &self.provider {
+            ControlBarProvider::Pdf(reader) => reader.read(cx).control_bar_metadata(),
+            ControlBarProvider::Settings(_) => None,
+        };
+        let weak = cx.weak_entity();
+        div()
+            .size_full()
+            .px_4()
+            .py_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .border_t_1()
+            .border_color(tokens.materials.surface.border)
+            .bg(tokens.materials.surface.background)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .design_typography(TypographyRole::Heading, &tokens)
+                            .child("PDF details"),
+                    )
+                    .child(
+                        div()
+                            .id("control-title-collapse")
+                            .h(px(tokens.components.common.control_small))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .design_radius(RadiusRole::Medium, &tokens)
+                            .cursor_pointer()
+                            .design_typography(TypographyRole::Label, &tokens)
+                            .text_color(tokens.content.secondary)
+                            .hover(move |button| button.bg(tokens.action.control_hover))
+                            .on_click(move |_, window, cx| {
+                                weak.update(cx, |bar, cx| {
+                                    bar.set_title_expanded(false, window, cx)
+                                })
+                                .ok();
+                            })
+                            .child(
+                                Icon::new(semantic_icon(tokens.icons.collapse))
+                                    .size(px(tokens.components.common.icon_medium)),
+                            )
+                            .child("Collapse"),
+                    ),
+            )
+            .when_some(metadata, |panel, metadata| {
+                panel
+                    .child(
+                        div()
+                            .design_typography(TypographyRole::Heading, &tokens)
+                            .child(metadata.title),
+                    )
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .design_typography(TypographyRole::Body, &tokens)
+                            .text_color(tokens.content.secondary)
+                            .child(metadata.path),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_4()
+                            .design_typography(TypographyRole::Body, &tokens)
+                            .text_color(tokens.content.secondary)
+                            .child(format!(
+                                "Page {} of {}",
+                                metadata.current_page, metadata.page_count
+                            ))
+                            .child(format!("{}% zoom", metadata.zoom_percent)),
+                    )
+            })
+            .into_any_element()
+    }
+
     fn render_card(
         &self,
         card: &ControlBarCard,
@@ -463,8 +694,8 @@ impl ViewControlBar {
         let preview = emphasized_text(card, tokens);
         div()
             .id(SharedString::from(format!("control-card-{id}")))
-            .h(px(66.0))
-            .w(px(270.0))
+            .h(px(tokens.components.control_bar.result_card_height))
+            .w(px(tokens.components.control_bar.result_card_width))
             .flex_none()
             .px_3()
             .py_2()
@@ -472,7 +703,7 @@ impl ViewControlBar {
             .flex_col()
             .gap_1()
             .overflow_hidden()
-            .rounded_lg()
+            .design_radius(RadiusRole::Large, &tokens)
             .border_1()
             .border_color(if card.selected {
                 tokens.action.accent_border
@@ -484,7 +715,7 @@ impl ViewControlBar {
             } else {
                 tokens.surface.overlay
             })
-            .shadow_sm()
+            .design_elevation(ElevationRole::Surface, &tokens)
             .cursor_pointer()
             .hover(move |card| card.bg(tokens.action.accent_soft_hover))
             .on_click(move |_, window, cx| {
@@ -494,18 +725,16 @@ impl ViewControlBar {
             .when_some(card.eyebrow.clone(), |card, eyebrow| {
                 card.child(
                     div()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .design_typography(TypographyRole::Heading, &tokens)
                         .text_color(tokens.action.accent)
                         .child(eyebrow),
                 )
             })
             .child(
                 div()
-                    .h(px(34.0))
+                    .h(px(tokens.components.control_bar.search_height))
                     .overflow_hidden()
-                    .text_sm()
-                    .line_height(px(17.0))
+                    .design_typography(TypographyRole::Body, &tokens)
                     .child(preview),
             )
             .into_any_element()
@@ -527,13 +756,48 @@ impl Render for ViewControlBar {
             }
         }
 
-        let tokens = ThemeTokens::from_theme(Theme::global(cx));
-        let available = (f32::from(window.viewport_size().width) - HOST_RESERVED_WIDTH).max(160.0);
-        let layout = solve_control_bar_layout(&self.snapshot.items, available, CONTROL_GAP);
+        let tokens = ThemeTokens::from_app(cx);
+        let system = resolved_design_system(cx);
+        let viewport_width = f32::from(window.viewport_size().width);
+        let chrome = system
+            .workspace
+            .chrome
+            .resolve(system.responsive.classify(viewport_width));
+        let available = (viewport_width
+            - tokens.components.control_bar.host_reserved_width
+            - chrome.control_leading_inset)
+            .max(tokens.components.popover.tab_hover_width * 0.57);
+        // Use the exact same reveal value for the search pill and the layout
+        // solver. That keeps the flexible title, all trailing controls, and
+        // the auxiliary row moving on one clock instead of snapping to the
+        // search field's final width.
+        let mut items = self.snapshot.items.clone();
+        let search_reveal = self.search_reveal.value();
+        if self.search_expanded || search_reveal > 0.0 {
+            if let Some(search) = items
+                .iter_mut()
+                .find(|item| item.id.as_str() == crate::reader::control_bar::PDF_CONTROL_SEARCH)
+            {
+                search.kind = ControlBarItemKind::TextInput;
+                search.state.expanded = true;
+                search.state.selected = true;
+                for (width, expanded_width) in search
+                    .presentation
+                    .widths
+                    .iter_mut()
+                    .zip(crate::reader::control_bar::PDF_SEARCH_EXPANDED_WIDTHS)
+                {
+                    let compact = tokens.components.common.control_small;
+                    *width = compact + (expanded_width - compact) * search_reveal;
+                }
+            }
+        }
+        let layout =
+            solve_control_bar_layout(&items, available, tokens.components.control_bar.item_gap);
         let mut leading = Vec::new();
         let mut center = Vec::new();
         let mut trailing = Vec::new();
-        for (item, layout) in self.snapshot.items.iter().zip(layout) {
+        for (item, layout) in items.iter().zip(layout) {
             if !item.state.visible || layout.width <= 0.0 {
                 continue;
             }
@@ -544,12 +808,26 @@ impl Render for ViewControlBar {
                 ControlBarRegion::Trailing => trailing.push(rendered),
             }
         }
-        let reveal = self.search_reveal.value();
-        let auxiliary = self
-            .snapshot
-            .auxiliary
-            .as_ref()
-            .map(|auxiliary| self.render_auxiliary(auxiliary, tokens, cx));
+        let title_reveal = self.title_reveal.value();
+        let auxiliary_height = (tokens.components.control_bar.auxiliary_height * search_reveal)
+            .max(tokens.components.control_bar.title_auxiliary_height * title_reveal);
+        let auxiliary = if self.search_expanded {
+            self.snapshot
+                .auxiliary
+                .as_ref()
+                .map(|auxiliary| self.render_auxiliary(auxiliary, tokens, cx))
+        } else if self.title_expanded {
+            Some(self.render_title_auxiliary(tokens, cx))
+        } else if search_reveal > 0.0 {
+            self.snapshot
+                .auxiliary
+                .as_ref()
+                .map(|auxiliary| self.render_auxiliary(auxiliary, tokens, cx))
+        } else if title_reveal > 0.0 {
+            Some(self.render_title_auxiliary(tokens, cx))
+        } else {
+            None
+        };
         WorkspaceContextBar::new(tokens)
             .leading(
                 div()
@@ -565,12 +843,12 @@ impl Render for ViewControlBar {
                     .flex_1()
                     .flex()
                     .items_center()
-                    .justify_center()
+                    .justify_start()
                     .children(center),
             )
             .trailing(div().flex().items_center().gap_1().children(trailing))
             .when_some(auxiliary, |bar, auxiliary| {
-                bar.auxiliary(AUXILIARY_HEIGHT * reveal, auxiliary)
+                bar.auxiliary(auxiliary_height, auxiliary)
             })
     }
 }
@@ -589,15 +867,26 @@ fn settings_snapshot(view: &WorkspaceViewDescriptor) -> ControlBarSnapshot {
     snapshot
 }
 
-fn control_icon(item: &ControlBarItem, mode: ControlBarDisplayMode) -> Option<gpui::AnyElement> {
+fn control_icon(
+    item: &ControlBarItem,
+    mode: ControlBarDisplayMode,
+    tokens: ThemeTokens,
+) -> Option<gpui::AnyElement> {
     let icon = item.presentation.icon?;
     let show = mode == ControlBarDisplayMode::Icon
         || item.kind == ControlBarItemKind::Button
         || item.kind == ControlBarItemKind::Display;
-    show.then(|| Icon::new(icon_name(icon)).size(px(15.0)).into_any_element())
+    show.then(|| {
+        Icon::new(icon_name(icon, tokens.icons))
+            .size(px(tokens.components.common.icon_medium))
+            .into_any_element()
+    })
 }
 
 fn control_label(item: &ControlBarItem, mode: ControlBarDisplayMode) -> Option<SharedString> {
+    if item.presentation.icon_only {
+        return None;
+    }
     match mode {
         ControlBarDisplayMode::Full => Some(item.presentation.label.clone().into()),
         ControlBarDisplayMode::Compact => Some(
@@ -613,21 +902,21 @@ fn control_label(item: &ControlBarItem, mode: ControlBarDisplayMode) -> Option<S
     }
 }
 
-fn icon_name(icon: ControlIcon) -> IconName {
+fn icon_name(icon: ControlIcon, icons: IconRoleConfig) -> IconName {
     match icon {
-        ControlIcon::Add => IconName::Plus,
-        ControlIcon::Close => IconName::Close,
-        ControlIcon::Comments => IconName::PanelRight,
-        ControlIcon::Document => IconName::File,
-        ControlIcon::FitWidth => IconName::Maximize,
-        ControlIcon::Minus => IconName::Minus,
-        ControlIcon::Moon => IconName::Moon,
-        ControlIcon::Next => IconName::ArrowDown,
-        ControlIcon::Previous => IconName::ArrowUp,
-        ControlIcon::Search => IconName::Search,
-        ControlIcon::Settings => IconName::Settings,
-        ControlIcon::Split => IconName::Frame,
-        ControlIcon::Sun => IconName::Sun,
+        ControlIcon::Add => semantic_icon(icons.new_tab),
+        ControlIcon::Close => semantic_icon(icons.close),
+        ControlIcon::Comments => semantic_icon(icons.comments),
+        ControlIcon::Document => semantic_icon(icons.document),
+        ControlIcon::FitWidth => semantic_icon(icons.fit_width),
+        ControlIcon::Minus => semantic_icon(icons.zoom_out),
+        ControlIcon::Moon => semantic_icon(icons.theme_dark),
+        ControlIcon::Next => semantic_icon(icons.next),
+        ControlIcon::Previous => semantic_icon(icons.previous),
+        ControlIcon::Search => semantic_icon(icons.search),
+        ControlIcon::Settings => semantic_icon(icons.settings),
+        ControlIcon::Split => semantic_icon(icons.split),
+        ControlIcon::Sun => semantic_icon(icons.theme_light),
     }
 }
 

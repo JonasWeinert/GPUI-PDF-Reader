@@ -89,6 +89,7 @@ actions!(
         AddComment,
         NextSearchResult,
         PreviousSearchResult,
+        LoadUiConfiguration,
         OpenSettings,
         Quit,
     ]
@@ -106,6 +107,10 @@ fn main() {
     ));
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        let design_system_path = theme::install_initial_design_system(cx);
+        if let Some(path) = design_system_path {
+            theme::watch_design_system(path, cx);
+        }
         bind_keys(cx);
         let safe_mode = std::env::var_os("GPUI_PDF_READER_SAFE_MODE").is_some();
         let mut extensions = app_extensions::ReaderExtensions::new_with_assets(
@@ -130,6 +135,13 @@ fn main() {
         let window =
             application_host::open_pdf_window(application_host.clone(), initial_paths.next(), cx)
                 .expect("failed to open the GPUI PDF Reader window");
+        window
+            .update(cx, |_, window, cx| {
+                if let Err(error) = theme::apply_current_design_system_theme(window, cx) {
+                    eprintln!("Configured theme could not be applied: {error}");
+                }
+            })
+            .ok();
         let mut deferred_paths = Vec::new();
         for path in initial_paths {
             if progressive_qa {
@@ -189,6 +201,7 @@ pub(crate) fn rebuild_application_menus(
     ]);
     let mut file_items = vec![
         MenuItem::action("Open…", OpenDocument),
+        MenuItem::action("Load UI Configuration…", LoadUiConfiguration),
         MenuItem::action("Settings…", OpenSettings),
     ];
     #[cfg(feature = "installable-extensions")]
@@ -272,6 +285,7 @@ pub(crate) fn rebuild_application_menus(
 fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-o", OpenDocument, None),
+        KeyBinding::new("cmd-shift-,", LoadUiConfiguration, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-=", ZoomIn, None),
         KeyBinding::new("cmd-+", ZoomIn, None),

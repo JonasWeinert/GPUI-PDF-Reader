@@ -6,13 +6,13 @@ use key_workspace_core::{
 };
 
 pub(crate) const PDF_CONTROL_ZOOM_OUT: &str = "pdf.zoom-out";
-pub(crate) const PDF_CONTROL_ZOOM: &str = "pdf.zoom";
 pub(crate) const PDF_CONTROL_ZOOM_IN: &str = "pdf.zoom-in";
 pub(crate) const PDF_CONTROL_FIT_WIDTH: &str = "pdf.fit-width";
 pub(crate) const PDF_CONTROL_TITLE: &str = "pdf.title";
 pub(crate) const PDF_CONTROL_SEARCH: &str = "pdf.search";
 pub(crate) const PDF_CONTROL_COMMENTS: &str = "pdf.comments";
 pub(crate) const PDF_CONTROL_DARK_MODE: &str = "pdf.dark-mode";
+pub(crate) const PDF_SEARCH_EXPANDED_WIDTHS: [f32; 3] = [420.0, 300.0, 180.0];
 const MAX_CONTROL_BAR_SEARCH_CARDS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,7 +32,38 @@ pub(crate) struct PdfControlBarSignature {
     pdf_dark_mode: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PdfControlBarMetadata {
+    pub title: String,
+    pub path: String,
+    pub current_page: usize,
+    pub page_count: usize,
+    pub zoom_percent: u32,
+}
+
 impl PdfReader {
+    pub(crate) fn control_bar_metadata(&self) -> Option<PdfControlBarMetadata> {
+        let document = self.document.as_ref()?;
+        let page_count = document.pages.len();
+        let current_page = self
+            .layout()
+            .map(|layout| layout.current_page(self.scroll.y, self.viewport_height) + 1)
+            .unwrap_or(1)
+            .min(page_count.max(1));
+        Some(PdfControlBarMetadata {
+            title: document.title.clone().unwrap_or_else(|| {
+                document.path.file_name().map_or_else(
+                    || "PDF document".to_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                )
+            }),
+            path: document.path.display().to_string(),
+            current_page,
+            page_count,
+            zoom_percent: (self.zoom * 100.0).round() as u32,
+        })
+    }
+
     pub(crate) fn control_bar_signature(
         &self,
         search_expanded: bool,
@@ -82,80 +113,44 @@ impl PdfReader {
                 .wrapping_add(u64::from(search_expanded).rotate_left(31)),
         );
 
+        let mut title_item = ControlBarItem::new(
+            PDF_CONTROL_TITLE,
+            ControlBarRegion::Leading,
+            ControlBarItemKind::Display,
+            ControlBarPresentation::new(title, [0.0, 0.0, 0.0], 100)
+                .short_label("PDF")
+                .icon(ControlIcon::Document)
+                .tooltip("Show document details")
+                .max_width(),
+        );
+        title_item.state.enabled = document_open;
+        snapshot.items.push(title_item);
+
         let mut zoom_out = ControlBarItem::new(
             PDF_CONTROL_ZOOM_OUT,
             ControlBarRegion::Leading,
             ControlBarItemKind::Button,
-            ControlBarPresentation::new("Zoom out", [86.0, 54.0, 32.0], 70)
+            ControlBarPresentation::new("Zoom out", [32.0, 32.0, 32.0], 70)
                 .short_label("Out")
                 .icon(ControlIcon::Minus)
-                .tooltip("Zoom out"),
+                .tooltip("Zoom out")
+                .icon_only(),
         );
         zoom_out.state.enabled = zoom_out_enabled;
         snapshot.items.push(zoom_out);
-
-        let mut zoom = ControlBarItem::new(
-            PDF_CONTROL_ZOOM,
-            ControlBarRegion::Leading,
-            ControlBarItemKind::Display,
-            ControlBarPresentation::new(
-                format!("{}%", (self.zoom * 100.0).round() as u32),
-                [58.0, 48.0, 40.0],
-                95,
-            ),
-        );
-        zoom.state.enabled = document_open;
-        snapshot.items.push(zoom);
 
         let mut zoom_in = ControlBarItem::new(
             PDF_CONTROL_ZOOM_IN,
             ControlBarRegion::Leading,
             ControlBarItemKind::Button,
-            ControlBarPresentation::new("Zoom in", [78.0, 48.0, 32.0], 70)
+            ControlBarPresentation::new("Zoom in", [32.0, 32.0, 32.0], 70)
                 .short_label("In")
                 .icon(ControlIcon::Add)
-                .tooltip("Zoom in"),
+                .tooltip("Zoom in")
+                .icon_only(),
         );
         zoom_in.state.enabled = zoom_in_enabled;
         snapshot.items.push(zoom_in);
-
-        let mut fit = ControlBarItem::new(
-            PDF_CONTROL_FIT_WIDTH,
-            ControlBarRegion::Leading,
-            ControlBarItemKind::Button,
-            ControlBarPresentation::new("Fit width", [92.0, 54.0, 32.0], 30)
-                .short_label("Fit")
-                .icon(ControlIcon::FitWidth)
-                .tooltip("Fit page width"),
-        );
-        fit.state.enabled = document_open;
-        fit.state.selected = self.fit_width;
-        snapshot.items.push(fit);
-
-        let mut title_item = ControlBarItem::new(
-            PDF_CONTROL_TITLE,
-            ControlBarRegion::Center,
-            ControlBarItemKind::Display,
-            ControlBarPresentation::new(title, [300.0, 150.0, 32.0], 8)
-                .short_label("PDF")
-                .icon(ControlIcon::Document),
-        );
-        title_item.state.enabled = document_open;
-        snapshot.items.push(title_item);
-
-        let mut comments = ControlBarItem::new(
-            PDF_CONTROL_COMMENTS,
-            ControlBarRegion::Trailing,
-            ControlBarItemKind::Button,
-            ControlBarPresentation::new("Comments", [104.0, 72.0, 32.0], 60)
-                .short_label("Notes")
-                .icon(ControlIcon::Comments)
-                .tooltip("Show comments"),
-        );
-        comments.state.enabled = document_open;
-        comments.state.selected =
-            self.sidebar.panel == SidePanel::Comments && self.sidebar.target > 0.5;
-        snapshot.items.push(comments);
 
         let mut search = ControlBarItem::new(
             PDF_CONTROL_SEARCH,
@@ -168,15 +163,16 @@ impl PdfReader {
             ControlBarPresentation::new(
                 "Search",
                 if search_expanded {
-                    [286.0, 180.0, 32.0]
+                    PDF_SEARCH_EXPANDED_WIDTHS
                 } else {
-                    [92.0, 66.0, 32.0]
+                    [32.0, 32.0, 32.0]
                 },
                 100,
             )
             .short_label("Find")
             .icon(ControlIcon::Search)
-            .tooltip("Search this document"),
+            .tooltip("Search this document")
+            .icon_only(),
         );
         search.state = ControlBarItemState {
             enabled: document_open,
@@ -187,19 +183,38 @@ impl PdfReader {
         };
         snapshot.items.push(search);
 
+        let mut comments = ControlBarItem::new(
+            PDF_CONTROL_COMMENTS,
+            ControlBarRegion::Trailing,
+            ControlBarItemKind::Button,
+            ControlBarPresentation::new("Comments", [32.0, 32.0, 32.0], 60)
+                .short_label("Notes")
+                .icon(ControlIcon::Comments)
+                .tooltip("Show comments")
+                .icon_only(),
+        );
+        comments.state.enabled = document_open;
+        comments.state.selected =
+            self.sidebar.panel == SidePanel::Comments && self.sidebar.target > 0.5;
+        snapshot.items.push(comments);
+
         if dark_theme {
             let mut dark_mode = ControlBarItem::new(
                 PDF_CONTROL_DARK_MODE,
                 ControlBarRegion::Trailing,
                 ControlBarItemKind::Button,
-                ControlBarPresentation::new("PDF colors", [96.0, 60.0, 32.0], 20)
-                    .short_label("Tone")
+                ControlBarPresentation::new("Invert PDF colors", [32.0, 32.0, 32.0], 60)
                     .icon(if self.pdf_dark_mode_enabled {
                         ControlIcon::Moon
                     } else {
                         ControlIcon::Sun
                     })
-                    .tooltip("Toggle PDF dark colors"),
+                    .tooltip(if self.pdf_dark_mode_enabled {
+                        "Show the original PDF colors"
+                    } else {
+                        "Invert PDF colors for this dark theme"
+                    })
+                    .icon_only(),
             );
             dark_mode.state.enabled = document_open;
             dark_mode.state.selected = self.pdf_dark_mode_enabled;

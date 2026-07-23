@@ -1,0 +1,16 @@
+[package]
+name = "key-ui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed, renderer-independent design-system contracts for Key applications"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "appearance": {
+    "theme": {
+      "source": "named",
+      "name": "Adventure"
+    },
+    "colors": {
+      "action_accent": {
+        "red": 0.34,
+        "green": 0.70,
+        "blue": 0.24,
+        "alpha": 1.0
+      },
+      "surface_split_gutter": {
+        "red": 0.055,
+        "green": 0.065,
+        "blue": 0.075,
+        "alpha": 1.0
+      }
+    },
+    "icons": {
+      "tab_list": "tab_list"
+    }
+  },
+  "workspace": {
+    "chrome": {
+      "regular": {
+        "row_order": "controls_then_tabs",
+        "utility_controls_row": "top",
+        "utility_controls_leading_inset": 104.0,
+        "tab_bar_height": 42.0,
+        "tab_height": 30.0,
+        "split_segment_height": 24.0,
+        "tab_leading_inset": 0.0,
+        "control_leading_inset": 196.0
+      },
+      "compact": {
+        "row_order": "controls_then_tabs",
+        "utility_controls_row": "top",
+        "utility_controls_leading_inset": 92.0,
+        "tab_bar_height": 40.0,
+        "tab_height": 28.0,
+        "split_segment_height": 22.0,
+        "tab_leading_inset": 0.0,
+        "control_leading_inset": 184.0
+      },
+      "comfortable": null
+    }
+  }
+}

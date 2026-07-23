@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "curvature": "disabled",
+    "concave_corners": "disabled",
+    "shadows": "disabled",
+    "translucency": "disabled",
+    "motion": "disabled",
+    "maximum_corner_radius": 0.0
+  },
+  "workspace": {
+    "chrome": {
+      "regular": {
+        "utility_controls_row": "top",
+        "utility_controls_leading_inset": 104.0
+      },
+      "compact": {
+        "utility_controls_row": "top",
+        "utility_controls_leading_inset": 92.0
+      },
+      "comfortable": null
+    }
+  }
+}

@@ -131,6 +131,74 @@ Runtime lookup order is `PDFIUM_DYNAMIC_LIB_PATH`, the executable directory,
 the executable's `../Resources` directory, `vendor/pdfium/lib`, and finally the
 system library lookup path.
 
+### Design-system overrides
+
+The renderer-independent UI configuration lives in
+`assets/ui/key-glass.json`. It controls root visual policy, geometry,
+materials/translucency, semantic region contrast, responsive width classes,
+base-theme selection, semantic color overrides, typed icon roles, and
+workspace composition through a strict, versioned schema. Workspace
+composition includes the order and geometry of the chrome rows, tab sizing,
+responsive placement of the sidebar/tab-overview utility group, independent
+split-tab segment height, control insets, and split-pane spacing. To run with
+another configuration:
+
+```sh
+GPUI_PDF_READER_STYLE_PATH=/path/to/design-system.json \
+  cargo run --locked -- /path/to/document.pdf
+```
+
+The bootstrap path is loaded once. A newly selected file is validated and
+applied to every open window immediately; invalid or unknown values produce a
+diagnostic and leave the last valid configuration active. Example extremes are provided in
+`assets/ui/variations/clear-glass.json` and
+`assets/ui/variations/square-opaque.json`. The standalone
+`assets/ui/variations/safari-glass.json` preset combines glass materials with a
+Safari-style control-row-first composition. A minimal layout-only override is
+also provided in `assets/ui/variations/safari-chrome.json`; selecting either
+requires no Rust changes:
+
+```sh
+GPUI_PDF_READER_STYLE_PATH=assets/ui/variations/safari-glass.json \
+  cargo run --locked -- /path/to/document.pdf
+```
+
+The square preset also demonstrates that root policy can prohibit curvature,
+shadows, translucency, and motion even when individual components request
+them.
+
+The environment variable is an optional developer/bootstrap override. Normal
+use does not require launching with a path: choose **File → Load UI
+Configuration…**, press **⌘⇧,**, or activate **Appearance** in Settings. The
+selected JSON is validated and applied immediately on demand; it is not polled
+after selection. A rejected theme name, color channel, icon value, layout
+value, or unknown key leaves the current configuration active.
+
+`appearance.theme` selects either the system theme or a named bundled theme.
+`appearance.colors` overrides semantic roles such as chrome, canvas, split
+gutter, content, accent, popover, border, and document paper. `appearance.icons`
+maps semantic UI roles to a closed typed glyph set. Components consume these
+resolved roles instead of parsing arbitrary CSS-like properties.
+
+The same file owns typography roles, state-dependent opacity/surface/border
+values, per-component metrics, reader panel and TOC geometry, shadow geometry,
+animation timing, and independent shapes for every component corner. Corners
+may be `square`, `convex`, or `concave`; root curvature and concavity policy is
+resolved last, so a component cannot override a disabled root capability. The
+vendored GPUI shader interprets concave radii as real inward cut-outs rather
+than approximating them with ordinary rounded corners.
+
+On macOS, window-level glass uses GPUI's native blurred background. Component
+materials use typed alpha, tint, border, highlight, and elevation values.
+`element_blur` is retained as an explicit capability request, but GPUI 0.2.2
+does not yet expose per-element backdrop sampling; it therefore renders with
+the configured translucent fallback rather than claiming a false blur.
+
+Every local reader compilation runs a build-time style-boundary audit before
+the app is compiled. It rejects feature-owned corner/shadow utilities and raw
+RGB/HSL construction; reusable views must go through typed `key-ui-gpui`
+roles. `scripts/test.sh` retains the broader dependency-boundary audit.
+
 For local redistribution, place `libpdfium.dylib` beside the executable or in
 `GPUI PDF Reader.app/Contents/Resources` and retain all project and dependency
 notices. A local, unsigned application bundle can be assembled after either

@@ -2,6 +2,8 @@ use gpui::{AnyElement, App, IntoElement, RenderOnce, Window, div, prelude::*, px
 
 use crate::ThemeTokens;
 
+/// Default retained for callers that need an initial window estimate before
+/// an application context exists. Rendering always uses the active config.
 pub const CONTEXT_BAR_HEIGHT: f32 = 44.0;
 
 /// Window-level row whose contents are supplied by the command-active view.
@@ -73,7 +75,7 @@ impl WorkspaceContextBar {
 impl RenderOnce for WorkspaceContextBar {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
         let primary = div()
-            .h(px(CONTEXT_BAR_HEIGHT))
+            .h(px(self.tokens.components.control_bar.primary_height))
             .w_full()
             .flex_none()
             .px_3()
@@ -112,9 +114,9 @@ impl RenderOnce for WorkspaceContextBar {
             .flex_col()
             .when(self.bottom_border, |bar| {
                 bar.border_b_1()
-                    .border_color(self.tokens.surface.border.opacity(0.72))
+                    .border_color(self.tokens.materials.chrome.border)
             })
-            .bg(self.tokens.surface.background)
+            .bg(self.tokens.materials.chrome.background)
             .child(primary)
             .when_some(self.auxiliary, |bar, auxiliary| {
                 bar.child(

@@ -2,7 +2,7 @@ use super::*;
 
 impl PdfReader {
     fn render_extension_contribution_panel(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
+        let palette = ReaderPalette::from_app(cx);
         let Some(pane) = self.extension_contribution.as_ref() else {
             return empty_state(
                 palette,
@@ -84,16 +84,19 @@ impl PdfReader {
         if progress <= 0.0 && self.extension_ui_panel.target() <= 0.0 {
             return None;
         }
-        let width = SIDEBAR_WIDTH.min((full_width - FLUID_PANEL_HORIZONTAL_MARGIN * 2.0).max(1.0));
-        let hidden_distance = width + FLUID_PANEL_HORIZONTAL_MARGIN + 8.0;
-        let right = FLUID_PANEL_HORIZONTAL_MARGIN - hidden_distance * (1.0 - progress);
+        let ui = self.theme_tokens.reader;
+        let width = ui
+            .sidebar_width
+            .min((full_width - ui.panel_horizontal_margin * 2.0).max(1.0));
+        let hidden_distance = width + ui.panel_horizontal_margin + ui.link_card_gap;
+        let right = ui.panel_horizontal_margin - hidden_distance * (1.0 - progress);
         let content = self.render_extension_contribution_panel(cx);
         Some(
             div()
                 .id("extension-ui-floating-panel")
                 .absolute()
-                .top(px(FLUID_PANEL_VERTICAL_MARGIN))
-                .bottom(px(FLUID_PANEL_VERTICAL_MARGIN))
+                .top(px(ui.panel_vertical_margin))
+                .bottom(px(ui.panel_vertical_margin))
                 .right(px(right))
                 .w(px(width))
                 .child(FloatingPanel::new(palette, content))
@@ -129,7 +132,7 @@ impl PdfReader {
                         .absolute()
                         .top_0()
                         .bottom_0()
-                        .left(px(-SIDEBAR_WIDTH * progress))
+                        .left(px(-self.theme_tokens.reader.sidebar_width * progress))
                         .w_full()
                         .child(overview),
                 )
@@ -138,7 +141,7 @@ impl PdfReader {
                         .absolute()
                         .top_0()
                         .bottom_0()
-                        .left(px(SIDEBAR_WIDTH * (1.0 - progress)))
+                        .left(px(self.theme_tokens.reader.sidebar_width * (1.0 - progress)))
                         .w_full()
                         .child(detail),
                 )
@@ -147,7 +150,7 @@ impl PdfReader {
     }
 
     fn render_extensions_overview(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
+        let palette = ReaderPalette::from_app(cx);
         let header = div()
             .h(px(54.0))
             .flex_none()
@@ -285,7 +288,7 @@ impl PdfReader {
                         .id(("extension-package", index))
                         .w_full()
                         .overflow_hidden()
-                        .rounded_lg()
+                        .design_radius(RadiusRole::Large, &palette.ui)
                         .border_1()
                         .border_color(palette.separator)
                         .bg(palette.surface)
@@ -329,7 +332,7 @@ impl PdfReader {
                                             div()
                                                 .px_2()
                                                 .py_1()
-                                                .rounded_full()
+                                                .design_radius(RadiusRole::Pill, &palette.ui)
                                                 .bg(state_color.opacity(0.12))
                                                 .text_xs()
                                                 .font_weight(FontWeight::MEDIUM)
@@ -345,7 +348,7 @@ impl PdfReader {
                                                 div()
                                                     .px_2()
                                                     .py_1()
-                                                    .rounded_full()
+                                                    .design_radius(RadiusRole::Pill, &palette.ui)
                                                     .bg(palette.surface_subtle)
                                                     .text_xs()
                                                     .text_color(palette.text_secondary)
@@ -357,7 +360,7 @@ impl PdfReader {
                                     card.child(
                                         div()
                                             .p_2()
-                                            .rounded_md()
+                                            .design_radius(RadiusRole::Medium, &palette.ui)
                                             .bg(palette.error_soft)
                                             .text_xs()
                                             .text_color(palette.error)
@@ -400,7 +403,7 @@ impl PdfReader {
                                                             .items_start()
                                                             .justify_between()
                                                             .gap_2()
-                                                            .rounded_md()
+                                                            .design_radius(RadiusRole::Medium, &palette.ui)
                                                             .bg(palette.surface_subtle)
                                                             .child(
                                                                 div()
@@ -422,7 +425,7 @@ impl PdfReader {
                                                                                     row.child(
                                                                                         div()
                                                                                             .px_1()
-                                                                                            .rounded_sm()
+                                                                                            .design_radius(RadiusRole::Small, &palette.ui)
                                                                                             .bg(palette.warning.opacity(0.14))
                                                                                             .text_color(palette.warning)
                                                                                             .child("Required"),
@@ -453,7 +456,7 @@ impl PdfReader {
                                                                     .flex_none()
                                                                     .flex()
                                                                     .items_center()
-                                                                    .rounded_md()
+                                                                    .design_radius(RadiusRole::Medium, &palette.ui)
                                                                     .cursor_pointer()
                                                                     .text_xs()
                                                                     .font_weight(FontWeight::MEDIUM)
@@ -516,7 +519,7 @@ impl PdfReader {
                                                     .flex()
                                                     .items_center()
                                                     .justify_between()
-                                                    .rounded_md()
+                                                    .design_radius(RadiusRole::Medium, &palette.ui)
                                                     .cursor_pointer()
                                                     .text_xs()
                                                     .font_weight(FontWeight::MEDIUM)
@@ -554,7 +557,7 @@ impl PdfReader {
                                                 .flex()
                                                 .items_center()
                                                 .gap_1()
-                                                .rounded_md()
+                                                .design_radius(RadiusRole::Medium, &palette.ui)
                                                 .cursor_pointer()
                                                 .text_xs()
                                                 .font_weight(FontWeight::MEDIUM)
@@ -584,7 +587,7 @@ impl PdfReader {
                                                 .px_3()
                                                 .flex()
                                                 .items_center()
-                                                .rounded_md()
+                                                .design_radius(RadiusRole::Medium, &palette.ui)
                                                 .border_1()
                                                 .border_color(palette.separator)
                                                 .text_xs()
@@ -628,7 +631,7 @@ impl PdfReader {
                                                 .px_3()
                                                 .flex()
                                                 .items_center()
-                                                .rounded_md()
+                                                .design_radius(RadiusRole::Medium, &palette.ui)
                                                 .cursor_pointer()
                                                 .text_xs()
                                                 .font_weight(FontWeight::MEDIUM)
@@ -656,7 +659,7 @@ impl PdfReader {
             .size_full()
             .flex()
             .flex_col()
-            .rounded_xl()
+            .design_radius(RadiusRole::Large, &palette.ui)
             .overflow_hidden()
             .bg(palette.surface)
             .text_color(palette.text)
@@ -721,7 +724,7 @@ impl PdfReader {
         preview: PackageInstallPreview,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
+        let palette = ReaderPalette::from_app(cx);
         let source = match preview.source {
             PackageSourceKind::KeyextArchive => "Signed archive",
             PackageSourceKind::DevelopmentDirectory => "Development folder",
@@ -773,7 +776,7 @@ impl PdfReader {
                     .child(
                         div()
                             .p_4()
-                            .rounded_xl()
+                            .design_radius(RadiusRole::Large, &palette.ui)
                             .bg(palette.accent_soft)
                             .child(
                                 div()
@@ -804,7 +807,7 @@ impl PdfReader {
                                     div()
                                         .px_2()
                                         .py_1()
-                                        .rounded_full()
+                                        .design_radius(RadiusRole::Pill, &palette.ui)
                                         .bg(palette.surface_subtle)
                                         .text_xs()
                                         .text_color(palette.text_secondary)
@@ -848,7 +851,7 @@ impl PdfReader {
                                                 div()
                                                     .id(("install-permission", index))
                                                     .p_3()
-                                                    .rounded_lg()
+                                                    .design_radius(RadiusRole::Large, &palette.ui)
                                                     .bg(palette.surface_subtle)
                                                     .child(
                                                         div()
@@ -911,7 +914,7 @@ impl PdfReader {
         extension: ExtensionId,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let palette = ReaderPalette::from_theme(Theme::global(cx));
+        let palette = ReaderPalette::from_app(cx);
         let Some(package) = self
             .extension_packages
             .iter()
@@ -957,7 +960,7 @@ impl PdfReader {
             settings_section = settings_section.child(
                 div()
                     .p_3()
-                    .rounded_lg()
+                    .design_radius(RadiusRole::Large, &palette.ui)
                     .bg(palette.surface_subtle)
                     .text_xs()
                     .text_color(palette.text_secondary)
@@ -1006,8 +1009,13 @@ impl PdfReader {
                                     .when(!enabled, |toggle| {
                                         toggle.justify_start().bg(palette.control_hover)
                                     })
-                                    .rounded_full()
-                                    .child(div().size(px(16.0)).rounded_full().bg(palette.surface)),
+                                    .design_radius(RadiusRole::Pill, &palette.ui)
+                                    .child(
+                                        div()
+                                            .size(px(16.0))
+                                            .design_radius(RadiusRole::Pill, &palette.ui)
+                                            .bg(palette.surface),
+                                    ),
                             )
                             .into_any_element()
                     }
@@ -1031,7 +1039,7 @@ impl PdfReader {
                                         .px_3()
                                         .flex()
                                         .items_center()
-                                        .rounded_full()
+                                        .design_radius(RadiusRole::Pill, &palette.ui)
                                         .cursor_pointer()
                                         .border_1()
                                         .border_color(if selected {
@@ -1094,7 +1102,7 @@ impl PdfReader {
                     div()
                         .id(("extension-setting", index))
                         .p_3()
-                        .rounded_lg()
+                        .design_radius(RadiusRole::Large, &palette.ui)
                         .bg(palette.surface_subtle)
                         .child(
                             div()
@@ -1138,7 +1146,7 @@ impl PdfReader {
                     .child(
                         div()
                             .p_4()
-                            .rounded_xl()
+                            .design_radius(RadiusRole::Large, &palette.ui)
                             .bg(palette.accent_soft)
                             .child(
                                 div()
@@ -1158,7 +1166,7 @@ impl PdfReader {
                                         div()
                                             .px_2()
                                             .py_1()
-                                            .rounded_full()
+                                            .design_radius(RadiusRole::Pill, &palette.ui)
                                             .bg(state_color.opacity(0.14))
                                             .text_xs()
                                             .text_color(state_color)
@@ -1213,7 +1221,7 @@ impl PdfReader {
                                                 div()
                                                     .id(("extension-detail-permission", index))
                                                     .p_3()
-                                                    .rounded_lg()
+                                                    .design_radius(RadiusRole::Large, &palette.ui)
                                                     .bg(palette.surface_subtle)
                                                     .child(
                                                         div()
@@ -1233,7 +1241,7 @@ impl PdfReader {
                                                                     .id(("extension-detail-permission-toggle", index))
                                                                     .px_2()
                                                                     .py_1()
-                                                                    .rounded_md()
+                                                                    .design_radius(RadiusRole::Medium, &palette.ui)
                                                                     .cursor_pointer()
                                                                     .text_xs()
                                                                     .text_color(if granted { palette.error } else { palette.accent })

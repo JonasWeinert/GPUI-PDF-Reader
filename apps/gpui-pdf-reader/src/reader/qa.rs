@@ -1949,7 +1949,7 @@ impl PdfReader {
                 let base_max = (layout.content_width - self.viewport_width).max(0.0);
                 let expected_max = base_max + self.fluid_panel_occlusion();
                 if (self.max_scroll_x(layout) - expected_max).abs() > 0.01
-                    || self.fluid_panel_occlusion() <= SIDEBAR_WIDTH
+                    || self.fluid_panel_occlusion() <= self.theme_tokens.reader.sidebar_width
                 {
                     return Err("Fluid panel occlusion was not added to horizontal reach".into());
                 }

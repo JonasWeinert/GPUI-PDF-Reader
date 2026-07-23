@@ -12,12 +12,13 @@ use crate::{
 };
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementInputHandler, EntityInputHandler,
-    EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, StyledText, TextLayout,
-    UTF16Selection, Window, canvas, div, point, prelude::*, px, quad, size,
+    EventEmitter, FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, SharedString, StyledText, TextLayout, UTF16Selection,
+    Window, canvas, div, point, prelude::*, px, quad, size,
 };
 use gpui_component::Icon;
 use key_editor_core::{line_at_offset, next_grapheme_boundary, previous_grapheme_boundary};
+use key_ui_gpui::{DesignStyled as _, ElevationRole, RadiusRole, ThemeTokens, TypographyRole};
 use std::{fmt, ops::Range};
 
 /// Events emitted by [`MarkdownEditor`].
@@ -546,32 +547,34 @@ impl MarkdownEditor {
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let menu = self.slash_menu.as_ref()?;
+        let tokens = ThemeTokens::from_app(cx);
+        let metrics = tokens.components.editor;
         let commands = self.filtered_slash_commands();
         let body = if commands.is_empty() {
             div()
                 .px_3()
                 .py_4()
-                .text_sm()
+                .design_typography(TypographyRole::Body, &tokens)
                 .text_color(palette.text_secondary)
                 .child("No matching Markdown style")
                 .into_any_element()
         } else {
             div()
                 .id("markdown-slash-menu-items")
-                .max_h(px(292.0))
+                .max_h(px(metrics.row_height * 6.0 + metrics.section_gap * 5.0))
                 .overflow_y_scroll()
                 .p_1()
                 .children(commands.into_iter().enumerate().map(|(index, command)| {
                     let selected = index == menu.selected;
                     div()
                         .id(("markdown-command", index))
-                        .h(px(48.0))
+                        .h(px(metrics.row_height))
                         .w_full()
                         .px_2()
                         .flex()
                         .items_center()
                         .gap_3()
-                        .rounded_lg()
+                        .design_radius(RadiusRole::Large, &tokens)
                         .cursor_pointer()
                         .bg(if selected {
                             palette.accent_soft
@@ -585,12 +588,12 @@ impl MarkdownEditor {
                         }))
                         .child(
                             div()
-                                .size(px(30.0))
+                                .size(px(metrics.button_height))
                                 .flex_none()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .rounded_md()
+                                .design_radius(RadiusRole::Medium, &tokens)
                                 .bg(if selected {
                                     palette.accent.opacity(0.14)
                                 } else {
@@ -601,7 +604,7 @@ impl MarkdownEditor {
                                 } else {
                                     palette.text_secondary
                                 })
-                                .child(Icon::new(command.icon()).size(px(15.0))),
+                                .child(Icon::new(command.icon()).size(px(metrics.icon_size))),
                         )
                         .child(
                             div()
@@ -610,14 +613,13 @@ impl MarkdownEditor {
                                 .flex_col()
                                 .child(
                                     div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
+                                        .design_typography(TypographyRole::Label, &tokens)
                                         .text_color(palette.text)
                                         .child(command.label()),
                                 )
                                 .child(
                                     div()
-                                        .text_xs()
+                                        .design_typography(TypographyRole::Caption, &tokens)
                                         .text_color(palette.text_secondary)
                                         .child(command.detail()),
                                 ),
@@ -629,27 +631,26 @@ impl MarkdownEditor {
             div()
                 .id("markdown-slash-menu")
                 .absolute()
-                .top(px(86.0))
-                .left(px(12.0))
-                .right(px(12.0))
-                .max_w(px(360.0))
+                .top(px(metrics.header_height + metrics.button_height))
+                .left(px(metrics.card_padding))
+                .right(px(metrics.card_padding))
+                .max_w(px(tokens.components.popover.tab_search_width - 20.0))
                 .overflow_hidden()
-                .rounded_xl()
+                .design_radius(RadiusRole::Large, &tokens)
                 .border_1()
                 .border_color(palette.separator)
                 .bg(palette.surface)
-                .shadow_lg()
+                .design_elevation(ElevationRole::Floating, &tokens)
                 .child(
                     div()
-                        .h(px(34.0))
+                        .h(px(tokens.components.common.control_medium))
                         .px_3()
                         .flex()
                         .items_center()
                         .justify_between()
                         .border_b_1()
                         .border_color(palette.separator)
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .design_typography(TypographyRole::Heading, &tokens)
                         .text_color(palette.text_secondary)
                         .child("INSERT MARKDOWN")
                         .child("↑↓  Return"),
@@ -661,6 +662,7 @@ impl MarkdownEditor {
 
     fn format_button(
         palette: MarkdownEditorStyle,
+        tokens: ThemeTokens,
         id: &'static str,
         label: impl IntoElement,
         active: bool,
@@ -668,14 +670,14 @@ impl MarkdownEditor {
     ) -> impl IntoElement {
         div()
             .id(id)
-            .h(px(30.0))
-            .min_w(px(30.0))
+            .h(px(tokens.components.editor.button_height))
+            .min_w(px(tokens.components.editor.button_height))
             .px_2()
             .flex()
             .items_center()
             .justify_center()
             .overflow_hidden()
-            .rounded_md()
+            .design_radius(RadiusRole::Medium, &tokens)
             .bg(if active {
                 palette.accent_soft
             } else {
@@ -686,8 +688,7 @@ impl MarkdownEditor {
             } else {
                 palette.text_secondary
             })
-            .text_sm()
-            .font_weight(FontWeight::MEDIUM)
+            .design_typography(TypographyRole::Label, &tokens)
             .cursor_pointer()
             .hover(move |style| style.bg(palette.control_hover))
             .active(move |style| style.bg(palette.control_pressed))
@@ -800,6 +801,7 @@ impl EntityInputHandler for MarkdownEditor {
 impl Render for MarkdownEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.config.style_policy.resolve(cx);
+        let tokens = ThemeTokens::from_app(cx);
         let focused = self.focus_handle.is_focused(window);
         self.projection = DisplayProjection::new(&self.buffer);
         let runs = display_text_runs(&self.buffer, &self.projection, palette);
@@ -844,7 +846,7 @@ impl Render for MarkdownEditor {
             div()
                 .id("markdown-validation-message")
                 .mt_1()
-                .text_xs()
+                .design_typography(TypographyRole::Caption, &tokens)
                 .text_color(palette.error)
                 .child(message)
         });
@@ -855,11 +857,11 @@ impl Render for MarkdownEditor {
             .relative()
             .mt(px(if has_toolbar { 44.0 } else { 0.0 }))
             .flex_1()
-            .min_h(px(116.0))
+            .min_h(px(tokens.components.editor.row_height * 3.0))
             .w_full()
             .overflow_y_scroll()
             .p_4()
-            .rounded_lg()
+            .design_radius(RadiusRole::Large, &tokens)
             .border_1()
             .border_color(if self.validation_message.is_some() {
                 palette.error
@@ -870,8 +872,7 @@ impl Render for MarkdownEditor {
             })
             .bg(palette.surface)
             .text_color(palette.text)
-            .text_sm()
-            .line_height(px(22.0))
+            .design_typography(TypographyRole::Body, &tokens)
             .cursor(CursorStyle::IBeam)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -904,14 +905,15 @@ impl Render for MarkdownEditor {
                         .gap_1()
                         .p_1()
                         .overflow_hidden()
-                        .rounded_xl()
+                        .design_radius(RadiusRole::Large, &tokens)
                         .border_1()
                         .border_color(palette.separator)
                         .bg(palette.surface)
-                        .shadow_sm()
+                        .design_elevation(ElevationRole::Surface, &tokens)
                         .children(self.config.format_commands.iter().copied().map(|command| {
                             Self::format_button(
                                 palette,
+                                tokens,
                                 command.element_id(),
                                 command.toolbar_label(),
                                 self.command_active(command),

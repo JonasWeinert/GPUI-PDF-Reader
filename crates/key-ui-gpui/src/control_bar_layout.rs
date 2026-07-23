@@ -1,4 +1,4 @@
-use key_workspace_core::{ControlBarItem, ControlBarItemKind};
+use key_workspace_core::{ControlBarItem, ControlBarItemKind, ControlBarWidth};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlBarDisplayMode {
@@ -30,8 +30,9 @@ pub struct ControlBarLayoutItem {
     pub width: f32,
 }
 
-/// Selects the richest presentation that fits. Expanded inputs are protected;
-/// other items collapse in ascending priority order and keep their stable order.
+/// Selects the richest presentation that fits. Expanded inputs retain their
+/// richest width while other controls collapse first, then step down through
+/// their own compact widths only when the bar would otherwise overflow.
 #[must_use]
 pub fn solve_control_bar_layout(
     items: &[ControlBarItem],
@@ -84,13 +85,55 @@ pub fn solve_control_bar_layout(
         }
     }
 
+    // An expanded field gets priority, not an unlimited width guarantee. At a
+    // narrow window it must still contract after the rest of the chrome has
+    // exhausted its compact presentations.
+    while total > budget {
+        let mut changed = false;
+        for &(_, index) in &candidates {
+            let item = &items[index];
+            if item.kind != ControlBarItemKind::TextInput || !item.state.expanded {
+                continue;
+            }
+            let current = modes[index];
+            let next = current.next();
+            if next == current {
+                continue;
+            }
+            total -= width(item, current) - width(item, next);
+            modes[index] = next;
+            changed = true;
+            if total <= budget {
+                break;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let remaining = (budget - measured_width(items, &modes)).max(0.0);
+    let max_items = items
+        .iter()
+        .filter(|item| item.state.visible && item.presentation.width == ControlBarWidth::Max)
+        .count();
+    let max_width = if max_items == 0 {
+        0.0
+    } else {
+        remaining / max_items as f32
+    };
+
     items
         .iter()
         .zip(modes)
         .map(|(item, mode)| ControlBarLayoutItem {
             mode,
             width: if item.state.visible {
-                width(item, mode)
+                if item.presentation.width == ControlBarWidth::Max {
+                    max_width
+                } else {
+                    width(item, mode)
+                }
             } else {
                 0.0
             },
@@ -108,6 +151,9 @@ fn measured_width(items: &[ControlBarItem], modes: &[ControlBarDisplayMode]) -> 
 }
 
 fn width(item: &ControlBarItem, mode: ControlBarDisplayMode) -> f32 {
+    if item.presentation.width == ControlBarWidth::Max {
+        return 0.0;
+    }
     let value = item.presentation.widths[mode.index()];
     if value.is_finite() {
         value.max(0.0)
@@ -158,10 +204,41 @@ mod tests {
     }
 
     #[test]
+    fn an_expanded_input_compacts_only_after_other_controls() {
+        let mut input = ControlBarItem::new(
+            "search",
+            ControlBarRegion::Trailing,
+            ControlBarItemKind::TextInput,
+            ControlBarPresentation::new("Search", [280.0, 180.0, 96.0], 1),
+        );
+        input.state = ControlBarItemState {
+            expanded: true,
+            ..ControlBarItemState::default()
+        };
+        let layout = solve_control_bar_layout(&[input, item("comments", 80)], 220.0, 4.0);
+        assert_eq!(layout[0].mode, ControlBarDisplayMode::Compact);
+        assert_eq!(layout[1].mode, ControlBarDisplayMode::Icon);
+    }
+
+    #[test]
     fn hidden_items_consume_no_width() {
         let mut hidden = item("hidden", 1);
         hidden.state.visible = false;
         let layout = solve_control_bar_layout(&[hidden], 0.0, 4.0);
         assert_eq!(layout[0].width, 0.0);
+    }
+
+    #[test]
+    fn max_width_item_receives_the_space_left_by_intrinsic_controls() {
+        let mut location = item("location", 1);
+        location.presentation.width = ControlBarWidth::Max;
+        let layout = solve_control_bar_layout(
+            &[item("split", 90), location, item("search", 90)],
+            300.0,
+            4.0,
+        );
+        assert_eq!(layout[0].width, 100.0);
+        assert_eq!(layout[2].width, 100.0);
+        assert_eq!(layout[1].width, 92.0);
     }
 }

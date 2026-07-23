@@ -117,8 +117,9 @@ impl TileDemandPlan {
     }
 }
 
-/// Calculates a sharp page raster while retaining the reader's 64-pixel
-/// quantization and hard 65,536-pixel safety ceiling by default.
+/// Calculates a sharp page raster at exact device-pixel dimensions, subject to
+/// the hard 65,536-pixel safety ceiling. Hosts may configure a larger raster
+/// quantum when they explicitly prefer fewer cache keys over exact sizing.
 #[must_use]
 pub fn desired_raster_size(
     page_rect: Rect,

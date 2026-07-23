@@ -10,6 +10,7 @@ gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "m
 gpui-component = "=0.5.1"
 
 [dependencies]
+key-ui-core = { path = "../key-ui-core" }
 key-workspace-core = { path = "../key-workspace-core" }
 
 [lints.rust]

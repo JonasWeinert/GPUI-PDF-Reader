@@ -38,6 +38,7 @@ audit key-pdf-runtime "$neutral_forbidden"
 audit key-extension-api "$neutral_forbidden key-pdf-core key-pdf-runtime key-pdf-extension-api"
 audit key-extension-host "$neutral_forbidden key-pdf-core key-pdf-runtime key-pdf-extension-api"
 audit key-pdf-extension-api "gpui gpui-component pdfium-render reqwest zed-reqwest wasmtime key-extension-wasm key-extension-gpui key-pdfium key-pdf-gpui key-safe-http"
+audit key-ui-core "$neutral_forbidden"
 
 # Reusable GPUI components may know their semantic dependencies, but never the
 # concrete PDF engine, application network stack, or executable runtime.
@@ -45,5 +46,18 @@ audit key-editor-gpui "pdfium-render reqwest zed-reqwest wasmtime key-pdfium key
 audit key-pdf-gpui "pdfium-render reqwest zed-reqwest wasmtime key-pdfium key-safe-http gpui-pdf-reader"
 audit key-extension-gpui "pdfium-render reqwest zed-reqwest wasmtime key-pdfium key-safe-http gpui-pdf-reader"
 audit key-ui-gpui "pdfium-render reqwest zed-reqwest wasmtime key-pdfium key-safe-http gpui-pdf-reader"
+
+# Feature views select typed semantic roles. Only key-ui-gpui may translate
+# those roles into renderer-specific radius and shadow utilities, ensuring
+# root curvature/elevation policy cannot be bypassed by incidental UI code.
+if visual_bypasses=$(rg -n '\.rounded(_[a-z]+)?\(|\.shadow(_(sm|md|lg))?\(|BoxShadow \{' \
+    apps/gpui-pdf-reader/src \
+    crates/key-editor-gpui/src \
+    crates/key-extension-gpui/src \
+    extensions/key-reference/src); then
+    echo "Feature UI bypasses key-ui-gpui geometry/elevation roles:" >&2
+    printf '%s\n' "$visual_bypasses" >&2
+    exit 1
+fi
 
 echo "Workspace dependency boundaries passed"

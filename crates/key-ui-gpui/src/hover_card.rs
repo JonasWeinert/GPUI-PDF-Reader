@@ -1,6 +1,6 @@
 use gpui::{AnyElement, App, IntoElement, Pixels, RenderOnce, Window, div, prelude::*, px};
 
-use crate::ThemeTokens;
+use crate::{DesignStyled, ElevationRole, ThemeTokens};
 
 /// Reusable elevated hover surface with arbitrary, separated content slots.
 ///
@@ -39,9 +39,9 @@ impl RenderOnce for HoverCardShell {
             if index > 0 {
                 children.push(
                     div()
-                        .h(px(1.0))
+                        .h(px(self.tokens.components.common.separator_width))
                         .mx_3()
-                        .bg(self.tokens.surface.border.opacity(0.7))
+                        .bg(self.tokens.materials.floating.border)
                         .into_any_element(),
                 );
             }
@@ -52,11 +52,11 @@ impl RenderOnce for HoverCardShell {
             .occlude()
             .w(self.width)
             .overflow_hidden()
-            .rounded_xl()
+            .design_corners(self.tokens.components.corners.popover)
             .border_1()
-            .border_color(self.tokens.content.primary.opacity(0.12))
-            .shadow_lg()
-            .bg(self.tokens.surface.background)
+            .border_color(self.tokens.materials.floating.border)
+            .design_elevation(ElevationRole::Floating, &self.tokens)
+            .bg(self.tokens.materials.floating.background)
             .text_color(self.tokens.content.primary)
             .flex()
             .flex_col()

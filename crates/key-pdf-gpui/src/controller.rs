@@ -10,7 +10,10 @@ use std::sync::Arc;
 
 pub const DEFAULT_MIN_ZOOM: f32 = 0.2;
 pub const DEFAULT_MAX_ZOOM: f32 = 5.0;
-pub const DEFAULT_RENDER_QUANTUM: u32 = 64;
+/// The default keeps the PDF raster aligned to the display's exact device-pixel
+/// dimensions. Hosts may opt into a larger quantum when cache-key stability is
+/// more important than pixel-perfect presentation.
+pub const DEFAULT_RENDER_QUANTUM: u32 = 1;
 pub const DEFAULT_TILE_SIZE: u32 = 1_024;
 pub const DEFAULT_TILE_BLEED: u32 = 32;
 pub const DEFAULT_MAX_RASTER_DIMENSION: u32 = 65_536;
